@@ -1,0 +1,36 @@
+{
+  "monitoring": {
+    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT", "DOTUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"],
+    "alert_threshold_percent": 5.0,
+    "update_interval_seconds": 60,
+    "price_history_days": 7,
+    "enable_websocket": true,
+    "enable_email_alerts": false,
+    "enable_telegram_alerts": true
+  },
+  "apis": {
+    "binance": {
+      "rest": "https://api.binance.com/api/v3",
+      "websocket": "wss://stream.binance.com:9443/ws",
+      "testnet": "https://testnet.binance.vision"
+    },
+    "okx": {
+      "rest": "https://www.okx.com",
+      "websocket": "wss://ws.okx.com:8443/ws/v5/public"
+    },
+    "coingecko": "https://api.coingecko.com/api/v3",
+    "coinmarketcap": "https://pro-api.coinmarketcap.com/v1"
+  },
+  "trading_hours": {
+    "start": "00:00",
+    "end": "23:59",
+    "timezone": "UTC",
+    "weekend_reduced_trading": true
+  },
+  "data_storage": {
+    "price_history_db": "database/price_history.db",
+    "trade_logs_db": "database/trade_logs.db",
+    "backup_interval_hours": 24,
+    "retention_days": 365
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "risk_limits": {
+    "max_daily_loss_percent": 2.0,
+    "max_position_percent": 30.0,
+    "max_single_trade_percent": 10.0,
+    "stop_loss_percent": 5.0,
+    "take_profit_percent": 15.0,
+    "max_leverage": 3.0,
+    "max_correlation": 0.7,
+    "min_liquidity_usd": 1000000,
+    "max_drawdown_percent": 20.0
+  },
+  "portfolio": {
+    "total_capital": 10000.0,
+    "base_currency": "USDT",
+    "target_annual_return_percent": 30.0,
+    "target_sharpe_ratio": 1.5,
+    "rebalance_interval_days": 7
+  },
+  "risk_factors": {
+    "volatility_weight": 0.4,
+    "correlation_weight": 0.3,
+    "liquidity_weight": 0.2,
+    "market_cap_weight": 0.1,
+    "age_weight": 0.0
+  },
+  "trading_strategies": {
+    "trend_following": {
+      "enabled": true,
+      "weight": 0.4,
+      "parameters": {
+        "ma_fast": 20,
+        "ma_slow": 50,
+        "rsi_period": 14,
+        "rsi_overbought": 70,
+        "rsi_oversold": 30
+      }
+    },
+    "mean_reversion": {
+      "enabled": true,
+      "weight": 0.3,
+      "parameters": {
+        "bollinger_period": 20,
+        "bollinger_std": 2,
+        "atr_period": 14,
+        "atr_multiplier": 1.5
+      }
+    },
+    "grid_trading": {
+      "enabled": true,
+      "weight": 0.2,
+      "parameters": {
+        "grid_levels": 10,
+        "grid_spacing_percent": 1.0,
+        "grid_size_usd": 100
+      }
+    },
+    "arbitrage": {
+      "enabled": false,
+      "weight": 0.1,
+      "parameters": {
+        "min_profit_percent": 0.5,
+        "max_execution_time_seconds": 10
+      }
+    }
+  },
+  "emergency_procedures": {
+    "market_crash_threshold_percent": -20.0,
+    "system_failure_action": "stop_all_trades",
+    "api_failure_action": "switch_to_backup",
+    "network_failure_action": "pause_and_retry",
+    "manual_override_enabled": true
+  },
+  "compliance": {
+    "record_all_trades": true,
+    "generate_tax_reports": true,
+    "compliance_report_interval": "monthly",
+    "audit_trail_retention_years": 7
+  }
+}

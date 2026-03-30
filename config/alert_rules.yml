@@ -1,0 +1,174 @@
+# 交易系统告警规则
+groups:
+  - name: trading_system_alerts
+    rules:
+      # 系统资源告警
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "高CPU使用率 (实例 {{ $labels.instance }})"
+          description: "CPU使用率超过80%持续5分钟。当前值: {{ $value }}%"
+
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "高内存使用率 (实例 {{ $labels.instance }})"
+          description: "内存使用率超过85%持续5分钟。当前值: {{ $value }}%"
+
+      - alert: HighDiskUsage
+        expr: (node_filesystem_size_bytes{fstype!~"tmpfs|ramfs"} - node_filesystem_free_bytes{fstype!~"tmpfs|ramfs"}) / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs"} * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "高磁盘使用率 (实例 {{ $labels.instance }})"
+          description: "磁盘使用率超过90%持续5分钟。当前值: {{ $value }}%"
+
+      # 交易系统业务告警
+      - alert: TradingEngineDown
+        expr: up{job="ai-trader"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "交易引擎宕机"
+          description: "交易引擎服务不可用超过1分钟"
+
+      - alert: HighErrorRate
+        expr: rate(trading_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "高错误率"
+          description: "交易错误率超过10%持续2分钟。当前值: {{ $value }}"
+
+      - alert: OrderExecutionDelay
+        expr: trading_order_execution_duration_seconds{quantile="0.95"} > 5
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "订单执行延迟"
+          description: "95%的订单执行时间超过5秒持续3分钟。当前值: {{ $value }}秒"
+
+      # 风险指标告警
+      - alert: HighDrawdown
+        expr: trading_portfolio_drawdown_percent > 10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "高回撤"
+          description: "投资组合回撤超过10%持续10分钟。当前值: {{ $value }}%"
+
+      - alert: LowLiquidity
+        expr: trading_market_liquidity_score < 0.3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "低流动性"
+          description: "市场流动性评分低于0.3持续5分钟。当前值: {{ $value }}"
+
+      - alert: HighVolatility
+        expr: trading_market_volatility > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "高波动性"
+          description: "市场波动性超过5%持续5分钟。当前值: {{ $value }}"
+
+      # 合规性告警
+      - alert: ComplianceViolation
+        expr: trading_compliance_violations_total > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "合规性违规"
+          description: "检测到合规性违规。当前违规次数: {{ $value }}"
+
+      - alert: UnauthorizedAccess
+        expr: rate(trading_unauthorized_access_attempts_total[10m]) > 5
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "未授权访问尝试"
+          description: "未授权访问尝试频率过高。当前频率: {{ $value }}次/分钟"
+
+      # 性能指标告警
+      - alert: SlowDataProcessing
+        expr: rate(trading_data_processing_duration_seconds_sum[5m]) / rate(trading_data_processing_duration_seconds_count[5m]) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "数据处理缓慢"
+          description: "平均数据处理时间超过2秒持续5分钟。当前值: {{ $value }}秒"
+
+      - alert: HighLatency
+        expr: trading_api_latency_seconds{quantile="0.95"} > 1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "高API延迟"
+          description: "95%的API响应时间超过1秒持续3分钟。当前值: {{ $value }}秒"
+
+      # 业务连续性告警
+      - alert: NoRecentTrades
+        expr: time() - trading_last_trade_timestamp_seconds > 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "长时间无交易"
+          description: "超过1小时没有新的交易。最后交易时间: {{ $value }}秒前"
+
+      - alert: HighCancellationRate
+        expr: rate(trading_order_cancellations_total[10m]) / rate(trading_order_submissions_total[10m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "高订单取消率"
+          description: "订单取消率超过50%持续5分钟。当前值: {{ $value }}%"
+
+  - name: predictive_alerts
+    rules:
+      # 预测性告警
+      - alert: PredictedHighLoss
+        expr: trading_predicted_daily_loss_percent > 8
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "预测高损失"
+          description: "预测日损失可能超过8%。当前预测值: {{ $value }}%"
+
+      - alert: PredictedMarketCrash
+        expr: trading_market_crash_probability > 0.7
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "预测市场崩盘"
+          description: "预测市场崩盘概率超过70%。当前概率: {{ $value }}"
+
+      - alert: PredictedLiquidityCrisis
+        expr: trading_liquidity_crisis_probability > 0.6
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: "预测流动性危机"
+          description: "预测流动性危机概率超过60%。当前概率: {{ $value }}"
