@@ -15,6 +15,7 @@ import json
 import logging
 import traceback
 import uuid
+import pandas as pd
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -24,10 +25,20 @@ from src.modules.core.event_system import EnhancedEventSystem, EventType as Core
 from src.modules.core.enhanced_data_quality import EnhancedDataQualitySystem
 from src.modules.core.enhanced_fault_tolerance import EnhancedFaultTolerance
 from src.modules.core.llm_integration import EnhancedLLMIntegration
+from src.modules.core.plugin_system import PluginManager
 from src.modules.monitoring.trading_monitor import TradingMonitor
-from src.modules.api.monitoring_api import set_trading_monitor
+from src.modules.api.monitoring_api import set_trading_monitor, set_anomaly_detector
 from src.modules.strategies.multi_strategy_manager import MultiStrategyManager
+from src.modules.strategies.portfolio_optimizer import PortfolioOptimizer
+from src.modules.strategies.parameter_optimizer import ParameterOptimizer
+from src.modules.backtesting.enhanced_backtester import EnhancedBacktester
+from src.modules.data.enhanced_data_storage import EnhancedDataStorage
+from src.modules.data.data_backup import DataBackupManager
 from src.modules.api.strategy_api import init_strategy_api
+from src.modules.intelligence.anomaly_detection import AnomalyDetector, AnomalyDetectionConfig
+from src.modules.intelligence.natural_language_interface import NaturalLanguageInterface
+from src.modules.simulation.simulated_market import SimulatedMarket
+from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +210,36 @@ class MainController:
         
         # 多策略管理器
         self.strategy_manager = None
+        
+        # 插件管理器
+        self.plugin_manager = None
+        
+        # 异常检测器
+        self.anomaly_detector = None
+        
+        # 策略组合优化器
+        self.portfolio_optimizer = None
+        
+        # 参数优化器
+        self.parameter_optimizer = None
+        
+        # 增强回测系统
+        self.enhanced_backtester = None
+        
+        # 增强数据存储系统
+        self.data_storage = None
+        
+        # 数据备份管理器
+        self.backup_manager = None
+        
+        # 策略评估器
+        self.strategy_evaluator = None
+        
+        # 自然语言接口
+        self.natural_language_interface = None
+        
+        # 模拟交易市场
+        self.simulated_market = None
 
         # 默认配置
         self.auto_restart_modules = True
@@ -256,6 +297,49 @@ class MainController:
         self.strategy_manager = MultiStrategyManager(strategy_config)
         # 初始化策略API
         init_strategy_api(self.strategy_manager)
+        
+        # 初始化插件管理器
+        self.plugin_manager = PluginManager(self.config_manager)
+        await self.plugin_manager.initialize()
+        # 加载插件
+        loaded_plugins = await self.plugin_manager.load_plugins()
+        logger.info(f"加载插件: {loaded_plugins}")
+        # 启动插件
+        started_plugins = await self.plugin_manager.start_plugins()
+        logger.info(f"启动插件: {started_plugins}")
+        
+        # 初始化异常检测器
+        self.anomaly_detector = AnomalyDetector(AnomalyDetectionConfig())
+        await self.anomaly_detector.initialize()
+        # 设置异常检测器实例到API模块
+        set_anomaly_detector(self.anomaly_detector)
+        
+        # 初始化策略组合优化器
+        self.portfolio_optimizer = PortfolioOptimizer()
+        
+        # 初始化参数优化器
+        self.parameter_optimizer = ParameterOptimizer()
+        
+        # 初始化增强回测系统
+        self.enhanced_backtester = EnhancedBacktester()
+        
+        # 初始化增强数据存储系统
+        self.data_storage = EnhancedDataStorage()
+        
+        # 初始化数据备份管理器
+        self.backup_manager = DataBackupManager()
+        # 启动定时备份任务
+        self._tasks.append(asyncio.create_task(self.backup_manager.schedule_backup()))
+        
+        # 初始化策略评估器
+        self.strategy_evaluator = StrategyEvaluator("main")
+        
+        # 初始化自然语言接口
+        self.natural_language_interface = NaturalLanguageInterface(self.llm_integration)
+        
+        # 初始化模拟交易市场
+        self.simulated_market = SimulatedMarket()
+        await self.simulated_market.initialize()
 
         # 注册默认事件处理器
         self._register_default_handlers()
@@ -318,6 +402,17 @@ class MainController:
         
         # 清理多策略管理器
         self.strategy_manager = None
+        
+        # 清理插件管理器
+        if self.plugin_manager:
+            await self.plugin_manager.stop_plugins()
+            await self.plugin_manager.cleanup_plugins()
+            self.plugin_manager = None
+        
+        # 清理异常检测器
+        if self.anomaly_detector:
+            await self.anomaly_detector.shutdown()
+            self.anomaly_detector = None
             
         self._initialized = False
 
@@ -1022,6 +1117,769 @@ class MainController:
         """
         if self.strategy_manager:
             self.strategy_manager.add_strategy(strategy)
+    
+    def get_plugin_manager(self) -> Optional[PluginManager]:
+        """
+        获取插件管理器实例
+
+        Returns:
+            插件管理器实例
+        """
+        return self.plugin_manager
+    
+    async def load_plugin(self, plugin_name: str, plugin_config: Dict[str, Any]) -> bool:
+        """
+        加载插件
+
+        Args:
+            plugin_name: 插件名称
+            plugin_config: 插件配置
+
+        Returns:
+            是否加载成功
+        """
+        if self.plugin_manager:
+            return await self.plugin_manager.load_plugin(plugin_name, plugin_config)
+        return False
+    
+    async def reload_plugin(self, plugin_name: str) -> bool:
+        """
+        重新加载插件
+
+        Args:
+            plugin_name: 插件名称
+
+        Returns:
+            是否重新加载成功
+        """
+        if self.plugin_manager:
+            return await self.plugin_manager.reload_plugin(plugin_name)
+        return False
+    
+    async def unload_plugin(self, plugin_name: str) -> bool:
+        """
+        卸载插件
+
+        Args:
+            plugin_name: 插件名称
+
+        Returns:
+            是否卸载成功
+        """
+        if self.plugin_manager:
+            return await self.plugin_manager.unload_plugin(plugin_name)
+        return False
+    
+    def get_plugin_info(self, plugin_name: str) -> Optional[Dict[str, Any]]:
+        """
+        获取插件信息
+
+        Args:
+            plugin_name: 插件名称
+
+        Returns:
+            插件信息
+        """
+        if self.plugin_manager:
+            return self.plugin_manager.get_plugin_info(plugin_name)
+        return None
+    
+    def get_all_plugin_info(self) -> Dict[str, Dict[str, Any]]:
+        """
+        获取所有插件信息
+
+        Returns:
+            插件信息字典
+        """
+        if self.plugin_manager:
+            return self.plugin_manager.get_all_plugin_info()
+        return {}
+    
+    def get_portfolio_optimizer(self) -> Optional[PortfolioOptimizer]:
+        """
+        获取策略组合优化器实例
+
+        Returns:
+            策略组合优化器实例
+        """
+        return self.portfolio_optimizer
+    
+    async def optimize_portfolio(self, optimization_type: str, strategies_data: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+        """
+        优化策略组合
+
+        Args:
+            optimization_type: 优化类型 (mean_variance, risk_parity, max_sharpe, min_variance)
+            strategies_data: 策略数据，包含returns, volatility, correlation
+
+        Returns:
+            优化后的权重
+        """
+        if not self.portfolio_optimizer:
+            return {}
+        
+        # 添加策略到优化器
+        for strategy_name, data in strategies_data.items():
+            self.portfolio_optimizer.add_strategy(
+                strategy_name,
+                data['returns'],
+                data['volatility'],
+                data['correlation']
+            )
+        
+        # 执行优化
+        if optimization_type == 'mean_variance':
+            return self.portfolio_optimizer.mean_variance_optimization()
+        elif optimization_type == 'risk_parity':
+            return self.portfolio_optimizer.risk_parity_optimization()
+        elif optimization_type == 'max_sharpe':
+            return self.portfolio_optimizer.maximum_sharpe_ratio_portfolio()
+        elif optimization_type == 'min_variance':
+            return self.portfolio_optimizer.minimum_variance_portfolio()
+        else:
+            return {}
+    
+    async def get_efficient_frontier(self, strategies_data: Dict[str, Dict[str, Any]], num_points: int = 100) -> pd.DataFrame:
+        """
+        获取有效前沿
+
+        Args:
+            strategies_data: 策略数据
+            num_points: 有效前沿上的点数量
+
+        Returns:
+            有效前沿数据框
+        """
+        if not self.portfolio_optimizer:
+            return pd.DataFrame()
+        
+        # 添加策略到优化器
+        for strategy_name, data in strategies_data.items():
+            self.portfolio_optimizer.add_strategy(
+                strategy_name,
+                data['returns'],
+                data['volatility'],
+                data['correlation']
+            )
+        
+        return self.portfolio_optimizer.efficient_frontier(num_points)
+    
+    def get_parameter_optimizer(self) -> Optional[ParameterOptimizer]:
+        """
+        获取参数优化器实例
+
+        Returns:
+            参数优化器实例
+        """
+        return self.parameter_optimizer
+    
+    async def optimize_strategy_parameters(self, strategy_name: str, method: str, 
+                                         param_space: Dict[str, Any], 
+                                         backtest_data: pd.DataFrame, 
+                                         **kwargs) -> Dict[str, Any]:
+        """
+        优化策略参数
+
+        Args:
+            strategy_name: 策略名称
+            method: 优化方法
+            param_space: 参数空间
+            backtest_data: 回测数据
+            **kwargs: 额外参数
+
+        Returns:
+            优化结果
+        """
+        if not self.parameter_optimizer or not self.strategy_manager:
+            return {}
+        
+        # 获取策略实例
+        strategy = self.strategy_manager.get_strategy(strategy_name)
+        if not strategy:
+            return {}
+        
+        # 设置策略到优化器
+        self.parameter_optimizer.set_strategy(strategy)
+        
+        # 执行优化
+        return self.parameter_optimizer.optimize(method, param_space, backtest_data, **kwargs)
+    
+    async def get_optimization_history(self) -> List[Dict[str, Any]]:
+        """
+        获取优化历史
+
+        Returns:
+            优化历史记录
+        """
+        if not self.parameter_optimizer:
+            return []
+        return self.parameter_optimizer.get_optimization_history()
+    
+    def get_enhanced_backtester(self) -> Optional[EnhancedBacktester]:
+        """
+        获取增强回测系统实例
+
+        Returns:
+            增强回测系统实例
+        """
+        return self.enhanced_backtester
+    
+    async def run_multi_strategy_backtest(self, strategies: Dict[str, Any], 
+                                         market_data: Dict[str, pd.DataFrame], 
+                                         start_date: Optional[datetime] = None, 
+                                         end_date: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        运行多策略协同回测
+
+        Args:
+            strategies: 策略字典
+            market_data: 市场数据
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            回测结果
+        """
+        if not self.enhanced_backtester:
+            return {}
+        
+        # 添加策略
+        for strategy_name, strategy in strategies.items():
+            self.enhanced_backtester.add_strategy(strategy_name, strategy)
+        
+        # 添加市场数据
+        for symbol, data in market_data.items():
+            self.enhanced_backtester.add_market_data(symbol, data)
+        
+        # 运行回测
+        result = self.enhanced_backtester.run_multi_strategy_backtest(start_date, end_date)
+        
+        return {
+            'total_return': result.total_return,
+            'sharpe_ratio': result.sharpe_ratio,
+            'max_drawdown': result.max_drawdown,
+            'win_rate': result.win_rate,
+            'total_trades': result.total_trades,
+            'profit_factor': result.profit_factor,
+            'calmar_ratio': result.calmar_ratio,
+            'sortino_ratio': result.sortino_ratio,
+            'trades': result.trades,
+            'equity_curve': result.equity_curve.to_dict() if result.equity_curve is not None else {},
+            'positions': result.positions
+        }
+    
+    async def run_cross_market_arbitrage_backtest(self, symbol1: str, symbol2: str, 
+                                                  market_data: Dict[str, pd.DataFrame], 
+                                                  spread_threshold: float = 0.01, 
+                                                  start_date: Optional[datetime] = None, 
+                                                  end_date: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        运行跨市场套利回测
+
+        Args:
+            symbol1: 第一个交易对
+            symbol2: 第二个交易对
+            market_data: 市场数据
+            spread_threshold: 价差阈值
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            回测结果
+        """
+        if not self.enhanced_backtester:
+            return {}
+        
+        # 添加市场数据
+        for symbol, data in market_data.items():
+            self.enhanced_backtester.add_market_data(symbol, data)
+        
+        # 运行回测
+        result = self.enhanced_backtester.run_cross_market_arbitrage_backtest(
+            symbol1, symbol2, spread_threshold, start_date, end_date
+        )
+        
+        return {
+            'total_return': result.total_return,
+            'sharpe_ratio': result.sharpe_ratio,
+            'max_drawdown': result.max_drawdown,
+            'win_rate': result.win_rate,
+            'total_trades': result.total_trades,
+            'profit_factor': result.profit_factor,
+            'calmar_ratio': result.calmar_ratio,
+            'sortino_ratio': result.sortino_ratio,
+            'trades': result.trades,
+            'equity_curve': result.equity_curve.to_dict() if result.equity_curve is not None else {},
+            'positions': result.positions
+        }
+    
+    def get_data_storage(self) -> Optional[EnhancedDataStorage]:
+        """
+        获取增强数据存储系统实例
+
+        Returns:
+            增强数据存储系统实例
+        """
+        return self.data_storage
+    
+    async def save_market_data(self, symbol: str, data: pd.DataFrame, timeframe: str = "1m") -> bool:
+        """
+        保存市场数据
+
+        Args:
+            symbol: 交易对
+            data: 市场数据
+            timeframe: 时间周期
+
+        Returns:
+            是否保存成功
+        """
+        if not self.data_storage:
+            return False
+        return self.data_storage.save_market_data(symbol, data, timeframe)
+    
+    async def load_market_data(self, symbol: str, start_time: datetime, end_time: datetime, 
+                             timeframe: str = "1m") -> pd.DataFrame:
+        """
+        加载市场数据
+
+        Args:
+            symbol: 交易对
+            start_time: 开始时间
+            end_time: 结束时间
+            timeframe: 时间周期
+
+        Returns:
+            市场数据
+        """
+        if not self.data_storage:
+            return pd.DataFrame()
+        return self.data_storage.load_market_data(symbol, start_time, end_time, timeframe)
+    
+    async def get_available_symbols(self) -> List[str]:
+        """
+        获取可用的交易对
+
+        Returns:
+            交易对列表
+        """
+        if not self.data_storage:
+            return []
+        return self.data_storage.get_available_symbols()
+    
+    async def get_available_timeframes(self, symbol: str) -> List[str]:
+        """
+        获取可用的时间周期
+
+        Args:
+            symbol: 交易对
+
+        Returns:
+            时间周期列表
+        """
+        if not self.data_storage:
+            return []
+        return self.data_storage.get_available_timeframes(symbol)
+    
+    async def get_data_range(self, symbol: str, timeframe: str = "1m") -> Tuple[Optional[datetime], Optional[datetime]]:
+        """
+        获取数据的时间范围
+
+        Args:
+            symbol: 交易对
+            timeframe: 时间周期
+
+        Returns:
+            (开始时间, 结束时间)
+        """
+        if not self.data_storage:
+            return None, None
+        return self.data_storage.get_data_range(symbol, timeframe)
+    
+    async def delete_market_data(self, symbol: str, timeframe: str = "1m", 
+                               start_time: Optional[datetime] = None, 
+                               end_time: Optional[datetime] = None) -> bool:
+        """
+        删除市场数据
+
+        Args:
+            symbol: 交易对
+            timeframe: 时间周期
+            start_time: 开始时间
+            end_time: 结束时间
+
+        Returns:
+            是否删除成功
+        """
+        if not self.data_storage:
+            return False
+        return self.data_storage.delete_market_data(symbol, timeframe, start_time, end_time)
+    
+    async def optimize_data_storage(self, symbol: str, timeframe: str = "1m") -> bool:
+        """
+        优化数据存储
+
+        Args:
+            symbol: 交易对
+            timeframe: 时间周期
+
+        Returns:
+            是否优化成功
+        """
+        if not self.data_storage:
+            return False
+        return self.data_storage.optimize_storage(symbol, timeframe)
+    
+    def get_backup_manager(self) -> Optional[DataBackupManager]:
+        """
+        获取数据备份管理器实例
+
+        Returns:
+            数据备份管理器实例
+        """
+        return self.backup_manager
+    
+    async def create_backup(self, backup_name: Optional[str] = None, 
+                          include_data: bool = True, 
+                          include_config: bool = True, 
+                          include_logs: bool = False) -> str:
+        """
+        创建数据备份
+
+        Args:
+            backup_name: 备份名称
+            include_data: 是否包含数据
+            include_config: 是否包含配置
+            include_logs: 是否包含日志
+
+        Returns:
+            备份文件路径
+        """
+        if not self.backup_manager:
+            return ""
+        return await self.backup_manager.create_backup(backup_name, include_data, include_config, include_logs)
+    
+    async def restore_backup(self, backup_file: str, 
+                           restore_data: bool = True, 
+                           restore_config: bool = True, 
+                           restore_logs: bool = False) -> bool:
+        """
+        恢复数据备份
+
+        Args:
+            backup_file: 备份文件路径
+            restore_data: 是否恢复数据
+            restore_config: 是否恢复配置
+            restore_logs: 是否恢复日志
+
+        Returns:
+            是否恢复成功
+        """
+        if not self.backup_manager:
+            return False
+        return await self.backup_manager.restore_backup(backup_file, restore_data, restore_config, restore_logs)
+    
+    async def list_backups(self) -> List[Dict[str, Any]]:
+        """
+        列出所有备份
+
+        Returns:
+            备份列表
+        """
+        if not self.backup_manager:
+            return []
+        return await self.backup_manager.list_backups()
+    
+    async def delete_backup(self, backup_file: str) -> bool:
+        """
+        删除备份
+
+        Args:
+            backup_file: 备份文件路径
+
+        Returns:
+            是否删除成功
+        """
+        if not self.backup_manager:
+            return False
+        return await self.backup_manager.delete_backup(backup_file)
+    
+    async def configure_backup(self, config: Dict[str, Any]):
+        """
+        配置备份设置
+
+        Args:
+            config: 备份配置
+        """
+        if self.backup_manager:
+            await self.backup_manager.configure_backup(config)
+    
+    def get_strategy_evaluator(self) -> Optional[StrategyEvaluator]:
+        """
+        获取策略评估器实例
+
+        Returns:
+            策略评估器实例
+        """
+        return self.strategy_evaluator
+    
+    async def evaluate_strategy(self, strategy_name: str, returns: List[float], trades: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        评估策略性能
+
+        Args:
+            strategy_name: 策略名称
+            returns: 收益数据
+            trades: 交易记录
+
+        Returns:
+            策略评估报告
+        """
+        if not self.strategy_evaluator:
+            return {}
+        
+        # 创建临时评估器
+        evaluator = StrategyEvaluator(strategy_name)
+        evaluator.add_returns(returns)
+        if trades:
+            for trade in trades:
+                evaluator.add_trade(trade)
+        
+        return evaluator.get_evaluation_report()
+    
+    async def get_strategy_risk_metrics(self, strategy_name: str, returns: List[float]) -> Dict[str, Any]:
+        """
+        获取策略风险指标
+
+        Args:
+            strategy_name: 策略名称
+            returns: 收益数据
+
+        Returns:
+            风险指标
+        """
+        if not self.strategy_evaluator:
+            return {}
+        
+        evaluator = StrategyEvaluator(strategy_name)
+        evaluator.add_returns(returns)
+        return evaluator.get_risk_metrics()
+    
+    async def get_strategy_performance_metrics(self, strategy_name: str, returns: List[float]) -> Dict[str, Any]:
+        """
+        获取策略性能指标
+
+        Args:
+            strategy_name: 策略名称
+            returns: 收益数据
+
+        Returns:
+            性能指标
+        """
+        if not self.strategy_evaluator:
+            return {}
+        
+        evaluator = StrategyEvaluator(strategy_name)
+        evaluator.add_returns(returns)
+        return evaluator.get_performance_metrics()
+    
+    async def get_strategy_trade_metrics(self, strategy_name: str, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        获取策略交易指标
+
+        Args:
+            strategy_name: 策略名称
+            trades: 交易记录
+
+        Returns:
+            交易指标
+        """
+        if not self.strategy_evaluator:
+            return {}
+        
+        evaluator = StrategyEvaluator(strategy_name)
+        for trade in trades:
+            evaluator.add_trade(trade)
+        return evaluator.get_trade_metrics()
+    
+    def get_natural_language_interface(self) -> Optional[NaturalLanguageInterface]:
+        """
+        获取自然语言接口实例
+
+        Returns:
+            自然语言接口实例
+        """
+        return self.natural_language_interface
+    
+    async def process_natural_language_query(self, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        处理自然语言查询
+
+        Args:
+            query: 自然语言查询
+            context: 上下文信息
+
+        Returns:
+            处理结果
+        """
+        if not self.natural_language_interface:
+            return {
+                "error": "自然语言接口未初始化",
+                "message": "无法处理自然语言查询"
+            }
+        return await self.natural_language_interface.process_query(query, context)
+    
+    async def respond_to_natural_language_query(self, query: str, context: Dict[str, Any] = None) -> str:
+        """
+        处理自然语言查询并生成响应
+
+        Args:
+            query: 自然语言查询
+            context: 上下文信息
+
+        Returns:
+            自然语言响应
+        """
+        if not self.natural_language_interface:
+            return "自然语言接口未初始化，无法处理查询"
+        return await self.natural_language_interface.process_and_respond(query, context)
+    
+    def get_available_commands(self) -> Dict[str, Dict[str, Any]]:
+        """
+        获取可用的自然语言命令
+
+        Returns:
+            可用命令列表
+        """
+        if not self.natural_language_interface:
+            return {}
+        return self.natural_language_interface.get_available_commands()
+    
+    def add_natural_language_command(self, command_name: str, description: str, keywords: list, function: str) -> bool:
+        """
+        添加新的自然语言命令
+
+        Args:
+            command_name: 命令名称
+            description: 命令描述
+            keywords: 关键词列表
+            function: 关联函数
+
+        Returns:
+            是否添加成功
+        """
+        if not self.natural_language_interface:
+            return False
+        return self.natural_language_interface.add_command(command_name, description, keywords, function)
+    
+    def remove_natural_language_command(self, command_name: str) -> bool:
+        """
+        删除自然语言命令
+
+        Args:
+            command_name: 命令名称
+
+        Returns:
+            是否删除成功
+        """
+        if not self.natural_language_interface:
+            return False
+        return self.natural_language_interface.remove_command(command_name)
+    
+    def get_simulated_market(self) -> Optional[SimulatedMarket]:
+        """
+        获取模拟交易市场实例
+
+        Returns:
+            模拟交易市场实例
+        """
+        return self.simulated_market
+    
+    async def start_simulated_market(self):
+        """
+        启动模拟交易市场
+        """
+        if self.simulated_market:
+            await self.simulated_market.start()
+    
+    async def stop_simulated_market(self):
+        """
+        停止模拟交易市场
+        """
+        if self.simulated_market:
+            await self.simulated_market.stop()
+    
+    def execute_simulated_order(self, symbol: str, side: str, size: float, price: Optional[float] = None) -> Dict[str, Any]:
+        """
+        在模拟市场中执行订单
+
+        Args:
+            symbol: 交易对
+            side: 交易方向 (buy/sell)
+            size: 交易数量
+            price: 交易价格（市价单为None）
+
+        Returns:
+            订单执行结果
+        """
+        if not self.simulated_market:
+            return {"error": "模拟市场未初始化"}
+        return self.simulated_market.execute_order(symbol, side, size, price)
+    
+    def get_simulated_market_data(self, symbol: str, timeframe: str = "1m", limit: int = 100) -> pd.DataFrame:
+        """
+        获取模拟市场的历史数据
+
+        Args:
+            symbol: 交易对
+            timeframe: 时间周期
+            limit: 数据条数
+
+        Returns:
+            历史数据DataFrame
+        """
+        if not self.simulated_market:
+            return pd.DataFrame()
+        return self.simulated_market.get_historical_data(symbol, timeframe, limit)
+    
+    def get_simulated_market_state(self) -> Dict[str, Any]:
+        """
+        获取模拟市场状态
+
+        Returns:
+            市场状态
+        """
+        if not self.simulated_market:
+            return {"error": "模拟市场未初始化"}
+        return self.simulated_market.get_market_state()
+    
+    def reset_simulated_market(self):
+        """
+        重置模拟市场
+        """
+        if self.simulated_market:
+            self.simulated_market.reset()
+    
+    def set_simulated_market_parameters(self, volatility: Optional[float] = None, trend_strength: Optional[float] = None, 
+                                      liquidity: Optional[float] = None, spread: Optional[float] = None):
+        """
+        设置模拟市场参数
+
+        Args:
+            volatility: 波动率
+            trend_strength: 趋势强度
+            liquidity: 流动性
+            spread: 买卖价差
+        """
+        if self.simulated_market:
+            if volatility is not None:
+                self.simulated_market.set_volatility(volatility)
+            if trend_strength is not None:
+                self.simulated_market.set_trend_strength(trend_strength)
+            if liquidity is not None:
+                self.simulated_market.set_liquidity(liquidity)
+            if spread is not None:
+                self.simulated_market.set_spread(spread)
     
     async def update_market_data(self, symbol: str, last_price: float, volume: float, bid: float, ask: float):
         """

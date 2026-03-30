@@ -72,6 +72,18 @@ class StrategyPerformance:
     max_drawdown: float
     sharpe_ratio: float
     last_update: float
+    # 新增细粒度指标
+    avg_win: float = 0.0  # 平均盈利
+    avg_loss: float = 0.0  # 平均亏损
+    profit_factor: float = 0.0  # 盈利因子
+    expectancy: float = 0.0  # 预期收益
+    drawdown_duration: int = 0  # 回撤持续时间（天）
+    current_drawdown: float = 0.0  # 当前回撤
+    win_streak: int = 0  # 连续盈利次数
+    loss_streak: int = 0  # 连续亏损次数
+    best_trade: float = 0.0  # 最佳交易
+    worst_trade: float = 0.0  # 最差交易
+    avg_holding_period: float = 0.0  # 平均持仓时间（小时）
 
 
 @dataclass
@@ -85,6 +97,16 @@ class MarketDataStatus:
     spread: float
     last_update: float
     data_age: float  # 数据年龄（秒）
+    # 新增市场异常检测指标
+    price_change_24h: float = 0.0  # 24小时价格变化百分比
+    volume_change_24h: float = 0.0  # 24小时交易量变化百分比
+    volatility_24h: float = 0.0  # 24小时波动率
+    price_momentum: float = 0.0  # 价格动量
+    volume_momentum: float = 0.0  # 交易量动量
+    order_book_depth: float = 0.0  # 订单簿深度
+    liquidity_score: float = 0.0  # 流动性评分
+    market_regime: str = "normal"  # 市场状态：normal, trending, volatile, sideways
+    anomaly_score: float = 0.0  # 异常评分
 
 
 @dataclass
@@ -215,7 +237,11 @@ class TradingMonitor:
         self.strategy_performance[strategy_name] = performance
     
     def update_market_data(self, symbol: str, last_price: float, volume: float, 
-                          bid: float, ask: float):
+                          bid: float, ask: float, price_change_24h: float = 0.0, 
+                          volume_change_24h: float = 0.0, volatility_24h: float = 0.0, 
+                          price_momentum: float = 0.0, volume_momentum: float = 0.0, 
+                          order_book_depth: float = 0.0, liquidity_score: float = 0.0, 
+                          market_regime: str = "normal", anomaly_score: float = 0.0):
         """更新市场数据"""
         spread = ((ask - bid) / bid) * 100 if bid > 0 else 0
         self.market_data_status[symbol] = MarketDataStatus(
@@ -226,7 +252,17 @@ class TradingMonitor:
             ask=ask,
             spread=spread,
             last_update=time.time(),
-            data_age=0
+            data_age=0,
+            # 新增市场异常检测指标
+            price_change_24h=price_change_24h,
+            volume_change_24h=volume_change_24h,
+            volatility_24h=volatility_24h,
+            price_momentum=price_momentum,
+            volume_momentum=volume_momentum,
+            order_book_depth=order_book_depth,
+            liquidity_score=liquidity_score,
+            market_regime=market_regime,
+            anomaly_score=anomaly_score
         )
     
     def update_risk_metrics(self, risk_metrics: RiskMetrics):

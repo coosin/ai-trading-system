@@ -34,6 +34,8 @@ class ConfigLayer(Enum):
     ENVIRONMENT = "environment"  # 环境配置
     USER = "user"           # 用户配置
     RUNTIME = "runtime"     # 运行时配置
+    ENV_VARS = "env_vars"   # 环境变量配置
+    SECRETS = "secrets"     # 密钥管理服务配置
 
 
 class ConfigValidationError(Exception):
@@ -152,6 +154,24 @@ class EnhancedConfigManager:
         # 配置元数据
         self._config_metadata: Dict[str, Dict[str, Any]] = {}
         
+        # 密钥管理服务配置
+        self._secrets_manager = None
+        self._secrets_config = {
+            "enabled": False,
+            "provider": "local",  # local, aws, gcp, azure
+            "key_prefix": "trading_system/"
+        }
+        
+        # 环境变量配置
+        self._env_var_prefix = "TRADING_"
+        self._env_var_mapping = {
+            "system.log_level": "LOG_LEVEL",
+            "trading.enabled": "TRADING_ENABLED",
+            "trading.paper_trading": "PAPER_TRADING",
+            "trading.max_position_size": "MAX_POSITION_SIZE",
+            "data.update_interval": "DATA_UPDATE_INTERVAL"
+        }
+        
         self._initialized = False
         self._lock = asyncio.Lock()
     
@@ -169,6 +189,12 @@ class EnhancedConfigManager:
             
             # 加载用户配置
             await self._load_user_config()
+            
+            # 加载环境变量配置
+            await self._load_env_vars_config()
+            
+            # 加载密钥管理服务配置
+            await self._load_secrets_config()
             
             # 启动文件监控
             self._start_file_watching()
@@ -398,13 +424,151 @@ class EnhancedConfigManager:
             
             logger.info(f"配置已更新: {key} = {value}")
     
+    async def _load_env_vars_config(self):
+        """加载环境变量配置"""
+        env_config = {}
+        
+        # 加载映射的环境变量
+        for config_key, env_key in self._env_var_mapping.items():
+            full_env_key = f"{self._env_var_prefix}{env_key}"
+            env_value = os.getenv(full_env_key)
+            if env_value is not None:
+                # 转换值类型
+                value = self._convert_env_var_value(env_value)
+                # 设置到配置中
+                keys = config_key.split(".")
+                current = env_config
+                for k in keys[:-1]:
+                    if k not in current:
+                        current[k] = {}
+                    current = current[k]
+                current[keys[-1]] = value
+        
+        # 加载所有以 TRADING_ 开头的环境变量
+        for key, value in os.environ.items():
+            if key.startswith(self._env_var_prefix) and key not in [f"{self._env_var_prefix}{v}" for v in self._env_var_mapping.values()]:
+                # 转换为配置键
+                config_key = key[len(self._env_var_prefix):].lower().replace("_", ".")
+                # 转换值类型
+                converted_value = self._convert_env_var_value(value)
+                # 设置到配置中
+                keys = config_key.split(".")
+                current = env_config
+                for k in keys[:-1]:
+                    if k not in current:
+                        current[k] = {}
+                    current = current[k]
+                current[keys[-1]] = converted_value
+        
+        self._configs[ConfigLayer.ENV_VARS] = env_config
+        logger.info(f"环境变量配置加载完成，{len(self._flatten_dict(env_config))} 个配置项")
+    
+    def _convert_env_var_value(self, value: str) -> Any:
+        """转换环境变量值类型"""
+        # 尝试转换为布尔值
+        if value.lower() == "true":
+            return True
+        elif value.lower() == "false":
+            return False
+        
+        # 尝试转换为整数
+        try:
+            return int(value)
+        except ValueError:
+            pass
+        
+        # 尝试转换为浮点数
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        
+        # 尝试转换为列表
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        
+        # 尝试转换为字典
+        if value.startswith("{") and value.endswith("}"):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        
+        # 默认返回字符串
+        return value
+    
+    async def _load_secrets_config(self):
+        """加载密钥管理服务配置"""
+        try:
+            # 初始化密钥管理器
+            await self._initialize_secrets_manager()
+            
+            # 加载密钥
+            secrets = await self._load_secrets()
+            self._configs[ConfigLayer.SECRETS] = secrets
+            
+            logger.info(f"密钥管理服务配置加载完成，{len(self._flatten_dict(secrets))} 个密钥")
+        except Exception as e:
+            logger.warning(f"密钥管理服务加载失败: {e}")
+            self._configs[ConfigLayer.SECRETS] = {}
+    
+    async def _initialize_secrets_manager(self):
+        """初始化密钥管理器"""
+        provider = self._secrets_config["provider"]
+        
+        if provider == "local":
+            # 本地文件存储
+            self._secrets_manager = LocalSecretsManager(self.config_dir / "secrets.yml")
+        elif provider == "aws":
+            # AWS Secrets Manager
+            try:
+                import boto3
+                self._secrets_manager = AWSSecretsManager()
+            except ImportError:
+                logger.warning("AWS SDK not installed, falling back to local secrets manager")
+                self._secrets_manager = LocalSecretsManager(self.config_dir / "secrets.yml")
+        elif provider == "gcp":
+            # GCP Secret Manager
+            try:
+                from google.cloud import secretmanager
+                self._secrets_manager = GCPSecretsManager()
+            except ImportError:
+                logger.warning("GCP SDK not installed, falling back to local secrets manager")
+                self._secrets_manager = LocalSecretsManager(self.config_dir / "secrets.yml")
+        elif provider == "azure":
+            # Azure Key Vault
+            try:
+                from azure.keyvault.secrets import SecretClient
+                from azure.identity import DefaultAzureCredential
+                self._secrets_manager = AzureSecretsManager()
+            except ImportError:
+                logger.warning("Azure SDK not installed, falling back to local secrets manager")
+                self._secrets_manager = LocalSecretsManager(self.config_dir / "secrets.yml")
+        else:
+            self._secrets_manager = LocalSecretsManager(self.config_dir / "secrets.yml")
+    
+    async def _load_secrets(self) -> Dict[str, Any]:
+        """加载密钥"""
+        if not self._secrets_manager:
+            return {}
+        
+        try:
+            return await self._secrets_manager.get_secrets()
+        except Exception as e:
+            logger.error(f"加载密钥失败: {e}")
+            return {}
+    
     def _rebuild_cache(self):
         """重建配置缓存"""
         self._cache = {}
         
         # 按层级合并配置
         for layer in [ConfigLayer.DEFAULT, ConfigLayer.ENVIRONMENT, 
-                     ConfigLayer.USER, ConfigLayer.RUNTIME]:
+                     ConfigLayer.USER, ConfigLayer.ENV_VARS, 
+                     ConfigLayer.SECRETS, ConfigLayer.RUNTIME]:
             self._deep_merge(self._cache, self._configs[layer])
         
         self._cache_valid = True
@@ -570,6 +734,216 @@ async def example_usage():
         
     finally:
         await config_manager.cleanup()
+
+
+class SecretsManager(ABC):
+    """密钥管理器基类"""
+    
+    @abstractmethod
+    async def get_secrets(self) -> Dict[str, Any]:
+        """获取所有密钥"""
+        pass
+    
+    @abstractmethod
+    async def get_secret(self, key: str) -> Any:
+        """获取单个密钥"""
+        pass
+    
+    @abstractmethod
+    async def set_secret(self, key: str, value: Any) -> bool:
+        """设置密钥"""
+        pass
+
+
+class LocalSecretsManager(SecretsManager):
+    """本地密钥管理器"""
+    
+    def __init__(self, secrets_file: Path):
+        self.secrets_file = secrets_file
+    
+    async def get_secrets(self) -> Dict[str, Any]:
+        """获取所有密钥"""
+        if self.secrets_file.exists():
+            return await self._load_secrets_file()
+        return {}
+    
+    async def get_secret(self, key: str) -> Any:
+        """获取单个密钥"""
+        secrets = await self.get_secrets()
+        # 支持点号分隔的键
+        keys = key.split(".")
+        value = secrets
+        for k in keys:
+            if isinstance(value, dict) and k in value:
+                value = value[k]
+            else:
+                return None
+        return value
+    
+    async def set_secret(self, key: str, value: Any) -> bool:
+        """设置密钥"""
+        secrets = await self.get_secrets()
+        # 支持点号分隔的键
+        keys = key.split(".")
+        current = secrets
+        for k in keys[:-1]:
+            if k not in current:
+                current[k] = {}
+            current = current[k]
+        current[keys[-1]] = value
+        
+        await self._save_secrets_file(secrets)
+        return True
+    
+    async def _load_secrets_file(self) -> Dict[str, Any]:
+        """加载密钥文件"""
+        try:
+            content = await asyncio.to_thread(self.secrets_file.read_text, encoding='utf-8')
+            return yaml.safe_load(content) or {}
+        except Exception as e:
+            logger.error(f"加载密钥文件失败: {e}")
+            return {}
+    
+    async def _save_secrets_file(self, secrets: Dict[str, Any]):
+        """保存密钥文件"""
+        try:
+            content = yaml.dump(secrets, default_flow_style=False, allow_unicode=True)
+            await asyncio.to_thread(self.secrets_file.write_text, content, encoding='utf-8')
+        except Exception as e:
+            logger.error(f"保存密钥文件失败: {e}")
+
+
+class AWSSecretsManager(SecretsManager):
+    """AWS Secrets Manager"""
+    
+    def __init__(self):
+        import boto3
+        self.client = boto3.client('secretsmanager')
+    
+    async def get_secrets(self) -> Dict[str, Any]:
+        """获取所有密钥"""
+        secrets = {}
+        try:
+            # 列出所有密钥
+            response = self.client.list_secrets()
+            for secret in response['SecretList']:
+                secret_name = secret['Name']
+                secret_value = await self.get_secret(secret_name)
+                if secret_value:
+                    secrets[secret_name] = secret_value
+        except Exception as e:
+            logger.error(f"AWS Secrets Manager 错误: {e}")
+        return secrets
+    
+    async def get_secret(self, key: str) -> Any:
+        """获取单个密钥"""
+        try:
+            response = self.client.get_secret_value(SecretId=key)
+            if 'SecretString' in response:
+                return json.loads(response['SecretString'])
+        except Exception as e:
+            logger.error(f"获取 AWS 密钥失败: {e}")
+        return None
+    
+    async def set_secret(self, key: str, value: Any) -> bool:
+        """设置密钥"""
+        try:
+            self.client.put_secret_value(
+                SecretId=key,
+                SecretString=json.dumps(value)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"设置 AWS 密钥失败: {e}")
+            return False
+
+
+class GCPSecretsManager(SecretsManager):
+    """GCP Secret Manager"""
+    
+    def __init__(self):
+        from google.cloud import secretmanager
+        self.client = secretmanager.SecretManagerServiceClient()
+    
+    async def get_secrets(self) -> Dict[str, Any]:
+        """获取所有密钥"""
+        secrets = {}
+        try:
+            # 这里需要实现列出所有密钥的逻辑
+            # 由于 GCP SDK 不支持异步，这里返回空字典
+            pass
+        except Exception as e:
+            logger.error(f"GCP Secret Manager 错误: {e}")
+        return secrets
+    
+    async def get_secret(self, key: str) -> Any:
+        """获取单个密钥"""
+        try:
+            # 这里需要实现获取单个密钥的逻辑
+            # 由于 GCP SDK 不支持异步，这里返回 None
+            pass
+        except Exception as e:
+            logger.error(f"获取 GCP 密钥失败: {e}")
+        return None
+    
+    async def set_secret(self, key: str, value: Any) -> bool:
+        """设置密钥"""
+        try:
+            # 这里需要实现设置密钥的逻辑
+            # 由于 GCP SDK 不支持异步，这里返回 False
+            pass
+        except Exception as e:
+            logger.error(f"设置 GCP 密钥失败: {e}")
+        return False
+
+
+class AzureSecretsManager(SecretsManager):
+    """Azure Key Vault"""
+    
+    def __init__(self):
+        from azure.keyvault.secrets import SecretClient
+        from azure.identity import DefaultAzureCredential
+        # 需要设置 AZURE_KEY_VAULT_URL 环境变量
+        vault_url = os.getenv("AZURE_KEY_VAULT_URL")
+        if vault_url:
+            self.client = SecretClient(vault_url=vault_url, credential=DefaultAzureCredential())
+        else:
+            self.client = None
+    
+    async def get_secrets(self) -> Dict[str, Any]:
+        """获取所有密钥"""
+        secrets = {}
+        try:
+            if self.client:
+                # 列出所有密钥
+                for secret in self.client.list_properties_of_secrets():
+                    secret_name = secret.name
+                    secret_value = await self.get_secret(secret_name)
+                    if secret_value:
+                        secrets[secret_name] = secret_value
+        except Exception as e:
+            logger.error(f"Azure Key Vault 错误: {e}")
+        return secrets
+    
+    async def get_secret(self, key: str) -> Any:
+        """获取单个密钥"""
+        try:
+            if self.client:
+                secret = self.client.get_secret(key)
+                return secret.value
+        except Exception as e:
+            logger.error(f"获取 Azure 密钥失败: {e}")
+        return None
+    
+    async def set_secret(self, key: str, value: Any) -> bool:
+        """设置密钥"""
+        try:
+            if self.client:
+                self.client.set_secret(key, str(value))
+                return True
+        except Exception as e:
+            logger.error(f"设置 Azure 密钥失败: {e}")
+        return False
 
 
 if __name__ == "__main__":

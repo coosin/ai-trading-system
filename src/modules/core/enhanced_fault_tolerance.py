@@ -321,7 +321,26 @@ class AutoRecovery:
         self._stats = {
             "recovery_attempts": 0,
             "successful_recoveries": 0,
-            "failed_recoveries": 0
+            "failed_recoveries": 0,
+            "recovery_time": {},  # 记录每个组件的恢复时间
+            "recovery_history": []  # 恢复历史记录
+        }
+        # 恢复策略配置
+        self.recovery_strategies = {
+            "exponential_backoff": True,  # 指数退避恢复
+            "parallel_recovery": True,  # 并行恢复多个组件
+            "priority_based": True,  # 基于优先级的恢复
+            "graceful_degradation": True  # 优雅降级
+        }
+        # 组件优先级
+        self.component_priorities = {
+            "database": 10,
+            "redis": 9,
+            "exchange_api": 8,
+            "strategy": 7,
+            "execution": 6,
+            "monitoring": 5,
+            "api_server": 4
         }
     
     async def initialize(self):
@@ -361,35 +380,117 @@ class AutoRecovery:
         """尝试恢复被隔离的组件"""
         isolated = self.isolation.get_isolated_components()
         
-        for component in isolated:
-            if component in self.recovery_handlers:
-                self._stats["recovery_attempts"] += 1
+        if not isolated:
+            return
+        
+        # 按优先级排序组件
+        if self.recovery_strategies["priority_based"]:
+            sorted_components = sorted(
+                isolated,
+                key=lambda c: self.component_priorities.get(c, 5),
+                reverse=True
+            )
+        else:
+            sorted_components = list(isolated)
+        
+        # 并行恢复多个组件
+        if self.recovery_strategies["parallel_recovery"]:
+            recovery_tasks = []
+            for component in sorted_components:
+                if component in self.recovery_handlers:
+                    recovery_tasks.append(self._recover_component(component))
+            
+            if recovery_tasks:
+                await asyncio.gather(*recovery_tasks, return_exceptions=True)
+        else:
+            # 串行恢复
+            for component in sorted_components:
+                if component in self.recovery_handlers:
+                    await self._recover_component(component)
+    
+    async def _recover_component(self, component: str):
+        """恢复单个组件"""
+        # 检查是否需要指数退避
+        if self.recovery_strategies["exponential_backoff"]:
+            last_recovery_time = self._stats["recovery_time"].get(component, 0)
+            current_time = time.time()
+            
+            # 计算退避时间
+            failure_count = len([f for f in self.isolation.get_fault_history(component) if not f.resolved])
+            base_delay = 10  # 基础延迟10秒
+            max_delay = 300  # 最大延迟5分钟
+            delay = min(base_delay * (2 ** (failure_count - 1)), max_delay)
+            
+            if current_time - last_recovery_time < delay:
+                logger.debug(f"组件 {component} 处于退避期，跳过本次恢复尝试")
+                return
+        
+        self._stats["recovery_attempts"] += 1
+        start_time = time.time()
+        
+        try:
+            handler = self.recovery_handlers[component]
+            
+            if asyncio.iscoroutinefunction(handler):
+                success = await handler()
+            else:
+                success = handler()
+            
+            if success:
+                await self.isolation.recover(component)
+                self._stats["successful_recoveries"] += 1
+                recovery_duration = time.time() - start_time
+                self._stats["recovery_time"][component] = time.time()
                 
-                try:
-                    handler = self.recovery_handlers[component]
-                    
-                    if asyncio.iscoroutinefunction(handler):
-                        success = await handler()
-                    else:
-                        success = handler()
-                    
-                    if success:
-                        await self.isolation.recover(component)
-                        self._stats["successful_recoveries"] += 1
-                        logger.info(f"组件 {component} 自动恢复成功")
-                    else:
-                        self._stats["failed_recoveries"] += 1
-                        logger.warning(f"组件 {component} 自动恢复失败")
-                        
-                except Exception as e:
-                    self._stats["failed_recoveries"] += 1
-                    logger.error(f"组件 {component} 恢复过程出错: {e}")
+                # 记录恢复历史
+                self._stats["recovery_history"].append({
+                    "component": component,
+                    "timestamp": time.time(),
+                    "duration": recovery_duration,
+                    "success": True
+                })
+                
+                logger.info(f"组件 {component} 自动恢复成功，耗时 {recovery_duration:.2f}秒")
+            else:
+                self._stats["failed_recoveries"] += 1
+                self._stats["recovery_time"][component] = time.time()
+                
+                # 记录恢复历史
+                self._stats["recovery_history"].append({
+                    "component": component,
+                    "timestamp": time.time(),
+                    "duration": time.time() - start_time,
+                    "success": False
+                })
+                
+                logger.warning(f"组件 {component} 自动恢复失败")
+                
+        except Exception as e:
+            self._stats["failed_recoveries"] += 1
+            self._stats["recovery_time"][component] = time.time()
+            
+            # 记录恢复历史
+            self._stats["recovery_history"].append({
+                "component": component,
+                "timestamp": time.time(),
+                "duration": time.time() - start_time,
+                "success": False,
+                "error": str(e)
+            })
+            
+            logger.error(f"组件 {component} 恢复过程出错: {e}")
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
+        # 限制恢复历史记录的大小
+        recovery_history = self._stats["recovery_history"][-50:]  # 只返回最近50条记录
+        
         return {
             **self._stats,
-            "isolated_components": len(self.isolation.get_isolated_components())
+            "recovery_history": recovery_history,
+            "isolated_components": len(self.isolation.get_isolated_components()),
+            "recovery_strategies": self.recovery_strategies,
+            "component_priorities": self.component_priorities
         }
 
 

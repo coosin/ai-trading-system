@@ -12,6 +12,8 @@ from fastapi import APIRouter, HTTPException
 from ..strategies.multi_strategy_manager import MultiStrategyManager
 from ..strategies.moving_average import MovingAverageStrategy
 from ..strategies.rsi_strategy import RSIStrategy
+from ..strategies.bb_strategy import BBStrategy
+from ..strategies.macd_strategy import MACDStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +142,10 @@ def add_strategy(strategy_config: Dict[str, Any]) -> Dict[str, Any]:
             strategy = MovingAverageStrategy(strategy_config)
         elif strategy_type == "rsi":
             strategy = RSIStrategy(strategy_config)
+        elif strategy_type == "bb":
+            strategy = BBStrategy(strategy_config)
+        elif strategy_type == "macd":
+            strategy = MACDStrategy(strategy_config)
         else:
             raise HTTPException(status_code=400, detail="不支持的策略类型")
         
