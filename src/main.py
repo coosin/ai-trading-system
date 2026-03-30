@@ -13,6 +13,7 @@ from typing import Optional
 
 from src.modules.core.enhanced_config_manager import EnhancedConfigManager
 from src.modules.main_controller import MainController
+from src.modules.api.server import APIServer
 
 # 全局配置管理器实例
 _config_manager = None
@@ -51,6 +52,7 @@ class TradingSystem:
     def __init__(self):
         self.config_manager = None
         self.main_controller = None
+        self.api_server = None
         self.running = False
         self.shutdown_event = asyncio.Event()
 
@@ -68,7 +70,18 @@ class TradingSystem:
             self.main_controller = MainController(self.config_manager)
             await self.main_controller.initialize()
 
-            # 3. 设置信号处理
+            # 3. 初始化API服务器
+            logger.info("3. 初始化API服务器...")
+            api_config = await self.config_manager.get_config("api", {})
+            self.api_server = APIServer(
+                config_manager=self.config_manager,
+                host=api_config.get("host", "0.0.0.0"),
+                port=api_config.get("port", 8000)
+            )
+            await self.api_server.initialize()
+
+            # 4. 设置信号处理
+            logger.info("4. 设置信号处理...")
             self._setup_signal_handlers()
 
             logger.info("✅ 系统初始化完成")
@@ -91,6 +104,11 @@ class TradingSystem:
             # 启动所有模块
             await self.main_controller.start_all_modules()
 
+            # 启动API服务器
+            if self.api_server:
+                await self.api_server.start()
+                logger.info(f"API服务器已启动，访问 http://{self.api_server.host}:{self.api_server.port}/docs 查看文档")
+
             # 等待关闭信号
             await self.shutdown_event.wait()
 
@@ -111,11 +129,17 @@ class TradingSystem:
         logger.info("正在关闭系统...")
 
         try:
-            # 1. 关闭主控制器
+            # 1. 关闭API服务器
+            if self.api_server:
+                logger.info("正在关闭API服务器...")
+                await self.api_server.stop()
+                await self.api_server.cleanup()
+
+            # 2. 关闭主控制器
             if self.main_controller:
                 await self.main_controller.shutdown()
 
-            # 2. 清理配置管理器
+            # 3. 清理配置管理器
             if self.config_manager:
                 await cleanup_config_manager()
 
