@@ -1,28 +1,104 @@
+# 全智能量化交易系统 - 默认配置文件
+
+system:
+  name: "AI Trading System"
+  version: "2.0.0"
+  debug: false
+  log_level: "INFO"
+
+controller:
+  auto_restart_modules: true
+  max_restart_attempts: 3
+  health_check_interval: 30
+  event_history_limit: 1000
+
+trading:
+  enabled: true
+  paper_trading: true
+  max_position_size: 0.1
+  max_daily_loss: 0.02
+  max_position_count: 10
+  commission_rate: 0.001
+  slippage_rate: 0.0005
+
+risk:
+  enabled: true
+  max_drawdown: 0.1
+  var_limit: 0.05
+  position_limit: 0.2
+  risk_level: "medium"  # low, medium, high, aggressive
+  risk_per_trade: 0.02
+  max_leverage: 3.0
+
+business_process:
+  pipeline_interval: 60
+  signal_cooldown: 300
+  max_pending_signals: 10
+  risk_check_enabled: true
+
 data:
-  history_days: 365
-  symbols:
-  - BTC/USDT
-  - ETH/USDT
   update_interval: 60
+  history_days: 365
+  symbols: ["BTC/USDT", "ETH/USDT"]
+  storage_path: "data/storage"
+
+database:
+  type: "sqlite"  # postgresql, mysql, sqlite
+  host: "localhost"
+  port: 5432
+  database: "data/trading_system.db"
+  username: "postgres"
+  password: ""
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+  pool_recycle: 3600
+  echo: false
+  isolation_level: "read_committed"
+
 monitoring:
   enabled: true
   health_check_interval: 30
   metrics_interval: 60
-risk:
+  prometheus_port: 9090
+
+llm:
+  local:
+    base_url: "http://localhost:11434/api/generate"
+    model: "llama3"
+  default_provider: "local"
   enabled: true
-  max_drawdown: 0.1
-  position_limit: 0.2
-  var_limit: 0.05
-system:
-  debug: false
-  log_level: INFO
-  name: AI Trading System
-  version: 1.0.0
-trading:
-  commission_rate: 0.001
+
+strategy:
+  switch_threshold: 0.05
+  evaluation_period: 3600
+  default_strategies: ["macd", "bollinger_bands", "rsi"]
+
+exchange:
+  default: "binance"
+  binance:
+    api_key: ""
+    api_secret: ""
+    testnet: true
+
+backup:
   enabled: true
-  max_daily_loss: 0.02
-  max_position_count: 10
-  max_position_size: 0.1
-  paper_trading: true
-  slippage_rate: 0.0005
+  interval_hours: 24
+  retention_days: 30
+  backup_path: "data/backups"
+  include_data: true
+  include_config: true
+  include_logs: false
+
+notification:
+  enabled: false
+  email:
+    smtp_server: ""
+    smtp_port: 587
+    username: ""
+    password: ""
+    from: ""
+    to: ""
+  telegram:
+    bot_token: ""
+    chat_id: ""

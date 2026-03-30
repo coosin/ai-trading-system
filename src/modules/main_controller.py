@@ -26,6 +26,8 @@ from src.modules.core.enhanced_data_quality import EnhancedDataQualitySystem
 from src.modules.core.enhanced_fault_tolerance import EnhancedFaultTolerance
 from src.modules.core.llm_integration import EnhancedLLMIntegration
 from src.modules.core.plugin_system import PluginManager
+from src.modules.core.database_manager import DatabaseManager
+from src.modules.core.business_process_manager import BusinessProcessManager
 from src.modules.monitoring.trading_monitor import TradingMonitor
 from src.modules.api.monitoring_api import set_trading_monitor, set_anomaly_detector
 from src.modules.strategies.multi_strategy_manager import MultiStrategyManager
@@ -240,6 +242,12 @@ class MainController:
         
         # 模拟交易市场
         self.simulated_market = None
+        
+        # 数据库管理器
+        self.database_manager = None
+        
+        # 业务流程管理器
+        self.business_process_manager = None
 
         # 默认配置
         self.auto_restart_modules = True
@@ -340,6 +348,14 @@ class MainController:
         # 初始化模拟交易市场
         self.simulated_market = SimulatedMarket()
         await self.simulated_market.initialize()
+        
+        # 初始化数据库管理器
+        self.database_manager = DatabaseManager(self.config_manager)
+        await self.database_manager.initialize()
+        
+        # 初始化业务流程管理器
+        self.business_process_manager = BusinessProcessManager(self)
+        await self.business_process_manager.initialize()
 
         # 注册默认事件处理器
         self._register_default_handlers()
@@ -413,6 +429,16 @@ class MainController:
         if self.anomaly_detector:
             await self.anomaly_detector.shutdown()
             self.anomaly_detector = None
+        
+        # 清理数据库管理器
+        if self.database_manager:
+            await self.database_manager.cleanup()
+            self.database_manager = None
+        
+        # 清理业务流程管理器
+        if self.business_process_manager:
+            await self.business_process_manager.shutdown()
+            self.business_process_manager = None
             
         self._initialized = False
 
@@ -1710,6 +1736,24 @@ class MainController:
             自然语言接口实例
         """
         return self.natural_language_interface
+    
+    def get_database_manager(self) -> Optional[DatabaseManager]:
+        """
+        获取数据库管理器实例
+
+        Returns:
+            数据库管理器实例
+        """
+        return self.database_manager
+    
+    def get_business_process_manager(self) -> Optional[BusinessProcessManager]:
+        """
+        获取业务流程管理器实例
+
+        Returns:
+            业务流程管理器实例
+        """
+        return self.business_process_manager
     
     async def process_natural_language_query(self, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
         """

@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { useAuthStore, useSystemStore } from './store';
+import Login from './components/Login';
 import SystemStatus from './components/SystemStatus';
 import TradingStrategies from './components/TradingStrategies';
 import PerformanceMetrics from './components/PerformanceMetrics';
@@ -8,30 +10,32 @@ import RiskManagement from './components/RiskManagement';
 
 function App() {
   const [activeView, setActiveView] = useState('status');
-  const [systemStatus, setSystemStatus] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const { isAuthenticated, initialize: initializeAuth, logout } = useAuthStore();
+  const { status, fetchStatus, loading } = useSystemStore();
 
+  // 初始化认证状态
   useEffect(() => {
-    fetchSystemStatus();
-    const interval = setInterval(fetchSystemStatus, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    initializeAuth();
+  }, [initializeAuth]);
 
-  const fetchSystemStatus = async () => {
-    try {
-      const response = await axios.get('/api/v1/status');
-      setSystemStatus(response.data);
-    } catch (error) {
-      console.error('Error fetching system status:', error);
-    } finally {
-      setLoading(false);
+  // 获取系统状态
+  useEffect(() => {
+    if (isAuthenticated) {
+      fetchStatus();
+      const interval = setInterval(fetchStatus, 5000);
+      return () => clearInterval(interval);
     }
-  };
+  }, [isAuthenticated, fetchStatus]);
+
+  // 如果未认证，显示登录页面
+  if (!isAuthenticated) {
+    return <Login />;
+  }
 
   const renderView = () => {
     switch (activeView) {
       case 'status':
-        return <SystemStatus status={systemStatus} loading={loading} />;
+        return <SystemStatus status={status} loading={loading} />;
       case 'strategies':
         return <TradingStrategies />;
       case 'performance':
@@ -41,8 +45,12 @@ function App() {
       case 'risk':
         return <RiskManagement />;
       default:
-        return <SystemStatus status={systemStatus} loading={loading} />;
+        return <SystemStatus status={status} loading={loading} />;
     }
+  };
+
+  const handleLogout = () => {
+    logout();
   };
 
   return (
@@ -53,10 +61,12 @@ function App() {
         backgroundColor: '#2c3e50',
         color: 'white',
         padding: '20px',
-        flexShrink: 0
+        flexShrink: 0,
+        display: 'flex',
+        flexDirection: 'column'
       }}>
         <h1 style={{ fontSize: '18px', marginBottom: '30px' }}>智能交易系统</h1>
-        <nav>
+        <nav style={{ flex: 1 }}>
           <ul style={{ listStyle: 'none', padding: 0 }}>
             <li style={{ marginBottom: '15px' }}>
               <button
@@ -145,6 +155,25 @@ function App() {
             </li>
           </ul>
         </nav>
+        
+        {/* 登出按钮 */}
+        <div style={{ borderTop: '1px solid #444', paddingTop: '20px' }}>
+          <button
+            onClick={handleLogout}
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#e74c3c',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              textAlign: 'center'
+            }}
+          >
+            退出登录
+          </button>
+        </div>
       </div>
 
       {/* Main Content */}

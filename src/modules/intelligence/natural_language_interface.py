@@ -186,12 +186,12 @@ class NaturalLanguageInterface:
         Returns:
             命令参数
         """
-        prompt = f"""请从查询 '{query}' 中提取命令 '{command}' 的参数：
+        prompt = f'''请从查询 '{query}' 中提取命令 '{command}' 的参数：
 
 命令描述: {self.command_templates[command]['description']}
 
 请以JSON格式返回提取的参数，只返回参数，不要返回其他内容。
-如果没有参数，请返回空对象 {}。"""
+如果没有参数，请返回空对象 {{}}。'''
         
         response = await self.llm_integration.generate(prompt)
         
