@@ -1,9 +1,8 @@
-from logging.config import fileConfig
 import asyncio
+from logging.config import fileConfig
 
 from sqlalchemy import pool
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from alembic import context
 
@@ -16,13 +15,23 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+import os
+
 # add your model's MetaData object here
 # for 'autogenerate' support
 import sys
-import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.modules.core.database_manager import Base, TradingSession, Trade, MarketData, StrategyMetrics, SystemLog
+from src.modules.core.database_manager import (
+    Base,
+    MarketData,
+    StrategyMetrics,
+    SystemLog,
+    Trade,
+    TradingSession,
+)
+
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,
@@ -68,9 +77,9 @@ async def run_migrations_online() -> None:
     )
 
     async with connectable.connect() as connection:
-        await connection.run_sync(lambda conn: context.configure(
-            connection=conn, target_metadata=target_metadata
-        ))
+        await connection.run_sync(
+            lambda conn: context.configure(connection=conn, target_metadata=target_metadata)
+        )
 
         async with connection.begin():
             await connection.run_sync(lambda conn: context.run_migrations())
