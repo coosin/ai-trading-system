@@ -6,8 +6,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
 
+import pandas as pd
+
 from src.modules.core.data_pipeline import DataPoint
 from src.modules.core.database_manager import DatabaseManager
+from src.modules.core.data_fusion import DataFusionSystem
+from src.modules.intelligence.machine_learning import ModelManager, ModelType
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +72,10 @@ class DecisionEngine:
         self.learning_rate = config.get("learning_rate", 0.1)  # 学习率
         self.reward_factor = config.get("reward_factor", 1.0)  # 奖励因子
         self.penalty_factor = config.get("penalty_factor", 1.0)  # 惩罚因子
+        # 机器学习模型管理器
+        self.model_manager = ModelManager(db_manager, config.get("machine_learning", {}))
+        # 数据融合系统
+        self.data_fusion_system = DataFusionSystem(db_manager, config.get("data_fusion", {}))
 
     async def initialize(self) -> bool:
         """初始化决策引擎
@@ -82,6 +90,12 @@ class DecisionEngine:
                 model_name = model_config.get("name")
                 if model_name:
                     self.models[model_name] = model_config
+
+            # 初始化模型管理器
+            await self.model_manager.initialize()
+
+            # 初始化数据融合系统
+            await self.data_fusion_system.initialize()
 
             self.enabled = True
             logger.info("DecisionEngine initialized successfully")
@@ -99,6 +113,10 @@ class DecisionEngine:
         try:
             self.enabled = False
             self.models.clear()
+            # 关闭模型管理器
+            await self.model_manager.shutdown()
+            # 关闭数据融合系统
+            await self.data_fusion_system.shutdown()
             logger.info("DecisionEngine shutdown successfully")
             return True
         except Exception as e:
@@ -153,7 +171,11 @@ class DecisionEngine:
             "sentiment": 0.0,
             "technical_indicators": {},
             "fundamental_indicators": {},
-            "model_predictions": {}
+            "model_predictions": {},
+            "ml_prediction": None,
+            "ml_confidence": 0.0,
+            "fused_data": None,
+            "fused_confidence": 0.0
         }
 
         # 分析市场趋势
@@ -172,6 +194,52 @@ class DecisionEngine:
                 if len(prices) > 2:
                     returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
                     analysis_result["volatility"] = sum(abs(r) for r in returns) / len(returns)
+
+            # 使用数据融合系统
+            symbol = data_points[0].symbol if data_points[0].symbol else "BTCUSDT"
+            fused_data = await self.data_fusion_system.fuse_data(symbol)
+            if fused_data:
+                analysis_result["fused_data"] = fused_data.data
+                analysis_result["fused_confidence"] = fused_data.confidence
+                
+                # 从融合数据中提取情绪指标
+                if "social_sentiment" in fused_data.data:
+                    analysis_result["sentiment"] = fused_data.data["social_sentiment"]
+                if "news_sentiment" in fused_data.data:
+                    analysis_result["sentiment"] = (analysis_result["sentiment"] + fused_data.data["news_sentiment"]) / 2
+
+            # 准备机器学习模型输入数据
+            df = pd.DataFrame([{
+                "timestamp": dp.timestamp,
+                "open": dp.data.get("open", dp.data.get("price", 0)),
+                "high": dp.data.get("high", dp.data.get("price", 0)),
+                "low": dp.data.get("low", dp.data.get("price", 0)),
+                "close": dp.data.get("price", 0),
+                "volume": dp.data.get("volume", 0)
+            } for dp in data_points])
+
+            # 使用机器学习模型预测
+            if len(df) >= 60:  # 确保有足够的历史数据
+                prediction = await self.model_manager.predict(symbol, df)
+                if prediction:
+                    analysis_result["ml_prediction"] = "up" if prediction > df["close"].iloc[-1] else "down"
+                    analysis_result["ml_confidence"] = 0.8  # 暂时使用固定置信度
+                    
+                    # 训练或更新模型（如果需要）
+                    if len(df) >= 100:  # 当有足够数据时更新模型
+                        await self.model_manager.train_model(
+                            symbol,
+                            ModelType.LSTM,
+                            df,
+                            {
+                                "lookback": 60,
+                                "hidden_size": 64,
+                                "num_layers": 2,
+                                "learning_rate": 0.001,
+                                "epochs": 50,
+                                "batch_size": 32
+                            }
+                        )
 
         # 集成多模型预测
         for model_name, model_config in self.models.items():
@@ -225,6 +293,18 @@ class DecisionEngine:
         else:
             avg_confidence = 0.5
 
+        # 集成机器学习模型的信心度
+        ml_confidence = analysis_result.get("ml_confidence", 0.0)
+        if ml_confidence > 0:
+            # 权重机器学习模型的预测
+            avg_confidence = (avg_confidence * 0.5) + (ml_confidence * 0.3)
+
+        # 集成数据融合系统的信心度
+        fused_confidence = analysis_result.get("fused_confidence", 0.0)
+        if fused_confidence > 0:
+            # 权重数据融合系统的结果
+            avg_confidence = (avg_confidence * 0.8) + (fused_confidence * 0.2)
+
         # 如果信心度低于阈值，返回持有决策
         if avg_confidence < self.confidence_threshold:
             return Decision(
@@ -239,15 +319,50 @@ class DecisionEngine:
                 metadata=analysis_result
             )
 
-        # 基于市场趋势和风险等级生成决策
+        # 基于市场趋势、机器学习预测、数据融合结果和风险等级生成决策
         market_trend = analysis_result.get("market_trend")
+        ml_prediction = analysis_result.get("ml_prediction")
+        fused_data = analysis_result.get("fused_data")
+        sentiment = analysis_result.get("sentiment", 0.0)
         
-        if market_trend == "up" and risk_level in [RiskLevel.LOW, RiskLevel.MEDIUM]:
+        # 综合考虑所有因素
+        buy_signals = 0
+        sell_signals = 0
+        
+        # 市场趋势信号
+        if market_trend == "up":
+            buy_signals += 1
+        elif market_trend == "down":
+            sell_signals += 1
+        
+        # 机器学习预测信号
+        if ml_prediction == "up":
+            buy_signals += 1
+        elif ml_prediction == "down":
+            sell_signals += 1
+        
+        # 情绪信号
+        if sentiment > 0.1:
+            buy_signals += 1
+        elif sentiment < -0.1:
+            sell_signals += 1
+        
+        # 数据融合信号
+        if fused_data:
+            if "social_sentiment" in fused_data and fused_data["social_sentiment"] > 0.2:
+                buy_signals += 1
+            if "news_sentiment" in fused_data and fused_data["news_sentiment"] > 0.2:
+                buy_signals += 1
+            if "onchain_activity" in fused_data and fused_data["onchain_activity"] > 0.6:
+                buy_signals += 1
+
+        # 基于信号数量和风险等级生成决策
+        if buy_signals > sell_signals and risk_level in [RiskLevel.LOW, RiskLevel.MEDIUM]:
             decision_type = DecisionType.BUY
-            reason = "Upward trend with acceptable risk"
-        elif market_trend == "down" or risk_level in [RiskLevel.HIGH, RiskLevel.EXTREME]:
+            reason = f"Positive signals ({buy_signals}-{sell_signals}) with acceptable risk"
+        elif sell_signals > buy_signals or risk_level in [RiskLevel.HIGH, RiskLevel.EXTREME]:
             decision_type = DecisionType.SELL
-            reason = "Downward trend or high risk"
+            reason = f"Negative signals ({sell_signals}-{buy_signals}) or high risk"
         else:
             decision_type = DecisionType.HOLD
             reason = "Neutral market conditions"
