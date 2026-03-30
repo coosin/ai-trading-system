@@ -1,104 +1,136 @@
 # 全智能量化交易系统 - 默认配置文件
 
+# 系统配置
 system:
-  name: "AI Trading System"
-  version: "2.0.0"
-  debug: false
-  log_level: "INFO"
+  name: "OpenClaw Trading System"
+  version: "1.0.0"
+  environment: "development"  # development, production, testing
+  debug: true
 
+# API 服务器配置
+api:
+  host: "0.0.0.0"
+  port: 8000
+  enable_cors: true
+  enable_swagger: true
+  enable_rate_limit: true
+  secret_key: "your-secret-key-change-in-production"
+  access_token_expire_minutes: 30
+  rate_limits:
+    default:
+      requests_per_minute: 60
+      requests_per_hour: 1000
+      requests_per_day: 10000
+      burst_size: 10
+
+# 控制器配置
 controller:
   auto_restart_modules: true
   max_restart_attempts: 3
   health_check_interval: 30
   event_history_limit: 1000
 
-trading:
-  enabled: true
-  paper_trading: true
-  max_position_size: 0.1
-  max_daily_loss: 0.02
-  max_position_count: 10
-  commission_rate: 0.001
-  slippage_rate: 0.0005
+# 大模型配置
+llm:
+  provider: "openai"  # openai, anthropic, local
+  api_key: ""  # 请设置你的API密钥
+  model: "gpt-4"
+  temperature: 0.7
+  max_tokens: 2000
+  timeout: 30
 
-risk:
-  enabled: true
-  max_drawdown: 0.1
-  var_limit: 0.05
-  position_limit: 0.2
-  risk_level: "medium"  # low, medium, high, aggressive
-  risk_per_trade: 0.02
-  max_leverage: 3.0
+# 策略配置
+strategy:
+  default_symbols:
+    - "BTC/USDT"
+    - "ETH/USDT"
+    - "SOL/USDT"
+  default_timeframe: "1h"
+  risk_management:
+    max_position_size: 0.1
+    stop_loss: 0.02
+    take_profit: 0.05
+    max_drawdown: 0.15
+    risk_per_trade: 0.01
 
-business_process:
-  pipeline_interval: 60
-  signal_cooldown: 300
-  max_pending_signals: 10
-  risk_check_enabled: true
-
-data:
-  update_interval: 60
-  history_days: 365
-  symbols: ["BTC/USDT", "ETH/USDT"]
-  storage_path: "data/storage"
-
+# 数据库配置
 database:
-  type: "sqlite"  # postgresql, mysql, sqlite
-  host: "localhost"
-  port: 5432
-  database: "data/trading_system.db"
-  username: "postgres"
-  password: ""
-  pool_size: 10
-  max_overflow: 20
-  pool_timeout: 30
-  pool_recycle: 3600
+  type: "sqlite"  # sqlite, postgresql
+  url: "sqlite:///data/trading.db"
+  # postgresql配置示例:
+  # url: "postgresql://user:password@localhost:5432/trading"
+  pool_size: 5
+  max_overflow: 10
   echo: false
-  isolation_level: "read_committed"
 
+# 缓存配置
+cache:
+  type: "memory"  # memory, redis
+  redis_url: "redis://localhost:6379/0"
+  ttl: 300
+
+# 日志配置
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/app.log"
+  max_size: "10MB"
+  backup_count: 5
+
+# 监控配置
 monitoring:
   enabled: true
+  metrics_port: 9090
   health_check_interval: 30
-  metrics_interval: 60
-  prometheus_port: 9090
+  alert_thresholds:
+    cpu_usage: 80
+    memory_usage: 80
+    disk_usage: 90
 
-llm:
-  local:
-    base_url: "http://localhost:11434/api/generate"
-    model: "llama3"
-  default_provider: "local"
-  enabled: true
-
-strategy:
-  switch_threshold: 0.05
-  evaluation_period: 3600
-  default_strategies: ["macd", "bollinger_bands", "rsi"]
-
-exchange:
-  default: "binance"
+# 交易所配置
+exchanges:
   binance:
+    enabled: false
     api_key: ""
     api_secret: ""
-    testnet: true
+    sandbox: true
+  coinbase:
+    enabled: false
+    api_key: ""
+    api_secret: ""
+    passphrase: ""
 
-backup:
-  enabled: true
-  interval_hours: 24
-  retention_days: 30
-  backup_path: "data/backups"
-  include_data: true
-  include_config: true
-  include_logs: false
-
-notification:
-  enabled: false
+# 通知配置
+notifications:
   email:
-    smtp_server: ""
+    enabled: false
+    smtp_host: "smtp.gmail.com"
     smtp_port: 587
     username: ""
     password: ""
-    from: ""
-    to: ""
+    from_address: ""
+    to_addresses: []
   telegram:
+    enabled: false
     bot_token: ""
     chat_id: ""
+
+# 回测配置
+backtest:
+  initial_capital: 10000
+  commission: 0.001
+  slippage: 0.0005
+  data_source: "local"
+
+# 数据配置
+data:
+  storage_path: "data/market"
+  backup_path: "data/backup"
+  default_timeframes:
+    - "1m"
+    - "5m"
+    - "15m"
+    - "1h"
+    - "4h"
+    - "1d"
+  retention_days: 365
