@@ -25,9 +25,11 @@ from src.modules.core.event_system import EnhancedEventSystem, EventType as Core
 from src.modules.core.enhanced_data_quality import EnhancedDataQualitySystem
 from src.modules.core.enhanced_fault_tolerance import EnhancedFaultTolerance
 from src.modules.core.llm_integration import EnhancedLLMIntegration
+from src.modules.core.enhanced_llm_manager import EnhancedLLMManager, TaskType
 from src.modules.core.plugin_system import PluginManager
 from src.modules.core.database_manager import DatabaseManager
 from src.modules.core.business_process_manager import BusinessProcessManager
+from src.modules.notification.telegram_bot import TelegramBot
 from src.modules.monitoring.trading_monitor import TradingMonitor
 from src.modules.api.monitoring_api import set_trading_monitor, set_anomaly_detector
 from src.modules.strategies.multi_strategy_manager import MultiStrategyManager
@@ -207,6 +209,12 @@ class MainController:
         # 大模型集成系统
         self.llm_integration = None
         
+        # 增强大模型管理器
+        self.enhanced_llm_manager = None
+        
+        # Telegram机器人
+        self.telegram_bot = None
+        
         # 交易监控器
         self.trading_monitor = None
         
@@ -294,6 +302,10 @@ class MainController:
         llm_config = await self.config_manager.get_config("llm", {})
         await self.llm_integration.initialize(llm_config)
         
+        # 初始化增强大模型管理器
+        self.enhanced_llm_manager = EnhancedLLMManager()
+        await self.enhanced_llm_manager.initialize(llm_config)
+        
         # 初始化交易监控器
         self.trading_monitor = TradingMonitor({})
         await self.trading_monitor.initialize()
@@ -344,6 +356,17 @@ class MainController:
         
         # 初始化自然语言接口
         self.natural_language_interface = NaturalLanguageInterface(self.llm_integration)
+        
+        # 初始化Telegram机器人
+        telegram_config = await self.config_manager.get_config("telegram", {})
+        self.telegram_bot = TelegramBot(
+            telegram_config,
+            nli=self.natural_language_interface,
+            llm_integration=self.llm_integration
+        )
+        await self.telegram_bot.initialize()
+        # 启动Telegram机器人轮询
+        await self.telegram_bot.start_polling()
         
         # 初始化模拟交易市场
         self.simulated_market = SimulatedMarket()
@@ -410,6 +433,16 @@ class MainController:
         if self.llm_integration:
             await self.llm_integration.cleanup()
             self.llm_integration = None
+        
+        # 清理增强大模型管理器
+        if self.enhanced_llm_manager:
+            await self.enhanced_llm_manager.cleanup()
+            self.enhanced_llm_manager = None
+        
+        # 清理Telegram机器人
+        if self.telegram_bot:
+            await self.telegram_bot.shutdown()
+            self.telegram_bot = None
         
         # 清理交易监控器
         if self.trading_monitor:
