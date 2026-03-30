@@ -23,6 +23,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from src.modules.api.strategy_api import router as strategy_router
+
 try:
     from fastapi import (
         APIRouter,
@@ -712,6 +714,9 @@ class APIServer:
         async def websocket_endpoint(websocket: WebSocket):
             """WebSocket端点"""
             await self._handle_websocket_connection(websocket)
+
+        # 添加策略API路由
+        self.app.include_router(strategy_router)
 
         logger.info("API路由设置完成")
 

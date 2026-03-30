@@ -1,52 +1,83 @@
 version: '3.8'
 
+networks:
+  trading-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  trading-logs:
+  trading-data:
+
 services:
-  # 主交易系统
-  ai-trader:
+  # 主应用服务
+  trading-app:
     build: .
-    container_name: ai-trader-system
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      - MODE=paper_trading
-      - LOG_LEVEL=INFO
-      - REDIS_HOST=redis
-      - POSTGRES_HOST=postgres
-      - PROMETHEUS_HOST=prometheus
+    container_name: trading-app
     ports:
       - "8000:8000"
-      - "9091:9091"  # 应用指标端口
     volumes:
-      - ./workspace:/app/workspace
-      - ./config:/app/config
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./cache:/app/cache
-      - ./backups:/app/backups
+      - trading-data:/app/data
+      - trading-logs:/app/logs
+    environment:
+      - LOG_LEVEL=INFO
+      - TRADING_ENV=production
+      - DATABASE_URL=postgresql://admin:password@postgres:5432/trading
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=your-secret-key-change-in-production
+      - PYTHONPATH=/app
     depends_on:
-      - redis
       - postgres
+      - redis
+    restart: unless-stopped
     networks:
       - trading-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 30s
+
+  # PostgreSQL数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: trading-postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=trading
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8
+    restart: unless-stopped
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d trading"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Redis缓存
   redis:
     image: redis:7-alpine
-    container_name: ai-trader-redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    container_name: trading-redis
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
-      - ./config/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server --appendonly yes
+    restart: unless-stopped
     networks:
       - trading-network
     healthcheck:
@@ -55,172 +86,43 @@ services:
       timeout: 10s
       retries: 3
 
-  # PostgreSQL数据库
-  postgres:
-    image: postgres:15-alpine
-    container_name: ai-trader-postgres
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=trader
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme123}
-      - POSTGRES_DB=trading_db
+  # Prometheus监控
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trading-prometheus
     ports:
-      - "5432:5432"
+      - "9090:9090"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./config/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    restart: unless-stopped
     networks:
       - trading-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trader"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090"]
       interval: 30s
       timeout: 10s
       retries: 3
 
-  # Prometheus监控
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: ai-trader-prometheus
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--storage.tsdb.retention.time=30d'
-      - '--web.enable-lifecycle'
-    networks:
-      - trading-network
-
-  # Grafana可视化
+  # Grafana监控面板
   grafana:
     image: grafana/grafana:latest
-    container_name: ai-trader-grafana
-    restart: unless-stopped
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin123}
-      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    container_name: trading-grafana
     ports:
       - "3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./config/grafana-dashboards:/etc/grafana/provisioning/dashboards
-      - ./config/grafana-datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-prometheus-datasource
+    restart: unless-stopped
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     depends_on:
       - prometheus
-    networks:
-      - trading-network
-
-  # ELK日志栈 - Elasticsearch
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
-    container_name: ai-trader-elasticsearch
-    restart: unless-stopped
-    environment:
-      - discovery.type=single-node
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-      - xpack.security.enabled=false
-    ports:
-      - "9200:9200"
-    volumes:
-      - elasticsearch-data:/usr/share/elasticsearch/data
-    networks:
-      - trading-network
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-
-  # ELK日志栈 - Logstash
-  logstash:
-    image: docker.elastic.co/logstash/logstash:8.10.0
-    container_name: ai-trader-logstash
-    restart: unless-stopped
-    volumes:
-      - ./config/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
-    ports:
-      - "5000:5000"
-    depends_on:
-      - elasticsearch
-    networks:
-      - trading-network
-
-  # ELK日志栈 - Kibana
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.10.0
-    container_name: ai-trader-kibana
-    restart: unless-stopped
-    ports:
-      - "5601:5601"
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-    depends_on:
-      - elasticsearch
-    networks:
-      - trading-network
-
-  # 反向代理（可选）
-  nginx:
-    image: nginx:alpine
-    container_name: ai-trader-nginx
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./config/nginx.conf:/etc/nginx/nginx.conf
-      - ./config/ssl:/etc/nginx/ssl
-    depends_on:
-      - ai-trader
-      - grafana
-      - kibana
-    networks:
-      - trading-network
-
-  # 备份服务
-  backup:
-    image: alpine:latest
-    container_name: ai-trader-backup
-    restart: unless-stopped
-    volumes:
-      - ./backups:/backups
-      - postgres-data:/source/postgres
-      - redis-data:/source/redis
-      - prometheus-data:/source/prometheus
-      - grafana-data:/source/grafana
-      - elasticsearch-data:/source/elasticsearch
-    command: >
-      sh -c "
-      echo '备份服务启动...' &&
-      while true; do
-        # 每天凌晨2点执行备份
-        if [ $$(date +%H) -eq 02 ]; then
-          echo '执行每日备份...' &&
-          tar -czf /backups/backup-$$(date +%Y%m%d-%H%M%S).tar.gz /source &&
-          echo '备份完成' &&
-          # 清理30天前的备份
-          find /backups -name 'backup-*.tar.gz' -mtime +30 -delete;
-        fi;
-        sleep 3600;
-      done"
-    networks:
-      - trading-network
-
-networks:
-  trading-network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-
-volumes:
-  redis-data:
-  postgres-data:
-  prometheus-data:
-  grafana-data:
-  elasticsearch-data:

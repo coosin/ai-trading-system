@@ -11,8 +11,26 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from src.modules.core.config_manager import cleanup_config_manager, get_config_manager
+from src.modules.core.enhanced_config_manager import EnhancedConfigManager
 from src.modules.main_controller import MainController
+
+# 全局配置管理器实例
+_config_manager = None
+
+async def get_config_manager() -> EnhancedConfigManager:
+    """获取配置管理器实例"""
+    global _config_manager
+    if _config_manager is None:
+        _config_manager = EnhancedConfigManager("data/config")
+        await _config_manager.initialize()
+    return _config_manager
+
+async def cleanup_config_manager() -> None:
+    """清理配置管理器"""
+    global _config_manager
+    if _config_manager:
+        await _config_manager.cleanup()
+        _config_manager = None
 
 # 配置日志
 logging.basicConfig(

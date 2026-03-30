@@ -455,9 +455,10 @@ class EnhancedFaultTolerance:
                 policy = self.get_retry_policy(component)
                 handler = RetryHandler(policy)
                 
-                return await breaker.call(
-                    lambda: handler.execute(func, *args, **kwargs)
-                )
+                async def wrapped_func():
+                    return await handler.execute(func, *args, **kwargs)
+                
+                return await breaker.call(wrapped_func)
             
             elif use_circuit_breaker:
                 breaker = self.get_circuit_breaker(component)

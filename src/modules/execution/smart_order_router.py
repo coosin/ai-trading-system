@@ -21,6 +21,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
+from ..exchanges.exchange_factory import ExchangeFactory
+from ..exchanges.exchange_base import Order
+
 logger = logging.getLogger(__name__)
 
 
@@ -415,6 +418,7 @@ class SmartOrderRouter:
     """智能订单路由器"""
     
     def __init__(self):
+        self.exchange_factory = ExchangeFactory()
         self.exchanges: Dict[str, ExchangeMetrics] = {}
         self.algorithms: Dict[OrderType, ExecutionAlgorithm] = {}
         self._running = False
@@ -445,19 +449,26 @@ class SmartOrderRouter:
         # 初始化交易所连接
         await self._init_exchanges()
         
+        # 初始化所有交易所
+        results = await self.exchange_factory.initialize_all()
+        logger.info(f"交易所初始化结果: {results}")
+        
         self._running = True
         self._initialized = True
         logger.info("智能订单路由器初始化完成")
     
     async def cleanup(self):
         """清理资源"""
+        # 清理所有交易所
+        await self.exchange_factory.cleanup_all()
+        
         self._running = False
         self._initialized = False
         logger.info("智能订单路由器清理完成")
     
     async def _init_exchanges(self):
         """初始化交易所连接"""
-        # 模拟交易所数据
+        # 模拟交易所数据（实际应从配置文件加载）
         self.exchanges = {
             "binance": ExchangeMetrics(
                 exchange_id="binance",
@@ -482,9 +493,22 @@ class SmartOrderRouter:
             )
         }
     
-    def register_exchange(self, exchange_id: str, metrics: ExchangeMetrics):
+    def register_exchange(self, exchange_id: str, config: Dict[str, Any]):
         """注册交易所"""
-        self.exchanges[exchange_id] = metrics
+        # 创建交易所实例
+        exchange = self.exchange_factory.create_exchange(exchange_id, config)
+        
+        # 初始化交易所指标
+        if exchange_id not in self.exchanges:
+            # 默认指标值
+            self.exchanges[exchange_id] = ExchangeMetrics(
+                exchange_id=exchange_id,
+                latency_ms=100,
+                fee_rate=0.001,
+                liquidity_score=80,
+                reliability_score=90
+            )
+        
         logger.info(f"注册交易所: {exchange_id}")
     
     def register_algorithm(self, order_type: OrderType, algorithm: ExecutionAlgorithm):

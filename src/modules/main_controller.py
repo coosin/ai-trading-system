@@ -20,6 +20,15 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from src.modules.core.event_system import EnhancedEventSystem, EventType as CoreEventType
+from src.modules.core.enhanced_data_quality import EnhancedDataQualitySystem
+from src.modules.core.enhanced_fault_tolerance import EnhancedFaultTolerance
+from src.modules.core.llm_integration import EnhancedLLMIntegration
+from src.modules.monitoring.trading_monitor import TradingMonitor
+from src.modules.api.monitoring_api import set_trading_monitor
+from src.modules.strategies.multi_strategy_manager import MultiStrategyManager
+from src.modules.api.strategy_api import init_strategy_api
+
 logger = logging.getLogger(__name__)
 
 
@@ -146,8 +155,6 @@ class MainController:
         self.module_dependencies: Dict[str, List[str]] = {}
 
         # 事件系统
-        self.event_handlers: Dict[EventType, List[Callable]] = {}
-        self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self.event_history: List[SystemEvent] = []
 
         # 健康检查
@@ -174,6 +181,24 @@ class MainController:
         self._lock = asyncio.Lock()
         self._initialized = False
         self._running = False
+
+        # 增强事件系统
+        self.event_system = None
+        
+        # 数据质量监控系统
+        self.data_quality_system = None
+        
+        # 容错机制系统
+        self.fault_tolerance = None
+        
+        # 大模型集成系统
+        self.llm_integration = None
+        
+        # 交易监控器
+        self.trading_monitor = None
+        
+        # 多策略管理器
+        self.strategy_manager = None
 
         # 默认配置
         self.auto_restart_modules = True
@@ -202,12 +227,41 @@ class MainController:
             self.health_check_interval = controller_config.get("health_check_interval", 30)
             self.event_history_limit = controller_config.get("event_history_limit", 1000)
 
+        # 初始化增强事件系统
+        self.event_system = EnhancedEventSystem("data/events.db")
+        await self.event_system.initialize()
+        
+        # 初始化数据质量监控系统
+        self.data_quality_system = EnhancedDataQualitySystem()
+        await self.data_quality_system.initialize()
+        
+        # 初始化容错机制系统
+        self.fault_tolerance = EnhancedFaultTolerance()
+        await self.fault_tolerance.initialize()
+        
+        # 初始化大模型集成系统
+        self.llm_integration = EnhancedLLMIntegration()
+        # 从配置中获取大模型配置
+        llm_config = await self.config_manager.get_config("llm", {})
+        await self.llm_integration.initialize(llm_config)
+        
+        # 初始化交易监控器
+        self.trading_monitor = TradingMonitor({})
+        await self.trading_monitor.initialize()
+        # 设置监控器实例到API模块
+        set_trading_monitor(self.trading_monitor)
+        
+        # 初始化多策略管理器
+        strategy_config = await self.config_manager.get_config("strategy", {})
+        self.strategy_manager = MultiStrategyManager(strategy_config)
+        # 初始化策略API
+        init_strategy_api(self.strategy_manager)
+
         # 注册默认事件处理器
         self._register_default_handlers()
 
         # 启动事件处理任务
         self._running = True
-        self._tasks.append(asyncio.create_task(self._event_processor()))
         self._tasks.append(asyncio.create_task(self._health_check_worker()))
 
         self._initialized = True
@@ -236,6 +290,35 @@ class MainController:
 
         self._tasks.clear()
         self.modules.clear()
+        
+        # 清理增强事件系统
+        if self.event_system:
+            await self.event_system.cleanup()
+            self.event_system = None
+        
+        # 清理数据质量监控系统
+        if self.data_quality_system:
+            await self.data_quality_system.cleanup()
+            self.data_quality_system = None
+        
+        # 清理容错机制系统
+        if self.fault_tolerance:
+            await self.fault_tolerance.cleanup()
+            self.fault_tolerance = None
+        
+        # 清理大模型集成系统
+        if self.llm_integration:
+            await self.llm_integration.cleanup()
+            self.llm_integration = None
+        
+        # 清理交易监控器
+        if self.trading_monitor:
+            await self.trading_monitor.shutdown()
+            self.trading_monitor = None
+        
+        # 清理多策略管理器
+        self.strategy_manager = None
+            
         self._initialized = False
 
         logger.info("主控制器清理完成")
@@ -567,11 +650,31 @@ class MainController:
             event_type: 事件类型
             handler: 处理函数
         """
-        if event_type not in self.event_handlers:
-            self.event_handlers[event_type] = []
+        if self.event_system:
+            # 转换为核心事件类型
+            core_event_type_map = {
+                EventType.SYSTEM_START: CoreEventType.SYSTEM_START,
+                EventType.SYSTEM_STOP: CoreEventType.SYSTEM_STOP,
+                EventType.MODULE_STARTED: CoreEventType.MODULE_STARTED,
+                EventType.MODULE_STOPPED: CoreEventType.MODULE_STOPPED,
+                EventType.MODULE_ERROR: CoreEventType.MODULE_ERROR,
+                EventType.CONFIG_CHANGED: CoreEventType.CONFIG_CHANGED,
+                EventType.DATA_RECEIVED: CoreEventType.DATA_RECEIVED,
+                EventType.TRADE_SIGNAL: CoreEventType.TRADE_SIGNAL,
+                EventType.ALERT: CoreEventType.RISK_ALERT,
+                EventType.HEARTBEAT: CoreEventType.SYSTEM_START
+            }
+            
+            core_event_type = core_event_type_map.get(event_type, CoreEventType.SYSTEM_START)
+            self.event_system.subscribe(core_event_type, handler)
+            logger.debug(f"注册事件处理器: {event_type.value} -> {handler.__name__}")
+        else:
+            # 回退到旧的事件处理器系统
+            if event_type not in self.event_handlers:
+                self.event_handlers[event_type] = []
 
-        self.event_handlers[event_type].append(handler)
-        logger.debug(f"注册事件处理器: {event_type.value} -> {handler.__name__}")
+            self.event_handlers[event_type].append(handler)
+            logger.debug(f"注册事件处理器: {event_type.value} -> {handler.__name__}")
 
     async def emit_event(
         self, event_type: EventType, source: str, data: Dict[str, Any], priority: int = 0
@@ -585,16 +688,55 @@ class MainController:
             data: 事件数据
             priority: 优先级
         """
-        event = SystemEvent(
-            id=str(uuid.uuid4()), type=event_type, source=source, data=data, priority=priority
-        )
-
-        try:
-            await self.event_queue.put(event)
+        if self.event_system:
+            # 转换为核心事件类型
+            core_event_type_map = {
+                EventType.SYSTEM_START: CoreEventType.SYSTEM_START,
+                EventType.SYSTEM_STOP: CoreEventType.SYSTEM_STOP,
+                EventType.MODULE_STARTED: CoreEventType.MODULE_STARTED,
+                EventType.MODULE_STOPPED: CoreEventType.MODULE_STOPPED,
+                EventType.MODULE_ERROR: CoreEventType.MODULE_ERROR,
+                EventType.CONFIG_CHANGED: CoreEventType.CONFIG_CHANGED,
+                EventType.DATA_RECEIVED: CoreEventType.DATA_RECEIVED,
+                EventType.TRADE_SIGNAL: CoreEventType.TRADE_SIGNAL,
+                EventType.ALERT: CoreEventType.RISK_ALERT,
+                EventType.HEARTBEAT: CoreEventType.SYSTEM_START
+            }
+            
+            core_event_type = core_event_type_map.get(event_type, CoreEventType.SYSTEM_START)
+            
+            # 转换优先级
+            from src.modules.core.event_system import EventPriority
+            event_priority = EventPriority.NORMAL
+            if priority >= 8:
+                event_priority = EventPriority.CRITICAL
+            elif priority >= 5:
+                event_priority = EventPriority.HIGH
+            elif priority <= 2:
+                event_priority = EventPriority.LOW
+            
+            # 使用增强事件系统发送事件
+            await self.event_system.emit(
+                event_type=core_event_type,
+                source=source,
+                data=data,
+                priority=event_priority
+            )
+            
             self.metrics["total_events"] += 1
             logger.debug(f"发送事件: {event_type.value} from {source}")
-        except asyncio.QueueFull:
-            logger.warning("事件队列已满，丢弃事件")
+        else:
+            # 回退到旧的事件队列
+            event = SystemEvent(
+                id=str(uuid.uuid4()), type=event_type, source=source, data=data, priority=priority
+            )
+            
+            try:
+                await self.event_queue.put(event)
+                self.metrics["total_events"] += 1
+                logger.debug(f"发送事件: {event_type.value} from {source}")
+            except asyncio.QueueFull:
+                logger.warning("事件队列已满，丢弃事件")
 
     def register_health_check(self, module_name: str, check_func: Callable) -> None:
         """
@@ -664,6 +806,299 @@ class MainController:
 
         events.sort(key=lambda e: e.timestamp, reverse=True)
         return [e.to_dict() for e in events[:limit]]
+    
+    async def check_data_quality(self, data_source: str, data: Any) -> Dict[str, Any]:
+        """
+        检查数据质量
+
+        Args:
+            data_source: 数据源名称
+            data: 要检查的数据
+
+        Returns:
+            数据质量报告
+        """
+        if self.data_quality_system:
+            return await self.data_quality_system.check_data_source(data_source, data)
+        return {"error": "数据质量系统未初始化"}
+    
+    def get_data_quality_report(self, data_source: str) -> Optional[Dict[str, Any]]:
+        """
+        获取数据质量报告
+
+        Args:
+            data_source: 数据源名称
+
+        Returns:
+            最新的数据质量报告
+        """
+        if self.data_quality_system:
+            return self.data_quality_system.get_latest_report(data_source)
+        return None
+    
+    async def execute_with_protection(self, func: Callable, component: str, *args, **kwargs) -> Any:
+        """
+        执行受保护的调用
+
+        Args:
+            func: 要执行的函数
+            component: 组件名称
+            *args: 函数参数
+            **kwargs: 函数关键字参数
+
+        Returns:
+            函数执行结果
+        """
+        if self.fault_tolerance:
+            return await self.fault_tolerance.execute_with_protection(func, component, *args, **kwargs)
+        # 回退到直接执行
+        if asyncio.iscoroutinefunction(func):
+            return await func(*args, **kwargs)
+        else:
+            return func(*args, **kwargs)
+    
+    def register_recovery_handler(self, component: str, handler: Callable[[], bool]):
+        """
+        注册组件恢复处理器
+
+        Args:
+            component: 组件名称
+            handler: 恢复处理函数
+        """
+        if self.fault_tolerance:
+            self.fault_tolerance.register_recovery_handler(component, handler)
+    
+    def get_fault_tolerance_stats(self) -> Dict[str, Any]:
+        """
+        获取容错机制统计信息
+
+        Returns:
+            容错机制统计信息
+        """
+        if self.fault_tolerance:
+            return self.fault_tolerance.get_stats()
+        return {"error": "容错系统未初始化"}
+    
+    async def analyze_market(self, market_data: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
+        """
+        分析市场数据
+
+        Args:
+            market_data: 市场数据
+            provider: 大模型提供者
+
+        Returns:
+            市场分析结果
+        """
+        if self.llm_integration:
+            return await self.llm_integration.analyze_market(market_data, provider)
+        return {"error": "大模型系统未初始化"}
+    
+    async def generate_strategy(self, market_analysis: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
+        """
+        生成交易策略
+
+        Args:
+            market_analysis: 市场分析结果
+            provider: 大模型提供者
+
+        Returns:
+            交易策略
+        """
+        if self.llm_integration:
+            return await self.llm_integration.generate_strategy(market_analysis, provider)
+        return {"error": "大模型系统未初始化"}
+    
+    async def generate_trading_signal(self, market_data: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
+        """
+        生成交易信号
+
+        Args:
+            market_data: 市场数据
+            provider: 大模型提供者
+
+        Returns:
+            交易信号
+        """
+        if self.llm_integration:
+            return await self.llm_integration.generate_trading_signal(market_data, provider)
+        return {"error": "大模型系统未初始化"}
+    
+    async def analyze_news(self, news: List[str], provider: Optional[str] = None) -> Dict[str, Any]:
+        """
+        分析新闻
+
+        Args:
+            news: 新闻列表
+            provider: 大模型提供者
+
+        Returns:
+            新闻分析结果
+        """
+        if self.llm_integration:
+            return await self.llm_integration.analyze_news(news, provider)
+        return {"error": "大模型系统未初始化"}
+    
+    async def evaluate_risk(self, position: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
+        """
+        评估风险
+
+        Args:
+            position: 交易仓位
+            provider: 大模型提供者
+
+        Returns:
+            风险评估结果
+        """
+        if self.llm_integration:
+            return await self.llm_integration.evaluate_risk(position, provider)
+        return {"error": "大模型系统未初始化"}
+    
+    async def generate_text(self, prompt: str, provider: Optional[str] = None, **kwargs) -> Any:
+        """
+        生成文本
+
+        Args:
+            prompt: 提示词
+            provider: 大模型提供者
+            **kwargs: 额外参数
+
+        Returns:
+            生成的文本
+        """
+        if self.llm_integration:
+            return await self.llm_integration.generate(prompt, provider, **kwargs)
+        return {"error": "大模型系统未初始化"}
+    
+    def get_trading_monitor(self) -> Optional[TradingMonitor]:
+        """
+        获取交易监控器实例
+
+        Returns:
+            交易监控器实例
+        """
+        return self.trading_monitor
+    
+    def get_strategy_manager(self) -> Optional[MultiStrategyManager]:
+        """
+        获取多策略管理器实例
+
+        Returns:
+            多策略管理器实例
+        """
+        return self.strategy_manager
+    
+    async def generate_trading_signals(self, market_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        生成交易信号
+
+        Args:
+            market_data: 市场数据
+
+        Returns:
+            交易信号列表
+        """
+        if self.strategy_manager:
+            return self.strategy_manager.generate_signals(market_data)
+        return []
+    
+    async def get_strategy_performance(self) -> Dict[str, Any]:
+        """
+        获取策略性能
+
+        Returns:
+            策略性能指标
+        """
+        if self.strategy_manager:
+            return self.strategy_manager.get_strategy_performance()
+        return {}
+    
+    async def add_strategy(self, strategy):
+        """
+        添加策略
+
+        Args:
+            strategy: 策略实例
+        """
+        if self.strategy_manager:
+            self.strategy_manager.add_strategy(strategy)
+    
+    async def update_market_data(self, symbol: str, last_price: float, volume: float, bid: float, ask: float):
+        """
+        更新市场数据
+
+        Args:
+            symbol: 交易对
+            last_price: 最新价格
+            volume: 交易量
+            bid: 买价
+            ask: 卖价
+        """
+        if self.trading_monitor:
+            self.trading_monitor.update_market_data(symbol, last_price, volume, bid, ask)
+    
+    async def update_risk_metrics(self, portfolio_value: float, total_exposure: float, var_95: float, 
+                              max_position_size: float, leverage_used: float, margin_level: float):
+        """
+        更新风险指标
+
+        Args:
+            portfolio_value: 组合价值
+            total_exposure: 总敞口
+            var_95: 95% VaR
+            max_position_size: 最大仓位大小
+            leverage_used: 使用的杠杆
+            margin_level: 保证金水平
+        """
+        if self.trading_monitor:
+            from src.modules.monitoring.trading_monitor import RiskMetrics
+            import time
+            
+            risk_metrics = RiskMetrics(
+                portfolio_value=portfolio_value,
+                total_exposure=total_exposure,
+                var_95=var_95,
+                max_position_size=max_position_size,
+                leverage_used=leverage_used,
+                margin_level=margin_level,
+                last_update=time.time()
+            )
+            
+            self.trading_monitor.update_risk_metrics(risk_metrics)
+    
+    async def update_strategy_performance(self, strategy_name: str, total_trades: int, win_trades: int, 
+                                       loss_trades: int, win_rate: float, total_pnl: float, 
+                                       max_drawdown: float, sharpe_ratio: float):
+        """
+        更新策略性能
+
+        Args:
+            strategy_name: 策略名称
+            total_trades: 总交易次数
+            win_trades: 盈利交易次数
+            loss_trades: 亏损交易次数
+            win_rate: 胜率
+            total_pnl: 总盈亏
+            max_drawdown: 最大回撤
+            sharpe_ratio: 夏普比率
+        """
+        if self.trading_monitor:
+            from src.modules.monitoring.trading_monitor import StrategyPerformance
+            import time
+            
+            performance = StrategyPerformance(
+                strategy_name=strategy_name,
+                total_trades=total_trades,
+                win_trades=win_trades,
+                loss_trades=loss_trades,
+                win_rate=win_rate,
+                total_pnl=total_pnl,
+                max_drawdown=max_drawdown,
+                sharpe_ratio=sharpe_ratio,
+                last_update=time.time()
+            )
+            
+            self.trading_monitor.update_strategy_performance(strategy_name, performance)
 
     # 私有方法
 
@@ -709,49 +1144,7 @@ class MainController:
 
         return True
 
-    async def _event_processor(self) -> None:
-        """
-        事件处理任务
-        """
-        logger.info("事件处理器启动")
 
-        while self._running:
-            try:
-                # 获取事件
-                event = await self.event_queue.get()
-                start_time = datetime.now()
-
-                # 添加到历史
-                self.event_history.append(event)
-                if len(self.event_history) > self.event_history_limit:
-                    self.event_history = self.event_history[-self.event_history_limit :]
-
-                # 处理事件
-                handlers = self.event_handlers.get(event.type, [])
-                for handler in handlers:
-                    try:
-                        if asyncio.iscoroutinefunction(handler):
-                            await handler(event)
-                        else:
-                            handler(event)
-                    except Exception as e:
-                        logger.error(f"事件处理器错误 {handler.__name__}: {e}")
-                        self.metrics["total_errors"] += 1
-
-                # 更新指标
-                processing_time = (datetime.now() - start_time).total_seconds() * 1000
-                self.metrics["event_processing_time_ms"] += processing_time
-
-                # 标记完成
-                self.event_queue.task_done()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"事件处理器异常: {e}")
-                await asyncio.sleep(1)
-
-        logger.info("事件处理器停止")
 
     async def _health_check_worker(self) -> None:
         """
@@ -806,13 +1199,13 @@ class MainController:
     def _register_default_handlers(self) -> None:
         """注册默认事件处理器"""
 
-        async def log_event_handler(event: SystemEvent):
+        async def log_event_handler(event):
             """日志事件处理器"""
             logger.info(f"事件: {event.type.value} from {event.source}")
 
-        async def error_event_handler(event: SystemEvent):
+        async def error_event_handler(event):
             """错误事件处理器"""
-            if event.type == EventType.MODULE_ERROR:
+            if event.type == CoreEventType.MODULE_ERROR:
                 module_name = event.data.get("module")
                 error_msg = event.data.get("error")
 
@@ -824,22 +1217,58 @@ class MainController:
                         logger.info(f"尝试自动重启模块: {module_name}")
                         await self.restart_module(module_name)
 
-        async def config_change_handler(event: SystemEvent):
+        async def config_change_handler(event):
             """配置变更处理器"""
-            if event.type == EventType.CONFIG_CHANGED:
+            if event.type == CoreEventType.CONFIG_CHANGED:
                 # 重新加载配置并通知模块
                 logger.info("配置变更，重新加载系统配置")
                 # 这里可以实现配置热重载逻辑
 
         # 注册处理器
-        self.register_event_handler(EventType.SYSTEM_START, log_event_handler)
-        self.register_event_handler(EventType.SYSTEM_STOP, log_event_handler)
-        self.register_event_handler(EventType.MODULE_STARTED, log_event_handler)
-        self.register_event_handler(EventType.MODULE_STOPPED, log_event_handler)
-        self.register_event_handler(EventType.MODULE_ERROR, error_event_handler)
-        self.register_event_handler(EventType.CONFIG_CHANGED, config_change_handler)
-        self.register_event_handler(EventType.ALERT, log_event_handler)
-        self.register_event_handler(EventType.HEARTBEAT, log_event_handler)
+        if self.event_system:
+            self.event_system.subscribe(CoreEventType.SYSTEM_START, log_event_handler)
+            self.event_system.subscribe(CoreEventType.SYSTEM_STOP, log_event_handler)
+            self.event_system.subscribe(CoreEventType.MODULE_STARTED, log_event_handler)
+            self.event_system.subscribe(CoreEventType.MODULE_STOPPED, log_event_handler)
+            self.event_system.subscribe(CoreEventType.MODULE_ERROR, error_event_handler)
+            self.event_system.subscribe(CoreEventType.CONFIG_CHANGED, config_change_handler)
+            self.event_system.subscribe(CoreEventType.RISK_ALERT, log_event_handler)
+        else:
+            # 回退到旧的事件处理器系统
+            async def old_log_event_handler(event: SystemEvent):
+                """日志事件处理器"""
+                logger.info(f"事件: {event.type.value} from {event.source}")
+
+            async def old_error_event_handler(event: SystemEvent):
+                """错误事件处理器"""
+                if event.type == EventType.MODULE_ERROR:
+                    module_name = event.data.get("module")
+                    error_msg = event.data.get("error")
+
+                    # 自动重启模块
+                    if self.auto_restart_modules and module_name and module_name in self.modules:
+
+                        module_info = self.modules[module_name]
+                        if module_info.error_count <= self.max_restart_attempts:
+                            logger.info(f"尝试自动重启模块: {module_name}")
+                            await self.restart_module(module_name)
+
+            async def old_config_change_handler(event: SystemEvent):
+                """配置变更处理器"""
+                if event.type == EventType.CONFIG_CHANGED:
+                    # 重新加载配置并通知模块
+                    logger.info("配置变更，重新加载系统配置")
+                    # 这里可以实现配置热重载逻辑
+
+            # 注册处理器
+            self.register_event_handler(EventType.SYSTEM_START, old_log_event_handler)
+            self.register_event_handler(EventType.SYSTEM_STOP, old_log_event_handler)
+            self.register_event_handler(EventType.MODULE_STARTED, old_log_event_handler)
+            self.register_event_handler(EventType.MODULE_STOPPED, old_log_event_handler)
+            self.register_event_handler(EventType.MODULE_ERROR, old_error_event_handler)
+            self.register_event_handler(EventType.CONFIG_CHANGED, old_config_change_handler)
+            self.register_event_handler(EventType.ALERT, old_log_event_handler)
+            self.register_event_handler(EventType.HEARTBEAT, old_log_event_handler)
 
 
 # 使用示例
