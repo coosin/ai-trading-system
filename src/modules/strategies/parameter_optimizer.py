@@ -1,9 +1,16 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize, differential_evolution
-from bayes_opt import BayesianOptimization
 from typing import Dict, Any, List, Callable, Tuple
 import random
+
+# 可选导入 bayes_opt
+try:
+    from bayes_opt import BayesianOptimization
+    HAS_BAYES_OPT = True
+except ImportError:
+    HAS_BAYES_OPT = False
+    BayesianOptimization = None
 
 class ParameterOptimizer:
     def __init__(self):
@@ -118,6 +125,15 @@ class ParameterOptimizer:
         Returns:
             最优参数和性能
         """
+        if not HAS_BAYES_OPT:
+            print("警告: bayes_opt 未安装，跳过贝叶斯优化")
+            return {
+                'best_params': {},
+                'best_score': 0.0,
+                'history': [],
+                'error': 'bayes_opt not installed'
+            }
+        
         # 目标函数
         def target(**params):
             return self.evaluate_strategy(params, backtest_data)

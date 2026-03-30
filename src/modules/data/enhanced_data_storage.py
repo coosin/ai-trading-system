@@ -3,11 +3,19 @@ import json
 import logging
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
+
+# 可选导入 pyarrow
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    HAS_PYARROW = True
+except ImportError:
+    HAS_PYARROW = False
+    pa = None
+    pq = None
 
 logger = logging.getLogger(__name__)
 

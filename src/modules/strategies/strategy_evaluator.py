@@ -51,11 +51,13 @@ class StrategyEvaluator:
         downside_std = downside_returns.std() if len(downside_returns) > 0 else 1
         return np.sqrt(trading_days) * excess_returns.mean() / downside_std
     
-    def calculate_max_drawdown(self):
+    def calculate_max_drawdown(self, returns=None):
         """计算最大回撤"""
-        if not self.returns:
+        if returns is None:
+            returns = self.returns
+        if not returns:
             return 0
-        cumulative_returns = np.cumsum(self.returns)
+        cumulative_returns = np.cumsum(returns)
         peak = cumulative_returns[0]
         max_drawdown = 0
         for r in cumulative_returns:
@@ -74,19 +76,23 @@ class StrategyEvaluator:
         annual_return = self.calculate_annual_return(trading_days)
         return annual_return / max_drawdown
     
-    def calculate_win_rate(self):
+    def calculate_win_rate(self, returns=None):
         """计算胜率"""
-        if not self.returns:
+        if returns is None:
+            returns = self.returns
+        if not returns:
             return 0
-        winning_trades = [r for r in self.returns if r > 0]
-        return len(winning_trades) / len(self.returns)
+        winning_trades = [r for r in returns if r > 0]
+        return len(winning_trades) / len(returns)
     
-    def calculate_profit_factor(self):
+    def calculate_profit_factor(self, returns=None):
         """计算盈利因子"""
-        if not self.returns:
+        if returns is None:
+            returns = self.returns
+        if not returns:
             return 0
-        total_profit = sum(r for r in self.returns if r > 0)
-        total_loss = abs(sum(r for r in self.returns if r < 0))
+        total_profit = sum(r for r in returns if r > 0)
+        total_loss = abs(sum(r for r in returns if r < 0))
         return total_profit / total_loss if total_loss > 0 else float('inf')
     
     def calculate_avg_win_loss_ratio(self):
@@ -173,13 +179,48 @@ class StrategyEvaluator:
             report['information_ratio'] = self.calculate_information_ratio(benchmark_returns)
         return report
     
+    def calculate_var(self, confidence_level=0.05, returns=None):
+        """计算风险价值 (VaR)
+        
+        Args:
+            confidence_level: 置信水平，默认 0.05 (95% VaR)
+            returns: 收益序列，默认使用 self.returns
+        
+        Returns:
+            VaR 值
+        """
+        if returns is None:
+            returns = self.returns
+        if not returns:
+            return 0
+        returns_array = np.array(returns)
+        return np.percentile(returns_array, confidence_level * 100)
+    
+    def calculate_cvar(self, confidence_level=0.05, returns=None):
+        """计算条件风险价值 (CVaR/Expected Shortfall)
+        
+        Args:
+            confidence_level: 置信水平，默认 0.05 (95% CVaR)
+            returns: 收益序列，默认使用 self.returns
+        
+        Returns:
+            CVaR 值
+        """
+        if returns is None:
+            returns = self.returns
+        if not returns:
+            return 0
+        returns_array = np.array(returns)
+        var = np.percentile(returns_array, confidence_level * 100)
+        return returns_array[returns_array <= var].mean()
+    
     def get_risk_metrics(self):
         """获取风险指标"""
         returns = np.array(self.returns)
         return {
             'volatility': returns.std() * math.sqrt(252),
-            'value_at_risk': np.percentile(returns, 5) * math.sqrt(252),
-            'conditional_value_at_risk': returns[returns <= np.percentile(returns, 5)].mean() * math.sqrt(252),
+            'value_at_risk': self.calculate_var(),
+            'conditional_value_at_risk': self.calculate_cvar(),
             'max_drawdown': self.calculate_max_drawdown()
         }
     

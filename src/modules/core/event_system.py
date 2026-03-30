@@ -135,9 +135,10 @@ class EventPersistence:
     """事件持久化存储"""
     
     def __init__(self, db_path: str = "events.db"):
-        self.db_path = Path(db_path)
+        self.db_path = db_path
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._connection = None
     
     async def initialize(self):
         """初始化数据库"""
@@ -151,7 +152,13 @@ class EventPersistence:
     
     def _init_db(self):
         """初始化数据库（同步方法）"""
-        conn = sqlite3.connect(self.db_path)
+        # 对于内存数据库，需要保持连接打开
+        if self.db_path == ":memory:":
+            self._connection = sqlite3.connect(self.db_path)
+            conn = self._connection
+        else:
+            conn = sqlite3.connect(self.db_path)
+        
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -179,7 +186,16 @@ class EventPersistence:
         ''')
         
         conn.commit()
-        conn.close()
+        # 对于内存数据库，不要关闭连接
+        if self.db_path != ":memory:":
+            conn.close()
+    
+    def _get_connection(self):
+        """获取数据库连接"""
+        if self.db_path == ":memory:":
+            return self._connection
+        else:
+            return sqlite3.connect(self.db_path)
     
     async def save_event(self, event: Event):
         """保存事件"""
@@ -188,7 +204,7 @@ class EventPersistence:
     
     def _save_event_sync(self, event: Event):
         """同步保存事件"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -206,7 +222,9 @@ class EventPersistence:
         ))
         
         conn.commit()
-        conn.close()
+        # 对于内存数据库，不要关闭连接
+        if self.db_path != ":memory:":
+            conn.close()
     
     async def load_events(self, 
                          event_types: Optional[List[EventType]] = None,
@@ -219,13 +237,13 @@ class EventPersistence:
                 self._load_events_sync, event_types, start_time, end_time, limit
             )
     
-    def _load_events_sync(self, 
+    def _load_events_sync(self,
                          event_types: Optional[List[EventType]],
                          start_time: Optional[datetime],
                          end_time: Optional[datetime],
                          limit: int) -> List[Event]:
         """同步加载事件"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         query = "SELECT * FROM events WHERE 1=1"
@@ -249,7 +267,9 @@ class EventPersistence:
         
         cursor.execute(query, params)
         rows = cursor.fetchall()
-        conn.close()
+        # 对于内存数据库，不要关闭连接
+        if self.db_path != ":memory:":
+            conn.close()
         
         events = []
         for row in rows:
@@ -273,14 +293,16 @@ class EventPersistence:
     
     def _mark_processed_sync(self, event_id: str):
         """同步标记事件已处理"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE events SET processed = 1 WHERE id = ?",
             (event_id,)
         )
         conn.commit()
-        conn.close()
+        # 对于内存数据库，不要关闭连接
+        if self.db_path != ":memory:":
+            conn.close()
 
 
 class EventBus:

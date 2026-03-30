@@ -7,10 +7,27 @@ class PortfolioOptimizer:
     def __init__(self):
         self.strategies = {}
     
-    def add_strategy(self, strategy_name: str, returns: pd.Series, volatility: float, correlation: Dict[str, float]):
-        """添加策略到组合中"""
+    def add_strategy(self, strategy_name: str, returns: pd.Series or float, volatility: float, correlation: Dict[str, float] = None):
+        """添加策略到组合中
+        
+        Args:
+            strategy_name: 策略名称
+            returns: 策略收益率序列或年化收益率
+            volatility: 策略波动率
+            correlation: 与其他策略的相关性字典 {strategy_name: correlation}
+        """
+        if correlation is None:
+            correlation = {}
+        
+        # 如果 returns 是数值，直接使用；如果是 Series，计算年化收益
+        if isinstance(returns, (int, float)):
+            annual_return = returns
+        else:
+            annual_return = returns.mean() * 252 if hasattr(returns, 'mean') else returns
+            
         self.strategies[strategy_name] = {
             'returns': returns,
+            'annual_return': annual_return,
             'volatility': volatility,
             'correlation': correlation
         }
@@ -20,7 +37,7 @@ class PortfolioOptimizer:
         total_return = 0.0
         for strategy_name, weight in weights.items():
             strategy = self.strategies[strategy_name]
-            total_return += weight * strategy['returns'].mean()
+            total_return += weight * strategy['annual_return']
         return total_return
     
     def calculate_volatility(self, weights: Dict[str, float]) -> float:

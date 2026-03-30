@@ -17,6 +17,7 @@ import os
 import shutil
 import time
 import yaml
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
