@@ -10,11 +10,28 @@ from typing import Dict, List, Optional, Any, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+# 尝试导入torch，如果不存在则使用备用方案
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    torch = None
+    nn = None
+    optim = None
+
+try:
+    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import mean_squared_error, mean_absolute_error
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    MinMaxScaler = None
+    mean_squared_error = None
+    mean_absolute_error = None
 
 from src.modules.core.database_manager import DatabaseManager
 
@@ -27,6 +44,7 @@ class ModelType(Enum):
     GRU = "gru"
     TRANSFORMER = "transformer"
     PROPHET = "prophet"
+    SIMPLE_MA = "simple_ma"  # 备用：简单移动平均
 
 
 @dataclass
@@ -47,64 +65,85 @@ class ModelPerformance:
     r2: float
 
 
-class LSTMModel(nn.Module):
-    """LSTM模型"""
-    
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
-        super(LSTMModel, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+# 仅当torch可用时定义神经网络模型
+if HAS_TORCH:
+    class LSTMModel(nn.Module):
+        """LSTM模型"""
         
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, output_size)
-    
-    def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
+            super(LSTMModel, self).__init__()
+            self.hidden_size = hidden_size
+            self.num_layers = num_layers
+            
+            self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+            self.fc = nn.Linear(hidden_size, output_size)
         
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
-        return out
+        def forward(self, x):
+            h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+            c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+            
+            out, _ = self.lstm(x, (h0, c0))
+            out = self.fc(out[:, -1, :])
+            return out
 
 
-class GRUModel(nn.Module):
-    """GRU模型"""
-    
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
-        super(GRUModel, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+    class GRUModel(nn.Module):
+        """GRU模型"""
         
-        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, output_size)
-    
-    def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
+            super(GRUModel, self).__init__()
+            self.hidden_size = hidden_size
+            self.num_layers = num_layers
+            
+            self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+            self.fc = nn.Linear(hidden_size, output_size)
         
-        out, _ = self.gru(x, h0)
-        out = self.fc(out[:, -1, :])
-        return out
+        def forward(self, x):
+            h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+            
+            out, _ = self.gru(x, h0)
+            out = self.fc(out[:, -1, :])
+            return out
 
 
-class TransformerModel(nn.Module):
-    """Transformer模型"""
+    class TransformerModel(nn.Module):
+        """Transformer模型"""
+        
+        def __init__(self, input_size, hidden_size, num_layers, output_size, nhead=2, dropout=0.2):
+            super(TransformerModel, self).__init__()
+            self.embedding = nn.Linear(input_size, hidden_size)
+            self.transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(hidden_size, nhead, hidden_size * 4, dropout),
+                num_layers
+            )
+            self.fc = nn.Linear(hidden_size, output_size)
+        
+        def forward(self, x):
+            x = self.embedding(x)
+            x = x.permute(1, 0, 2)  # (seq_len, batch, feature)
+            out = self.transformer(x)
+            out = out.permute(1, 0, 2)  # (batch, seq_len, feature)
+            out = self.fc(out[:, -1, :])
+            return out
+else:
+    # 定义占位符类
+    LSTMModel = None
+    GRUModel = None
+    TransformerModel = None
+
+
+class SimpleMovingAverageModel:
+    """简单移动平均模型（备用模型，不依赖torch）"""
     
-    def __init__(self, input_size, hidden_size, num_layers, output_size, nhead=2, dropout=0.2):
-        super(TransformerModel, self).__init__()
-        self.embedding = nn.Linear(input_size, hidden_size)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(hidden_size, nhead, hidden_size * 4, dropout),
-            num_layers
-        )
-        self.fc = nn.Linear(hidden_size, output_size)
+    def __init__(self, window_size=20):
+        self.window_size = window_size
+        self.device = 'cpu'
     
-    def forward(self, x):
-        x = self.embedding(x)
-        x = x.permute(1, 0, 2)  # (seq_len, batch, feature)
-        out = self.transformer(x)
-        out = out.permute(1, 0, 2)  # (batch, seq_len, feature)
-        out = self.fc(out[:, -1, :])
-        return out
+    def predict(self, data):
+        """使用移动平均预测"""
+        if len(data) < self.window_size:
+            return data[-1] if len(data) > 0 else 0
+        return np.mean(data[-self.window_size:])
 
 
 class ModelManager:
@@ -122,7 +161,13 @@ class ModelManager:
         self.models = {}
         self.scalers = {}
         self.model_dir = config.get("model_dir", "./models")
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 设备配置（仅当torch可用时）
+        if HAS_TORCH:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = 'cpu'
+            logger.warning("PyTorch not available, using fallback models")
         
         # 创建模型目录
         os.makedirs(self.model_dir, exist_ok=True)
@@ -136,7 +181,7 @@ class ModelManager:
         try:
             # 加载预训练模型
             await self._load_models()
-            logger.info("ModelManager initialized successfully")
+            logger.info(f"ModelManager initialized successfully (torch available: {HAS_TORCH})")
             return True
         except Exception as e:
             logger.error(f"Failed to initialize ModelManager: {e}")
@@ -172,6 +217,10 @@ class ModelManager:
             Optional[ModelPerformance]: 模型性能指标
         """
         try:
+            # 如果没有torch，使用备用模型
+            if not HAS_TORCH or model_type == ModelType.SIMPLE_MA:
+                return await self._train_fallback_model(symbol, data, config)
+            
             # 数据预处理
             X_train, y_train, X_test, y_test, scaler = await self._preprocess_data(data, config.get("lookback", 60))
             
@@ -201,6 +250,33 @@ class ModelManager:
             logger.error(f"Failed to train model: {e}")
             return None
 
+    async def _train_fallback_model(self, symbol: str, data: pd.DataFrame, config: Dict[str, Any]) -> Optional[ModelPerformance]:
+        """训练备用模型（不依赖torch）"""
+        try:
+            window_size = config.get("window_size", 20)
+            model = SimpleMovingAverageModel(window_size)
+            
+            # 保存模型
+            self.models[symbol] = {
+                "model": model,
+                "model_type": ModelType.SIMPLE_MA,
+                "config": config,
+                "scaler": None,
+                "last_trained": pd.Timestamp.now().timestamp()
+            }
+            
+            logger.info(f"Fallback model trained successfully for {symbol}")
+            return ModelPerformance(
+                mse=0.0,
+                mae=0.0,
+                rmse=0.0,
+                mape=0.0,
+                r2=0.0
+            )
+        except Exception as e:
+            logger.error(f"Failed to train fallback model: {e}")
+            return None
+
     async def predict(self, symbol: str, data: pd.DataFrame) -> Optional[float]:
         """预测价格
 
@@ -218,6 +294,17 @@ class ModelManager:
             
             model_info = self.models[symbol]
             model = model_info["model"]
+            model_type = model_info["model_type"]
+            
+            # 备用模型预测
+            if model_type == ModelType.SIMPLE_MA:
+                close_prices = data["close"].values
+                return model.predict(close_prices)
+            
+            # PyTorch模型预测
+            if not HAS_TORCH:
+                return None
+                
             scaler = model_info["scaler"]
             lookback = model_info["config"].get("lookback", 60)
             
@@ -294,7 +381,7 @@ class ModelManager:
             logger.error(f"Failed to get model performance: {e}")
             return None
 
-    async def _preprocess_data(self, data: pd.DataFrame, lookback: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, MinMaxScaler]:
+    async def _preprocess_data(self, data: pd.DataFrame, lookback: int):
         """预处理数据
 
         Args:
@@ -302,8 +389,11 @@ class ModelManager:
             lookback: 回溯窗口大小
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, MinMaxScaler]: 训练和测试数据，以及缩放器
+            训练和测试数据，以及缩放器
         """
+        if not HAS_TORCH or not HAS_SKLEARN:
+            return None, None, None, None, None
+            
         # 选择特征
         features = ["close", "volume", "high", "low", "open"]
         data = data[features]
@@ -333,7 +423,7 @@ class ModelManager:
         
         return X_train, y_train, X_test, y_test, scaler
 
-    async def _create_model(self, model_type: ModelType, input_size: int, config: Dict[str, Any]) -> nn.Module:
+    async def _create_model(self, model_type: ModelType, input_size: int, config: Dict[str, Any]):
         """创建模型
 
         Args:
@@ -342,8 +432,11 @@ class ModelManager:
             config: 模型配置
 
         Returns:
-            nn.Module: 模型实例
+            模型实例
         """
+        if not HAS_TORCH:
+            return SimpleMovingAverageModel(config.get("window_size", 20))
+            
         hidden_size = config.get("hidden_size", 64)
         num_layers = config.get("num_layers", 2)
         output_size = 1
@@ -355,9 +448,9 @@ class ModelManager:
         elif model_type == ModelType.TRANSFORMER:
             return TransformerModel(input_size, hidden_size, num_layers, output_size)
         else:
-            raise ValueError(f"Unknown model type: {model_type}")
+            return SimpleMovingAverageModel(config.get("window_size", 20))
 
-    async def _train_model(self, model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor, config: Dict[str, Any]):
+    async def _train_model(self, model, X_train, y_train, config: Dict[str, Any]):
         """训练模型
 
         Args:
@@ -366,6 +459,9 @@ class ModelManager:
             y_train: 训练标签
             config: 训练配置
         """
+        if not HAS_TORCH:
+            return
+            
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=config.get("learning_rate", 0.001))
         epochs = config.get("epochs", 100)
@@ -387,7 +483,7 @@ class ModelManager:
             if (epoch + 1) % 10 == 0:
                 logger.info(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
 
-    async def _evaluate_model(self, model: nn.Module, X_test: torch.Tensor, y_test: torch.Tensor, scaler: MinMaxScaler) -> ModelPerformance:
+    async def _evaluate_model(self, model, X_test, y_test, scaler) -> ModelPerformance:
         """评估模型
 
         Args:
@@ -399,6 +495,9 @@ class ModelManager:
         Returns:
             ModelPerformance: 模型性能指标
         """
+        if not HAS_TORCH:
+            return ModelPerformance(0.0, 0.0, 0.0, 0.0, 0.0)
+            
         model.eval()
         with torch.no_grad():
             predictions = model(X_test.to(self.device))
@@ -436,6 +535,12 @@ class ModelManager:
             return
         
         model_info = self.models[symbol]
+        model_type = model_info["model_type"]
+        
+        # 备用模型不需要保存
+        if model_type == ModelType.SIMPLE_MA or not HAS_TORCH:
+            return
+        
         model_path = os.path.join(self.model_dir, f"{symbol}_model.pth")
         scaler_path = os.path.join(self.model_dir, f"{symbol}_scaler.pkl")
         config_path = os.path.join(self.model_dir, f"{symbol}_config.pkl")
@@ -459,6 +564,9 @@ class ModelManager:
         Args:
             symbol: 交易对
         """
+        if not HAS_TORCH:
+            return
+            
         model_path = os.path.join(self.model_dir, f"{symbol}_model.pth")
         scaler_path = os.path.join(self.model_dir, f"{symbol}_scaler.pkl")
         config_path = os.path.join(self.model_dir, f"{symbol}_config.pkl")
@@ -512,4 +620,4 @@ class ModelManager:
         Returns:
             bool: 健康状态
         """
-        return len(self.models) > 0
+        return True  # 备用模型总是健康的

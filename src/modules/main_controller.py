@@ -19,7 +19,7 @@ import pandas as pd
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from src.modules.core.event_system import EnhancedEventSystem, EventType as CoreEventType
 from src.modules.core.enhanced_data_quality import EnhancedDataQualitySystem

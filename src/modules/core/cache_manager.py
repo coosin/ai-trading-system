@@ -21,8 +21,20 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
-import aioredis
-import msgpack
+# 尝试导入aioredis，如果不兼容则使用备用方案
+try:
+    import aioredis
+    HAS_AIOREDIS = True
+except (ImportError, TypeError):
+    HAS_AIOREDIS = False
+    aioredis = None
+
+try:
+    import msgpack
+    HAS_MSGPACK = True
+except ImportError:
+    HAS_MSGPACK = False
+    msgpack = None
 
 logger = logging.getLogger(__name__)
 
