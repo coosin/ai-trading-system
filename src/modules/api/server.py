@@ -268,11 +268,11 @@ class APIServer:
         self.routers: Dict[str, APIRouter] = {}
 
         # 认证
-        self.security = HTTPBearer()
-        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-        self.secret_key = secrets.token_urlsafe(32)
-        self.algorithm = "HS256"
-        self.access_token_expire_minutes = 30
+        self.security = HTTPBearer() if HAS_FASTAPI else None
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto") if HAS_FASTAPI else None
+        self.secret_key = secrets.token_urlsafe(32) if HAS_FASTAPI else None
+        self.algorithm = "HS256" if HAS_FASTAPI else None
+        self.access_token_expire_minutes = 30 if HAS_FASTAPI else None
 
         # WebSocket连接管理
         self.websocket_connections: Dict[str, WebSocketConnection] = {}

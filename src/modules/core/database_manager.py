@@ -799,16 +799,20 @@ class DatabaseManager:
         connection_string = self.config.get_connection_string()
 
         # 创建异步引擎
-        self.engine = create_async_engine(
-            connection_string,
-            pool_size=self.config.pool_size,
-            max_overflow=self.config.max_overflow,
-            pool_timeout=self.config.pool_timeout,
-            pool_recycle=self.config.pool_recycle,
-            echo=self.config.echo,
-            isolation_level=self.config.isolation_level.value.upper(),
-            future=True,
-        )
+        engine_kwargs = {
+            "pool_size": self.config.pool_size,
+            "max_overflow": self.config.max_overflow,
+            "pool_timeout": self.config.pool_timeout,
+            "pool_recycle": self.config.pool_recycle,
+            "echo": self.config.echo,
+            "future": True,
+        }
+        
+        # SQLite不支持READ COMMITTED隔离级别，使用默认隔离级别
+        if self.config.type != DatabaseType.SQLITE:
+            engine_kwargs["isolation_level"] = self.config.isolation_level.value.upper()
+        
+        self.engine = create_async_engine(connection_string, **engine_kwargs)
 
         # 创建会话工厂
         self.session_factory = async_sessionmaker(
