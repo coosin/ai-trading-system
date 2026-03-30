@@ -134,3 +134,47 @@ data:
     - "4h"
     - "1d"
   retention_days: 365
+
+# 代理配置
+proxy:
+  enabled: false
+  use_global_proxy: false
+  global_proxy:
+    name: "default"
+    proxy_type: "http"  # http, https, socks5, socks4
+    host: "127.0.0.1"
+    port: 8080
+    username: null
+    password: null
+    enabled: true
+  proxies: []
+  whitelist_domains: []  # 仅对这些域名使用代理
+  blacklist_domains: []  # 不对这些域名使用代理
+
+# 记忆配置
+memory:
+  enabled: true
+  db_path: "data/memory.db"
+  max_conversation_history: 50
+  retention_days:
+    critical: 3650  # 10年
+    high: 365       # 1年
+    normal: 30      # 30天
+    low: 7          # 7天
+
+# 域名和SSL配置
+domains:
+  letsencrypt:
+    email: ""  # Let's Encrypt 邮箱
+    staging: false  # 使用测试环境
+  domains: []
+  # 域名配置示例:
+  # - domain: "trading.example.com"
+  #   enabled: true
+  #   backend_host: "localhost"
+  #   backend_port: 8000
+  #   ssl_enabled: true
+  #   force_https: true
+  #   ssl_certificate:
+  #     source: "letsencrypt"
+  #     auto_renew: true
