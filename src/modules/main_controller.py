@@ -201,6 +201,7 @@ class MainController:
         self._register_default_handlers()
         
         # 启动事件处理任务
+        self._running = True
         self._tasks.append(asyncio.create_task(self._event_processor()))
         self._tasks.append(asyncio.create_task(self._health_check_worker()))
         

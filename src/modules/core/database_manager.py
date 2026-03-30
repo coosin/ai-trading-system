@@ -62,6 +62,14 @@ class ConnectionStatus(Enum):
     ERROR = "error"
 
 
+class HealthStatus(Enum):
+    """健康状态"""
+    HEALTHY = "healthy"
+    WARNING = "warning"
+    CRITICAL = "critical"
+    UNKNOWN = "unknown"
+
+
 class TransactionIsolationLevel(Enum):
     """事务隔离级别"""
     READ_UNCOMMITTED = "read_uncommitted"
@@ -140,7 +148,7 @@ if HAS_SQLALCHEMY:
         current_balance = Column(Float, nullable=False, default=0.0)
         profit_loss = Column(Float, nullable=False, default=0.0)
         profit_loss_percent = Column(Float, nullable=False, default=0.0)
-        metadata = Column(JSON, default=dict)
+        metadata_json = Column(JSON, default=dict)
         
         __table_args__ = (
             Index('idx_session_strategy', 'session_id', 'strategy_id'),
@@ -170,7 +178,7 @@ if HAS_SQLALCHEMY:
         commission = Column(Float, nullable=False, default=0.0)
         pnl = Column(Float, nullable=False, default=0.0)
         pnl_percent = Column(Float, nullable=False, default=0.0)
-        metadata = Column(JSON, default=dict)
+        metadata_json = Column(JSON, default=dict)
         
         __table_args__ = (
             Index('idx_trade_session', 'trade_id', 'session_id'),
@@ -193,7 +201,7 @@ if HAS_SQLALCHEMY:
         source = Column(String(32), nullable=False, default="exchange")
         interval = Column(String(8), nullable=False, default="1m")  # 1m, 5m, 15m, 1h, 1d
         created_at = Column(DateTime, nullable=False, default=datetime.now)
-        metadata = Column(JSON, default=dict)
+        metadata_json = Column(JSON, default=dict)
         
         __table_args__ = (
             UniqueConstraint('symbol', 'timestamp', 'interval', name='uq_symbol_timestamp_interval'),
@@ -211,7 +219,7 @@ if HAS_SQLALCHEMY:
         metric_name = Column(String(64), nullable=False, index=True)
         metric_value = Column(Float, nullable=False)
         metric_type = Column(String(32), nullable=False, default="gauge")  # gauge/counter/histogram
-        metadata = Column(JSON, default=dict)
+        metadata_json = Column(JSON, default=dict)
         
         __table_args__ = (
             Index('idx_strategy_session_metric', 'strategy_id', 'session_id', 'metric_name'),
@@ -227,7 +235,7 @@ if HAS_SQLALCHEMY:
         module = Column(String(64), nullable=False, index=True)
         message = Column(Text, nullable=False)
         timestamp = Column(DateTime, nullable=False, default=datetime.now, index=True)
-        metadata = Column(JSON, default=dict)
+        metadata_json = Column(JSON, default=dict)
         
         __table_args__ = (
             Index('idx_module_level_time', 'module', 'level', 'timestamp'),

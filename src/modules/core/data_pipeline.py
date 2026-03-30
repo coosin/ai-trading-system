@@ -160,7 +160,7 @@ class DataPipeline:
         
         # 注册默认处理器
         self.register_processor(self._default_cleaner)
-        self.register_processor(self._default_validator)
+        self.register_validator(self._default_validator)
         
         self._stats["start_time"] = datetime.now()
         logger.info("数据管道初始化完成")
@@ -608,11 +608,12 @@ class DataPipeline:
         for validator in self.validators:
             try:
                 if asyncio.iscoroutinefunction(validator):
-                    is_valid = await validator(point)
+                    validated_point = await validator(point)
                 else:
-                    is_valid = validator(point)
-                    
-                if not is_valid:
+                    validated_point = validator(point)
+                
+                # 检查验证后的数据质量
+                if validated_point.quality == DataQuality.INVALID:
                     return False
                     
             except Exception as e:
@@ -657,7 +658,7 @@ class DataPipeline:
         
         return point
     
-    async def _default_validator(self, point: DataPoint) -> bool:
+    async def _default_validator(self, point: DataPoint) -> DataPoint:
         """
         默认数据验证器
         
@@ -665,7 +666,7 @@ class DataPipeline:
             point: 数据点
         
         Returns:
-            是否有效
+            验证后的数据点
         """
         data = point.data
         
@@ -674,16 +675,16 @@ class DataPipeline:
             price = data["price"]
             if price <= 0 or price > 1_000_000:  # 假设价格上限
                 logger.warning(f"价格异常: {price}")
-                return False
+                point.quality = DataQuality.INVALID
         
         # 检查交易量是否合理
         if "volume" in data:
             volume = data["volume"]
             if volume < 0:
                 logger.warning(f"交易量异常: {volume}")
-                return False
+                point.quality = DataQuality.INVALID
         
-        return True
+        return point
 
 
 # 使用示例
