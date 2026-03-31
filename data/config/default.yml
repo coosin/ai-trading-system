@@ -33,16 +33,16 @@ controller:
 # 增强大模型配置
 llm:
   enabled: true
-  default_model: "deepseek-reasoner"
+  default_model: "astron-code-latest"
   
   # 任务-模型映射（按任务类型选择最优模型）
   task_model_mapping:
-    market_analysis: ["deepseek-reasoner", "gpt-4-turbo", "claude-3-opus-20240229"]
-    strategy_generation: ["deepseek-reasoner", "gpt-4", "qwen-max"]
-    signal_generation: ["deepseek-chat", "gpt-4-turbo"]
+    market_analysis: ["astron-code-latest", "gpt-4-turbo", "claude-3-opus-20240229"]
+    strategy_generation: ["astron-code-latest", "gpt-4", "qwen-max"]
+    signal_generation: ["astron-code-latest", "gpt-4-turbo"]
     risk_assessment: ["gpt-4", "claude-3-opus-20240229"]
-    news_analysis: ["deepseek-chat", "qwen-max"]
-    natural_language: ["deepseek-chat", "gpt-4-turbo"]
+    news_analysis: ["astron-code-latest", "qwen-max"]
+    natural_language: ["astron-code-latest", "gpt-4-turbo"]
   
   # 自定义模型配置
   models:
