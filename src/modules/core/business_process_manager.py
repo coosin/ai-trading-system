@@ -103,12 +103,19 @@ class BusinessProcessManager:
         self.pending_signals: List[TradingSignal] = []
         self.executed_signals: List[TradingSignal] = []
 
+        # AI集成
+        self.llm_integration = None
+        self.ai_analyses: Dict[str, Dict[str, Any]] = {}
+        self.ai_strategies: Dict[str, Dict[str, Any]] = {}
+
         # 配置
         self.config = {
             "pipeline_interval": 60,  # 秒
             "signal_cooldown": 300,  # 秒
             "max_pending_signals": 10,
             "risk_check_enabled": True,
+            "ai_enabled": True,
+            "ai_model_id": "astron-code-latest",
         }
 
         # 状态管理
@@ -126,6 +133,11 @@ class BusinessProcessManager:
         if self.main_controller and self.main_controller.config_manager:
             bp_config = await self.main_controller.config_manager.get_config("business_process", {})
             self.config.update(bp_config)
+
+        # 初始化LLM集成
+        if self.main_controller and hasattr(self.main_controller, 'llm_integration'):
+            self.llm_integration = self.main_controller.llm_integration
+            logger.info("AI大模型集成已连接到业务流程管理器")
 
         self._running = True
         logger.info("业务流程管理器初始化完成")
@@ -272,7 +284,7 @@ class BusinessProcessManager:
 
     async def _trigger_strategy_analysis(self, symbol: str) -> None:
         """
-        触发策略分析
+        触发策略分析（集成AI智能分析）
 
         Args:
             symbol: 交易对
@@ -292,12 +304,76 @@ class BusinessProcessManager:
             if not pipeline or pipeline.data_buffer.empty:
                 return
 
-            # 生成交易信号
+            # 构建市场数据
+            latest_data = pipeline.data_buffer.tail(1).iloc[0]
             market_data_dict = {
                 'symbol': symbol,
+                'price': float(latest_data.get('close', 0)),
                 'data': pipeline.data_buffer.tail(100).to_dict('records')
             }
 
+            # ============================================
+            # AI 智能分析集成
+            # ============================================
+            if self.config.get('ai_enabled', True) and self.llm_integration:
+                try:
+                    model_id = self.config.get('ai_model_id', 'astron-code-latest')
+                    
+                    # 1. AI 市场分析
+                    logger.info(f"AI 正在分析 {symbol} 市场...")
+                    ai_analysis = await self.llm_integration.analyze_market(
+                        market_data_dict,
+                        model_id=model_id
+                    )
+                    self.ai_analyses[symbol] = ai_analysis
+                    logger.info(f"AI 市场分析完成: {symbol}")
+
+                    # 2. AI 生成交易信号
+                    logger.info(f"AI 正在生成 {symbol} 交易信号...")
+                    ai_signal = await self.llm_integration.generate_trading_signal(
+                        market_data_dict,
+                        model_id=model_id
+                    )
+                    
+                    # 处理 AI 生成的交易信号
+                    if ai_signal and 'signal' in ai_signal:
+                        signal_type_str = ai_signal.get('signal', 'hold')
+                        if signal_type_str in ['buy', 'sell']:
+                            signal_data = {
+                                'signal_id': f'ai_sig_{datetime.now().timestamp()}',
+                                'strategy_id': 'ai_strategy',
+                                'signal_type': signal_type_str,
+                                'price': market_data_dict['price'],
+                                'quantity': ai_signal.get('quantity', 0.01),
+                                'confidence': ai_signal.get('confidence', 0.7),
+                                'metadata': {
+                                    'ai_analysis': ai_analysis,
+                                    'ai_signal': ai_signal,
+                                    'is_ai_generated': True
+                                }
+                            }
+                            
+                            signal = TradingSignal(
+                                signal_id=signal_data['signal_id'],
+                                strategy_id=signal_data['strategy_id'],
+                                symbol=symbol,
+                                signal_type=SignalType(signal_data['signal_type']),
+                                price=signal_data['price'],
+                                quantity=signal_data['quantity'],
+                                confidence=signal_data['confidence'],
+                                metadata=signal_data['metadata'],
+                                timestamp=datetime.now()
+                            )
+                            
+                            logger.info(f"AI 生成信号: {signal_type_str} {symbol} @ {signal_data['price']}")
+                            await self._process_signal(signal)
+                
+                except Exception as ai_error:
+                    logger.error(f"AI 分析失败: {ai_error}")
+            
+            # ============================================
+            # 传统策略分析（作为补充）
+            # ============================================
             signals = await strategy_manager.generate_signals(market_data_dict)
 
             # 处理生成的信号
