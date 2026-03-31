@@ -19,6 +19,7 @@ import ControlCenter from './components/ControlCenter';
 import AIInteraction from './components/AIInteraction';
 import RealTimeMarket from './components/RealTimeMarket';
 import ExternalData from './components/ExternalData';
+import AIMarketAnalysis from './components/AIMarketAnalysis';
 import ThemeToggle from './components/ThemeToggle';
 
 function App() {
@@ -56,6 +57,8 @@ function App() {
         return <RealTimeMarket />;
       case 'external-data':
         return <ExternalData />;
+      case 'ai-market-analysis':
+        return <AIMarketAnalysis />;
       case 'status':
         return <SystemStatus status={status} loading={loading} />;
       case 'strategies':
@@ -393,6 +396,23 @@ function App() {
                   }}
                 >
                   外部数据源
+                </button>
+              </li>
+              <li style={{ marginBottom: '15px' }}>
+                <button
+                  onClick={() => setActiveView('ai-market-analysis')}
+                  style={{
+                    width: '100%',
+                    padding: '10px',
+                    backgroundColor: activeView === 'ai-market-analysis' ? (styles.sidebar.backgroundColor === '#2d2d2d' ? '#3a3a3a' : '#3498db') : 'transparent',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    textAlign: 'left'
+                  }}
+                >
+                  AI市场分析
                 </button>
               </li>
             </ul>

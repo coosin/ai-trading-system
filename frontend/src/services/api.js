@@ -156,6 +156,46 @@ export const api = {
   ai: {
     chat: (message, modelId = null) => apiClient.post('/ai/chat', { message, model_id: modelId }),
     query: (query, context = {}) => apiClient.post('/ai/query', { query, context }),
+    analyzeMarket: (marketData, modelId = null) => apiClient.post('/ai/analyze-market', { market_data: marketData, model_id: modelId }),
+    generateStrategy: (analysis, modelId = null) => apiClient.post('/ai/generate-strategy', { analysis, model_id: modelId }),
+    generateSignal: (marketData, modelId = null) => apiClient.post('/ai/generate-signal', { market_data: marketData, model_id: modelId }),
+  },
+
+  // 外部数据获取
+  externalData: {
+    getSources: () => apiClient.get('/external-data/sources'),
+    fetchData: (source, params) => apiClient.post(`/external-data/fetch/${source}`, params),
+    getIndicators: (symbol, indicators) => apiClient.post('/external-data/indicators', { symbol, indicators }),
+    analyzeTrends: (symbol) => apiClient.get(`/external-data/analyze-trends/${symbol}`),
+    getSignals: (symbol) => apiClient.get(`/external-data/signals/${symbol}`),
+  },
+
+  // 链上数据
+  onchain: {
+    getTransactions: (address, params) => apiClient.post('/onchain/transactions', { address, ...params }),
+    getBalance: (address) => apiClient.get(`/onchain/balance/${address}`),
+  },
+
+  // 社交媒体数据
+  social: {
+    getTweets: (query, maxResults = 100) => apiClient.get('/social/tweets', { params: { query, max_results: maxResults } }),
+    getNews: (query, pageSize = 100) => apiClient.get('/social/news', { params: { query, page_size: pageSize } }),
+  },
+
+  // 模拟合约交易
+  contractTrading: {
+    getAccount: () => apiClient.get('/contract-trading/account'),
+    getPositions: () => apiClient.get('/contract-trading/positions'),
+    placeOrder: (orderData) => apiClient.post('/contract-trading/order', orderData),
+    closePosition: (symbol, size = null) => apiClient.post('/contract-trading/close', { symbol, size }),
+    getStats: () => apiClient.get('/contract-trading/stats'),
+  },
+
+  // 交易所管理
+  exchange: {
+    getList: () => apiClient.get('/exchanges'),
+    getBalance: (exchangeId) => apiClient.get(`/exchanges/${exchangeId}/balance`),
+    getTicker: (exchangeId, symbol) => apiClient.get(`/exchanges/${exchangeId}/ticker/${symbol}`),
   },
 };
 
