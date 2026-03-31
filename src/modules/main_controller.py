@@ -259,6 +259,9 @@ class MainController:
         
         # 业务流程管理器
         self.business_process_manager = None
+        
+        # 全智能AI交易引擎
+        self.ai_trading_engine = None
 
         # 默认配置
         self.auto_restart_modules = True
@@ -402,6 +405,12 @@ class MainController:
         # 初始化业务流程管理器
         self.business_process_manager = BusinessProcessManager(self)
         await self.business_process_manager.initialize()
+        
+        # 初始化全智能AI交易引擎
+        from src.modules.core.ai_trading_engine import AITradingEngine
+        self.ai_trading_engine = AITradingEngine(self)
+        await self.ai_trading_engine.initialize()
+        logger.info("✅ 全智能AI交易引擎初始化完成")
 
         # 注册默认事件处理器
         self._register_default_handlers()
@@ -533,6 +542,11 @@ class MainController:
                     self.system_status = ModuleStatus.RUNNING
                     self._running = True
                     logger.info("系统启动成功")
+                    
+                    # 启动全智能AI交易引擎
+                    if self.ai_trading_engine:
+                        await self.ai_trading_engine.start()
+                        logger.info("🚀 全智能AI交易引擎已启动，开始全自动交易")
 
                     # 发送心跳事件
                     await self.emit_event(
