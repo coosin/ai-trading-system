@@ -35,7 +35,7 @@ from src.modules.api.monitoring_api import set_trading_monitor, set_anomaly_dete
 from src.modules.core.strategy_manager import StrategyManager
 from src.modules.strategies.portfolio_optimizer import PortfolioOptimizer
 from src.modules.strategies.parameter_optimizer import ParameterOptimizer
-from src.modules.backtesting.enhanced_backtester import EnhancedBacktester
+from src.modules.backtesting.backtest_engine import BacktestEngine
 from src.modules.data.enhanced_data_storage import EnhancedDataStorage
 from src.modules.data.data_backup import DataBackupManager
 from src.modules.api.strategy_api import init_strategy_api
@@ -323,10 +323,7 @@ class MainController:
         set_trading_monitor(self.trading_monitor)
         
         # 初始化多策略管理器
-        strategy_config = {}
-        if self.config_manager:
-            strategy_config = await self.config_manager.get_config("strategy", {})
-        self.strategy_manager = StrategyManager(strategy_config)
+        self.strategy_manager = StrategyManager(self.config_manager)
         # 初始化策略API
         init_strategy_api(self.strategy_manager)
         
@@ -354,7 +351,7 @@ class MainController:
         self.parameter_optimizer = ParameterOptimizer()
         
         # 初始化增强回测系统
-        self.enhanced_backtester = EnhancedBacktester()
+        self.enhanced_backtester = BacktestEngine()
         
         # 初始化增强数据存储系统
         self.data_storage = EnhancedDataStorage()
@@ -1404,7 +1401,7 @@ class MainController:
             return []
         return self.parameter_optimizer.get_optimization_history()
     
-    def get_enhanced_backtester(self) -> Optional[EnhancedBacktester]:
+    def get_enhanced_backtester(self) -> Optional[BacktestEngine]:
         """
         获取增强回测系统实例
 

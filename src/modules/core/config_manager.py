@@ -137,26 +137,35 @@ class ConfigManager:
         self._initialized = False
         logger.info("配置管理器已清理")
 
-    async def get_config(self, section: str, key: str, default: Any = None) -> Any:
+    async def get_config(self, section: str, key: Any = None, default: Any = None) -> Any:
         """
         获取配置值
 
         Args:
             section: 配置段名
-            key: 配置键名
+            key: 配置键名（可选）
             default: 默认值（如果配置不存在）
 
         Returns:
             配置值
         """
         async with self._lock:
-            section_config = self._config.get(section, {})
-            value = section_config.get(key)
+            # 如果只传递了两个参数，第二个参数作为default
+            if key is not None and not isinstance(key, str):
+                default = key
+                key = None
+            
+            if key:
+                section_config = self._config.get(section, {})
+                value = section_config.get(key)
 
-            if value is None and default is not None:
-                return default
+                if value is None and default is not None:
+                    return default
 
-            return value
+                return value
+            else:
+                # 如果没有指定key，返回整个section
+                return self._config.get(section, default)
 
     async def set_config(self, section: str, key: str, value: Any, validate: bool = True) -> bool:
         """

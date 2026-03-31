@@ -137,7 +137,7 @@ class TradingSystem:
 
             # 2. 关闭主控制器
             if self.main_controller:
-                await self.main_controller.shutdown()
+                await self.main_controller.cleanup()
 
             # 3. 清理配置管理器
             if self.config_manager:
