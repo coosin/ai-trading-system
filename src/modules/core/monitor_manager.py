@@ -34,6 +34,7 @@ class MonitorType(Enum):
     SYSTEM = "system"  # 系统监控
     SERVICE = "service"  # 服务监控
     BUSINESS = "business"  # 业务监控
+    TRADING = "trading"  # 交易监控
     CUSTOM = "custom"  # 自定义监控
 
 
@@ -252,6 +253,26 @@ class MonitorManager:
         # 系统指标
         self.system_metrics: List[SystemMetrics] = []
 
+        # 交易监控
+        self.trade_executions: Dict[str, Dict[str, Any]] = {}
+        self.strategy_performance: Dict[str, Dict[str, Any]] = {}
+        self.market_data_status: Dict[str, Dict[str, Any]] = {}
+        self.risk_metrics: Optional[Dict[str, Any]] = None
+        
+        # 交易监控配置
+        self.trading_thresholds = {
+            "max_drawdown": 10.0,  # 百分比
+            "max_leverage": 5.0,
+            "min_margin_level": 1.5,
+            "max_position_size": 0.3,  # 占总资金的比例
+            "max_var": 5.0,  # 百分比
+            "max_data_age": 30,  # 秒
+            "max_spread": 0.5,  # 百分比
+            "min_volume": 1000,  # USD
+            "max_pending_time": 300,  # 秒
+            "min_fill_rate": 0.8  # 80%
+        }
+
         # 统计
         self.stats = {
             "total_checks": 0,
@@ -259,6 +280,9 @@ class MonitorManager:
             "active_alerts": 0,
             "system_up_time": 0,
             "last_check_time": None,
+            "total_trades": 0,
+            "total_strategies": 0,
+            "total_symbols": 0,
         }
 
         # 任务和锁
@@ -295,6 +319,7 @@ class MonitorManager:
             self._tasks.append(asyncio.create_task(self._system_monitoring_worker()))
             self._tasks.append(asyncio.create_task(self._service_monitoring_worker()))
             self._tasks.append(asyncio.create_task(self._alert_checking_worker()))
+            self._tasks.append(asyncio.create_task(self._trading_monitoring_worker()))
 
             self._initialized = True
             logger.info("监控管理器初始化完成")
@@ -910,6 +935,21 @@ class MonitorManager:
         )
         await self.register_monitor(api_monitor)
 
+        # 交易监控
+        trading_monitor = MonitorConfig(
+            monitor_id="trading_overview",
+            name="交易概览",
+            monitor_type=MonitorType.TRADING,
+            check_interval=30,
+            alert_thresholds={
+                "max_drawdown": 10.0,
+                "max_leverage": 5.0,
+                "min_margin_level": 1.5,
+            },
+            tags=["trading", "overview"],
+        )
+        await self.register_monitor(trading_monitor)
+
         logger.info(f"设置 {len(self.monitor_configs)} 个默认监控")
 
     async def _system_monitoring_worker(self) -> None:
@@ -968,6 +1008,261 @@ class MonitorManager:
                 await asyncio.sleep(10)
 
         logger.info("告警检查线程停止")
+
+    # 交易监控方法
+    
+    async def _trading_monitoring_worker(self) -> None:
+        """交易监控工作线程"""
+        logger.info("启动交易监控线程")
+
+        while self._initialized:
+            try:
+                await asyncio.sleep(30)  # 每30秒检查一次
+
+                # 检查订单状态
+                await self._check_orders()
+                
+                # 检查市场数据状态
+                await self._check_market_data()
+                
+                # 检查风险指标
+                await self._check_risk_metrics()
+                
+                # 检查策略性能
+                await self._check_strategy_performance()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"交易监控线程错误: {e}")
+                await asyncio.sleep(30)
+
+        logger.info("交易监控线程停止")
+
+    def add_trade_execution(self, trade_data: Dict[str, Any]):
+        """添加交易执行记录"""
+        order_id = trade_data.get("order_id")
+        if order_id:
+            self.trade_executions[order_id] = trade_data
+            
+            # 限制交易记录数量
+            if len(self.trade_executions) > 1000:
+                # 删除最早的记录
+                oldest_order_id = next(iter(self.trade_executions))
+                del self.trade_executions[oldest_order_id]
+            
+            # 更新统计
+            self.stats["total_trades"] = len(self.trade_executions)
+
+    def update_strategy_performance(self, strategy_name: str, performance: Dict[str, Any]):
+        """更新策略性能"""
+        self.strategy_performance[strategy_name] = performance
+        # 更新统计
+        self.stats["total_strategies"] = len(self.strategy_performance)
+
+    def update_market_data(self, symbol: str, market_data: Dict[str, Any]):
+        """更新市场数据"""
+        import time
+        market_data["last_update"] = time.time()
+        market_data["data_age"] = 0
+        self.market_data_status[symbol] = market_data
+        # 更新统计
+        self.stats["total_symbols"] = len(self.market_data_status)
+
+    def update_risk_metrics(self, risk_metrics: Dict[str, Any]):
+        """更新风险指标"""
+        import time
+        risk_metrics["last_update"] = time.time()
+        self.risk_metrics = risk_metrics
+
+    async def _check_orders(self):
+        """检查订单状态"""
+        import time
+        current_time = time.time()
+        
+        for order_id, trade in list(self.trade_executions.items()):
+            # 检查订单是否长时间处于待处理状态
+            if trade.get("status") == "pending":
+                pending_time = current_time - trade.get("timestamp", current_time)
+                if pending_time > self.trading_thresholds["max_pending_time"]:
+                    await self._create_alert(
+                        monitor_id="trading_overview",
+                        alert_level=AlertLevel.WARNING,
+                        message=f"Order {order_id} has been pending for {pending_time:.1f} seconds",
+                        metric_name="order_pending_time",
+                        metric_value=pending_time,
+                        threshold=self.trading_thresholds["max_pending_time"]
+                    )
+            
+            # 检查订单填充率
+            if trade.get("status") in ["filled", "partially_filled"]:
+                executed_quantity = trade.get("executed_quantity", 0)
+                quantity = trade.get("quantity", 1)
+                fill_rate = executed_quantity / quantity
+                if fill_rate < self.trading_thresholds["min_fill_rate"]:
+                    await self._create_alert(
+                        monitor_id="trading_overview",
+                        alert_level=AlertLevel.INFO,
+                        message=f"Order {order_id} has low fill rate: {fill_rate:.2f}",
+                        metric_name="order_fill_rate",
+                        metric_value=fill_rate,
+                        threshold=self.trading_thresholds["min_fill_rate"]
+                    )
+
+    async def _check_market_data(self):
+        """检查市场数据状态"""
+        import time
+        current_time = time.time()
+        
+        for symbol, market_data in list(self.market_data_status.items()):
+            # 计算数据年龄
+            data_age = current_time - market_data.get("last_update", current_time)
+            market_data["data_age"] = data_age
+            
+            # 检查数据是否过期
+            if data_age > self.trading_thresholds["max_data_age"]:
+                await self._create_alert(
+                    monitor_id="trading_overview",
+                    alert_level=AlertLevel.WARNING,
+                    message=f"Market data for {symbol} is stale: {data_age:.1f} seconds",
+                    metric_name="market_data_age",
+                    metric_value=data_age,
+                    threshold=self.trading_thresholds["max_data_age"]
+                )
+            
+            # 检查点差是否过大
+            spread = market_data.get("spread", 0)
+            if spread > self.trading_thresholds["max_spread"]:
+                await self._create_alert(
+                    monitor_id="trading_overview",
+                    alert_level=AlertLevel.INFO,
+                    message=f"High spread for {symbol}: {spread:.2f}%",
+                    metric_name="market_spread",
+                    metric_value=spread,
+                    threshold=self.trading_thresholds["max_spread"]
+                )
+            
+            # 检查交易量是否过低
+            volume = market_data.get("volume", 0)
+            if volume < self.trading_thresholds["min_volume"]:
+                await self._create_alert(
+                    monitor_id="trading_overview",
+                    alert_level=AlertLevel.INFO,
+                    message=f"Low volume for {symbol}: {volume:.2f}",
+                    metric_name="market_volume",
+                    metric_value=volume,
+                    threshold=self.trading_thresholds["min_volume"]
+                )
+
+    async def _check_risk_metrics(self):
+        """检查风险指标"""
+        if not self.risk_metrics:
+            return
+        
+        # 检查最大回撤
+        max_drawdown = self.risk_metrics.get("max_drawdown", 0)
+        if max_drawdown > self.trading_thresholds["max_drawdown"]:
+            await self._create_alert(
+                monitor_id="trading_overview",
+                alert_level=AlertLevel.ERROR,
+                message=f"High drawdown: {max_drawdown:.2f}%",
+                metric_name="max_drawdown",
+                metric_value=max_drawdown,
+                threshold=self.trading_thresholds["max_drawdown"]
+            )
+        
+        # 检查杠杆使用
+        leverage_used = self.risk_metrics.get("leverage_used", 0)
+        if leverage_used > self.trading_thresholds["max_leverage"]:
+            await self._create_alert(
+                monitor_id="trading_overview",
+                alert_level=AlertLevel.WARNING,
+                message=f"High leverage: {leverage_used}x",
+                metric_name="leverage_used",
+                metric_value=leverage_used,
+                threshold=self.trading_thresholds["max_leverage"]
+            )
+        
+        # 检查保证金水平
+        margin_level = self.risk_metrics.get("margin_level", 10)
+        if margin_level < self.trading_thresholds["min_margin_level"]:
+            await self._create_alert(
+                monitor_id="trading_overview",
+                alert_level=AlertLevel.CRITICAL,
+                message=f"Low margin level: {margin_level}x",
+                metric_name="margin_level",
+                metric_value=margin_level,
+                threshold=self.trading_thresholds["min_margin_level"]
+            )
+        
+        # 检查仓位大小
+        max_position_size = self.risk_metrics.get("max_position_size", 0)
+        if max_position_size > self.trading_thresholds["max_position_size"]:
+            await self._create_alert(
+                monitor_id="trading_overview",
+                alert_level=AlertLevel.WARNING,
+                message=f"Large position size: {max_position_size:.2f}",
+                metric_name="max_position_size",
+                metric_value=max_position_size,
+                threshold=self.trading_thresholds["max_position_size"]
+            )
+        
+        # 检查VaR
+        var_95 = self.risk_metrics.get("var_95", 0)
+        if var_95 > self.trading_thresholds["max_var"]:
+            await self._create_alert(
+                monitor_id="trading_overview",
+                alert_level=AlertLevel.WARNING,
+                message=f"High VaR: {var_95:.2f}%",
+                metric_name="var_95",
+                metric_value=var_95,
+                threshold=self.trading_thresholds["max_var"]
+            )
+
+    async def _check_strategy_performance(self):
+        """检查策略性能"""
+        for strategy_name, performance in self.strategy_performance.items():
+            # 检查胜率
+            win_rate = performance.get("win_rate", 1)
+            if win_rate < 0.4:
+                await self._create_alert(
+                    monitor_id="trading_overview",
+                    alert_level=AlertLevel.INFO,
+                    message=f"Low win rate for {strategy_name}: {win_rate:.2f}",
+                    metric_name="win_rate",
+                    metric_value=win_rate,
+                    threshold=0.4
+                )
+            
+            # 检查夏普比率
+            sharpe_ratio = performance.get("sharpe_ratio", 1)
+            if sharpe_ratio < 0.5:
+                await self._create_alert(
+                    monitor_id="trading_overview",
+                    alert_level=AlertLevel.INFO,
+                    message=f"Low Sharpe ratio for {strategy_name}: {sharpe_ratio:.2f}",
+                    metric_name="sharpe_ratio",
+                    metric_value=sharpe_ratio,
+                    threshold=0.5
+                )
+
+    def get_trade_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取交易历史"""
+        trades = list(self.trade_executions.values())
+        trades.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return trades[:limit]
+
+    def get_strategy_performance(self) -> Dict[str, Dict[str, Any]]:
+        """获取策略性能"""
+        return self.strategy_performance
+
+    def get_market_data_status(self) -> Dict[str, Dict[str, Any]]:
+        """获取市场数据状态"""
+        return self.market_data_status
+
+    def get_risk_metrics(self) -> Optional[Dict[str, Any]]:
+        """获取风险指标"""
+        return self.risk_metrics
 
     async def _collect_system_metrics(self) -> None:
         """收集系统指标"""

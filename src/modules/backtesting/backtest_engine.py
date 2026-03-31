@@ -70,6 +70,12 @@ class BacktestResult:
     start_balance: float
     equity_curve: List[Tuple[datetime, float]]
     drawdown_curve: List[Tuple[datetime, float]]
+    # 新增字段
+    calmar_ratio: float = 0.0
+    beta: float = 0.0
+    alpha: float = 0.0
+    equity_series: Optional[pd.Series] = None
+    positions: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
 
 
 class StrategyBase:
@@ -99,6 +105,11 @@ class BacktestEngine:
         self.strategy = None
         self.data = None
         self.config = None
+        # 新增多策略支持
+        self.strategies = {}
+        self.market_data = {}
+        self.portfolio = {}
+        self.positions = {}
     
     async def run_backtest(self, strategy: StrategyBase, data: pd.DataFrame, config: BacktestConfig) -> BacktestResult:
         """运行回测"""
@@ -338,7 +349,7 @@ class BacktestEngine:
         """生成回测报告"""
         report = {
             "基本信息": {
-                "策略名称": self.strategy.name,
+                "策略名称": self.strategy.name if self.strategy else "多策略组合",
                 "交易对": result.config.symbol,
                 "回测周期": f"{result.config.start_time} 至 {result.config.end_time}",
                 "初始资金": result.start_balance,
@@ -359,11 +370,421 @@ class BacktestEngine:
                 "最大回撤": f"{result.max_drawdown:.2f}%",
                 "夏普比率": f"{result.sharpe_ratio:.2f}",
                 "索提诺比率": f"{result.sortino_ratio:.2f}",
+                "卡马比率": f"{result.calmar_ratio:.2f}",
                 "盈利因子": f"{result.profit_factor:.2f}"
             }
         }
         
         return report
+    
+    # 多策略回测方法
+    
+    def add_strategy(self, strategy_name: str, strategy):
+        """添加策略"""
+        self.strategies[strategy_name] = strategy
+    
+    def add_market_data(self, symbol: str, data: pd.DataFrame):
+        """添加市场数据"""
+        self.market_data[symbol] = data
+    
+    def set_initial_balance(self, balance: float):
+        """设置初始资金"""
+        if self.config:
+            self.config.initial_balance = balance
+    
+    async def run_multi_strategy_backtest(self, start_date: Optional[datetime] = None, 
+                                         end_date: Optional[datetime] = None) -> BacktestResult:
+        """运行多策略协同回测"""
+        # 重置状态
+        self._reset_state()
+        
+        # 获取时间范围
+        all_data = []
+        for data in self.market_data.values():
+            all_data.append(data)
+        
+        if not all_data:
+            return BacktestResult(
+                config=BacktestConfig(symbol="MULTI", start_time=start_date or datetime.now(), 
+                                     end_time=end_date or datetime.now(), initial_balance=100000),
+                trades=[],
+                final_balance=100000,
+                total_pnl=0,
+                win_rate=0,
+                average_win=0,
+                average_loss=0,
+                max_drawdown=0,
+                sharpe_ratio=0,
+                sortino_ratio=0,
+                profit_factor=0,
+                total_trades=0,
+                win_trades=0,
+                loss_trades=0,
+                start_balance=100000,
+                equity_curve=[],
+                drawdown_curve=[]
+            )
+        
+        combined_data = pd.concat(all_data)
+        combined_data = combined_data.sort_index()
+        
+        if start_date:
+            combined_data = combined_data[combined_data.index >= start_date]
+        if end_date:
+            combined_data = combined_data[combined_data.index <= end_date]
+        
+        # 初始化回测状态
+        balance = self.config.initial_balance if self.config else 100000
+        portfolio = {}
+        trades = []
+        equity_curve = []
+        drawdown_curve = []
+        high_watermark = balance
+        win_trades = 0
+        loss_trades = 0
+        total_win = 0.0
+        total_loss = 0.0
+        positions = {}
+        
+        # 运行回测
+        for timestamp in combined_data.index.unique():
+            # 获取当前时间点的所有市场数据
+            current_data = {}
+            for symbol, data in self.market_data.items():
+                if timestamp in data.index:
+                    current_data[symbol] = data.loc[timestamp]
+            
+            if not current_data:
+                continue
+            
+            # 让每个策略生成信号
+            signals = {}
+            for strategy_name, strategy in self.strategies.items():
+                try:
+                    signal = strategy.on_data(pd.DataFrame([current_data]), 0)
+                    if signal:
+                        signals[strategy_name] = signal
+                except Exception as e:
+                    logger.error(f"策略 {strategy_name} 生成信号时出错: {e}")
+            
+            # 处理信号
+            for strategy_name, signal in signals.items():
+                symbol = signal.get("symbol")
+                side = signal.get("side")
+                quantity = signal.get("quantity")
+                price = signal.get("price") or current_data.get(symbol, {}).get("close")
+                
+                if not symbol or not side or not quantity or not price:
+                    continue
+                
+                # 执行交易
+                trade = await self._execute_trade(
+                    {"side": side, "quantity": quantity},
+                    current_data.get(symbol),
+                    balance,
+                    portfolio.get(symbol, 0)
+                )
+                
+                if trade:
+                    trades.append(trade)
+                    balance = trade.balance
+                    portfolio[symbol] = trade.position
+                    
+                    # 更新高水位线
+                    if balance > high_watermark:
+                        high_watermark = balance
+                    
+                    # 计算回撤
+                    drawdown = (high_watermark - balance) / high_watermark * 100
+                    
+                    # 更新曲线
+                    equity_curve.append((timestamp, balance))
+                    drawdown_curve.append((timestamp, drawdown))
+                    
+                    # 更新交易统计
+                    if trade.pnl > 0:
+                        win_trades += 1
+                        total_win += trade.pnl
+                    else:
+                        loss_trades += 1
+                        total_loss += abs(trade.pnl)
+            
+            # 无信号时也更新曲线
+            equity_curve.append((timestamp, balance))
+            drawdown = (high_watermark - balance) / high_watermark * 100
+            drawdown_curve.append((timestamp, drawdown))
+        
+        # 计算性能指标
+        total_pnl = balance - (self.config.initial_balance if self.config else 100000)
+        win_rate = win_trades / len(trades) * 100 if trades else 0
+        average_win = total_win / win_trades if win_trades else 0
+        average_loss = total_loss / loss_trades if loss_trades else 0
+        max_drawdown = max([d[1] for d in drawdown_curve]) if drawdown_curve else 0
+        sharpe_ratio = self._calculate_sharpe_ratio(equity_curve)
+        sortino_ratio = self._calculate_sortino_ratio(equity_curve)
+        profit_factor = total_win / total_loss if total_loss > 0 else float('inf')
+        calmar_ratio = total_pnl / max_drawdown if max_drawdown > 0 else 0
+        
+        # 创建回测结果
+        result = BacktestResult(
+            config=BacktestConfig(symbol="MULTI", start_time=start_date or datetime.now(), 
+                                 end_time=end_date or datetime.now(), initial_balance=self.config.initial_balance if self.config else 100000),
+            trades=trades,
+            final_balance=balance,
+            total_pnl=total_pnl,
+            win_rate=win_rate,
+            average_win=average_win,
+            average_loss=average_loss,
+            max_drawdown=max_drawdown,
+            sharpe_ratio=sharpe_ratio,
+            sortino_ratio=sortino_ratio,
+            profit_factor=profit_factor,
+            total_trades=len(trades),
+            win_trades=win_trades,
+            loss_trades=loss_trades,
+            start_balance=self.config.initial_balance if self.config else 100000,
+            equity_curve=equity_curve,
+            drawdown_curve=drawdown_curve,
+            calmar_ratio=calmar_ratio,
+            positions=positions
+        )
+        
+        return result
+    
+    async def run_cross_market_arbitrage_backtest(self, symbol1: str, symbol2: str, 
+                                              spread_threshold: float = 0.01, 
+                                              start_date: Optional[datetime] = None, 
+                                              end_date: Optional[datetime] = None) -> BacktestResult:
+        """运行跨市场套利回测"""
+        # 重置状态
+        self._reset_state()
+        
+        # 获取两个市场的数据
+        if symbol1 not in self.market_data or symbol2 not in self.market_data:
+            return BacktestResult(
+                config=BacktestConfig(symbol=f"{symbol1}/{symbol2}", start_time=start_date or datetime.now(), 
+                                     end_time=end_date or datetime.now(), initial_balance=100000),
+                trades=[],
+                final_balance=100000,
+                total_pnl=0,
+                win_rate=0,
+                average_win=0,
+                average_loss=0,
+                max_drawdown=0,
+                sharpe_ratio=0,
+                sortino_ratio=0,
+                profit_factor=0,
+                total_trades=0,
+                win_trades=0,
+                loss_trades=0,
+                start_balance=100000,
+                equity_curve=[],
+                drawdown_curve=[]
+            )
+        
+        data1 = self.market_data[symbol1]
+        data2 = self.market_data[symbol2]
+        
+        # 对齐时间索引
+        combined_index = data1.index.intersection(data2.index)
+        data1 = data1.loc[combined_index]
+        data2 = data2.loc[combined_index]
+        
+        if start_date:
+            data1 = data1[data1.index >= start_date]
+            data2 = data2[data2.index >= start_date]
+        if end_date:
+            data1 = data1[data1.index <= end_date]
+            data2 = data2[data2.index <= end_date]
+        
+        # 计算价差
+        spread = data1['close'] - data2['close']
+        spread_mean = spread.mean()
+        spread_std = spread.std()
+        
+        # 初始化回测状态
+        balance = self.config.initial_balance if self.config else 100000
+        portfolio = {}
+        trades = []
+        equity_curve = []
+        drawdown_curve = []
+        high_watermark = balance
+        win_trades = 0
+        loss_trades = 0
+        total_win = 0.0
+        total_loss = 0.0
+        
+        # 运行套利策略
+        position = 0  # 0: 无仓位, 1: 做多symbol1做空symbol2, -1: 做空symbol1做多功能2
+        entry_price = 0.0
+        
+        for i, timestamp in enumerate(data1.index):
+            current_spread = spread.iloc[i]
+            price1 = data1.loc[timestamp, 'close']
+            price2 = data2.loc[timestamp, 'close']
+            
+            # 套利信号
+            if position == 0:
+                # 价差偏离过大，开仓
+                if current_spread > spread_mean + spread_threshold * spread_std:
+                    # 做空symbol1，做多功能2
+                    position = -1
+                    entry_price = current_spread
+                    
+                    # 执行交易
+                    trade1 = await self._execute_trade(
+                        {"side": "sell", "quantity": balance * 0.5 / price1},
+                        data1.loc[timestamp],
+                        balance,
+                        portfolio.get(symbol1, 0)
+                    )
+                    if trade1:
+                        trades.append(trade1)
+                        balance = trade1.balance
+                        portfolio[symbol1] = trade1.position
+                    
+                    trade2 = await self._execute_trade(
+                        {"side": "buy", "quantity": balance * 0.5 / price2},
+                        data2.loc[timestamp],
+                        balance,
+                        portfolio.get(symbol2, 0)
+                    )
+                    if trade2:
+                        trades.append(trade2)
+                        balance = trade2.balance
+                        portfolio[symbol2] = trade2.position
+                        
+                elif current_spread < spread_mean - spread_threshold * spread_std:
+                    # 做多symbol1，做空symbol2
+                    position = 1
+                    entry_price = current_spread
+                    
+                    # 执行交易
+                    trade1 = await self._execute_trade(
+                        {"side": "buy", "quantity": balance * 0.5 / price1},
+                        data1.loc[timestamp],
+                        balance,
+                        portfolio.get(symbol1, 0)
+                    )
+                    if trade1:
+                        trades.append(trade1)
+                        balance = trade1.balance
+                        portfolio[symbol1] = trade1.position
+                    
+                    trade2 = await self._execute_trade(
+                        {"side": "sell", "quantity": balance * 0.5 / price2},
+                        data2.loc[timestamp],
+                        balance,
+                        portfolio.get(symbol2, 0)
+                    )
+                    if trade2:
+                        trades.append(trade2)
+                        balance = trade2.balance
+                        portfolio[symbol2] = trade2.position
+            else:
+                # 价差回归，平仓
+                if (position == 1 and current_spread >= spread_mean) or \
+                   (position == -1 and current_spread <= spread_mean):
+                    # 平仓
+                    trade1 = await self._execute_trade(
+                        {"side": "sell" if position == 1 else "buy", "quantity": portfolio.get(symbol1, 0)},
+                        data1.loc[timestamp],
+                        balance,
+                        portfolio.get(symbol1, 0)
+                    )
+                    if trade1:
+                        trades.append(trade1)
+                        balance = trade1.balance
+                        portfolio[symbol1] = trade1.position
+                    
+                    trade2 = await self._execute_trade(
+                        {"side": "buy" if position == 1 else "sell", "quantity": portfolio.get(symbol2, 0)},
+                        data2.loc[timestamp],
+                        balance,
+                        portfolio.get(symbol2, 0)
+                    )
+                    if trade2:
+                        trades.append(trade2)
+                        balance = trade2.balance
+                        portfolio[symbol2] = trade2.position
+                    
+                    position = 0
+            
+            # 更新高水位线
+            if balance > high_watermark:
+                high_watermark = balance
+            
+            # 计算回撤
+            drawdown = (high_watermark - balance) / high_watermark * 100
+            
+            # 更新曲线
+            equity_curve.append((timestamp, balance))
+            drawdown_curve.append((timestamp, drawdown))
+            
+            # 更新交易统计
+            if trades:
+                last_trade = trades[-1]
+                if last_trade.pnl > 0:
+                    win_trades += 1
+                    total_win += last_trade.pnl
+                else:
+                    loss_trades += 1
+                    total_loss += abs(last_trade.pnl)
+        
+        # 计算性能指标
+        total_pnl = balance - (self.config.initial_balance if self.config else 100000)
+        win_rate = win_trades / len(trades) * 100 if trades else 0
+        average_win = total_win / win_trades if win_trades else 0
+        average_loss = total_loss / loss_trades if loss_trades else 0
+        max_drawdown = max([d[1] for d in drawdown_curve]) if drawdown_curve else 0
+        sharpe_ratio = self._calculate_sharpe_ratio(equity_curve)
+        sortino_ratio = self._calculate_sortino_ratio(equity_curve)
+        profit_factor = total_win / total_loss if total_loss > 0 else float('inf')
+        calmar_ratio = total_pnl / max_drawdown if max_drawdown > 0 else 0
+        
+        # 创建回测结果
+        result = BacktestResult(
+            config=BacktestConfig(symbol=f"{symbol1}/{symbol2}", start_time=start_date or datetime.now(), 
+                                 end_time=end_date or datetime.now(), initial_balance=self.config.initial_balance if self.config else 100000),
+            trades=trades,
+            final_balance=balance,
+            total_pnl=total_pnl,
+            win_rate=win_rate,
+            average_win=average_win,
+            average_loss=average_loss,
+            max_drawdown=max_drawdown,
+            sharpe_ratio=sharpe_ratio,
+            sortino_ratio=sortino_ratio,
+            profit_factor=profit_factor,
+            total_trades=len(trades),
+            win_trades=win_trades,
+            loss_trades=loss_trades,
+            start_balance=self.config.initial_balance if self.config else 100000,
+            equity_curve=equity_curve,
+            drawdown_curve=drawdown_curve,
+            calmar_ratio=calmar_ratio
+        )
+        
+        return result
+    
+    def _reset_state(self):
+        """重置回测状态"""
+        self.portfolio = {}
+        self.positions = {}
+    
+    def get_equity_curve(self) -> pd.Series:
+        """获取资产曲线"""
+        if not self.strategy or not hasattr(self, 'equity_curve') or not self.equity_curve:
+            return pd.Series()
+        equity_df = pd.DataFrame(self.equity_curve, columns=['timestamp', 'equity'])
+        equity_df.set_index('timestamp', inplace=True)
+        return equity_df['equity']
+    
+    def get_trades(self) -> List[Trade]:
+        """获取交易记录"""
+        if not self.strategy or not hasattr(self, 'trades'):
+            return []
+        return self.trades
     
     async def load_historical_data(self, symbol: str, start_time: datetime, 
                                  end_time: datetime, time_frame: str) -> pd.DataFrame:

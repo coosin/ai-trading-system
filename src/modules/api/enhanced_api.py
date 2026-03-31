@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from src.modules.core.enhanced_fault_tolerance import EnhancedFaultTolerance
 from src.modules.core.event_system import EnhancedEventSystem, EventType
 from src.modules.execution.smart_order_router import SmartOrderRouter
-from src.modules.strategy.enhanced_strategy_manager import EnhancedStrategySystem
+from src.modules.core.strategy_manager import StrategyManager
 
 logger = logging.getLogger(__name__)
 

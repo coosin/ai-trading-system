@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "openclaw-trading-system": {
+      "command": "python3",
+      "args": [
+        "/home/cool/.openclaw-trading/mcp_bridge.py"
+      ],
+      "env": {
+        "PYTHONPATH": "/home/cool/.openclaw-trading"
+      }
+    }
+  }
+}

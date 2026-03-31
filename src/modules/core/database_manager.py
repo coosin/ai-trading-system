@@ -128,12 +128,15 @@ class DatabaseConfig:
     database: str = "trading_system"
     username: str = "postgres"
     password: str = ""
-    pool_size: int = 10
-    max_overflow: int = 20
-    pool_timeout: int = 30
-    pool_recycle: int = 3600
+    pool_size: int = 20
+    max_overflow: int = 30
+    pool_timeout: int = 60
+    pool_recycle: int = 1800
     echo: bool = False
     isolation_level: TransactionIsolationLevel = TransactionIsolationLevel.READ_COMMITTED
+    backup_enabled: bool = True
+    backup_interval: int = 3600
+    backup_retention: int = 7
 
     def get_connection_string(self) -> str:
         """获取连接字符串"""
@@ -310,6 +313,10 @@ class DatabaseManager:
         self.pool_monitor_task: Optional[asyncio.Task] = None
         self.connection_stats: Dict[str, Any] = {}
 
+        # 备份管理
+        self.backup_task: Optional[asyncio.Task] = None
+        self.last_backup: Optional[datetime] = None
+
         # 统计信息
         self.stats = DatabaseStats()
 
@@ -352,6 +359,10 @@ class DatabaseManager:
             # 启动连接池监控
             self.pool_monitor_task = asyncio.create_task(self._pool_monitor())
 
+            # 启动备份任务
+            if self.config.backup_enabled:
+                self.backup_task = asyncio.create_task(self._backup_manager())
+
             self._initialized = True
             self._running = True
             self.status = ConnectionStatus.CONNECTED
@@ -382,6 +393,14 @@ class DatabaseManager:
             self.pool_monitor_task.cancel()
             try:
                 await self.pool_monitor_task
+            except asyncio.CancelledError:
+                pass
+
+        # 停止备份任务
+        if self.backup_task:
+            self.backup_task.cancel()
+            try:
+                await self.backup_task
             except asyncio.CancelledError:
                 pass
 
@@ -946,6 +965,124 @@ class DatabaseManager:
 
         logger.info("连接池监控任务停止")
 
+    async def _backup_manager(self) -> None:
+        """备份管理任务"""
+        logger.info("启动备份管理任务")
+
+        while self._running:
+            try:
+                await asyncio.sleep(self.config.backup_interval)
+
+                if self.config.backup_enabled:
+                    await self._create_backup()
+                    await self._cleanup_old_backups()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"备份管理错误: {e}")
+                await asyncio.sleep(60)
+
+        logger.info("备份管理任务停止")
+
+    async def _create_backup(self) -> bool:
+        """创建数据库备份"""
+        try:
+            if not self.engine or self.status != ConnectionStatus.CONNECTED:
+                logger.warning("数据库未连接，跳过备份")
+                return False
+
+            backup_dir = Path("backups")
+            backup_dir.mkdir(exist_ok=True)
+
+            backup_filename = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
+            backup_path = backup_dir / backup_filename
+
+            if self.config.type == DatabaseType.POSTGRESQL:
+                # PostgreSQL备份
+                import subprocess
+                cmd = [
+                    "pg_dump",
+                    f"--host={self.config.host}",
+                    f"--port={self.config.port}",
+                    f"--username={self.config.username}",
+                    f"--dbname={self.config.database}",
+                    "--format=c",
+                    f"--file={backup_path}"
+                ]
+                env = os.environ.copy()
+                env["PGPASSWORD"] = self.config.password
+                result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+                if result.returncode != 0:
+                    logger.error(f"PostgreSQL备份失败: {result.stderr}")
+                    return False
+            elif self.config.type == DatabaseType.MYSQL:
+                # MySQL备份
+                import subprocess
+                cmd = [
+                    "mysqldump",
+                    f"--host={self.config.host}",
+                    f"--port={self.config.port}",
+                    f"--user={self.config.username}",
+                    f"--password={self.config.password}",
+                    f"{self.config.database}",
+                    f"--result-file={backup_path}"
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    logger.error(f"MySQL备份失败: {result.stderr}")
+                    return False
+            elif self.config.type in [DatabaseType.SQLITE, DatabaseType.MEMORY]:
+                # SQLite备份
+                if self.config.type == DatabaseType.MEMORY:
+                    logger.warning("内存数据库不支持备份")
+                    return False
+                import shutil
+                db_path = Path(self.config.database)
+                if db_path.exists():
+                    shutil.copy2(db_path, backup_path)
+                else:
+                    logger.warning(f"SQLite数据库文件不存在: {db_path}")
+                    return False
+
+            self.last_backup = datetime.now()
+            logger.info(f"数据库备份成功: {backup_path}")
+            return True
+        except Exception as e:
+            logger.error(f"创建备份失败: {e}")
+            return False
+
+    async def _cleanup_old_backups(self) -> None:
+        """清理旧备份"""
+        try:
+            backup_dir = Path("backups")
+            if not backup_dir.exists():
+                return
+
+            cutoff_time = datetime.now() - timedelta(days=self.config.backup_retention)
+            backups = list(backup_dir.glob("backup_*.sql")) + list(backup_dir.glob("backup_*.dump"))
+
+            for backup in backups:
+                backup_time = datetime.strptime(backup.stem.split("_")[1], "%Y%m%d_%H%M%S")
+                if backup_time < cutoff_time:
+                    backup.unlink()
+                    logger.info(f"清理旧备份: {backup}")
+        except Exception as e:
+            logger.error(f"清理旧备份失败: {e}")
+
+    async def create_backup(self) -> bool:
+        """手动创建备份"""
+        return await self._create_backup()
+
+    async def get_backup_status(self) -> Dict[str, Any]:
+        """获取备份状态"""
+        return {
+            "enabled": self.config.backup_enabled if self.config else False,
+            "last_backup": self.last_backup.isoformat() if self.last_backup else None,
+            "backup_interval": self.config.backup_interval if self.config else 3600,
+            "backup_retention": self.config.backup_retention if self.config else 7
+        }
+
 
 # 使用示例
 async def example_usage():
@@ -1002,6 +1139,14 @@ async def example_usage():
         # 健康检查
         health = await db_manager.health_check()
         print(f"数据库健康状态: {health.value}")
+
+        # 手动创建备份
+        backup_result = await db_manager.create_backup()
+        print(f"手动备份结果: {backup_result}")
+
+        # 获取备份状态
+        backup_status = await db_manager.get_backup_status()
+        print(f"备份状态: {json.dumps(backup_status, indent=2, default=str)}")
 
     finally:
         await db_manager.cleanup()

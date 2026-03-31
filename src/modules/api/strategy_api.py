@@ -9,7 +9,7 @@ from typing import Dict, Any, List
 
 from fastapi import APIRouter, HTTPException
 
-from ..strategies.multi_strategy_manager import MultiStrategyManager
+from ..core.strategy_manager import StrategyManager
 from ..strategies.moving_average import MovingAverageStrategy
 from ..strategies.rsi_strategy import RSIStrategy
 from ..strategies.bb_strategy import BBStrategy
@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
 
 # 全局策略管理器实例
-strategy_manager: MultiStrategyManager = None
+strategy_manager: StrategyManager = None
 
-def init_strategy_api(manager: MultiStrategyManager):
+def init_strategy_api(manager: StrategyManager):
     """初始化策略API
     
     Args:

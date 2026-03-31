@@ -49,9 +49,108 @@ class SystemHealth:
     overall_status: SystemStatus
     component_statuses: List[ComponentStatus]
     cpu_usage: float
+    cpu_details: Dict[str, Any]
     memory_usage: float
+    memory_details: Dict[str, Any]
     disk_usage: float
+    disk_details: Dict[str, Any]
     network_status: Dict[str, Any]
+    network_details: Dict[str, Any]
+    business_metrics: Dict[str, Any]
+
+
+class PerformanceAnalyzer:
+    """性能分析器"""
+
+    def __init__(self):
+        """初始化性能分析器"""
+        self.performance_data = []
+        self.max_data_points = 1000
+        self.start_times = {}
+
+    def start_measurement(self, name: str):
+        """开始性能测量
+
+        Args:
+            name: 测量名称
+        """
+        self.start_times[name] = time.time()
+
+    def end_measurement(self, name: str) -> float:
+        """结束性能测量
+
+        Args:
+            name: 测量名称
+
+        Returns:
+            float: 执行时间（秒）
+        """
+        if name in self.start_times:
+            duration = time.time() - self.start_times[name]
+            del self.start_times[name]
+            
+            # 记录性能数据
+            self.performance_data.append({
+                "timestamp": time.time(),
+                "name": name,
+                "duration": duration
+            })
+            
+            # 限制数据点数量
+            if len(self.performance_data) > self.max_data_points:
+                self.performance_data = self.performance_data[-self.max_data_points:]
+            
+            return duration
+        return 0.0
+
+    def get_performance_stats(self, name: str = None) -> Dict[str, Any]:
+        """获取性能统计信息
+
+        Args:
+            name: 测量名称，None表示所有测量
+
+        Returns:
+            Dict[str, Any]: 性能统计信息
+        """
+        if name:
+            data = [d for d in self.performance_data if d["name"] == name]
+        else:
+            data = self.performance_data
+        
+        if not data:
+            return {}
+        
+        durations = [d["duration"] for d in data]
+        stats = {
+            "count": len(durations),
+            "average": sum(durations) / len(durations),
+            "min": min(durations),
+            "max": max(durations),
+            "total": sum(durations)
+        }
+        
+        return stats
+
+    def get_performance_history(self, name: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取性能历史数据
+
+        Args:
+            name: 测量名称，None表示所有测量
+            limit: 返回的历史记录数量
+
+        Returns:
+            List[Dict[str, Any]]: 性能历史数据
+        """
+        if name:
+            data = [d for d in self.performance_data if d["name"] == name]
+        else:
+            data = self.performance_data
+        
+        return data[-limit:]
+
+    def clear_performance_data(self):
+        """清除性能数据"""
+        self.performance_data.clear()
 
 
 class SystemMonitor:
@@ -83,6 +182,7 @@ class SystemMonitor:
         })
         self.alert_history = []
         self.max_alert_history = config.get("max_alert_history", 100)
+        self.performance_analyzer = PerformanceAnalyzer()
 
     async def initialize(self) -> bool:
         """初始化系统监控
@@ -251,17 +351,52 @@ class SystemMonitor:
         """
         try:
             # 检查系统资源
-            cpu_usage = psutil.cpu_percent()
+            cpu_usage = psutil.cpu_percent(interval=0.1)
+            cpu_details = {
+                "per_cpu_usage": psutil.cpu_percent(interval=0.1, percpu=True),
+                "cpu_count": psutil.cpu_count(),
+                "cpu_count_logical": psutil.cpu_count(logical=True),
+                "cpu_freq": psutil.cpu_freq()._asdict() if psutil.cpu_freq() else {}
+            }
+            
             memory = psutil.virtual_memory()
             memory_usage = memory.percent
+            memory_details = {
+                "total": memory.total,
+                "available": memory.available,
+                "used": memory.used,
+                "free": memory.free,
+                "active": getattr(memory, 'active', 0),
+                "inactive": getattr(memory, 'inactive', 0)
+            }
+            
             disk = psutil.disk_usage('/')
             disk_usage = disk.percent
+            disk_details = {
+                "total": disk.total,
+                "used": disk.used,
+                "free": disk.free,
+                "partitions": [{
+                    "device": p.device,
+                    "mountpoint": p.mountpoint,
+                    "fstype": p.fstype,
+                    "opts": p.opts
+                } for p in psutil.disk_partitions()]
+            }
             
             # 检查网络状态
             network_status = await self._check_network_status()
+            network_details = {
+                "interfaces": dict(psutil.net_if_stats()),
+                "connections": len(psutil.net_connections()),
+                "io_counters": psutil.net_io_counters()._asdict()
+            }
             
             # 检查组件状态
             component_statuses = await self._check_components()
+            
+            # 业务级别的性能指标
+            business_metrics = await self._get_business_metrics()
             
             # 确定整体状态
             overall_status = self._determine_overall_status(component_statuses)
@@ -271,9 +406,14 @@ class SystemMonitor:
                 overall_status=overall_status,
                 component_statuses=component_statuses,
                 cpu_usage=cpu_usage,
+                cpu_details=cpu_details,
                 memory_usage=memory_usage,
+                memory_details=memory_details,
                 disk_usage=disk_usage,
-                network_status=network_status
+                disk_details=disk_details,
+                network_status=network_status,
+                network_details=network_details,
+                business_metrics=business_metrics
             )
         except Exception as e:
             logger.error(f"Error checking system health: {e}")
@@ -282,9 +422,14 @@ class SystemMonitor:
                 overall_status=SystemStatus.CRITICAL,
                 component_statuses=[],
                 cpu_usage=0,
+                cpu_details={},
                 memory_usage=0,
+                memory_details={},
                 disk_usage=0,
-                network_status={}
+                disk_details={},
+                network_status={},
+                network_details={},
+                business_metrics={}
             )
 
     async def _check_network_status(self) -> Dict[str, Any]:
@@ -306,6 +451,35 @@ class SystemMonitor:
                 "status": "unhealthy",
                 "error": str(e)
             }
+
+    async def _get_business_metrics(self) -> Dict[str, Any]:
+        """获取业务级别的性能指标
+
+        Returns:
+            Dict[str, Any]: 业务指标
+        """
+        try:
+            # 业务级别的性能指标
+            business_metrics = {
+                "strategy_execution_time": 0.0,
+                "order_response_time": 0.0,
+                "market_data_update_time": 0.0,
+                "risk_analysis_time": 0.0,
+                "active_strategies": 0,
+                "active_orders": 0,
+                "completed_trades": 0,
+                "error_rate": 0.0
+            }
+            
+            # 这里可以从各个模块收集实际的业务指标
+            # 例如从策略管理器获取活跃策略数量
+            # 从交易执行器获取订单状态
+            # 从市场分析模块获取数据更新时间
+            
+            return business_metrics
+        except Exception as e:
+            logger.error(f"Error getting business metrics: {e}")
+            return {}
 
     async def _generate_alert(self, alert_type: str, severity: str, message: str, details: Dict[str, Any]):
         """生成告警
@@ -565,3 +739,49 @@ class SystemMonitor:
         if alert_type in self.alert_thresholds:
             self.alert_thresholds[alert_type] = threshold
             logger.info(f"Set alert threshold for {alert_type} to {threshold}")
+
+    def start_performance_measurement(self, name: str):
+        """开始性能测量
+
+        Args:
+            name: 测量名称
+        """
+        self.performance_analyzer.start_measurement(name)
+
+    def end_performance_measurement(self, name: str) -> float:
+        """结束性能测量
+
+        Args:
+            name: 测量名称
+
+        Returns:
+            float: 执行时间（秒）
+        """
+        return self.performance_analyzer.end_measurement(name)
+
+    def get_performance_stats(self, name: str = None) -> Dict[str, Any]:
+        """获取性能统计信息
+
+        Args:
+            name: 测量名称，None表示所有测量
+
+        Returns:
+            Dict[str, Any]: 性能统计信息
+        """
+        return self.performance_analyzer.get_performance_stats(name)
+
+    def get_performance_history(self, name: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取性能历史数据
+
+        Args:
+            name: 测量名称，None表示所有测量
+            limit: 返回的历史记录数量
+
+        Returns:
+            List[Dict[str, Any]]: 性能历史数据
+        """
+        return self.performance_analyzer.get_performance_history(name, limit)
+
+    def clear_performance_data(self):
+        """清除性能数据"""
+        self.performance_analyzer.clear_performance_data()

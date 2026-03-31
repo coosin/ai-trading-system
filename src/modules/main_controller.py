@@ -32,7 +32,7 @@ from src.modules.core.business_process_manager import BusinessProcessManager
 from src.modules.notification.telegram_bot import TelegramBot
 from src.modules.monitoring.trading_monitor import TradingMonitor
 from src.modules.api.monitoring_api import set_trading_monitor, set_anomaly_detector
-from src.modules.strategies.multi_strategy_manager import MultiStrategyManager
+from src.modules.core.strategy_manager import StrategyManager
 from src.modules.strategies.portfolio_optimizer import PortfolioOptimizer
 from src.modules.strategies.parameter_optimizer import ParameterOptimizer
 from src.modules.backtesting.enhanced_backtester import EnhancedBacktester
@@ -326,7 +326,7 @@ class MainController:
         strategy_config = {}
         if self.config_manager:
             strategy_config = await self.config_manager.get_config("strategy", {})
-        self.strategy_manager = MultiStrategyManager(strategy_config)
+        self.strategy_manager = StrategyManager(strategy_config)
         # 初始化策略API
         init_strategy_api(self.strategy_manager)
         
@@ -1163,7 +1163,7 @@ class MainController:
         """
         return self.trading_monitor
     
-    def get_strategy_manager(self) -> Optional[MultiStrategyManager]:
+    def get_strategy_manager(self) -> Optional[StrategyManager]:
         """
         获取多策略管理器实例
 

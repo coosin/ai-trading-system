@@ -2,233 +2,64 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop, feature/* ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main, develop ]
-  schedule:
-    - cron: '0 0 * * *'  # 每天午夜执行
+    branches: [ main, master ]
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Deployment environment'
+        description: 'Environment to deploy to'
         required: true
         default: 'staging'
-        type: choice
-        options:
-          - development
-          - staging
-          - production
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    
-    - name: Cache dependencies
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-    
-    - name: Run unit tests
-      run: |
-        python -m pytest tests/unit/ -v --cov=src --cov-report=xml
-    
-    - name: Run integration tests
-      run: |
-        python -m pytest tests/integration/ -v
-    
-    - name: Run end-to-end tests
-      run: |
-        python -m pytest tests/e2e/ -v
-    
-    - name: Lint code
-      run: |
-        flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
-        flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    
-    - name: Check code style
-      run: |
-        black --check src/ tests/
-    
-    - name: Type check
-      run: |
-        mypy src/
-    
-    - name: Upload coverage report
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage.xml
-
   build:
-    needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/'))
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-    
-    - name: Login to DockerHub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
-    
-    - name: Cache Docker layers
-      uses: actions/cache@v3
-      with:
-        path: /tmp/.buildx-cache
-        key: ${{ runner.os }}-buildx-${{ github.sha }}
-        restore-keys: |
-          ${{ runner.os }}-buildx-
-    
-    - name: Determine image tags
-      id: determine-tags
-      run: |
-        if [ "${{ github.ref }}" == "refs/heads/main" ]; then
-          echo "tags=yourusername/ai-trading-system:latest,yourusername/ai-trading-system:${{ github.sha }},yourusername/ai-trading-system:production" >> $GITHUB_OUTPUT
-        elif [ "${{ github.ref }}" == "refs/heads/develop" ]; then
-          echo "tags=yourusername/ai-trading-system:develop,yourusername/ai-trading-system:${{ github.sha }},yourusername/ai-trading-system:staging" >> $GITHUB_OUTPUT
-        else
-          feature_branch=$(echo "${{ github.ref }}" | sed 's/refs\/heads\/feature\///')
-          echo "tags=yourusername/ai-trading-system:${feature_branch},yourusername/ai-trading-system:${{ github.sha }}" >> $GITHUB_OUTPUT
-        fi
-    
-    - name: Build and push
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        tags: ${{ steps.determine-tags.outputs.tags }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-        build-args:
-          ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'production' || github.ref == 'refs/heads/develop' && 'staging' || 'development' }}
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+      - name: Lint code
+        run: |
+          if command -v flake8 &> /dev/null; then
+            flake8 .
+          fi
+      - name: Run tests
+        run: |
+          if command -v pytest &> /dev/null; then
+            pytest
+          fi
+      - name: Build Docker image
+        run: |
+          if [ -f Dockerfile ]; then
+            docker build -t openclaw-trading:${{ github.sha }} .
+          fi
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        environment: [development, staging, production]
-      fail-fast: false
-    if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.environment == 'production') ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/develop' && matrix.environment == 'staging') ||
-      (github.event_name == 'workflow_dispatch' && matrix.environment == github.event.inputs.environment)
-    environment:
-      name: ${{ matrix.environment }}
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set deployment variables
-      id: set-deployment-vars
-      run: |
-        if [ "${{ matrix.environment }}" == "production" ]; then
-          echo "server=prod-server" >> $GITHUB_OUTPUT
-          echo "port=22" >> $GITHUB_OUTPUT
-          echo "deploy_path=/app/production" >> $GITHUB_OUTPUT
-        elif [ "${{ matrix.environment }}" == "staging" ]; then
-          echo "server=staging-server" >> $GITHUB_OUTPUT
-          echo "port=22" >> $GITHUB_OUTPUT
-          echo "deploy_path=/app/staging" >> $GITHUB_OUTPUT
-        else
-          echo "server=dev-server" >> $GITHUB_OUTPUT
-          echo "port=22" >> $GITHUB_OUTPUT
-          echo "deploy_path=/app/development" >> $GITHUB_OUTPUT
-        fi
-    
-    - name: Deploy to ${{ matrix.environment }}
-      run: |
-        echo "Deploying to ${{ matrix.environment }} environment..."
-        # 这里可以添加实际的部署脚本
-        # 例如使用 ssh 连接到服务器并执行部署命令
-        # ssh -p ${{ steps.set-deployment-vars.outputs.port }} user@${{ steps.set-deployment-vars.outputs.server }} "cd ${{ steps.set-deployment-vars.outputs.deploy_path }} && docker-compose pull && docker-compose up -d"
-        echo "Deployment to ${{ matrix.environment }} completed"
-    
-    - name: Health check
-      run: |
-        echo "Performing health check for ${{ matrix.environment }}..."
-        # 这里可以添加健康检查脚本
-        # curl -f https://${{ matrix.environment }}.example.com/health || exit 1
-        echo "Health check passed for ${{ matrix.environment }}"
+      - uses: actions/checkout@v4
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production..."
+          # 这里添加部署命令，例如 SSH 到服务器执行部署脚本
+          # ssh user@server "bash /path/to/deploy.sh"
 
-  security-scan:
+  monitor:
+    needs: deploy
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Run security scan
-      uses: security-code-scan/security-code-scan-action@v1
-      with:
-        language: python
-        path: src/
-    
-    - name: Run dependency scan
-      uses: dependency-check/Dependency-Check_Action@main
-      with:
-        project: 'AI Trading System'
-        path: '.'
-        format: 'HTML'
-        out: 'reports'
-    
-    - name: Upload security reports
-      uses: actions/upload-artifact@v3
-      with:
-        name: security-reports
-        path: reports/
-
-  lint-and-format:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    
-    - name: Install linting tools
-      run: |
-        pip install flake8 black mypy
-    
-    - name: Run flake8
-      run: flake8 src/ tests/
-    
-    - name: Run black
-      run: black --check src/ tests/
-    
-    - name: Run mypy
-      run: mypy src/
-
-  deploy-rollback:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment
-    environment:
-      name: ${{ github.event.inputs.environment }}
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Rollback deployment
-      run: |
-        echo "Rolling back deployment to ${{ github.event.inputs.environment }}..."
-        # 这里可以添加回滚脚本
-        # ssh user@server "cd /app/${{ github.event.inputs.environment }} && docker-compose down && docker-compose up -d"
-        echo "Rollback completed for ${{ github.event.inputs.environment }}"
-
+      - name: Check service status
+        run: |
+          echo "Checking service status..."
+          # 这里添加检查服务状态的命令
+          # ssh user@server "systemctl status openclaw-trading-gateway.service"

@@ -1,0 +1,28 @@
+data:
+  history_days: 365
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  update_interval: 60
+monitoring:
+  enabled: true
+  health_check_interval: 30
+  metrics_interval: 60
+risk:
+  enabled: true
+  max_drawdown: 0.1
+  position_limit: 0.2
+  var_limit: 0.05
+system:
+  debug: false
+  log_level: INFO
+  name: AI Trading System
+  version: 1.0.0
+trading:
+  commission_rate: 0.001
+  enabled: true
+  max_daily_loss: 0.02
+  max_position_count: 10
+  max_position_size: 0.1
+  paper_trading: true
+  slippage_rate: 0.0005

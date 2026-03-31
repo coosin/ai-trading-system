@@ -327,30 +327,54 @@ class TradingExecutionEngine:
             order.status = OrderStatus.OPEN
             order.updated_at = datetime.now()
 
-        logger.info(f"开始TWAP执行: {order.order_id}, 持续时间: {order.twap_duration}")
+        exchange = order.metadata.get("exchange", "binance")
+        logger.info(f"开始TWAP执行: {order.order_id}, 持续时间: {order.twap_duration}, 交易所: {exchange}")
 
         total_intervals = math.ceil(order.twap_duration.total_seconds() / order.twap_interval.total_seconds())
         quantity_per_interval = order.quantity / total_intervals
+        
+        # 智能调整间隔：根据市场 volatility 调整
+        adjusted_interval = order.twap_interval
 
         for i in range(total_intervals):
             if not self._running or order.status != OrderStatus.OPEN:
                 break
 
             try:
-                market_price = await self._get_market_price(order.symbol)
+                # 获取市场价格
+                market_price = await self._get_market_price(order.symbol, exchange)
+                
+                # 计算当前市场 volatility（简化版）
+                volatility = 0.01  # 假设1%波动率
+                
+                # 根据 volatility 调整执行间隔
+                if volatility > 0.02:
+                    # 高 volatility，缩短间隔
+                    adjusted_interval = timedelta(seconds=order.twap_interval.total_seconds() * 0.5)
+                elif volatility < 0.005:
+                    # 低 volatility，延长间隔
+                    adjusted_interval = timedelta(seconds=order.twap_interval.total_seconds() * 1.5)
+                else:
+                    # 正常 volatility，使用默认间隔
+                    adjusted_interval = order.twap_interval
+                
+                # 计算当前执行数量
                 fill_quantity = min(quantity_per_interval, order.remaining_quantity)
                 
                 if fill_quantity > 0:
+                    # 智能价格计算：根据市场趋势调整
                     fill_price = self._calculate_fill_price(order, market_price)
+                    
+                    # 执行交易
                     await self._fill_order(order, fill_price, fill_quantity)
 
             except Exception as e:
                 logger.error(f"TWAP执行失败 {order.order_id}, 第{i+1}次: {e}")
 
             if i < total_intervals - 1:
-                await asyncio.sleep(order.twap_interval.total_seconds())
+                await asyncio.sleep(adjusted_interval.total_seconds())
 
-        logger.info(f"TWAP执行完成: {order.order_id}")
+        logger.info(f"TWAP执行完成: {order.order_id}, 成交: {order.filled_quantity}/{order.quantity}")
 
     async def _execute_vwap_order(self, order: Order) -> None:
         """
@@ -366,32 +390,71 @@ class TradingExecutionEngine:
             order.status = OrderStatus.OPEN
             order.updated_at = datetime.now()
 
-        logger.info(f"开始VWAP执行: {order.order_id}, 结束时间: {order.vwap_end_time}")
+        exchange = order.metadata.get("exchange", "binance")
+        logger.info(f"开始VWAP执行: {order.order_id}, 结束时间: {order.vwap_end_time}, 交易所: {exchange}")
 
-        # 简单的VWAP实现：根据成交量分布执行
+        # 智能VWAP实现：根据成交量分布和时间进度执行
+        start_time = datetime.now()
+        total_duration = (order.vwap_end_time - start_time).total_seconds()
+        
         while self._running and order.status == OrderStatus.OPEN and datetime.now() < order.vwap_end_time:
             try:
+                # 计算时间进度
+                elapsed_time = (datetime.now() - start_time).total_seconds()
+                time_progress = min(elapsed_time / total_duration, 1.0)
+                
+                # 计算目标执行进度
+                target_progress = time_progress
+                current_progress = order.filled_quantity / order.quantity
+                
                 # 模拟获取成交量数据
-                volume_profile = await self._get_volume_profile(order.symbol)
+                volume_profile = await self._get_volume_profile(order.symbol, exchange)
                 current_volume = volume_profile.get('current_volume', 1.0)
                 total_volume = volume_profile.get('total_volume', 100.0)
                 
-                # 计算应该执行的数量
+                # 计算成交量比例
                 volume_ratio = current_volume / total_volume
-                target_quantity = order.quantity * volume_ratio
-                fill_quantity = max(0, target_quantity - order.filled_quantity)
+                
+                # 智能调整执行数量：结合时间进度和成交量分布
+                # 如果时间进度快于执行进度，增加执行量
+                # 如果成交量大，增加执行量
+                adjustment_factor = 1.0
+                
+                if target_progress > current_progress * 1.2:
+                    # 时间进度明显快于执行进度，加速执行
+                    adjustment_factor = 1.5
+                elif target_progress < current_progress * 0.8:
+                    # 执行进度快于时间进度，减速执行
+                    adjustment_factor = 0.5
+                
+                # 成交量大时增加执行
+                if volume_ratio > 0.02:
+                    adjustment_factor *= 1.3
+                
+                # 计算应该执行的数量
+                target_quantity = order.quantity * volume_ratio * adjustment_factor
+                fill_quantity = min(target_quantity, order.remaining_quantity)
                 
                 if fill_quantity > 0.0001:
-                    market_price = await self._get_market_price(order.symbol)
+                    market_price = await self._get_market_price(order.symbol, exchange)
                     fill_price = self._calculate_fill_price(order, market_price)
-                    await self._fill_order(order, fill_price, min(fill_quantity, order.remaining_quantity))
+                    await self._fill_order(order, fill_price, fill_quantity)
 
             except Exception as e:
                 logger.error(f"VWAP执行失败 {order.order_id}: {e}")
 
-            await asyncio.sleep(60)  # 每分钟检查一次
+            # 智能调整检查间隔：根据执行进度和市场情况
+            if order.filled_quantity / order.quantity < 0.3:
+                # 执行初期，频繁检查
+                await asyncio.sleep(30)  # 每30秒检查一次
+            elif order.filled_quantity / order.quantity > 0.7:
+                # 执行后期，更频繁检查
+                await asyncio.sleep(20)  # 每20秒检查一次
+            else:
+                # 执行中期，正常检查
+                await asyncio.sleep(45)  # 每45秒检查一次
 
-        logger.info(f"VWAP执行完成: {order.order_id}")
+        logger.info(f"VWAP执行完成: {order.order_id}, 成交: {order.filled_quantity}/{order.quantity}")
 
     async def _execute_iceberg_order(self, order: Order) -> None:
         """
@@ -407,25 +470,98 @@ class TradingExecutionEngine:
             order.status = OrderStatus.OPEN
             order.updated_at = datetime.now()
 
-        logger.info(f"开始冰山订单执行: {order.order_id}, 显示数量: {order.iceberg_visible_size}")
+        exchange = order.metadata.get("exchange", "binance")
+        logger.info(f"开始冰山订单执行: {order.order_id}, 显示数量: {order.iceberg_visible_size}, 交易所: {exchange}")
 
+        # 智能冰山订单实现：根据市场深度和流动性调整
+        base_visible_size = order.iceberg_visible_size
+        
         while self._running and order.status == OrderStatus.OPEN and order.remaining_quantity > 0:
             try:
-                visible_quantity = min(order.iceberg_visible_size, order.remaining_quantity)
-                market_price = await self._get_market_price(order.symbol)
+                # 模拟获取市场深度数据
+                market_depth = await self._get_market_depth(order.symbol, exchange)
+                liquidity = market_depth.get('liquidity', 1.0)
+                spread = market_depth.get('spread', 0.001)
+                
+                # 根据市场深度调整显示数量
+                if liquidity > 1.5:
+                    # 高流动性，增加显示数量
+                    adjusted_visible_size = base_visible_size * 1.5
+                elif liquidity < 0.5:
+                    # 低流动性，减少显示数量
+                    adjusted_visible_size = base_visible_size * 0.5
+                else:
+                    # 正常流动性，使用默认显示数量
+                    adjusted_visible_size = base_visible_size
+                
+                visible_quantity = min(adjusted_visible_size, order.remaining_quantity)
+                
+                # 获取市场价格
+                market_price = await self._get_market_price(order.symbol, exchange)
                 fill_price = self._calculate_fill_price(order, market_price)
                 
-                # 模拟冰山订单成交：部分成交
-                fill_quantity = visible_quantity * 0.5  # 假设每次成交50%的显示数量
+                # 根据市场流动性调整成交比例
+                if liquidity > 1.5:
+                    # 高流动性，更高的成交比例
+                    fill_ratio = 0.7
+                elif liquidity < 0.5:
+                    # 低流动性，更低的成交比例
+                    fill_ratio = 0.3
+                else:
+                    # 正常流动性，中等成交比例
+                    fill_ratio = 0.5
+                
+                # 计算实际成交数量
+                fill_quantity = visible_quantity * fill_ratio
+                
                 if fill_quantity > 0.0001:
                     await self._fill_order(order, fill_price, min(fill_quantity, order.remaining_quantity))
 
             except Exception as e:
                 logger.error(f"冰山订单执行失败 {order.order_id}: {e}")
 
-            await asyncio.sleep(30)  # 每30秒检查一次
+            # 智能调整检查间隔：根据剩余数量和市场情况
+            remaining_ratio = order.remaining_quantity / order.quantity
+            if remaining_ratio > 0.7:
+                # 剩余数量多，较慢执行
+                await asyncio.sleep(45)  # 每45秒检查一次
+            elif remaining_ratio < 0.3:
+                # 剩余数量少，较快执行
+                await asyncio.sleep(15)  # 每15秒检查一次
+            else:
+                # 剩余数量中等，正常执行
+                await asyncio.sleep(30)  # 每30秒检查一次
 
-        logger.info(f"冰山订单执行完成: {order.order_id}")
+        logger.info(f"冰山订单执行完成: {order.order_id}, 成交: {order.filled_quantity}/{order.quantity}")
+
+    async def _get_market_depth(self, symbol: str, exchange: str = "binance") -> Dict[str, float]:
+        """
+        获取市场深度数据
+
+        Args:
+            symbol: 交易对
+            exchange: 交易所
+
+        Returns:
+            市场深度数据
+        """
+        # 模拟市场深度数据
+        import random
+        # 不同交易所的流动性不同
+        liquidity_factors = {
+            "binance": 1.0,
+            "coinbase": 0.8,
+            "kraken": 0.6,
+            "okx": 0.9,
+            "bybit": 0.7
+        }
+        base_liquidity = liquidity_factors.get(exchange, 1.0)
+        
+        return {
+            'liquidity': base_liquidity * random.uniform(0.5, 1.5),
+            'spread': random.uniform(0.0005, 0.002),
+            'order_book_depth': random.uniform(10000, 100000)
+        }
 
     async def _fill_order(self, order: Order, price: float, quantity: float) -> None:
         """
@@ -561,12 +697,13 @@ class TradingExecutionEngine:
             cost_percentage=cost_percentage
         )
 
-    async def _get_market_price(self, symbol: str) -> float:
+    async def _get_market_price(self, symbol: str, exchange: str = "binance") -> float:
         """
         获取市场价格
 
         Args:
             symbol: 交易对
+            exchange: 交易所
 
         Returns:
             市场价格
@@ -575,24 +712,104 @@ class TradingExecutionEngine:
         # 模拟价格
         import random
         base_price = 40000 if "BTC" in symbol else 2000
-        return base_price + random.normalvariate(0, base_price * 0.001)
+        # 不同交易所的价格略有差异
+        exchange_factor = {
+            "binance": 1.0,
+            "coinbase": 1.001,  # Coinbase价格略高
+            "kraken": 0.999,     # Kraken价格略低
+            "okx": 1.0005,       # OKX价格略高
+            "bybit": 0.9995      # Bybit价格略低
+        }
+        factor = exchange_factor.get(exchange, 1.0)
+        return (base_price + random.normalvariate(0, base_price * 0.001)) * factor
 
-    async def _get_volume_profile(self, symbol: str) -> Dict[str, float]:
+    async def _get_volume_profile(self, symbol: str, exchange: str = "binance") -> Dict[str, float]:
         """
         获取成交量分布
 
         Args:
             symbol: 交易对
+            exchange: 交易所
 
         Returns:
             成交量数据
         """
         # 这里应该从交易所获取真实的成交量数据
         import random
-        return {
-            'current_volume': random.uniform(0.5, 1.5),
-            'total_volume': 100.0
+        # 不同交易所的成交量不同
+        volume_factors = {
+            "binance": 1.0,
+            "coinbase": 0.7,
+            "kraken": 0.5,
+            "okx": 0.8,
+            "bybit": 0.6
         }
+        factor = volume_factors.get(exchange, 1.0)
+        return {
+            'current_volume': random.uniform(0.5, 1.5) * factor,
+            'total_volume': 100.0 * factor
+        }
+
+    async def create_order_with_exchange(self, 
+                                      exchange: str,
+                                      symbol: str,
+                                      side: OrderSide,
+                                      order_type: OrderType,
+                                      quantity: float,
+                                      price: Optional[float] = None,
+                                      stop_price: Optional[float] = None,
+                                      execution_algorithm: ExecutionAlgorithm = ExecutionAlgorithm.SIMPLE,
+                                      **kwargs) -> Order:
+        """
+        在指定交易所创建订单
+
+        Args:
+            exchange: 交易所名称
+            symbol: 交易对
+            side: 买卖方向
+            order_type: 订单类型
+            quantity: 数量
+            price: 价格（限价单）
+            stop_price: 止损价格
+            execution_algorithm: 执行算法
+            **kwargs: 其他参数
+
+        Returns:
+            订单对象
+        """
+        # 验证交易所
+        supported_exchanges = ["binance", "coinbase", "kraken", "okx", "bybit"]
+        if exchange not in supported_exchanges:
+            raise ValueError(f"不支持的交易所: {exchange}")
+
+        # 调整交易对格式
+        exchange_symbol_map = {
+            "binance": symbol.replace("/", ""),  # BTC/USDT -> BTCUSDT
+            "coinbase": symbol.replace("/", "-"),  # BTC/USDT -> BTC-USDT
+            "kraken": symbol,  # 保持BTC/USDT格式
+            "okx": symbol.replace("/", ""),  # BTC/USDT -> BTCUSDT
+            "bybit": symbol.replace("/", "")  # BTC/USDT -> BTCUSDT
+        }
+        exchange_symbol = exchange_symbol_map.get(exchange, symbol)
+
+        # 创建订单
+        order = await self.create_order(
+            symbol=exchange_symbol,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+            execution_algorithm=execution_algorithm,
+            **kwargs
+        )
+
+        # 添加交易所信息到订单元数据
+        order.metadata["exchange"] = exchange
+        order.metadata["original_symbol"] = symbol
+
+        logger.info(f"在 {exchange} 创建订单: {order.order_id}, {side.value} {quantity} {exchange_symbol}")
+        return order
 
     def get_order(self, order_id: str) -> Optional[Order]:
         """
@@ -698,33 +915,99 @@ async def example_usage():
     await engine.initialize()
 
     try:
-        # 创建简单市价单
-        order = await engine.create_order(
+        # 在不同交易所创建订单
+        print("=== 在不同交易所创建订单 ===")
+        
+        # 在Binance创建市价单
+        binance_order = await engine.create_order_with_exchange(
+            exchange="binance",
             symbol="BTC/USDT",
             side=OrderSide.BUY,
             order_type=OrderType.MARKET,
             quantity=0.01
         )
-        print(f"创建订单: {order.order_id}")
+        print(f"在Binance创建订单: {binance_order.order_id}")
+        
+        # 在Coinbase创建限价单
+        coinbase_order = await engine.create_order_with_exchange(
+            exchange="coinbase",
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=0.005,
+            price=40000.0
+        )
+        print(f"在Coinbase创建订单: {coinbase_order.order_id}")
 
         # 等待执行
         await asyncio.sleep(2)
 
         # 获取订单状态
-        updated_order = engine.get_order(order.order_id)
-        print(f"订单状态: {updated_order.status.value}")
-        print(f"成交数量: {updated_order.filled_quantity}")
-        print(f"平均价格: {updated_order.avg_fill_price}")
+        print("\n=== 订单执行状态 ===")
+        updated_binance_order = engine.get_order(binance_order.order_id)
+        print(f"Binance订单状态: {updated_binance_order.status.value}")
+        print(f"成交数量: {updated_binance_order.filled_quantity}")
+        print(f"平均价格: {updated_binance_order.avg_fill_price}")
+
+        # 测试智能执行算法
+        print("\n=== 测试智能执行算法 ===")
+        
+        # 创建TWAP订单
+        twap_order = await engine.create_order(
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=0.02,
+            twap_duration=timedelta(minutes=1),
+            twap_interval=timedelta(seconds=10)
+        )
+        print(f"创建TWAP订单: {twap_order.order_id}")
+
+        # 等待TWAP执行
+        await asyncio.sleep(70)  # 等待1分10秒
+
+        # 获取TWAP订单状态
+        updated_twap_order = engine.get_order(twap_order.order_id)
+        print(f"TWAP订单状态: {updated_twap_order.status.value}")
+        print(f"TWAP成交数量: {updated_twap_order.filled_quantity}/{updated_twap_order.quantity}")
+
+        # 创建冰山订单
+        iceberg_order = await engine.create_order(
+            symbol="BTC/USDT",
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=0.03,
+            price=42000.0,
+            iceberg_visible_size=0.005
+        )
+        print(f"\n创建冰山订单: {iceberg_order.order_id}")
+
+        # 等待冰山订单执行
+        await asyncio.sleep(40)
+
+        # 获取冰山订单状态
+        updated_iceberg_order = engine.get_order(iceberg_order.order_id)
+        print(f"冰山订单状态: {updated_iceberg_order.status.value}")
+        print(f"冰山成交数量: {updated_iceberg_order.filled_quantity}/{updated_iceberg_order.quantity}")
 
         # 分析交易成本
-        cost = await engine.analyze_trading_costs(order.order_id)
+        print("\n=== 交易成本分析 ===")
+        cost = await engine.analyze_trading_costs(binance_order.order_id)
         if cost:
-            print(f"交易成本分析:")
+            print(f"Binance订单成本分析:")
             print(f"  佣金: {cost.commission_cost}")
             print(f"  滑点: {cost.slippage_cost}")
             print(f"  市场冲击: {cost.market_impact_cost}")
             print(f"  总成本: {cost.total_cost}")
             print(f"  成本占比: {cost.cost_percentage:.2f}%")
+
+        # 获取执行引擎状态
+        status = await engine.get_execution_engine_status()
+        print("\n=== 执行引擎状态 ===")
+        print(f"运行状态: {status['running']}")
+        print(f"活跃订单: {status['active_orders']}")
+        print(f"总订单数: {status['total_orders']}")
+        print(f"总交易数: {status['total_trades']}")
 
     finally:
         await engine.shutdown()

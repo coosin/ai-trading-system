@@ -74,7 +74,7 @@ async def test_data_fusion():
 async def test_risk_manager():
     """测试高级风险管理系统"""
     try:
-        from src.modules.core.advanced_risk_manager import AdvancedRiskManager
+        from src.modules.core.risk_manager import RiskManager
         logger.info("测试高级风险管理系统...")
         config = {
             "risk_thresholds": {
@@ -101,7 +101,7 @@ async def test_risk_manager():
 async def test_fund_manager():
     """测试智能资金管理系统"""
     try:
-        from src.modules.core.advanced_risk_manager import AdvancedRiskManager
+        from src.modules.core.risk_manager import RiskManager
         from src.modules.core.intelligent_fund_manager import IntelligentFundManager
         logger.info("测试智能资金管理系统...")
         risk_config = {

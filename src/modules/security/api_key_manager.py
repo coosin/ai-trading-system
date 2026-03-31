@@ -17,11 +17,15 @@ import logging
 import secrets
 import sqlite3
 import time
+import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +111,7 @@ class APIKey:
     key_id: str
     api_key: str
     api_secret: str
+    salt: str
     user_id: str
     role: UserRole
     permissions: List[Permission]
@@ -119,6 +124,7 @@ class APIKey:
     usage_count: int
     ip_whitelist: List[str]
     rate_limit: int  # 每分钟请求数
+    allowed_endpoints: List[str]
 
 
 @dataclass
@@ -177,6 +183,7 @@ class APIKeyManager:
                 key_id TEXT PRIMARY KEY,
                 api_key TEXT UNIQUE NOT NULL,
                 api_secret_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 permissions TEXT NOT NULL,
@@ -188,7 +195,8 @@ class APIKeyManager:
                 last_used_at TEXT,
                 usage_count INTEGER DEFAULT 0,
                 ip_whitelist TEXT,
-                rate_limit INTEGER DEFAULT 60
+                rate_limit INTEGER DEFAULT 60,
+                allowed_endpoints TEXT
             )
         ''')
         
@@ -229,7 +237,8 @@ class APIKeyManager:
         expires_days: Optional[int] = None,
         ip_whitelist: List[str] = None,
         rate_limit: int = 60,
-        custom_permissions: List[Permission] = None
+        custom_permissions: List[Permission] = None,
+        allowed_endpoints: List[str] = None
     ) -> Dict[str, str]:
         """
         生成API密钥
@@ -240,13 +249,26 @@ class APIKeyManager:
                 "api_key": "...",
                 "api_secret": "...",  # 只返回一次
                 "role": "...",
-                "permissions": [...]
+                "permissions": [...],
+                "allowed_endpoints": [...]
             }
         """
         async with self._lock:
             key_id = str(uuid4())
             api_key = f"ak_{secrets.token_urlsafe(32)}"
             api_secret = secrets.token_urlsafe(64)
+            
+            # 生成盐和哈希
+            salt = secrets.token_bytes(32)
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=100000,
+                backend=default_backend()
+            )
+            api_secret_hash = base64.b64encode(kdf.derive(api_secret.encode())).decode()
+            salt_encoded = base64.b64encode(salt).decode()
             
             # 确定权限
             if custom_permissions:
@@ -265,13 +287,14 @@ class APIKeyManager:
             
             cursor.execute('''
                 INSERT INTO api_keys 
-                (key_id, api_key, api_secret_hash, user_id, role, permissions, name, description,
-                 enabled, created_at, expires_at, ip_whitelist, rate_limit)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (key_id, api_key, api_secret_hash, salt, user_id, role, permissions, name, description,
+                 enabled, created_at, expires_at, ip_whitelist, rate_limit, allowed_endpoints)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 key_id,
                 api_key,
-                hashlib.sha256(api_secret.encode()).hexdigest(),
+                api_secret_hash,
+                salt_encoded,
                 user_id,
                 role.value,
                 json.dumps([p.value for p in permissions]),
@@ -281,7 +304,8 @@ class APIKeyManager:
                 datetime.now().isoformat(),
                 expires_at.isoformat() if expires_at else None,
                 json.dumps(ip_whitelist or []),
-                rate_limit
+                rate_limit,
+                json.dumps(allowed_endpoints or [])
             ))
             
             conn.commit()
@@ -294,7 +318,8 @@ class APIKeyManager:
                 "api_key": api_key,
                 "api_secret": api_secret,  # 只返回一次，请妥善保存
                 "role": role.value,
-                "permissions": [p.value for p in permissions]
+                "permissions": [p.value for p in permissions],
+                "allowed_endpoints": allowed_endpoints or []
             }
     
     async def verify_api_key(
@@ -304,7 +329,9 @@ class APIKeyManager:
         timestamp: str,
         method: str,
         path: str,
-        body: str = ""
+        body: str = "",
+        ip_address: str = None,
+        user_agent: str = None
     ) -> Optional[APIKey]:
         """
         验证API密钥和签名
@@ -316,6 +343,8 @@ class APIKeyManager:
             method: HTTP方法
             path: 请求路径
             body: 请求体
+            ip_address: IP地址
+            user_agent: 用户代理
         
         Returns:
             APIKey对象或None
@@ -346,6 +375,19 @@ class APIKeyManager:
         if key_info.expires_at and datetime.now() > key_info.expires_at:
             logger.warning(f"API密钥已过期: {api_key}")
             return None
+        
+        # 检查IP白名单
+        if key_info.ip_whitelist and ip_address:
+            if ip_address not in key_info.ip_whitelist:
+                logger.warning(f"IP地址不在白名单中: {ip_address}")
+                return None
+        
+        # 检查允许的端点
+        if key_info.allowed_endpoints:
+            endpoint = path.split('?')[0]  # 去掉查询参数
+            if endpoint not in key_info.allowed_endpoints:
+                logger.warning(f"端点未被允许: {endpoint}")
+                return None
         
         # 验证签名
         message = f"{timestamp}{method.upper()}{path}{body}"
@@ -390,18 +432,20 @@ class APIKeyManager:
             key_id=row[0],
             api_key=row[1],
             api_secret=row[2],  # 存储的是hash，实际验证时需要重新输入
-            user_id=row[3],
-            role=UserRole(row[4]),
-            permissions=[Permission(p) for p in json.loads(row[5])],
-            name=row[6],
-            description=row[7] or "",
-            enabled=bool(row[8]),
-            created_at=datetime.fromisoformat(row[9]),
-            expires_at=datetime.fromisoformat(row[10]) if row[10] else None,
-            last_used_at=datetime.fromisoformat(row[11]) if row[11] else None,
-            usage_count=row[12],
-            ip_whitelist=json.loads(row[13]) if row[13] else [],
-            rate_limit=row[14]
+            salt=row[3],
+            user_id=row[4],
+            role=UserRole(row[5]),
+            permissions=[Permission(p) for p in json.loads(row[6])],
+            name=row[7],
+            description=row[8] or "",
+            enabled=bool(row[9]),
+            created_at=datetime.fromisoformat(row[10]),
+            expires_at=datetime.fromisoformat(row[11]) if row[11] else None,
+            last_used_at=datetime.fromisoformat(row[12]) if row[12] else None,
+            usage_count=row[13],
+            ip_whitelist=json.loads(row[14]) if row[14] else [],
+            rate_limit=row[15],
+            allowed_endpoints=json.loads(row[16]) if row[16] else []
         )
         
         # 更新缓存

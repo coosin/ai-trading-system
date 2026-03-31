@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, "/home/cool/.openclaw-trading/src")
 
-from modules.core.config_manager_simple import ConfigManager
+from modules.core.config_manager import ConfigManager
 
 
 async def main():

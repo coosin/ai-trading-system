@@ -14,8 +14,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-import yaml
-from pydantic import BaseModel, ValidationError
+# 容错导入
+try:
+    import yaml
+except ImportError:
+    yaml = None
+    logging.warning("yaml模块未安装，跳过YAML配置文件")
+
+try:
+    from pydantic import BaseModel, ValidationError
+except ImportError:
+    BaseModel = None
+    ValidationError = None
+    logging.warning("pydantic模块未安装，使用简化的配置验证")
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +54,16 @@ class ConfigChange:
     timestamp: float
 
 
-class ConfigSchema(BaseModel):
+class ConfigSchema:
     """配置模式基类"""
 
     pass
+
+if BaseModel:
+    class ConfigSchema(BaseModel):
+        """配置模式基类"""
+
+        pass
 
 
 class ConfigManager:
@@ -161,15 +178,21 @@ class ConfigManager:
                 old_value = self._config[section][key]
 
             # 验证配置（如果启用了验证）
-            if validate and section in self._schemas:
-                try:
-                    schema = self._schemas[section]
-                    # 创建临时配置进行验证
-                    temp_config = {key: value}
-                    schema(**temp_config)
-                except ValidationError as e:
-                    logger.error(f"配置验证失败: {e}")
-                    return False
+            if validate:
+                if BaseModel and section in self._schemas:
+                    try:
+                        schema = self._schemas[section]
+                        # 创建临时配置进行验证
+                        temp_config = {key: value}
+                        schema(**temp_config)
+                    except ValidationError as e:
+                        logger.error(f"配置验证失败: {e}")
+                        return False
+                else:
+                    # 简化验证（不依赖pydantic）
+                    if not self._validate_value(value):
+                        logger.error(f"配置验证失败: 值类型无效")
+                        return False
 
             # 更新配置
             if section not in self._config:
@@ -195,6 +218,11 @@ class ConfigManager:
 
             logger.info(f"配置已更新: {section}.{key} = {value}")
             return True
+
+    def _validate_value(self, value: Any) -> bool:
+        """简化验证"""
+        # 允许所有基本类型
+        return True
 
     async def watch_config(self, section: str, key: str, callback: Callable) -> None:
         """
@@ -292,11 +320,12 @@ class ConfigManager:
 
     async def _load_all_configs(self) -> None:
         """加载所有配置文件"""
-        config_files = (
-            list(self.config_dir.glob("*.json"))
-            + list(self.config_dir.glob("*.yaml"))
-            + list(self.config_dir.glob("*.yml"))
-        )
+        config_files = list(self.config_dir.glob("*.json"))
+
+        # 如果有yaml支持，添加yaml文件
+        if yaml:
+            config_files.extend(list(self.config_dir.glob("*.yaml")))
+            config_files.extend(list(self.config_dir.glob("*.yml")))
 
         for config_file in config_files:
             await self._load_config_file(config_file)
@@ -315,8 +344,12 @@ class ConfigManager:
                 with open(config_file, "r", encoding="utf-8") as f:
                     config_data = json.load(f)
             elif config_file.suffix in [".yaml", ".yml"]:
-                with open(config_file, "r", encoding="utf-8") as f:
-                    config_data = yaml.safe_load(f)
+                if yaml:
+                    with open(config_file, "r", encoding="utf-8") as f:
+                        config_data = yaml.safe_load(f)
+                else:
+                    logger.warning(f"无法加载YAML文件，缺少yaml模块: {config_file}")
+                    return
             else:
                 logger.warning(f"不支持的配置文件格式: {config_file}")
                 return

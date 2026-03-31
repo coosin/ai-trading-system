@@ -1,0 +1,7 @@
+{
+  "validation": {
+    "test_key": "test_value",
+    "number_value": 42,
+    "bool_value": true
+  }
+}

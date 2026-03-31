@@ -226,9 +226,15 @@ class ParallelDataProcessor:
     
     def __init__(self, 
                  max_workers: int = None,
-                 mode: ProcessingMode = ProcessingMode.THREAD):
+                 mode: ProcessingMode = ProcessingMode.THREAD,
+                 dynamic_scaling: bool = True,
+                 min_workers: int = 1,
+                 max_concurrency: int = None):
         self.max_workers = max_workers or mp.cpu_count()
+        self.min_workers = min_workers
+        self.max_concurrency = max_concurrency or self.max_workers * 2
         self.mode = mode
+        self.dynamic_scaling = dynamic_scaling
         self._executor: Optional[Union[ThreadPoolExecutor, ProcessPoolExecutor]] = None
         self._memory_pool = MemoryPool()
         self._pipelines: Dict[str, DataPipeline] = {}
@@ -236,10 +242,15 @@ class ParallelDataProcessor:
             "total_tasks": 0,
             "completed_tasks": 0,
             "failed_tasks": 0,
-            "total_processing_time": 0.0
+            "total_processing_time": 0.0,
+            "active_tasks": 0,
+            "queue_size": 0,
+            "worker_utilization": 0.0
         }
         self._lock = asyncio.Lock()
+        self._task_queue = asyncio.Queue(maxsize=self.max_concurrency)
         self._initialized = False
+        self._scaling_task = None
     
     async def initialize(self):
         """初始化处理器"""
@@ -252,11 +263,67 @@ class ParallelDataProcessor:
         elif self.mode == ProcessingMode.PROCESS:
             self._executor = ProcessPoolExecutor(max_workers=self.max_workers)
         
+        # 启动动态扩缩容任务
+        if self.dynamic_scaling:
+            self._scaling_task = asyncio.create_task(self._dynamic_scaling_loop())
+        
         self._initialized = True
-        logger.info(f"并行数据处理器初始化完成，模式: {self.mode.value}, 工作线程: {self.max_workers}")
+        logger.info(f"并行数据处理器初始化完成，模式: {self.mode.value}, 工作线程: {self.max_workers}, 动态扩缩容: {self.dynamic_scaling}")
+
+    async def _dynamic_scaling_loop(self):
+        """动态扩缩容循环"""
+        while self._initialized:
+            try:
+                await asyncio.sleep(30)  # 每30秒检查一次
+                
+                if not self._executor:
+                    continue
+                
+                # 计算当前利用率
+                active_tasks = self._stats.get("active_tasks", 0)
+                worker_count = self.max_workers
+                
+                if worker_count > 0:
+                    utilization = min(active_tasks / worker_count, 1.0)
+                    self._stats["worker_utilization"] = utilization
+                    
+                    # 根据利用率调整工作线程数
+                    if utilization > 0.8 and worker_count < self.max_workers:
+                        # 增加工作线程
+                        new_worker_count = min(worker_count + 2, self.max_workers)
+                        logger.info(f"提高工作线程数: {worker_count} -> {new_worker_count}")
+                        # 这里需要重新创建执行器
+                        self._executor.shutdown(wait=False)
+                        if self.mode == ProcessingMode.THREAD:
+                            self._executor = ThreadPoolExecutor(max_workers=new_worker_count)
+                        elif self.mode == ProcessingMode.PROCESS:
+                            self._executor = ProcessPoolExecutor(max_workers=new_worker_count)
+                        self.max_workers = new_worker_count
+                    elif utilization < 0.3 and worker_count > self.min_workers:
+                        # 减少工作线程
+                        new_worker_count = max(worker_count - 1, self.min_workers)
+                        logger.info(f"减少工作线程数: {worker_count} -> {new_worker_count}")
+                        # 这里需要重新创建执行器
+                        self._executor.shutdown(wait=False)
+                        if self.mode == ProcessingMode.THREAD:
+                            self._executor = ThreadPoolExecutor(max_workers=new_worker_count)
+                        elif self.mode == ProcessingMode.PROCESS:
+                            self._executor = ProcessPoolExecutor(max_workers=new_worker_count)
+                        self.max_workers = new_worker_count
+            except Exception as e:
+                logger.error(f"动态扩缩容错误: {e}")
+                await asyncio.sleep(30)
     
     async def cleanup(self):
         """清理资源"""
+        # 停止动态扩缩容任务
+        if self._scaling_task:
+            self._scaling_task.cancel()
+            try:
+                await self._scaling_task
+            except asyncio.CancelledError:
+                pass
+        
         # 清理管道
         for pipeline in self._pipelines.values():
             await pipeline.cleanup()
@@ -272,8 +339,21 @@ class ParallelDataProcessor:
     async def process_batch(self, 
                            data_list: List[Any],
                            processor: Callable,
-                           mode: Optional[ProcessingMode] = None) -> List[ProcessingResult]:
-        """批量处理数据"""
+                           mode: Optional[ProcessingMode] = None,
+                           max_retries: int = 3,
+                           retry_delay: float = 0.1) -> List[ProcessingResult]:
+        """批量处理数据
+
+        Args:
+            data_list: 要处理的数据列表
+            processor: 处理函数
+            mode: 处理模式
+            max_retries: 最大重试次数
+            retry_delay: 重试延迟（秒）
+
+        Returns:
+            处理结果列表
+        """
         if not self._initialized:
             raise RuntimeError("处理器未初始化")
         
@@ -282,71 +362,89 @@ class ParallelDataProcessor:
         
         async with self._lock:
             self._stats["total_tasks"] += len(data_list)
+            self._stats["queue_size"] = self._task_queue.qsize()
         
-        if use_mode == ProcessingMode.SYNC:
-            # 同步处理
-            results = []
-            for data in data_list:
+        # 处理任务
+        async def process_with_retry(data, task_id):
+            """带重试的处理"""
+            retries = 0
+            while retries <= max_retries:
                 try:
-                    result_data = processor(data)
-                    results.append(ProcessingResult(
-                        task_id=str(id(data)),
+                    if use_mode == ProcessingMode.ASYNC:
+                        if asyncio.iscoroutinefunction(processor):
+                            result_data = await processor(data)
+                        else:
+                            result_data = processor(data)
+                    elif use_mode == ProcessingMode.SYNC:
+                        result_data = processor(data)
+                    else:
+                        loop = asyncio.get_event_loop()
+                        result_data = await loop.run_in_executor(self._executor, processor, data)
+                    
+                    return ProcessingResult(
+                        task_id=task_id,
                         success=True,
                         data=result_data
-                    ))
+                    )
                 except Exception as e:
-                    results.append(ProcessingResult(
-                        task_id=str(id(data)),
-                        success=False,
-                        error=str(e)
-                    ))
+                    retries += 1
+                    if retries > max_retries:
+                        return ProcessingResult(
+                            task_id=task_id,
+                            success=False,
+                            error=str(e)
+                        )
+                    await asyncio.sleep(retry_delay)
         
-        elif use_mode == ProcessingMode.ASYNC:
-            # 异步处理
-            tasks = []
-            for data in data_list:
-                task = asyncio.create_task(self._async_process(data, processor))
-                tasks.append(task)
+        # 限制并发处理
+        tasks = []
+        for i, data in enumerate(data_list):
+            task_id = str(id(data))
             
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            results = [r if isinstance(r, ProcessingResult) else 
-                      ProcessingResult(task_id="", success=False, error=str(r))
-                      for r in results]
+            # 等待队列有空间
+            await self._task_queue.put(None)
+            
+            # 增加活跃任务数
+            async with self._lock:
+                self._stats["active_tasks"] += 1
+            
+            # 创建处理任务
+            task = asyncio.create_task(process_with_retry(data, task_id))
+            
+            # 任务完成后从队列中移除
+            async def on_task_done(t, task_id=task_id):
+                await self._task_queue.get()
+                self._task_queue.task_done()
+                async with self._lock:
+                    self._stats["active_tasks"] -= 1
+            
+            task.add_done_callback(lambda t: asyncio.create_task(on_task_done(t)))
+            tasks.append(task)
         
-        else:
-            # 线程/进程池处理
-            loop = asyncio.get_event_loop()
-            futures = []
-            
-            for data in data_list:
-                future = loop.run_in_executor(self._executor, processor, data)
-                futures.append(future)
-            
-            raw_results = await asyncio.gather(*futures, return_exceptions=True)
-            
-            results = []
-            for i, result in enumerate(raw_results):
-                if isinstance(result, Exception):
-                    results.append(ProcessingResult(
-                        task_id=str(id(data_list[i])),
-                        success=False,
-                        error=str(result)
-                    ))
-                else:
-                    results.append(ProcessingResult(
-                        task_id=str(id(data_list[i])),
-                        success=True,
-                        data=result
-                    ))
+        # 等待所有任务完成
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 处理异常
+        processed_results = []
+        for r in results:
+            if isinstance(r, ProcessingResult):
+                processed_results.append(r)
+            else:
+                processed_results.append(ProcessingResult(
+                    task_id="",
+                    success=False,
+                    error=str(r)
+                ))
         
         # 更新统计
         processing_time = time.time() - start_time
         async with self._lock:
-            self._stats["completed_tasks"] += sum(1 for r in results if r.success)
-            self._stats["failed_tasks"] += sum(1 for r in results if not r.success)
+            self._stats["completed_tasks"] += sum(1 for r in processed_results if r.success)
+            self._stats["failed_tasks"] += sum(1 for r in processed_results if not r.success)
             self._stats["total_processing_time"] += processing_time
+            self._stats["queue_size"] = self._task_queue.qsize()
         
-        return results
+        return processed_results
     
     async def _async_process(self, data: Any, processor: Callable) -> ProcessingResult:
         """异步处理单个数据"""

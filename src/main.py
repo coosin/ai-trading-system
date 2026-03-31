@@ -11,18 +11,18 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from src.modules.core.enhanced_config_manager import EnhancedConfigManager
+from src.modules.core.config_manager import ConfigManager
 from src.modules.main_controller import MainController
 from src.modules.api.server import APIServer
 
 # 全局配置管理器实例
 _config_manager = None
 
-async def get_config_manager() -> EnhancedConfigManager:
+async def get_config_manager() -> ConfigManager:
     """获取配置管理器实例"""
     global _config_manager
     if _config_manager is None:
-        _config_manager = EnhancedConfigManager("data/config")
+        _config_manager = ConfigManager("data/config")
         await _config_manager.initialize()
     return _config_manager
 

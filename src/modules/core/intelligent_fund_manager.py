@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from src.modules.core.database_manager import DatabaseManager
-from src.modules.core.advanced_risk_manager import AdvancedRiskManager, RiskLevel
+from src.modules.core.risk_manager import RiskManager, RiskLevel
 
 logger = logging.getLogger(__name__)
 
