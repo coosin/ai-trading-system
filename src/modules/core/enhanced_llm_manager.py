@@ -452,12 +452,19 @@ class EnhancedLLMManager:
     async def _register_model_from_config(self, model_config: Dict[str, Any]):
         """从配置注册模型"""
         try:
+            model_id = model_config["model_id"]
+            
+            # 如果预定义模型中已经有该模型，跳过（保留预定义模型的API Key）
+            if model_id in self.models:
+                logger.info(f"模型 {model_id} 已在预定义模型中，跳过配置加载")
+                return
+            
             provider = ModelProvider(model_config.get("provider", "custom"))
             
             model = ModelConfig(
                 provider=provider,
-                model_id=model_config["model_id"],
-                display_name=model_config.get("display_name", model_config["model_id"]),
+                model_id=model_id,
+                display_name=model_config.get("display_name", model_id),
                 api_key=model_config.get("api_key", ""),
                 base_url=model_config.get("base_url", ""),
                 temperature=model_config.get("temperature", 0.7),
