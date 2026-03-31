@@ -426,6 +426,7 @@ class EnhancedLLMManager:
                 model_id="astron-code-latest",
                 display_name="讯飞 astron-code-latest",
                 base_url="https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
+                api_key="243e9f47189b02df7d63322146e7c1d2:MGZjNWQzNTk3Mzg5MTM0MTNhYmNmZDhl",
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=32768,
