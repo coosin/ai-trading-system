@@ -502,6 +502,7 @@ class EnhancedLLMIntegration:
         
         # 使用EnhancedLLMManager的generate方法
         from src.modules.core.enhanced_llm_manager import TaskType
+        # provider参数实际上是model_id，直接使用
         model_id = kwargs.get('model_id') or provider
         return await self.llm_manager.generate(
             prompt=prompt,
