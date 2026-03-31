@@ -420,6 +420,17 @@ class EnhancedLLMManager:
                 context_window=32768,
                 priority=5
             ),
+            # 讯飞模型
+            ModelConfig(
+                provider=ModelProvider.OPENAI,
+                model_id="astron-code-latest",
+                display_name="讯飞 astron-code-latest",
+                base_url="https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
+                cost_per_input_token=0.0,
+                cost_per_output_token=0.0,
+                context_window=32768,
+                priority=8
+            ),
             # 本地模型
             ModelConfig(
                 provider=ModelProvider.LOCAL,

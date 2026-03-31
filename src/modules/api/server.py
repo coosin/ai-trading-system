@@ -705,9 +705,10 @@ class APIServer:
             stats = await self.get_api_stats()
             return stats
 
-        # 状态端点 - 支持 /api/status 和 /api/v1/status
+        # 状态端点 - 支持 /api/status 和 /api/v1/status 和 /api/v1/system/status
         @api_router.get("/status", tags=["system"])
         @api_v1_router.get("/status", tags=["system"])
+        @api_v1_router.get("/system/status", tags=["system"])
         async def get_status():
             """获取系统状态"""
             return {
@@ -989,6 +990,25 @@ class APIServer:
             # 反转数据，使最新的数据在最后
             data.reverse()
             return data
+
+        # 市场行情路由 - 支持 /api/v1/market/ticker/{symbol}
+        @api_v1_router.get("/market/ticker/{symbol}", tags=["market"])
+        async def get_market_ticker(symbol: str):
+            """获取市场行情"""
+            import random
+            base_price = 50000 if symbol == "BTC/USDT" else 3000 if symbol == "ETH/USDT" else 100
+            price = base_price + random.uniform(-1000, 1000)
+            return {
+                "symbol": symbol,
+                "price": round(price, 2),
+                "bid": round(price - random.uniform(1, 10), 2),
+                "ask": round(price + random.uniform(1, 10), 2),
+                "high": round(price + random.uniform(50, 100), 2),
+                "low": round(price - random.uniform(50, 100), 2),
+                "volume": round(random.uniform(1000, 5000), 2),
+                "change": round(random.uniform(-5, 5), 2),
+                "timestamp": datetime.now().isoformat()
+            }
 
         # 风险指标路由 - 支持 /api/v1/risk/metrics
         @api_v1_router.get("/risk/metrics", tags=["risk"])
