@@ -33,11 +33,12 @@ apiClient.interceptors.response.use(
     if (error.response) {
       const { status, data } = error.response;
       
-      // 401 Unauthorized - 清除token并跳转到登录页
+      // 401 Unauthorized - 清除token
       if (status === 401) {
         localStorage.removeItem('auth_token');
         localStorage.removeItem('user');
-        window.location.href = '/login';
+        // 触发页面重新渲染，显示登录页面
+        window.location.reload();
       }
       
       console.error('API Error:', { status, message: data?.message || error.message });
@@ -124,6 +125,37 @@ export const api = {
   // 自然语言接口
   nlp: {
     query: (question) => apiClient.post('/nlp/query', { question }),
+  },
+
+  // 设置管理
+  settings: {
+    get: () => apiClient.get('/settings'),
+    update: (settings) => apiClient.put('/settings', settings),
+  },
+
+  // 模型管理
+  models: {
+    getList: () => apiClient.get('/models'),
+    train: (modelData) => apiClient.post('/models/train', modelData),
+    update: (id, modelData) => apiClient.put(`/models/${id}`, modelData),
+    delete: (id) => apiClient.delete(`/models/${id}`),
+    getPerformance: (id) => apiClient.get(`/models/${id}/performance`),
+  },
+
+  // AI模型管理
+  aiModels: {
+    getList: () => apiClient.get('/ai-models'),
+    add: (modelData) => apiClient.post('/ai-models', modelData),
+    update: (id, modelData) => apiClient.put(`/ai-models/${id}`, modelData),
+    delete: (id) => apiClient.delete(`/ai-models/${id}`),
+    getDefault: () => apiClient.get('/ai-models/default'),
+    setDefault: (defaultData) => apiClient.put('/ai-models/default', defaultData),
+  },
+
+  // AI对话
+  ai: {
+    chat: (message, modelId = null) => apiClient.post('/ai/chat', { message, model_id: modelId }),
+    query: (query, context = {}) => apiClient.post('/ai/query', { query, context }),
   },
 };
 

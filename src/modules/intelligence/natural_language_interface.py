@@ -118,7 +118,7 @@ class NaturalLanguageInterface:
 只返回命令名称，不要返回其他内容。"""
         
         response = await self.llm_integration.generate(prompt)
-        command = response.strip() if response else 'unknown'
+        command = response.content.strip() if response and response.success else 'unknown'
         
         if command not in self.command_templates and command != 'unknown':
             command = 'unknown'

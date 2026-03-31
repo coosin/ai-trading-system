@@ -379,7 +379,7 @@ class EnhancedNaturalLanguageInterface:
 请生成友好、专业的中文回复。"""
 
         response = await self.llm_integration.generate(prompt)
-        return response.strip()
+        return response.content.strip() if response and response.success else "抱歉，我无法生成回复。"
     
     async def _ask_clarification(self, message: str, context: ConversationContext) -> Dict[str, Any]:
         """请求用户澄清"""
@@ -396,7 +396,7 @@ class EnhancedNaturalLanguageInterface:
         return {
             "success": False,
             "requires_clarification": True,
-            "message": response.strip(),
+            "message": response.content.strip() if response and response.success else "请问您具体想了解什么？",
             "intent": "clarification"
         }
     
@@ -415,7 +415,7 @@ class EnhancedNaturalLanguageInterface:
         
         return {
             "success": True,
-            "message": response.strip(),
+            "message": response.content.strip() if response and response.success else "抱歉，我暂时无法回答您的问题。",
             "intent": "general_chat"
         }
     

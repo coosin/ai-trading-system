@@ -42,6 +42,7 @@ from src.modules.api.strategy_api import init_strategy_api
 from src.modules.intelligence.anomaly_detection import AnomalyDetector, AnomalyDetectionConfig
 from src.modules.intelligence.natural_language_interface import NaturalLanguageInterface
 from src.modules.simulation.simulated_market import SimulatedMarket
+from src.modules.simulation.contract_simulator import ContractSimulator
 from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 
 logger = logging.getLogger(__name__)
@@ -304,17 +305,18 @@ class MainController:
         self.fault_tolerance = EnhancedFaultTolerance()
         await self.fault_tolerance.initialize()
         
-        # 初始化大模型集成系统
-        self.llm_integration = EnhancedLLMIntegration()
-        # 从配置中获取大模型配置（如果有）
+        # 初始化增强大模型管理器（先初始化，以便传递给其他组件）
         llm_config = {}
         if self.config_manager:
             llm_config = await self.config_manager.get_config("llm", {})
-        await self.llm_integration.initialize(llm_config)
         
-        # 初始化增强大模型管理器
         self.enhanced_llm_manager = EnhancedLLMManager()
         await self.enhanced_llm_manager.initialize(llm_config)
+        
+        # 初始化大模型集成系统，使用已初始化的enhanced_llm_manager
+        self.llm_integration = EnhancedLLMIntegration()
+        self.llm_integration.set_llm_manager(self.enhanced_llm_manager)
+        logger.info("大模型集成系统已连接到增强大模型管理器")
         
         # 初始化交易监控器
         self.trading_monitor = TradingMonitor({})
@@ -382,6 +384,16 @@ class MainController:
         # 初始化模拟交易市场
         self.simulated_market = SimulatedMarket()
         await self.simulated_market.initialize()
+        
+        # 初始化模拟合约交易管理器（如果配置为模拟模式）
+        trading_config = await self.config_manager.get_config("trading", {})
+        if trading_config.get("mode") == "simulation":
+            simulation_config = trading_config.get("simulation", {})
+            self.contract_simulator = ContractSimulator(simulation_config)
+            await self.contract_simulator.initialize()
+            logger.info("模拟合约交易管理器已启动")
+        else:
+            self.contract_simulator = None
         
         # 初始化数据库管理器
         self.database_manager = DatabaseManager(self.config_manager)

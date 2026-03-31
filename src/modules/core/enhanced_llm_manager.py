@@ -135,7 +135,16 @@ class OpenAIProvider(BaseLLMProvider):
         start_time = time.time()
         
         try:
-            url = self.config.base_url or "https://api.openai.com/v1/chat/completions"
+            # 构建完整的URL
+            base_url = self.config.base_url or "https://api.openai.com/v1"
+            # 如果base_url已经包含/chat/completions，则不再添加
+            if base_url.endswith('/chat/completions'):
+                url = base_url
+            elif base_url.endswith('/v1'):
+                url = f"{base_url}/chat/completions"
+            else:
+                # 对于其他情况，尝试添加/chat/completions
+                url = f"{base_url}/chat/completions"
             
             headers = {
                 "Authorization": f"Bearer {self.config.api_key}",
@@ -626,10 +635,17 @@ class EnhancedLLMManager:
 
     async def switch_model(self, model_id: str) -> bool:
         """切换默认模型"""
+        print(f"[DEBUG switch_model] model_id: {model_id}", flush=True)
+        print(f"[DEBUG switch_model] models keys: {list(self.models.keys())}", flush=True)
+        exists = model_id in self.models
+        print(f"[DEBUG switch_model] model_id in models: {exists}", flush=True)
+        if exists:
+            print(f"[DEBUG switch_model] model enabled: {self.models[model_id].enabled}", flush=True)
         if model_id in self.models and self.models[model_id].enabled:
             self.default_model = model_id
             logger.info(f"默认模型已切换为: {model_id}")
             return True
+        print(f"[DEBUG switch_model] returning False", flush=True)
         return False
 
     async def set_model_api_key(self, model_id: str, api_key: str) -> bool:

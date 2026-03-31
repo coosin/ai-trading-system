@@ -8,6 +8,7 @@ import logging
 from typing import Dict, Any
 
 from .binance import BinanceExchange
+from .okx import OKXExchange
 from .exchange_base import ExchangeBase
 
 logger = logging.getLogger(__name__)
@@ -18,8 +19,8 @@ class ExchangeFactory:
     
     _exchange_classes = {
         "binance": BinanceExchange,
+        "okx": OKXExchange,
         # 可以添加更多交易所实现
-        # "okx": OKXExchange,
         # "bybit": BybitExchange,
         # "huobi": HuobiExchange
     }

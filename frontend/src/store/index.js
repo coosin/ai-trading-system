@@ -104,6 +104,7 @@ const useSystemStore = create((set, get) => ({
   metrics: null,
   isLoading: false,
   error: null,
+  theme: localStorage.getItem('theme') || 'light', // 从localStorage恢复主题
 
   // 获取系统状态
   fetchStatus: async () => {
@@ -136,9 +137,68 @@ const useSystemStore = create((set, get) => ({
     }
   },
 
+  // 切换主题
+  toggleTheme: () => set((state) => {
+    const newTheme = state.theme === 'light' ? 'dark' : 'light';
+    localStorage.setItem('theme', newTheme);
+    return { theme: newTheme };
+  }),
+
+  // 设置主题
+  setTheme: (theme) => {
+    localStorage.setItem('theme', theme);
+    set({ theme });
+  },
+
   // 清除错误
   clearError: () => set({ error: null }),
 }));
+
+// 主题样式管理
+const useThemeStyles = () => {
+  const theme = useSystemStore((state) => state.theme);
+  
+  return {
+    container: {
+      backgroundColor: theme === 'dark' ? '#1a1a1a' : '#f0f2f5',
+      color: theme === 'dark' ? '#e0e0e0' : '#333',
+      minHeight: '100vh'
+    },
+    sidebar: {
+      backgroundColor: theme === 'dark' ? '#2d2d2d' : '#3498db',
+      color: 'white'
+    },
+    content: {
+      backgroundColor: theme === 'dark' ? '#1a1a1a' : 'white',
+      color: theme === 'dark' ? '#e0e0e0' : '#333'
+    },
+    card: {
+      backgroundColor: theme === 'dark' ? '#2d2d2d' : '#f8f9fa',
+      color: theme === 'dark' ? '#e0e0e0' : '#333',
+      border: theme === 'dark' ? '1px solid #444' : '1px solid #e9ecef'
+    },
+    button: {
+      backgroundColor: theme === 'dark' ? '#34495e' : '#3498db',
+      color: 'white',
+      border: theme === 'dark' ? '1px solid #5a6d80' : '1px solid #2980b9'
+    },
+    input: {
+      backgroundColor: theme === 'dark' ? '#343434' : 'white',
+      color: theme === 'dark' ? '#e0e0e0' : '#333',
+      border: theme === 'dark' ? '1px solid #444' : '1px solid #ced4da'
+    },
+    table: {
+      backgroundColor: theme === 'dark' ? '#2d2d2d' : 'white',
+      color: theme === 'dark' ? '#e0e0e0' : '#333'
+    },
+    tableHeader: {
+      backgroundColor: theme === 'dark' ? '#3a3a3a' : '#e9ecef'
+    },
+    tableRow: {
+      borderBottom: theme === 'dark' ? '1px solid #444' : '1px solid #dee2e6'
+    }
+  };
+};
 
 // 策略状态管理
 const useStrategyStore = create((set, get) => ({
@@ -373,4 +433,5 @@ export {
   useStrategyStore,
   useTradingStore,
   useMarketStore,
+  useThemeStyles
 };

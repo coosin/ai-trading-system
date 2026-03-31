@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenClaw Trading System
+After=network.target
+
+[Service]
+Type=simple
+User=cool
+WorkingDirectory=/home/cool/.openclaw-trading
+ExecStart=/home/cool/.openclaw-trading/venv/bin/python -m src.main
+Restart=always
+RestartSec=5
+Environment=PYTHONPATH=/home/cool/.openclaw-trading
+Environment=TRADING_ENV=production
+Environment=LOG_LEVEL=INFO
+
+[Install]
+WantedBy=multi-user.target

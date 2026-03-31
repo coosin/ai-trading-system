@@ -124,6 +124,39 @@ llm:
       enabled: false  # 默认禁用，需要时启用
       priority: 1
 
+# 交易模式配置
+trading:
+  mode: "simulation"  # 交易模式: simulation(模拟交易), paper(纸面交易), live(实盘交易)
+  
+  # 模拟交易配置
+  simulation:
+    enabled: true
+    initial_capital: 100000  # 初始资金 (USDT)
+    symbols:
+      - "BTC/USDT"
+      - "ETH/USDT"
+      - "SOL/USDT"
+      - "BNB/USDT"
+    leverage: 10  # 合约杠杆倍数
+    margin_mode: "cross"  # 保证金模式: cross(全仓), isolated(逐仓)
+    contract_type: "perpetual"  # 合约类型: perpetual(永续), futures(交割)
+    fee_rate:
+      maker: 0.0002  # 挂单手续费
+      taker: 0.0005  # 吃单手续费
+    
+  # 纸面交易配置
+  paper:
+    enabled: false
+    exchange: "okx"  # 使用 OKX 交易所数据
+    initial_capital: 100000
+    
+  # 实盘交易配置
+  live:
+    enabled: false
+    exchange: "okx"
+    risk_control: true
+    max_daily_loss: 1000  # 最大日亏损
+
 # 策略配置
 strategy:
   default_symbols:
@@ -184,6 +217,13 @@ exchanges:
     api_key: ""
     api_secret: ""
     passphrase: ""
+  okx:
+    enabled: true
+    api_key: "bf73ac3f-6552-48b0-99dd-f279bf47b336"
+    api_secret: "8A550FDA562D66523D175599D8166BE1"
+    passphrase: "Cool+095136"
+    sandbox: false
+    testnet: false
 
 # 通知配置
 notifications:
@@ -240,13 +280,13 @@ data:
 
 # 代理配置
 proxy:
-  enabled: false
-  use_global_proxy: false
+  enabled: true
+  use_global_proxy: true
   global_proxy:
-    name: "default"
+    name: "clash"
     proxy_type: "http"  # http, https, socks5, socks4
     host: "127.0.0.1"
-    port: 8080
+    port: 7890
     username: null
     password: null
     enabled: true

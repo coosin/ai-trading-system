@@ -9,7 +9,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Union, Any, callable
+from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ class ExchangeBase(ABC):
         pass
     
     @abstractmethod
-    async def subscribe_market_data(self, symbol: str, callback: callable) -> bool:
+    async def subscribe_market_data(self, symbol: str, callback: Callable) -> bool:
         """订阅市场数据"""
         pass
     

@@ -75,6 +75,7 @@ class TradingSystem:
             api_config = await self.config_manager.get_config("api", {})
             self.api_server = APIServer(
                 config_manager=self.config_manager,
+                main_controller=self.main_controller,
                 host=api_config.get("host", "0.0.0.0"),
                 port=api_config.get("port", 8000)
             )

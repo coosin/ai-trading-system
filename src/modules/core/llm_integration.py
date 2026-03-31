@@ -456,43 +456,197 @@ class LLMManager:
 
 
 class EnhancedLLMIntegration:
-    """增强的大模型集成"""
+    """增强的大模型集成 - 使用EnhancedLLMManager"""
     
-    def __init__(self):
-        self.llm_manager = LLMManager()
+    def __init__(self, llm_manager=None):
+        """
+        初始化大模型集成
+        
+        Args:
+            llm_manager: 可选的EnhancedLLMManager实例，如果不提供则创建新的
+        """
+        self.llm_manager = llm_manager
         self._initialized = False
     
     async def initialize(self, config: Dict[str, Any]):
         """初始化大模型集成"""
-        await self.llm_manager.initialize(config)
+        if self.llm_manager is None:
+            # 如果没有提供llm_manager，创建一个新的
+            from src.modules.core.enhanced_llm_manager import EnhancedLLMManager
+            self.llm_manager = EnhancedLLMManager()
+            await self.llm_manager.initialize(config)
         self._initialized = True
         logger.info("增强大模型集成初始化完成")
     
     async def cleanup(self):
         """清理资源"""
-        await self.llm_manager.cleanup()
+        if self.llm_manager:
+            await self.llm_manager.cleanup()
         self._initialized = False
         logger.info("增强大模型集成清理完成")
     
+    def set_llm_manager(self, llm_manager):
+        """设置外部提供的LLM管理器"""
+        self.llm_manager = llm_manager
+        self._initialized = True
+        logger.info("增强大模型集成已设置外部LLM管理器")
+    
     async def generate(self, prompt: str, provider: Optional[str] = None, **kwargs) -> LLMResponse:
         """生成文本"""
-        return await self.llm_manager.generate(prompt, provider, **kwargs)
+        if not self.llm_manager:
+            return LLMResponse(
+                content="",
+                success=False,
+                error_message="LLM管理器未初始化"
+            )
+        
+        # 使用EnhancedLLMManager的generate方法
+        from src.modules.core.enhanced_llm_manager import TaskType
+        model_id = kwargs.get('model_id') or provider
+        return await self.llm_manager.generate(
+            prompt=prompt,
+            model_id=model_id,
+            task_type=TaskType.GENERAL,
+            **kwargs
+        )
     
     async def analyze_market(self, market_data: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
         """分析市场数据"""
-        return await self.llm_manager.analyze_market(market_data, provider)
+        if not self.llm_manager:
+            return {"error": "LLM管理器未初始化"}
+        
+        prompt = f"""分析以下市场数据：
+
+{market_data}
+
+请提供：
+1. 市场趋势分析
+2. 关键支撑位和阻力位
+3. 技术指标解读
+4. 市场情绪分析
+5. 交易建议
+
+请以JSON格式返回分析结果。"""
+
+        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
+        
+        if response.success:
+            try:
+                import json
+                result = json.loads(response.content)
+                result["provider"] = response.provider.value if response.provider else provider
+                return result
+            except:
+                return {
+                    "analysis": response.content,
+                    "provider": response.provider.value if response.provider else provider
+                }
+        else:
+            return {"error": response.error_message or "市场分析失败"}
     
     async def generate_strategy(self, market_analysis: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
         """生成交易策略"""
-        return await self.llm_manager.generate_strategy(market_analysis, provider)
+        if not self.llm_manager:
+            return {"error": "LLM管理器未初始化"}
+        
+        prompt = f"""基于以下市场分析，生成交易策略：
+
+{market_analysis}
+
+请提供：
+1. 策略名称和描述
+2. 入场条件
+3. 出场条件
+4. 止损止盈设置
+5. 仓位管理建议
+6. 风险提示
+
+请以JSON格式返回策略。"""
+
+        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
+        
+        if response.success:
+            try:
+                import json
+                result = json.loads(response.content)
+                result["provider"] = response.provider.value if response.provider else provider
+                return result
+            except:
+                return {
+                    "strategy": response.content,
+                    "provider": response.provider.value if response.provider else provider
+                }
+        else:
+            return {"error": response.error_message or "策略生成失败"}
     
     async def analyze_news(self, news: List[str], provider: Optional[str] = None) -> Dict[str, Any]:
         """分析新闻"""
-        return await self.llm_manager.analyze_news(news, provider)
+        if not self.llm_manager:
+            return {"error": "LLM管理器未初始化"}
+        
+        news_text = "\n".join(news)
+        prompt = f"""分析以下新闻：
+
+{news_text}
+
+请提供：
+1. 新闻摘要
+2. 市场影响分析
+3. 情绪分析（正面/负面/中性）
+4. 交易机会识别
+5. 风险提示
+
+请以JSON格式返回分析结果。"""
+
+        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
+        
+        if response.success:
+            try:
+                import json
+                result = json.loads(response.content)
+                result["provider"] = response.provider.value if response.provider else provider
+                return result
+            except:
+                return {
+                    "analysis": response.content,
+                    "provider": response.provider.value if response.provider else provider
+                }
+        else:
+            return {"error": response.error_message or "新闻分析失败"}
     
     async def evaluate_risk(self, position: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
         """评估风险"""
-        return await self.llm_manager.evaluate_risk(position, provider)
+        if not self.llm_manager:
+            return {"error": "LLM管理器未初始化"}
+        
+        prompt = f"""评估以下持仓的风险：
+
+{position}
+
+请提供：
+1. 风险等级（低/中/高）
+2. 最大可能损失
+3. 风险因素分析
+4. 风险缓解建议
+5. 止损建议
+
+请以JSON格式返回风险评估。"""
+
+        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
+        
+        if response.success:
+            try:
+                import json
+                result = json.loads(response.content)
+                result["provider"] = response.provider.value if response.provider else provider
+                return result
+            except:
+                return {
+                    "risk_assessment": response.content,
+                    "provider": response.provider.value if response.provider else provider
+                }
+        else:
+            return {"error": response.error_message or "风险评估失败"}
     
     async def generate_trading_signal(self, market_data: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
         """生成交易信号"""
