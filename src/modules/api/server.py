@@ -1541,6 +1541,117 @@ class APIServer:
                     "message": f"自然语言查询失败: {str(e)}",
                     "timestamp": datetime.now().isoformat()
                 }
+        
+        # AI记忆管理路由
+        @api_v1_router.post("/ai/memory/instruction", tags=["ai-memory"])
+        async def add_system_instruction(instruction_data: Dict[str, Any]):
+            """添加系统指令（工作要求、任务等）"""
+            try:
+                instruction = instruction_data.get("instruction", "")
+                context = instruction_data.get("context", "")
+                
+                if not instruction:
+                    return {
+                        "status": "error",
+                        "message": "指令不能为空",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                
+                memory_manager = self.main_controller.ai_memory_manager
+                memory_id = await memory_manager.add_system_instruction(instruction, context)
+                
+                return {
+                    "status": "success",
+                    "message": "系统指令添加成功",
+                    "data": {
+                        "memory_id": memory_id
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"添加系统指令失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"添加系统指令失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+        
+        @api_v1_router.post("/ai/memory/preference", tags=["ai-memory"])
+        async def add_user_preference(pref_data: Dict[str, Any]):
+            """添加用户偏好"""
+            try:
+                key = pref_data.get("key", "")
+                value = pref_data.get("value", "")
+                description = pref_data.get("description", "")
+                
+                if not key or value is None:
+                    return {
+                        "status": "error",
+                        "message": "偏好键和值不能为空",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                
+                memory_manager = self.main_controller.ai_memory_manager
+                memory_id = await memory_manager.add_user_preference(key, value, description)
+                
+                return {
+                    "status": "success",
+                    "message": "用户偏好添加成功",
+                    "data": {
+                        "memory_id": memory_id
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"添加用户偏好失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"添加用户偏好失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+        
+        @api_v1_router.get("/ai/memory/stats", tags=["ai-memory"])
+        async def get_memory_stats():
+            """获取记忆统计"""
+            try:
+                memory_manager = self.main_controller.ai_memory_manager
+                stats = memory_manager.get_stats()
+                
+                return {
+                    "status": "success",
+                    "data": stats,
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"获取记忆统计失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"获取记忆统计失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+        
+        @api_v1_router.get("/ai/memory/trading-summary", tags=["ai-memory"])
+        async def get_trading_summary(days: int = 30):
+            """获取交易历史总结"""
+            try:
+                memory_manager = self.main_controller.ai_memory_manager
+                summary = await memory_manager.summarize_trade_history(days)
+                
+                return {
+                    "status": "success",
+                    "data": {
+                        "summary": summary,
+                        "days": days
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"获取交易总结失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"获取交易总结失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
 
         # WebSocket端点
         @self.app.websocket("/ws")

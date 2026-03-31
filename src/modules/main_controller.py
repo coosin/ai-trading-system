@@ -262,6 +262,9 @@ class MainController:
         
         # 全智能AI交易引擎
         self.ai_trading_engine = None
+        
+        # AI记忆管理器
+        self.ai_memory_manager = None
 
         # 默认配置
         self.auto_restart_modules = True
@@ -316,10 +319,17 @@ class MainController:
         self.enhanced_llm_manager = EnhancedLLMManager()
         await self.enhanced_llm_manager.initialize(llm_config)
         
-        # 初始化大模型集成系统，使用已初始化的enhanced_llm_manager
-        self.llm_integration = EnhancedLLMIntegration()
-        self.llm_integration.set_llm_manager(self.enhanced_llm_manager)
-        logger.info("大模型集成系统已连接到增强大模型管理器")
+        # 初始化AI记忆管理器
+        from src.modules.core.ai_memory import AIMemoryManager
+        self.ai_memory_manager = AIMemoryManager()
+        logger.info("✅ AI记忆管理器初始化完成")
+        
+        # 初始化大模型集成系统，使用已初始化的enhanced_llm_manager和ai_memory_manager
+        self.llm_integration = EnhancedLLMIntegration(
+            llm_manager=self.enhanced_llm_manager,
+            memory_manager=self.ai_memory_manager
+        )
+        logger.info("大模型集成系统已连接到增强大模型管理器和AI记忆管理器")
         
         # 初始化交易监控器
         self.trading_monitor = TradingMonitor({})

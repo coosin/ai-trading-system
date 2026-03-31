@@ -458,14 +458,16 @@ class LLMManager:
 class EnhancedLLMIntegration:
     """增强的大模型集成 - 使用EnhancedLLMManager"""
     
-    def __init__(self, llm_manager=None):
+    def __init__(self, llm_manager=None, memory_manager=None):
         """
         初始化大模型集成
         
         Args:
             llm_manager: 可选的EnhancedLLMManager实例，如果不提供则创建新的
+            memory_manager: 可选的AIMemoryManager实例，用于记忆管理
         """
         self.llm_manager = llm_manager
+        self.memory_manager = memory_manager
         self._initialized = False
     
     async def initialize(self, config: Dict[str, Any]):
@@ -492,7 +494,7 @@ class EnhancedLLMIntegration:
         logger.info("增强大模型集成已设置外部LLM管理器")
     
     async def generate(self, prompt: str, provider: Optional[str] = None, **kwargs) -> LLMResponse:
-        """生成文本"""
+        """生成文本（带记忆注入）"""
         if not self.llm_manager:
             return LLMResponse(
                 content="",
@@ -500,16 +502,54 @@ class EnhancedLLMIntegration:
                 error_message="LLM管理器未初始化"
             )
         
+        # 构建完整提示词（包含记忆）
+        full_prompt = prompt
+        if self.memory_manager:
+            try:
+                # 构建记忆上下文
+                memory_context = await self.memory_manager.build_memory_context(prompt)
+                if memory_context:
+                    full_prompt = f"""请根据以下记忆和当前问题进行回答。
+
+【记忆信息】
+{memory_context}
+
+【当前问题】
+{prompt}
+
+请参考记忆信息来回答当前问题，保持回答的连贯性和一致性。"""
+                
+                # 保存用户问题到短期记忆
+                await self.memory_manager.add_short_term_memory(
+                    f"用户: {prompt}",
+                    importance=0.7
+                )
+                
+            except Exception as e:
+                logger.warning(f"记忆注入失败: {e}")
+        
         # 使用EnhancedLLMManager的generate方法
         from src.modules.core.enhanced_llm_manager import TaskType
         # provider参数实际上是model_id，直接使用
         model_id = kwargs.get('model_id') or provider
-        return await self.llm_manager.generate(
-            prompt=prompt,
+        response = await self.llm_manager.generate(
+            prompt=full_prompt,
             model_id=model_id,
             task_type=TaskType.GENERAL,
             **kwargs
         )
+        
+        # 保存AI回复到短期记忆
+        if response.success and self.memory_manager:
+            try:
+                await self.memory_manager.add_short_term_memory(
+                    f"AI: {response.content[:500]}...",
+                    importance=0.8
+                )
+            except Exception as e:
+                logger.warning(f"保存AI回复记忆失败: {e}")
+        
+        return response
     
     async def analyze_market(self, market_data: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
         """分析市场数据"""
