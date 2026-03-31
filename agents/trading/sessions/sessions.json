@@ -1,7 +1,7 @@
 {
   "agent:trading:main": {
     "sessionId": "336a6721-c38d-4c86-b597-179d8f3fc225",
-    "updatedAt": 1774900576716,
+    "updatedAt": 1774905978776,
     "systemSent": true,
     "abortedLastRun": false,
     "chatType": "direct",
@@ -44,12 +44,12 @@
       "version": 0
     },
     "status": "done",
-    "startedAt": 1774900572193,
+    "startedAt": 1774905971696,
     "modelProvider": "qianfan",
     "model": "deepseek-v3.2",
     "systemPromptReport": {
       "source": "run",
-      "generatedAt": 1774900572069,
+      "generatedAt": 1774905971647,
       "sessionId": "336a6721-c38d-4c86-b597-179d8f3fc225",
       "sessionKey": "agent:trading:main",
       "provider": "qianfan",
@@ -278,10 +278,10 @@
     "totalTokensFresh": true,
     "contextTokens": 98304,
     "inputTokens": 27225,
-    "outputTokens": 64,
+    "outputTokens": 90,
     "estimatedCostUsd": 0,
     "totalTokens": 13672,
-    "endedAt": 1774900576648,
-    "runtimeMs": 4455
+    "endedAt": 1774905978706,
+    "runtimeMs": 7010
   }
 }

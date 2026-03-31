@@ -40,6 +40,7 @@ try:
         func,
         insert,
         select,
+        text,
         update,
     )
     from sqlalchemy.exc import SQLAlchemyError
@@ -762,23 +763,71 @@ class DatabaseManager:
         """加载数据库配置"""
         if self.config_manager:
             db_config = await self.config_manager.get_config("database", {})
-
-            self.config = DatabaseConfig(
-                type=DatabaseType(db_config.get("type", "postgresql")),
-                host=db_config.get("host", "localhost"),
-                port=db_config.get("port", 5432),
-                database=db_config.get("database", "trading_system"),
-                username=db_config.get("username", "postgres"),
-                password=db_config.get("password", ""),
-                pool_size=db_config.get("pool_size", 10),
-                max_overflow=db_config.get("max_overflow", 20),
-                pool_timeout=db_config.get("pool_timeout", 30),
-                pool_recycle=db_config.get("pool_recycle", 3600),
-                echo=db_config.get("echo", False),
-                isolation_level=TransactionIsolationLevel(
-                    db_config.get("isolation_level", "read_committed")
-                ),
-            )
+            
+            # 检查是否有直接的URL配置
+            if "url" in db_config and db_config["url"]:
+                url = db_config["url"]
+                # 解析URL来确定数据库类型和参数
+                if url.startswith("sqlite://"):
+                    db_type = DatabaseType.SQLITE
+                    # 从SQLite URL中提取数据库路径
+                    if url == "sqlite:///:memory:":
+                        db_path = ":memory:"
+                    elif url.startswith("sqlite:///"):
+                        db_path = url[10:]  # 移除 sqlite:///
+                    elif url.startswith("sqlite://"):
+                        db_path = url[9:]  # 移除 sqlite://
+                    else:
+                        db_path = "trading_system.db"
+                    
+                    self.config = DatabaseConfig(
+                        type=db_type,
+                        database=db_path,
+                        pool_size=db_config.get("pool_size", 5),
+                        max_overflow=db_config.get("max_overflow", 10),
+                        pool_timeout=db_config.get("pool_timeout", 30),
+                        pool_recycle=db_config.get("pool_recycle", 3600),
+                        echo=db_config.get("echo", False),
+                        isolation_level=TransactionIsolationLevel(
+                            db_config.get("isolation_level", "read_committed")
+                        ),
+                    )
+                else:
+                    # 对于其他数据库类型，使用标准配置
+                    self.config = DatabaseConfig(
+                        type=DatabaseType(db_config.get("type", "postgresql")),
+                        host=db_config.get("host", "localhost"),
+                        port=db_config.get("port", 5432),
+                        database=db_config.get("database", "trading_system"),
+                        username=db_config.get("username", "postgres"),
+                        password=db_config.get("password", ""),
+                        pool_size=db_config.get("pool_size", 10),
+                        max_overflow=db_config.get("max_overflow", 20),
+                        pool_timeout=db_config.get("pool_timeout", 30),
+                        pool_recycle=db_config.get("pool_recycle", 3600),
+                        echo=db_config.get("echo", False),
+                        isolation_level=TransactionIsolationLevel(
+                            db_config.get("isolation_level", "read_committed")
+                        ),
+                    )
+            else:
+                # 没有URL配置，使用标准配置
+                self.config = DatabaseConfig(
+                    type=DatabaseType(db_config.get("type", "postgresql")),
+                    host=db_config.get("host", "localhost"),
+                    port=db_config.get("port", 5432),
+                    database=db_config.get("database", "trading_system"),
+                    username=db_config.get("username", "postgres"),
+                    password=db_config.get("password", ""),
+                    pool_size=db_config.get("pool_size", 10),
+                    max_overflow=db_config.get("max_overflow", 20),
+                    pool_timeout=db_config.get("pool_timeout", 30),
+                    pool_recycle=db_config.get("pool_recycle", 3600),
+                    echo=db_config.get("echo", False),
+                    isolation_level=TransactionIsolationLevel(
+                        db_config.get("isolation_level", "read_committed")
+                    ),
+                )
         else:
             # 默认配置
             self.config = DatabaseConfig()
@@ -832,15 +881,15 @@ class DatabaseManager:
             async with self.engine.connect() as conn:
                 # 执行一个简单查询测试连接
                 if self.config.type == DatabaseType.POSTGRESQL:
-                    result = await conn.execute("SELECT version()")
+                    result = await conn.execute(text("SELECT version()"))
                     version = result.scalar()
                     logger.info(f"PostgreSQL版本: {version}")
                 elif self.config.type == DatabaseType.MYSQL:
-                    result = await conn.execute("SELECT version()")
+                    result = await conn.execute(text("SELECT version()"))
                     version = result.scalar()
                     logger.info(f"MySQL版本: {version}")
                 elif self.config.type in [DatabaseType.SQLITE, DatabaseType.MEMORY]:
-                    result = await conn.execute("SELECT sqlite_version()")
+                    result = await conn.execute(text("SELECT sqlite_version()"))
                     version = result.scalar()
                     logger.info(f"SQLite版本: {version}")
 
@@ -862,22 +911,29 @@ class DatabaseManager:
                     # 获取连接池状态
                     pool = self.engine.pool
 
+                    # 安全地获取连接池属性，跳过方法
+                    def safe_getattr(obj, attr, default):
+                        value = getattr(obj, attr, default)
+                        if callable(value):
+                            return default
+                        return value
+
                     # 记录连接池统计
                     self.connection_stats = {
                         "timestamp": datetime.now().isoformat(),
-                        "size": getattr(pool, "size", 0),
-                        "checkedin": getattr(pool, "checkedin", 0),
-                        "checkedout": getattr(pool, "checkedout", 0),
-                        "overflow": getattr(pool, "overflow", 0),
-                        "connections": getattr(pool, "_conn.current_connections", 0),
+                        "size": safe_getattr(pool, "size", 0),
+                        "checkedin": safe_getattr(pool, "checkedin", 0),
+                        "checkedout": safe_getattr(pool, "checkedout", 0),
+                        "overflow": safe_getattr(pool, "overflow", 0),
                     }
 
                     # 检查连接池健康状态
                     checked_out = self.connection_stats.get("checkedout", 0)
                     pool_size = self.connection_stats.get("size", 0)
 
-                    if checked_out >= pool_size:
-                        logger.warning(f"连接池饱和: {checked_out}/{pool_size}")
+                    if isinstance(checked_out, (int, float)) and isinstance(pool_size, (int, float)) and pool_size > 0:
+                        if checked_out >= pool_size:
+                            logger.warning(f"连接池饱和: {checked_out}/{pool_size}")
 
                     # 记录日志
                     logger.debug(f"连接池状态: {self.connection_stats}")

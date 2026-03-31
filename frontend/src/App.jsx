@@ -11,7 +11,7 @@ import RiskManagement from './components/RiskManagement';
 function App() {
   const [activeView, setActiveView] = useState('status');
   const { isAuthenticated, initialize: initializeAuth, logout } = useAuthStore();
-  const { status, fetchStatus, loading } = useSystemStore();
+  const { status, fetchStatus, isLoading: loading } = useSystemStore();
 
   // 初始化认证状态
   useEffect(() => {

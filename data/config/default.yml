@@ -141,7 +141,7 @@ strategy:
 # 数据库配置
 database:
   type: "sqlite"  # sqlite, postgresql
-  url: "sqlite:///data/trading.db"
+  url: "sqlite:///database/trading.db"
   # postgresql配置示例:
   # url: "postgresql://user:password@localhost:5432/trading"
   pool_size: 5

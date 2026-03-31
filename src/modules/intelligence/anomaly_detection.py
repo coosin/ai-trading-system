@@ -85,6 +85,7 @@ class AnomalyDetector:
         self.model = None
         self.scaler = None
         self.pipeline = None
+        self.model_trained = False
         self.last_retrain_time = 0
         
         # 告警冷却
@@ -167,8 +168,8 @@ class AnomalyDetector:
         # 准备特征
         features = self._prepare_features(data)
         
-        # 检查是否有足够的历史数据
-        if len(self.history_data) < self.config.min_history or not self.pipeline:
+        # 检查是否有足够的历史数据和已训练的模型
+        if len(self.history_data) < self.config.min_history or not self.pipeline or not self.model_trained:
             return AnomalyScore(
                 timestamp=time.time(),
                 score=0.0,
@@ -346,6 +347,7 @@ class AnomalyDetector:
             
             # 训练模型
             self.pipeline.fit(features)
+            self.model_trained = True
             
             logger.info("Model retrained successfully")
         except Exception as e:
