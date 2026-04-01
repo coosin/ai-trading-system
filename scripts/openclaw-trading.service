@@ -6,21 +6,13 @@ After=network.target
 Type=simple
 User=cool
 Group=cool
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-
-[Service]
-ExecStart=/home/cool/.openclaw-trading/scripts/start-openclaw-trading.sh
-ExecStop=/home/cool/.openclaw-trading/scripts/stop-openclaw-trading.sh
 WorkingDirectory=/home/cool/.openclaw-trading
 Environment="PATH=/home/cool/.openclaw-trading:/usr/local/bin:/usr/bin"
-
-[Timer]
-OnCalendar=*-*-* **:00:00
-Unit=openclaw-trading.service
+ExecStart=/usr/bin/python3 -m src.main
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

@@ -1,43 +1,94 @@
 #!/bin/bash
-# 健康检查脚本
+# OpenClaw Trading System - Health Check Script
+# Run frequency: hourly
 
 APP_NAME="openclaw-trading"
 APP_DIR="/home/cool/.openclaw-trading"
 LOG_FILE="$APP_DIR/logs/health_check.log"
 ALERT_FILE="$APP_DIR/logs/alerts.log"
 
+# Telegram configuration
+TELEGRAM_BOT_TOKEN="8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60"
+TELEGRAM_CHAT_ID="6716232147"
+
 mkdir -p "$(dirname "$LOG_FILE")"
 
-echo "=== $(date) 健康检查 ===" >> "$LOG_FILE"
+send_telegram() {
+    local message="$1"
+    if [ -n "$TELEGRAM_CHAT_ID" ]; then
+        curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d text="$message" \
+            -d parse_mode="Markdown" > /dev/null 2>&1
+    fi
+}
 
-# 检查进程
+echo "=== $(date) Health Check ===" >> "$LOG_FILE"
+
+ALERTS=""
+CRITICAL=false
+
+# Check process
 if ! pgrep -f "python3 -m src.main" > /dev/null; then
-    echo "[CRITICAL] 进程未运行！尝试重启..." | tee -a "$ALERT_FILE"
-    cd "$APP_DIR" && rm -f /tmp/${APP_NAME}.*.lock /tmp/${APP_NAME}.*.pid 2>/dev/null
-    nohup python3 -m src.main >> "$APP_DIR/logs/app.log" 2>&1 &
+    ALERTS="${ALERTS}WARNING: Process not running!\n"
+    echo "[CRITICAL] Process not running!" | tee -a "$ALERT_FILE"
+    
+    # Clean lock files
+    rm -f /tmp/${APP_NAME}.lock /tmp/${APP_NAME}.pid 2>/dev/null
+    
+    # Try to restart
+    cd "$APP_DIR" && nohup python3 -m src.main >> "$APP_DIR/logs/app.log" 2>&1 &
     sleep 5
+    
     if pgrep -f "python3 -m src.main" > /dev/null; then
-        echo "[INFO] 服务已自动重启" >> "$LOG_FILE"
+        ALERTS="${ALERTS}SUCCESS: Service auto-restarted\n"
+        echo "[INFO] Service auto-restarted" >> "$LOG_FILE"
     else
-        echo "[EMERGENCY] 服务重启失败！" | tee -a "$ALERT_FILE"
+        ALERTS="${ALERTS}ERROR: Service restart failed!\n"
+        echo "[EMERGENCY] Service restart failed!" | tee -a "$ALERT_FILE"
+        CRITICAL=true
     fi
 fi
 
-# 检查 API
-if ! curl -s http://localhost:8000/health > /dev/null 2>&1; then
-    echo "[WARNING] API 服务无响应" >> "$ALERT_FILE"
+# Check API
+if ! curl -s http://localhost:8000/api/v1/health > /dev/null 2>&1; then
+    ALERTS="${ALERTS}WARNING: API service not responding\n"
+    echo "[WARNING] API service not responding" >> "$ALERT_FILE"
 fi
 
-# 检查内存
+# Check memory
 MEM_USED=$(free | grep Mem | awk '{print int($3/$2 * 100)}')
 if [ "$MEM_USED" -gt 90 ]; then
-    echo "[WARNING] 内存使用过高: ${MEM_USED}%" | tee -a "$ALERT_FILE"
+    ALERTS="${ALERTS}WARNING: High memory usage: ${MEM_USED}%\n"
+    echo "[WARNING] High memory usage: ${MEM_USED}%" | tee -a "$ALERT_FILE"
+    CRITICAL=true
+elif [ "$MEM_USED" -gt 80 ]; then
+    ALERTS="${ALERTS}INFO: Memory usage: ${MEM_USED}%\n"
 fi
 
-# 检查错误日志
+# Check disk
+DISK_USED=$(df -h /home | grep -v Filesystem | awk '{print $5}' | tr -d '%')
+if [ "$DISK_USED" -gt 90 ]; then
+    ALERTS="${ALERTS}WARNING: Low disk space: ${DISK_USED}%\n"
+    echo "[WARNING] Low disk space: ${DISK_USED}%" | tee -a "$ALERT_FILE"
+    CRITICAL=true
+fi
+
+# Check error logs
 ERROR_COUNT=$(grep -c "ERROR" "$APP_DIR/logs/app.log" 2>/dev/null || echo "0")
-if [ "$ERROR_COUNT" -gt 10 ]; then
-    echo "[WARNING] 错误日志过多: ${ERROR_COUNT} 条" >> "$ALERT_FILE"
+if [ "$ERROR_COUNT" -gt 20 ]; then
+    ALERTS="${ALERTS}WARNING: Too many errors in log: ${ERROR_COUNT}\n"
+    echo "[WARNING] Too many errors: ${ERROR_COUNT}" >> "$ALERT_FILE"
 fi
 
-echo "健康检查完成" >> "$LOG_FILE"
+# Send Telegram notification
+if [ -n "$ALERTS" ]; then
+    if [ "$CRITICAL" = true ]; then
+        MESSAGE="*OpenClaw System Alert*\n\n$(echo -e "$ALERTS")\nTime: $(date '+%Y-%m-%d %H:%M:%S')\nPlease check immediately!"
+    else
+        MESSAGE="*OpenClaw System Notice*\n\n$(echo -e "$ALERTS")\nTime: $(date '+%Y-%m-%d %H:%M:%S')"
+    fi
+    send_telegram "$MESSAGE"
+fi
+
+echo "Health check complete" >> "$LOG_FILE"

@@ -1,8 +1,26 @@
 # OpenClaw Trading System - 维护保养指南
 
-**版本**: 1.0.0  
+**版本**: 1.3.0  
 **创建日期**: 2026-04-01  
+**更新日期**: 2026-04-01  
 **适用对象**: OpenClaw 主智能体、运维工程师
+
+**核心运维原则**:
+- ✅ **绝对不停止交易系统** - 保证交易连续性
+- ✅ **优先在线修复** - 所有问题在线解决
+- ✅ **重启是最后手段** - 仅在极端条件下考虑
+- ✅ **7x24小时监控** - 确保系统稳定运行
+
+**关键依赖说明**:
+- 🔌 **代理服务**：交易系统关键依赖，影响所有API连接
+- 📡 **必须确保代理稳定**：代理故障会导致交易中断
+- 🛡️ **代理监控优先级高**：与交易系统进程同等重要
+
+**系统端口说明**:
+- **后端API服务端口**: 8000
+- **前端开发服务器端口**: 5173  
+- **代理服务端口**: 7890 (关键依赖，影响API连接)
+- **监控检查端口**: 8000 (健康检查、API访问)
 
 ---
 
@@ -23,16 +41,22 @@
 
 | 检查项 | 正常值 | 异常处理 |
 |--------|--------|----------|
-| 进程状态 | 运行中 | 重启服务 |
-| 内存使用 | < 3Gi | 清理缓存或重启 |
-| CPU 使用率 | < 50% | 检查异常进程 |
-| 日志错误数 | 0 | 排查错误原因 |
+| 进程状态 | 运行中 | **在线监控并报警**，除非极端情况绝不停止 |
+| 代理服务 | 运行中 | **立即检查修复**，代理故障会影响API连接 |
+| 内存使用 | < 3Gi | **清理缓存、优化内存**，在线处理不重启 |
+| CPU 使用率 | < 50% | 检查异常进程，**在线优化** |
+| 日志错误数 | 0 | 排查错误原因，**在线修复** |
 
 ### 1.2 检查命令
 
 ```bash
 # 检查进程状态
 ps aux | grep -E "python.*src.main" | grep -v grep
+
+# 检查代理服务状态（关键依赖）
+curl --proxy http://127.0.0.1:7890 https://www.okx.com -I 2>/dev/null | head -1
+# 或检查代理进程
+ps aux | grep -E "(clash|v2ray|proxy)" | grep -v grep
 
 # 检查内存使用
 free -h
@@ -47,8 +71,17 @@ tail -100 /home/cool/.openclaw-trading/logs/app.log | grep -E "(ERROR|CRITICAL)"
 ### 1.3 自动化检查脚本
 
 ```bash
-# 运行健康检查
+# 运行后端健康检查（端口8000）
 curl -s http://localhost:8000/health
+
+# 检查代理服务连通性（关键依赖）
+curl --proxy http://127.0.0.1:7890 https://www.okx.com -o /dev/null -w "代理状态: %{http_code}, 耗时: %{time_total}s\\n" 2>/dev/null || echo "❌ 代理连接失败"
+
+# 检查前端开发服务器（端口5173）
+curl -s http://localhost:5173 2>/dev/null | head -1
+
+# 检查所有相关服务端口
+netstat -tlnp | grep -E ":(8000|5173|7890)"
 ```
 
 ---
@@ -193,22 +226,65 @@ print(f'长期记忆数量: {len(data.get(\"long_term\", []))}')
 "
 ```
 
-### 4.2 紧急恢复流程
+#### 问题 4: 代理服务故障
+
+**症状**:
+- 日志显示 "获取OKX真实行情失败"
+- API调用超时或连接拒绝
+- 交易系统无法获取市场数据
+
+**排查步骤**:
+```bash
+# 1. 检查代理服务是否运行
+ps aux | grep -E "(clash|v2ray|proxy|7890)" | grep -v grep
+
+# 2. 测试代理连通性
+curl --proxy http://127.0.0.1:7890 https://www.okx.com -I 2>/dev/null | head -1
+
+# 3. 检查代理配置
+env | grep -i proxy
+cat ~/.bashrc ~/.zshrc 2>/dev/null | grep -i proxy
+
+# 4. 检查网络连接
+ping -c 3 www.okx.com
+curl -v https://www.okx.com 2>&1 | head -20
+
+# 5. 重启代理服务（在线操作，不影响交易系统）
+# sudo systemctl restart clash  # 根据实际代理软件调整
+# 或
+# pkill -f "clash" && nohup clash > /tmp/clash.log 2>&1 &
+
+# 6. 验证修复
+sleep 2 && curl --proxy http://127.0.0.1:7890 https://www.okx.com -o /dev/null -w "修复后: %{http_code}\\n"
+```
+
+### 4.2 在线应急处理流程
+
+**基本原则：绝不停止交易系统，保证交易连续性**
 
 ```bash
-# 1. 停止服务
-./scripts/stop-openclaw-trading.sh
+# 1. 立即报警通知
+#    发送紧急通知给管理员，说明问题情况
 
-# 2. 备份当前状态
+# 2. 在线创建紧急备份（不停止服务）
 tar -czf /home/cool/.openclaw-trading/backups/emergency_$(date +%Y%m%d_%H%M%S).tar.gz \
     /home/cool/.openclaw-trading/data \
-    /home/cool/.openclaw-trading/logs
+    /home/cool/.openclaw-trading/logs \
+    --exclude='*.lock'
 
-# 3. 清理锁文件
-rm -f /tmp/openclaw-trading.*.lock /tmp/openclaw-trading.*.pid
+# 3. 在线诊断和修复
+#    - 检查进程状态（不停止）
+#    - 分析错误日志（不中断）
+#    - 在线修复配置（热更新）
+#    - 清理无效锁文件（谨慎操作）
 
-# 4. 重启服务
-./scripts/start-openclaw-trading.sh
+# 4. 如需极端情况处理（仅在无法联系管理员且系统完全失控时）
+#    a. 选择市场低波动时段
+#    b. 极速重启（秒级完成）
+#    c. 确保仓位状态恢复
+#    d. 立即报告处理情况
+
+# 注意：优先在线修复，重启是最后手段
 ```
 
 ---
@@ -235,56 +311,120 @@ watch -n 1 "free -h | grep Mem"
 top -p $(pgrep -f "python.*src.main")
 
 # 网络监控
-netstat -an | grep 8000
+# 监控后端API服务端口（8000）和前端开发端口（5173）
+netstat -an | grep -E ":(8000|5173)"
 ```
 
 ---
 
 ## 6. 应急处理流程
 
-### 6.1 服务宕机处理
+### 6.1 服务异常在线处理
+
+**核心原则：服务必须保持运行，交易不能中断**
 
 ```
-1. 检查服务状态
-   systemctl status openclaw-trading
+1. 立即报警通知
+   # 发送紧急通知，说明异常情况
 
-2. 查看错误日志
-   journalctl -u openclaw-trading -n 100
+2. 在线诊断问题（不停止服务）
+   # 检查进程状态（ps aux | grep python.*src.main）
+   # 查看实时错误日志（tail -f /home/cool/.openclaw-trading/logs/app.log）
+   # 监控系统资源（top -p <pid>）
 
-3. 重启服务
-   systemctl restart openclaw-trading
+3. 在线修复方案（优先级排序）
+   a. 热更新配置（在线加载新配置）
+   b. 重启单个异常模块（不停止主进程）
+   c. 内存优化和垃圾回收（在线执行）
+   d. 网络连接修复（代理、API重连）
 
-4. 验证服务恢复
-   curl http://localhost:8000/health
+4. 极端情况处理（最后手段）
+   # 仅在以下条件同时满足时考虑：
+   # 1. 系统完全失控，无法正常交易
+   # 2. 无法联系到管理员决策
+   # 3. 选择市场最低波动时段
+   # 4. 执行极速重启（< 5秒完成）
+   
+   如果必须重启：
+   a. 创建完整状态快照
+   b. 极速重启服务
+   c. 验证所有仓位状态恢复
+   d. 立即报告处理结果
+
+5. 验证服务恢复（在线验证）
+   curl -s http://localhost:8000/health
+   # 持续监控确保交易正常进行
 ```
 
-### 6.2 数据损坏处理
+### 6.2 在线数据修复处理
+
+**核心原则：交易继续运行，在线修复数据问题**
 
 ```
-1. 停止服务
-   systemctl stop openclaw-trading
+1. 立即报警通知
+   # 发送数据异常警告，保持交易运行
 
-2. 恢复最近备份
-   tar -xzf /home/cool/.openclaw-trading/backups/backup_最新日期.tar.gz -C /
-
-3. 验证数据完整性
+2. 在线诊断数据问题（不停止服务）
+   # 检查关键数据文件完整性
    python3 -c "
 import json
 files = [
     '/home/cool/.openclaw-trading/data/memory/enhanced_memory.json',
     '/home/cool/.openclaw-trading/data/config/default.yml'
 ]
+errors = []
 for f in files:
     try:
         with open(f) as fp:
             json.load(fp)
         print(f'✅ {f} OK')
     except Exception as e:
+        errors.append((f, str(e)))
         print(f'❌ {f} ERROR: {e}')
+        
+if errors:
+    print('\\n发现数据问题，开始在线修复...')
 "
 
-4. 重启服务
-   systemctl start openclaw-trading
+3. 在线数据修复策略
+   a. 配置文件损坏 → 在线热重载配置
+   b. 记忆文件损坏 → 使用备份副本在线替换
+   c. 交易数据异常 → 在线校验和修复
+   d. 日志文件问题 → 在线清理和重建
+
+4. 在线恢复数据（不停止交易）
+   # 对于非关键数据：在线修复
+   # 对于关键配置文件：在线热更新
+   # 对于交易状态数据：在线验证和校正
+   
+   # 示例：在线修复记忆文件
+   python3 -c "
+import json, shutil, os
+backup_file = '/home/cool/.openclaw-trading/backups/latest_memory_backup.json'
+current_file = '/home/cool/.openclaw-trading/data/memory/enhanced_memory.json'
+
+try:
+    # 尝试修复当前文件
+    with open(current_file, 'r') as f:
+        data = json.load(f)
+    print('✅ 当前记忆文件可读取')
+except:
+    print('⚠️ 当前记忆文件损坏，尝试在线恢复...')
+    if os.path.exists(backup_file):
+        shutil.copy2(backup_file, current_file)
+        print('✅ 已在线恢复记忆文件（交易继续运行）')
+    else:
+        print('⚠️ 无可用备份，创建空记忆结构（交易继续运行）')
+        with open(current_file, 'w') as f:
+            json.dump({'short_term': [], 'long_term': []}, f)
+"
+
+5. 验证修复结果（在线验证）
+   # 验证数据完整性，确保交易正常
+   curl -s http://localhost:8000/health
+   # 监控交易系统是否正常处理订单
+
+注意：绝不停止交易系统进行数据修复，所有操作在线完成。
 ```
 
 ---

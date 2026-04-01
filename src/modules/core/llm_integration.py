@@ -10,8 +10,10 @@
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -21,6 +23,47 @@ from typing import Any, Dict, List, Optional, Union
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def safe_json_parse(content: str) -> Dict[str, Any]:
+    """安全解析JSON，支持从markdown代码块中提取"""
+    if not content:
+        return {"error": "内容为空"}
+    
+    content = content.strip()
+    
+    # 尝试直接解析
+    try:
+        return json.loads(content)
+    except:
+        pass
+    
+    # 尝试从markdown代码块中提取
+    json_block_patterns = [
+        r'```json\s*([\s\S]*?)\s*```',
+        r'```\s*([\s\S]*?)\s*```',
+        r'\{[\s\S]*\}',
+    ]
+    
+    for pattern in json_block_patterns:
+        match = re.search(pattern, content)
+        if match:
+            try:
+                json_str = match.group(1) if '```' in pattern else match.group(0)
+                return json.loads(json_str.strip())
+            except:
+                continue
+    
+    # 尝试找到第一个 { 和最后一个 }
+    try:
+        start = content.find('{')
+        end = content.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            return json.loads(content[start:end+1])
+    except:
+        pass
+    
+    return {"error": "JSON解析失败", "raw_content": content[:500]}
 
 
 class LLMProvider(ABC):
@@ -93,12 +136,7 @@ class OpenAIProvider(LLMProvider):
         
         response = await self.generate(prompt, temperature=0.7, max_tokens=2000)
         
-        try:
-            import json
-            return json.loads(response)
-        except Exception as e:
-            logger.error(f"解析分析结果失败: {e}")
-            return {"error": "分析失败"}
+        return safe_json_parse(response)
     
     async def generate_strategy(self, market_analysis: Dict[str, Any]) -> Dict[str, Any]:
         """生成交易策略"""
@@ -119,12 +157,7 @@ class OpenAIProvider(LLMProvider):
         
         response = await self.generate(prompt, temperature=0.7, max_tokens=2000)
         
-        try:
-            import json
-            return json.loads(response)
-        except Exception as e:
-            logger.error(f"解析策略结果失败: {e}")
-            return {"error": "策略生成失败"}
+        return safe_json_parse(response)
 
 
 class AnthropicProvider(LLMProvider):
@@ -179,12 +212,7 @@ class AnthropicProvider(LLMProvider):
         
         response = await self.generate(prompt, max_tokens=2000)
         
-        try:
-            import json
-            return json.loads(response)
-        except Exception as e:
-            logger.error(f"解析分析结果失败: {e}")
-            return {"error": "分析失败"}
+        return safe_json_parse(response)
     
     async def generate_strategy(self, market_analysis: Dict[str, Any]) -> Dict[str, Any]:
         """生成交易策略"""
@@ -580,8 +608,10 @@ class EnhancedLLMIntegration:
         response = await self.generate(prompt, provider, temperature=0.5, max_tokens=1000)
         
         try:
-            import json
-            signal = json.loads(response.content)
+            signal = safe_json_parse(response.content)
+            if "error" in signal and "raw_content" in signal:
+                logger.error(f"解析交易信号失败: {signal.get('error')}")
+                return {"error": "信号生成失败", "detail": signal.get("error")}
             signal["timestamp"] = datetime.now().isoformat()
             signal["provider"] = provider or self.llm_manager.default_provider
             return signal

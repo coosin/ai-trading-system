@@ -1,21 +1,39 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuthStore } from '../store';
 
-function Login() {
+function Login({ onLogin }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const { login, isLoading, error, clearError } = useAuthStore();
+  const [localLoading, setLocalLoading] = useState(false);
+  const [localError, setLocalError] = useState('');
+  
+  const { login, isLoading, error, clearError, isAuthenticated } = useAuthStore();
+
+  useEffect(() => {
+    if (isAuthenticated && onLogin) {
+      const token = localStorage.getItem('auth_token');
+      const user = JSON.parse(localStorage.getItem('user') || '{}');
+      onLogin(user, token);
+    }
+  }, [isAuthenticated, onLogin]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    clearError();
+    setLocalError('');
+    setLocalLoading(true);
     
     try {
       await login({ username, password });
     } catch (err) {
       console.error('Login failed:', err);
+      setLocalError(err.message || '登录失败，请检查用户名和密码');
+    } finally {
+      setLocalLoading(false);
     }
   };
+
+  const displayError = localError || error;
+  const displayLoading = localLoading || isLoading;
 
   return (
     <div style={{
@@ -65,6 +83,7 @@ function Login() {
               }}
               placeholder="请输入用户名"
               required
+              disabled={displayLoading}
             />
           </div>
           
@@ -91,10 +110,11 @@ function Login() {
               }}
               placeholder="请输入密码"
               required
+              disabled={displayLoading}
             />
           </div>
           
-          {error && (
+          {displayError && (
             <div style={{
               background: '#fee',
               color: '#c33',
@@ -103,26 +123,26 @@ function Login() {
               marginBottom: '20px',
               fontSize: '14px'
             }}>
-              {error}
+              {displayError}
             </div>
           )}
           
           <button
             type="submit"
-            disabled={isLoading}
+            disabled={displayLoading}
             style={{
               width: '100%',
               padding: '12px',
-              background: isLoading ? '#aaa' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+              background: displayLoading ? '#aaa' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
               color: 'white',
               border: 'none',
               borderRadius: '4px',
               fontSize: '16px',
-              cursor: isLoading ? 'not-allowed' : 'pointer',
+              cursor: displayLoading ? 'not-allowed' : 'pointer',
               fontWeight: 'bold'
             }}
           >
-            {isLoading ? '登录中...' : '登录'}
+            {displayLoading ? '登录中...' : '登录'}
           </button>
         </form>
         

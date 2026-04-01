@@ -94,10 +94,18 @@ export const api = {
   // 市场数据
   market: {
     getSymbols: () => apiClient.get('/market/symbols'),
-    getTicker: (symbol) => apiClient.get(`/market/ticker/${symbol}`),
-    getKlines: (symbol, interval, limit = 100) => 
-      apiClient.get(`/market/klines/${symbol}`, { params: { interval, limit } }),
-    getOrderBook: (symbol) => apiClient.get(`/market/orderbook/${symbol}`),
+    getTicker: (symbol) => {
+      const formattedSymbol = symbol.replace('/', '-');
+      return apiClient.get(`/market/ticker/${formattedSymbol}`);
+    },
+    getKlines: (symbol, interval, limit = 100) => {
+      const formattedSymbol = symbol.replace('/', '-');
+      return apiClient.get(`/market/klines/${formattedSymbol}`, { params: { interval, limit } });
+    },
+    getOrderBook: (symbol) => {
+      const formattedSymbol = symbol.replace('/', '-');
+      return apiClient.get(`/market/orderbook/${formattedSymbol}`);
+    },
   },
 
   // 风险管理
