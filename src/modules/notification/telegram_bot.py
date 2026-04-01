@@ -125,7 +125,18 @@ class TelegramBot:
                 logger.error("Telegram bot token未配置")
                 return False
             
-            self.session = aiohttp.ClientSession()
+            # 配置代理
+            proxy = self.config.get("proxy")
+            connector = None
+            
+            if proxy:
+                connector = aiohttp.TCPConnector(
+                    ssl=False
+                )
+                logger.info(f"Telegram机器人配置代理: {proxy}")
+            
+            self.session = aiohttp.ClientSession(connector=connector)
+            self._proxy = proxy
             
             # 测试连接
             if not await self._test_connection():
@@ -190,11 +201,13 @@ class TelegramBot:
         """测试连接"""
         try:
             url = f"{self.base_url}/getMe"
-            async with self.session.get(url) as response:
+            kwargs = {"proxy": self._proxy} if hasattr(self, '_proxy') and self._proxy else {}
+            async with self.session.get(url, **kwargs) as response:
                 if response.status == 200:
                     data = await response.json()
-                    logger.info(f"Telegram机器人连接成功: {data['result']['username']}")
-                    return True
+                    if data and data.get("ok"):
+                        logger.info(f"Telegram机器人连接成功: {data['result'].get('username', 'unknown')}")
+                        return True
                 return False
         except Exception as e:
             logger.error(f"Telegram连接测试失败: {e}")
@@ -209,13 +222,14 @@ class TelegramBot:
                 "limit": 100,
                 "timeout": 30
             }
-            async with self.session.get(url, params=params) as response:
+            kwargs = {"proxy": self._proxy} if hasattr(self, '_proxy') and self._proxy else {}
+            async with self.session.get(url, params=params, **kwargs) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if data["ok"]:
-                        for update in data["result"]:
+                    if data and data.get("ok"):
+                        for update in data.get("result", []):
                             self._last_update_id = max(self._last_update_id, update["update_id"])
-                        return data["result"]
+                        return data.get("result", [])
                 return []
         except Exception as e:
             logger.error(f"获取更新失败: {e}")
@@ -322,15 +336,9 @@ class TelegramBot:
     async def _process_natural_language(self, message: TelegramMessage):
         """处理自然语言消息"""
         try:
-            if self.nli:
-                # 使用自然语言接口处理
-                response = await self.nli.process_message(message.text)
-                await self._send_message(TelegramResponse(
-                    chat_id=message.chat_id,
-                    text=response,
-                    reply_to_message_id=message.message_id
-                ))
-            elif self.llm_integration:
+            logger.info(f"处理自然语言消息: {message.text[:50]}...")
+            
+            if self.llm_integration:
                 # 直接使用大模型
                 prompt = f"""你是一个专业的量化交易助手。请用简洁、友好的语言回应用户的问题。
 
@@ -342,15 +350,30 @@ class TelegramBot:
 3. 使用Markdown格式美化回复
 """
                 response = await self.llm_integration.generate(prompt)
+                if response and hasattr(response, 'content') and response.content:
+                    await self._send_message(TelegramResponse(
+                        chat_id=message.chat_id,
+                        text=response.content,
+                        reply_to_message_id=message.message_id
+                    ))
+                else:
+                    await self._send_message(TelegramResponse(
+                        chat_id=message.chat_id,
+                        text="🤖 我正在思考中，请稍后再试...",
+                        reply_to_message_id=message.message_id
+                    ))
+            elif self.nli:
+                # 使用自然语言接口处理
+                response = await self.nli.process_message(message.text)
                 await self._send_message(TelegramResponse(
                     chat_id=message.chat_id,
-                    text=response.content,
+                    text=response,
                     reply_to_message_id=message.message_id
                 ))
             else:
                 await self._send_message(TelegramResponse(
                     chat_id=message.chat_id,
-                    text="🤖 请使用命令进行交互。输入 /help 查看可用命令。",
+                    text="🤖 我可以理解自然语言！请告诉我您想了解什么？\n\n例如：\n- 当前市场行情如何？\n- 帮我分析一下BTC\n- 查看我的持仓\n- 有什么交易建议？",
                     reply_to_message_id=message.message_id
                 ))
         except Exception as e:
@@ -380,7 +403,8 @@ class TelegramBot:
             if response.reply_to_message_id:
                 data["reply_to_message_id"] = response.reply_to_message_id
             
-            async with self.session.post(url, json=data) as resp:
+            kwargs = {"proxy": self._proxy} if hasattr(self, '_proxy') and self._proxy else {}
+            async with self.session.post(url, json=data, **kwargs) as resp:
                 if resp.status == 200:
                     return True
                 else:

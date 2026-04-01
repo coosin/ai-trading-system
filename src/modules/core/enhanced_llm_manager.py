@@ -146,8 +146,11 @@ class OpenAIProvider(BaseLLMProvider):
                 # 对于其他情况，尝试添加/chat/completions
                 url = f"{base_url}/chat/completions"
             
+            # 讯飞API使用完整的API Key（ID:SECRET格式）
+            api_key = self.config.api_key
+            
             headers = {
-                "Authorization": f"Bearer {self.config.api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             }
             
@@ -355,72 +358,6 @@ class EnhancedLLMManager:
     def _load_predefined_models(self):
         """加载预定义模型"""
         predefined = [
-            # OpenAI模型
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="gpt-4",
-                display_name="GPT-4",
-                base_url="https://api.openai.com/v1/chat/completions",
-                cost_per_input_token=0.00003,
-                cost_per_output_token=0.00006,
-                context_window=8192,
-                priority=10
-            ),
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="gpt-4-turbo",
-                display_name="GPT-4 Turbo",
-                base_url="https://api.openai.com/v1/chat/completions",
-                cost_per_input_token=0.00001,
-                cost_per_output_token=0.00003,
-                context_window=128000,
-                priority=9
-            ),
-            # DeepSeek模型
-            ModelConfig(
-                provider=ModelProvider.DEEPSEEK,
-                model_id="deepseek-chat",
-                display_name="DeepSeek Chat",
-                base_url="https://api.deepseek.com/v1/chat/completions",
-                cost_per_input_token=0.000001,
-                cost_per_output_token=0.000002,
-                context_window=32768,
-                priority=8
-            ),
-            ModelConfig(
-                provider=ModelProvider.DEEPSEEK,
-                model_id="deepseek-reasoner",
-                display_name="DeepSeek Reasoner",
-                base_url="https://api.deepseek.com/v1/chat/completions",
-                cost_per_input_token=0.000002,
-                cost_per_output_token=0.000008,
-                context_window=65536,
-                supports_reasoning=True,
-                priority=7
-            ),
-            # Anthropic模型
-            ModelConfig(
-                provider=ModelProvider.ANTHROPIC,
-                model_id="claude-3-opus-20240229",
-                display_name="Claude 3 Opus",
-                base_url="https://api.anthropic.com/v1/messages",
-                cost_per_input_token=0.000015,
-                cost_per_output_token=0.000075,
-                context_window=200000,
-                priority=6
-            ),
-            # Qwen模型
-            ModelConfig(
-                provider=ModelProvider.QWEN,
-                model_id="qwen-max",
-                display_name="Qwen Max",
-                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-                cost_per_input_token=0.000008,
-                cost_per_output_token=0.00002,
-                context_window=32768,
-                priority=5
-            ),
-            # 讯飞模型
             ModelConfig(
                 provider=ModelProvider.OPENAI,
                 model_id="astron-code-latest",
@@ -430,18 +367,17 @@ class EnhancedLLMManager:
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=32768,
-                priority=8
+                priority=10
             ),
-            # 本地模型
             ModelConfig(
                 provider=ModelProvider.LOCAL,
                 model_id="llama3",
-                display_name="Llama 3",
+                display_name="Llama 3 (本地)",
                 base_url="http://localhost:11434/api/chat",
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=8192,
-                priority=1
+                priority=5
             )
         ]
         
@@ -493,6 +429,11 @@ class EnhancedLLMManager:
         
         model_config = self.models[model_id]
         
+        if not model_config.api_key and model_config.provider not in [ModelProvider.LOCAL]:
+            logger.warning(f"模型 {model_id} 没有配置 API key，跳过初始化")
+            model_config.enabled = False
+            return
+        
         if model_config.provider in [ModelProvider.OPENAI, ModelProvider.DEEPSEEK, 
                                     ModelProvider.QWEN, ModelProvider.KIMI, 
                                     ModelProvider.GLM, ModelProvider.CUSTOM]:
@@ -509,6 +450,7 @@ class EnhancedLLMManager:
         
         await provider.initialize()
         self.providers[model_id] = provider
+        logger.info(f"✅ 模型 {model_id} 提供者初始化成功")
 
     def get_available_models(self) -> List[ModelConfig]:
         """获取可用模型列表"""
@@ -522,21 +464,20 @@ class EnhancedLLMManager:
                           prefer_reasoning: bool = False,
                           max_cost: Optional[float] = None) -> Optional[str]:
         """根据任务选择最优模型"""
-        # 首先检查任务特定的模型映射
         if task_type in self.task_model_mapping:
             for model_id in self.task_model_mapping[task_type]:
-                model = self.models.get(model_id)
-                if model and model.enabled:
-                    if prefer_reasoning and not model.supports_reasoning:
-                        continue
-                    if max_cost is not None:
-                        if (model.cost_per_input_token + model.cost_per_output_token * 1000) > max_cost:
+                if model_id in self.providers:
+                    model = self.models.get(model_id)
+                    if model and model.enabled:
+                        if prefer_reasoning and not model.supports_reasoning:
                             continue
-                    return model_id
+                        if max_cost is not None:
+                            if (model.cost_per_input_token + model.cost_per_output_token * 1000) > max_cost:
+                                continue
+                        return model_id
         
-        # 如果没有任务映射，按优先级选择
         available_models = sorted(
-            [m for m in self.models.values() if m.enabled],
+            [m for m in self.models.values() if m.enabled and m.model_id in self.providers],
             key=lambda x: (-x.priority, x.cost_per_input_token)
         )
         
@@ -566,11 +507,12 @@ class EnhancedLLMManager:
                 error_message="LLM管理器未初始化"
             )
         
-        # 选择模型
         if not model_id:
             model_id = await self.select_model(task_type, prefer_reasoning)
+            logger.debug(f"自动选择模型: {model_id}, 可用providers: {list(self.providers.keys())}")
         
         if not model_id:
+            logger.error("没有可用的模型")
             return LLMResponse(
                 content="",
                 model_id="none",
@@ -579,15 +521,23 @@ class EnhancedLLMManager:
                 error_message="没有可用的模型"
             )
         
-        # 尝试使用选定的模型
+        if model_id not in self.providers:
+            logger.error(f"模型 {model_id} 没有初始化provider，可用: {list(self.providers.keys())}")
+            return LLMResponse(
+                content="",
+                model_id=model_id,
+                provider=ModelProvider.CUSTOM,
+                success=False,
+                error_message=f"模型提供者未初始化: {model_id}"
+            )
+        
         response = await self._generate_with_model(prompt, model_id, task_type, **kwargs)
         
-        # 如果失败且启用了回退，尝试回退模型
         if not response.success and use_fallback:
             model_config = self.models.get(model_id)
             if model_config and model_config.fallback_models:
                 for fallback_model_id in model_config.fallback_models:
-                    if fallback_model_id in self.models and self.models[fallback_model_id].enabled:
+                    if fallback_model_id in self.providers:
                         logger.info(f"尝试回退模型: {fallback_model_id}")
                         fallback_response = await self._generate_with_model(
                             prompt, fallback_model_id, task_type, **kwargs

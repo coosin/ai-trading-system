@@ -1,0 +1,15 @@
+{
+  "short_term": [
+    {
+      "memory_id": "st_1774989309.847152",
+      "memory_type": "short_term",
+      "content": "这是一条测试短期记忆",
+      "metadata": {},
+      "importance": 0.6,
+      "timestamp": "2026-03-31T20:35:09.847169",
+      "accessed_count": 0,
+      "last_accessed": null
+    }
+  ],
+  "long_term": []
+}

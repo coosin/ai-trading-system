@@ -1426,10 +1426,10 @@ class APIServer:
         # AI对话API端点
         @api_v1_router.post("/ai/chat", tags=["ai"])
         async def ai_chat(chat_data: Dict[str, Any]):
-            """与AI模型对话"""
+            """与AI模型对话 - 直接带记忆注入，让AI自主判断"""
             try:
                 message = chat_data.get("message", "")
-                model_id = chat_data.get("model_id")  # 可选，如果不提供则使用默认模型
+                model_id = chat_data.get("model_id")
                 
                 if not message:
                     return {
@@ -1438,42 +1438,27 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
                 
-                # 获取LLM管理器
-                llm_manager = self.main_controller.enhanced_llm_manager
+                # 获取LLM集成（带记忆管理）
+                llm_integration = self.main_controller.llm_integration
+                
+                if not llm_integration:
+                    return {
+                        "status": "error",
+                        "message": "LLM集成未初始化",
+                        "timestamp": datetime.now().isoformat()
+                    }
                 
                 # 如果没有指定模型，使用默认模型
                 if not model_id:
-                    model_id = llm_manager.default_model
+                    model_id = llm_integration.llm_manager.default_model
                 
-                if not model_id:
-                    return {
-                        "status": "error",
-                        "message": "没有可用的AI模型",
-                        "timestamp": datetime.now().isoformat()
-                    }
+                print(f"[DEBUG] Calling AI with memory: {message[:50]}...")
+                print(f"[DEBUG] Memory manager available: {llm_integration.memory_manager is not None}")
                 
-                # 检查模型是否存在
-                if model_id not in llm_manager.models:
-                    return {
-                        "status": "error",
-                        "message": f"AI模型不存在: {model_id}",
-                        "timestamp": datetime.now().isoformat()
-                    }
-                
-                # 检查模型是否启用
-                if not llm_manager.models[model_id].enabled:
-                    return {
-                        "status": "error",
-                        "message": f"AI模型未启用: {model_id}",
-                        "timestamp": datetime.now().isoformat()
-                    }
-                
-                # 调用AI模型生成回复
-                print(f"[DEBUG] Calling AI model {model_id} with message: {message[:50]}...")
-                response = await llm_manager.generate(
+                # 直接调用带记忆的LLM，让AI自己理解和判断该做什么
+                response = await llm_integration.generate(
                     prompt=message,
-                    model_id=model_id,
-                    task_type=TaskType.GENERAL
+                    model_id=model_id
                 )
                 
                 if response.success:
@@ -1483,7 +1468,7 @@ class APIServer:
                         "data": {
                             "response": response.content,
                             "model_id": response.model_id,
-                            "provider": response.provider.value,
+                            "provider": response.provider.value if hasattr(response.provider, 'value') else str(response.provider),
                             "tokens_used": response.tokens_used,
                             "latency_ms": response.latency_ms,
                             "cost": response.cost
@@ -1650,6 +1635,95 @@ class APIServer:
                 return {
                     "status": "error",
                     "message": f"获取交易总结失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+        
+        @api_v1_router.get("/ai/memory/workspace-files", tags=["ai-memory"])
+        async def get_workspace_memory_files():
+            """获取工作区记忆文件列表"""
+            try:
+                memory_manager = self.main_controller.ai_memory_manager
+                memory_files = memory_manager.get_workspace_memory()
+                
+                return {
+                    "status": "success",
+                    "data": {
+                        "files": list(memory_files.keys())
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"获取工作区记忆文件列表失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"获取工作区记忆文件列表失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+        
+        @api_v1_router.get("/ai/memory/workspace-file/{filename}", tags=["ai-memory"])
+        async def get_workspace_memory_file(filename: str):
+            """获取工作区记忆文件内容"""
+            try:
+                memory_manager = self.main_controller.ai_memory_manager
+                memory_files = memory_manager.get_workspace_memory(filename)
+                
+                if filename not in memory_files:
+                    return {
+                        "status": "error",
+                        "message": f"记忆文件 {filename} 不存在",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                
+                return {
+                    "status": "success",
+                    "data": {
+                        "filename": filename,
+                        "content": memory_files[filename]
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"获取工作区记忆文件内容失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"获取工作区记忆文件内容失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+        
+        @api_v1_router.put("/ai/memory/workspace-file/{filename}", tags=["ai-memory"])
+        async def update_workspace_memory_file(filename: str, file_data: Dict[str, Any]):
+            """更新工作区记忆文件内容"""
+            try:
+                content = file_data.get("content", "")
+                notify_user = file_data.get("notify_user", True)
+                
+                if not content:
+                    return {
+                        "status": "error",
+                        "message": "文件内容不能为空",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                
+                memory_manager = self.main_controller.ai_memory_manager
+                success = await memory_manager.update_workspace_memory(filename, content, notify_user)
+                
+                if success:
+                    return {
+                        "status": "success",
+                        "message": f"记忆文件 {filename} 更新成功",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "message": f"记忆文件 {filename} 更新失败",
+                        "timestamp": datetime.now().isoformat()
+                    }
+            except Exception as e:
+                logger.error(f"更新工作区记忆文件失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"更新工作区记忆文件失败: {str(e)}",
                     "timestamp": datetime.now().isoformat()
                 }
 

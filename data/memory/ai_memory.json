@@ -1,0 +1,505 @@
+{
+  "short_term": [
+    {
+      "memory_id": "st_1775004946.681639",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68319.9, 'data': MarketData(symbol='BTC/USDT', timestamp=datetime.datetime(2026, 4, 1, 0, 0), open=68277.9, high=68349.1, low=67855.0, close=68314.1, volume=230.15828713, quote_volume=15670274.909000564)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:55:46.681647",
+      "accessed_count": 6,
+      "last_accessed": "2026-04-01T01:06:44.766895"
+    },
+    {
+      "memory_id": "st_1775004947.098919",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68319.9, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:55:47.098927",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775004953.579799",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2113.45, 'data': MarketData(symbol='ETH/USDT', timestamp=datetime.datetime(2026, 4, 1, 0, 0), open=2105.61, high=2117.88, low=2097.12, close=2113.45, volume=5831.497126, quote_volume=12282895.43498711)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:55:53.579812",
+      "accessed_count": 2,
+      "last_accessed": "2026-04-01T01:02:23.617700"
+    },
+    {
+      "memory_id": "st_1775004954.053599",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2113.45, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:55:54.053618",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005021.425612",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.31, 'data': None}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:57:01.425624",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005021.856389",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.31, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:57:01.856404",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005028.075854",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.1, 'data': MarketData(symbol='BNB/USDT', timestamp=datetime.datetime(2026, 4, 1, 0, 0), open=617.5, high=619.8, low=616.1, close=618.9, volume=251.401448, quote_volume=155292.760981)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:57:08.075868",
+      "accessed_count": 1,
+      "last_accessed": "2026-04-01T00:58:35.673153"
+    },
+    {
+      "memory_id": "st_1775005028.465929",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.1, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:57:08.465941",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005095.229728",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68244.0, 'data': MarketData(symbol='BTC/USDT', timestamp=datetime.datetime(2026, 4, 1, 0, 0), open=68277.9, high=68349.1, low=67855.0, close=68243.9, volume=232.06830464, quote_volume=15800618.587808156)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:58:15.229739",
+      "accessed_count": 1,
+      "last_accessed": "2026-04-01T00:59:42.929258"
+    },
+    {
+      "memory_id": "st_1775005095.706408",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68244.0, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:58:15.706414",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005101.924451",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2111.39, 'data': MarketData(symbol='ETH/USDT', timestamp=datetime.datetime(2026, 4, 1, 0, 0), open=2105.61, high=2117.88, low=2097.12, close=2111.39, volume=5912.366428, quote_volume=12453670.8339585)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:58:21.924465",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005102.343863",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2111.39, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:58:22.343931",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005109.023442",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.4, 'data': MarketData(symbol='SOL/USDT', timestamp=datetime.datetime(2026, 4, 1, 0, 0), open=83.2, high=83.6, low=82.85, close=83.38, volume=20140.146061, quote_volume=1675511.87845644)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:58:29.023455",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005109.447867",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.4, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:58:29.447903",
+      "accessed_count": 18,
+      "last_accessed": "2026-04-01T01:06:45.219898"
+    },
+    {
+      "memory_id": "st_1775005115.673216",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.1, 'data': MarketData(symbol='BNB/USDT', timestamp=datetime.datetime(2026, 4, 1, 0, 0), open=617.5, high=619.8, low=616.1, close=619.1, volume=255.238082, quote_volume=157667.8126817)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:58:35.673228",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005116.128795",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.1, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:58:36.128807",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005182.929285",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68302.6, 'data': MarketData(symbol='BTC/USDT', timestamp=datetime.datetime(2026, 4, 1, 0, 0), open=68277.9, high=68349.1, low=67855.0, close=68302.6, volume=233.0430707, quote_volume=15867169.592333268)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:59:42.929291",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005187.948547",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68302.6, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T00:59:47.948555",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005255.434639",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2113.12, 'data': None}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:00:55.434651",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005256.542669",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2113.12, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:00:56.542677",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005262.883588",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.46, 'data': MarketData(symbol='SOL/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=83.42, high=83.48, low=83.36, close=83.46, volume=1768.18469, quote_volume=147464.13897808)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:01:02.883604",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005263.379116",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.46, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:01:03.379121",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005269.683467",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.3, 'data': MarketData(symbol='BNB/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=619.3, high=619.5, low=619.2, close=619.3, volume=0.662028, quote_volume=409.9699553)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:01:09.683479",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005270.1451",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.3, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:01:10.145112",
+      "accessed_count": 1,
+      "last_accessed": "2026-04-01T01:05:37.542652"
+    },
+    {
+      "memory_id": "st_1775005336.817608",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68228.5, 'data': MarketData(symbol='BTC/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=68327.3, high=68359.1, low=68214.7, close=68228.5, volume=12.89993428, quote_volume=881106.848814881)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:02:16.817615",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005337.305107",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68228.5, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:02:17.305120",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005343.617734",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2109.34, 'data': MarketData(symbol='ETH/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=2115.0, high=2116.27, low=2108.8, close=2109.54, volume=481.998163, quote_volume=1018212.05661722)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:02:23.617741",
+      "accessed_count": 2,
+      "last_accessed": "2026-04-01T01:05:23.674890"
+    },
+    {
+      "memory_id": "st_1775005344.086818",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2109.34, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:02:24.086830",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005350.365838",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.34, 'data': MarketData(symbol='SOL/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=83.42, high=83.48, low=83.28, close=83.34, volume=2583.305128, quote_volume=215391.15598261)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:02:30.365849",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005350.80811",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.34, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:02:30.808123",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005359.357708",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.0, 'data': MarketData(symbol='BNB/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=619.3, high=619.5, low=618.9, close=619.0, volume=5.869877, quote_volume=3633.8767451)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:02:39.357721",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005359.892169",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.0, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:02:39.892175",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005428.041658",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68326.8, 'data': MarketData(symbol='BTC/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=68327.3, high=68359.1, low=68214.7, close=68326.7, volume=14.45617674, quote_volume=987360.04760939)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:03:48.041664",
+      "accessed_count": 1,
+      "last_accessed": "2026-04-01T01:05:16.885876"
+    },
+    {
+      "memory_id": "st_1775005428.479184",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68326.8, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:03:48.479191",
+      "accessed_count": 5,
+      "last_accessed": "2026-04-01T01:06:45.219900"
+    },
+    {
+      "memory_id": "st_1775005434.83362",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2110.25, 'data': MarketData(symbol='ETH/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=2115.0, high=2116.27, low=2108.8, close=2110.25, volume=567.783761, quote_volume=1199273.2686137)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:03:54.833635",
+      "accessed_count": 1,
+      "last_accessed": "2026-04-01T01:05:23.674891"
+    },
+    {
+      "memory_id": "st_1775005435.276473",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2110.25, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:03:55.276488",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005442.034989",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.44, 'data': MarketData(symbol='SOL/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=83.42, high=83.48, low=83.28, close=83.42, volume=2764.293912, quote_volume=230487.42717376)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:04:02.035002",
+      "accessed_count": 1,
+      "last_accessed": "2026-04-01T01:05:30.331662"
+    },
+    {
+      "memory_id": "st_1775005442.535428",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.44, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:04:02.535441",
+      "accessed_count": 2,
+      "last_accessed": "2026-04-01T01:06:45.219901"
+    },
+    {
+      "memory_id": "st_1775005449.628434",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.5, 'data': MarketData(symbol='BNB/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=619.3, high=619.7, low=618.9, close=619.5, volume=16.41806, quote_volume=10166.1084598)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:04:09.628440",
+      "accessed_count": 1,
+      "last_accessed": "2026-04-01T01:05:37.081041"
+    },
+    {
+      "memory_id": "st_1775005450.060936",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.5, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:04:10.060946",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005516.885902",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68301.8, 'data': MarketData(symbol='BTC/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=68327.3, high=68359.1, low=68214.7, close=68307.8, volume=19.60760032, quote_volume=1339254.436787603)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:05:16.885906",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005517.430273",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68301.8, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:05:17.430286",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005523.674921",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2110.48, 'data': MarketData(symbol='ETH/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=2115.0, high=2116.27, low=2108.8, close=2110.39, volume=727.64482, quote_volume=1536701.95913977)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:05:23.674927",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005524.080516",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2110.48, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:05:24.080523",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005530.331715",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.41, 'data': MarketData(symbol='SOL/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=83.42, high=83.48, low=83.28, close=83.41, volume=3211.037346, quote_volume=267754.67276738)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:05:30.331726",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005530.762897",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 83.41, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:05:30.762912",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005537.081086",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.3, 'data': MarketData(symbol='BNB/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=619.3, high=619.7, low=618.9, close=619.3, volume=17.023921, quote_volume=10541.342146)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:05:37.081093",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005537.542703",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 619.3, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:05:37.542716",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005604.766953",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68178.6, 'data': MarketData(symbol='BTC/USDT', timestamp=datetime.datetime(2026, 4, 1, 1, 0), open=68327.3, high=68359.1, low=68149.8, close=68178.6, volume=21.55988464, quote_volume=1472466.274884579)}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:06:44.766967",
+      "accessed_count": 0,
+      "last_accessed": null
+    },
+    {
+      "memory_id": "st_1775005605.219943",
+      "memory_type": "short_term",
+      "content": "用户: 分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 68178.6, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.5}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。",
+      "metadata": {},
+      "importance": 0.7,
+      "timestamp": "2026-04-01T01:06:45.219954",
+      "accessed_count": 0,
+      "last_accessed": null
+    }
+  ],
+  "long_term": []
+}

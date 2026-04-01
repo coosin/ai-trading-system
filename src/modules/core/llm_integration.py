@@ -290,169 +290,9 @@ class LocalLLMProvider(LLMProvider):
             return {"error": "策略生成失败"}
 
 
-@dataclass
-class LLMResponse:
-    """大模型响应"""
-    content: str
-    provider: str
-    model: str
-    timestamp: datetime = field(default_factory=datetime.now)
-    processing_time: float = 0.0
-    tokens_used: int = 0
-
-
-class LLMManager:
-    """大模型管理器"""
-    
-    def __init__(self):
-        self.providers: Dict[str, LLMProvider] = {}
-        self.default_provider: Optional[str] = None
-        self._initialized = False
-    
-    async def initialize(self, config: Dict[str, Any]):
-        """初始化大模型管理器"""
-        # 注册OpenAI提供者
-        if "openai" in config and config["openai"].get("api_key"):
-            openai_config = config["openai"]
-            self.providers["openai"] = OpenAIProvider(
-                api_key=openai_config["api_key"],
-                model=openai_config.get("model", "gpt-4-turbo")
-            )
-            logger.info("注册OpenAI大模型提供者")
-        
-        # 注册Anthropic提供者
-        if "anthropic" in config and config["anthropic"].get("api_key"):
-            anthropic_config = config["anthropic"]
-            self.providers["anthropic"] = AnthropicProvider(
-                api_key=anthropic_config["api_key"],
-                model=anthropic_config.get("model", "claude-3-opus-20240229")
-            )
-            logger.info("注册Anthropic大模型提供者")
-        
-        # 注册本地LLM提供者
-        if "local" in config:
-            local_config = config["local"]
-            self.providers["local"] = LocalLLMProvider(
-                base_url=local_config.get("base_url", "http://localhost:11434/api/generate"),
-                model=local_config.get("model", "llama3")
-            )
-            logger.info("注册本地大模型提供者")
-        
-        # 设置默认提供者
-        self.default_provider = config.get("default_provider", "local")
-        
-        self._initialized = True
-        logger.info("大模型管理器初始化完成")
-    
-    async def cleanup(self):
-        """清理资源"""
-        self.providers.clear()
-        self.default_provider = None
-        self._initialized = False
-        logger.info("大模型管理器清理完成")
-    
-    def get_provider(self, provider_name: Optional[str] = None) -> Optional[LLMProvider]:
-        """获取大模型提供者"""
-        if not self._initialized:
-            return None
-        
-        provider_name = provider_name or self.default_provider
-        return self.providers.get(provider_name)
-    
-    async def generate(self, prompt: str, provider: Optional[str] = None, **kwargs) -> LLMResponse:
-        """生成文本"""
-        llm_provider = self.get_provider(provider)
-        if not llm_provider:
-            return LLMResponse(content="", provider="none", model="none")
-        
-        start_time = time.time()
-        try:
-            content = await llm_provider.generate(prompt, **kwargs)
-            processing_time = time.time() - start_time
-            
-            return LLMResponse(
-                content=content,
-                provider=provider or self.default_provider or "none",
-                model=getattr(llm_provider, "model", "unknown"),
-                processing_time=processing_time
-            )
-        except Exception as e:
-            logger.error(f"生成文本失败: {e}")
-            return LLMResponse(
-                content="",
-                provider=provider or self.default_provider or "none",
-                model=getattr(llm_provider, "model", "unknown")
-            )
-    
-    async def analyze_market(self, market_data: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
-        """分析市场数据"""
-        llm_provider = self.get_provider(provider)
-        if not llm_provider:
-            return {"error": "未找到大模型提供者"}
-        
-        try:
-            return await llm_provider.analyze_market(market_data)
-        except Exception as e:
-            logger.error(f"市场分析失败: {e}")
-            return {"error": "分析失败"}
-    
-    async def generate_strategy(self, market_analysis: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
-        """生成交易策略"""
-        llm_provider = self.get_provider(provider)
-        if not llm_provider:
-            return {"error": "未找到大模型提供者"}
-        
-        try:
-            return await llm_provider.generate_strategy(market_analysis)
-        except Exception as e:
-            logger.error(f"策略生成失败: {e}")
-            return {"error": "策略生成失败"}
-    
-    async def analyze_news(self, news: List[str], provider: Optional[str] = None) -> Dict[str, Any]:
-        """分析新闻"""
-        prompt = f"""请分析以下新闻并提供市场影响评估：
-
-{"\n".join(news)}
-
-分析内容应包括：
-1. 新闻对市场的潜在影响
-2. 可能的价格走势
-3. 投资建议
-4. 风险评估
-
-请以JSON格式返回分析结果。"""
-        
-        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
-        
-        try:
-            import json
-            return json.loads(response.content)
-        except Exception as e:
-            logger.error(f"解析新闻分析结果失败: {e}")
-            return {"error": "分析失败"}
-    
-    async def evaluate_risk(self, position: Dict[str, Any], provider: Optional[str] = None) -> Dict[str, Any]:
-        """评估风险"""
-        prompt = f"""请评估以下交易仓位的风险：
-
-{position}
-
-评估内容应包括：
-1. 风险等级
-2. 潜在损失
-3. 风险缓解措施
-4. 建议操作
-
-请以JSON格式返回评估结果。"""
-        
-        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=1000)
-        
-        try:
-            import json
-            return json.loads(response.content)
-        except Exception as e:
-            logger.error(f"解析风险评估结果失败: {e}")
-            return {"error": "评估失败"}
+# 注意：使用 enhanced_llm_manager 中的 LLMResponse
+# 删除旧的 LLMResponse 定义，避免混淆
+# 旧的 LLMManager 类已删除，使用 EnhancedLLMManager
 
 
 class EnhancedLLMIntegration:
@@ -468,6 +308,7 @@ class EnhancedLLMIntegration:
         """
         self.llm_manager = llm_manager
         self.memory_manager = memory_manager
+        self.enhanced_memory = None
         self._initialized = False
     
     async def initialize(self, config: Dict[str, Any]):
@@ -493,23 +334,39 @@ class EnhancedLLMIntegration:
         self._initialized = True
         logger.info("增强大模型集成已设置外部LLM管理器")
     
-    async def generate(self, prompt: str, provider: Optional[str] = None, **kwargs) -> LLMResponse:
+    async def generate(self, prompt: str, provider: Optional[str] = None, **kwargs):
         """生成文本（带记忆注入）"""
+        from src.modules.core.enhanced_llm_manager import LLMResponse
+        
         if not self.llm_manager:
             return LLMResponse(
                 content="",
+                model_id="",
+                provider=None,
                 success=False,
                 error_message="LLM管理器未初始化"
             )
         
-        # 构建完整提示词（包含记忆）
-        full_prompt = prompt
-        if self.memory_manager:
+        memory_context = ""
+        
+        if self.enhanced_memory:
             try:
-                # 构建记忆上下文
+                memory_context = self.enhanced_memory.build_memory_context(prompt)
+                self.enhanced_memory.add_message("user", prompt)
+            except Exception as e:
+                logger.warning(f"增强记忆注入失败: {e}")
+        elif self.memory_manager:
+            try:
                 memory_context = await self.memory_manager.build_memory_context(prompt)
-                if memory_context:
-                    full_prompt = f"""请根据以下记忆和当前问题进行回答。
+                await self.memory_manager.add_short_term_memory(
+                    f"用户: {prompt}",
+                    importance=0.7
+                )
+            except Exception as e:
+                logger.warning(f"记忆注入失败: {e}")
+        
+        if memory_context:
+            full_prompt = f"""请根据以下记忆和当前问题进行回答。
 
 【记忆信息】
 {memory_context}
@@ -517,21 +374,12 @@ class EnhancedLLMIntegration:
 【当前问题】
 {prompt}
 
-请参考记忆信息来回答当前问题，保持回答的连贯性和一致性。"""
-                
-                # 保存用户问题到短期记忆
-                await self.memory_manager.add_short_term_memory(
-                    f"用户: {prompt}",
-                    importance=0.7
-                )
-                
-            except Exception as e:
-                logger.warning(f"记忆注入失败: {e}")
+请参考记忆信息来回答当前问题，保持回答的连贯性和一致性。记住用户的重要偏好和设置。如果用户表达了新的偏好或设置，请记住它们。"""
+        else:
+            full_prompt = prompt
         
-        # 使用EnhancedLLMManager的generate方法
         from src.modules.core.enhanced_llm_manager import TaskType
-        # provider参数实际上是model_id，直接使用
-        model_id = kwargs.get('model_id') or provider
+        model_id = kwargs.pop('model_id', None) or provider
         response = await self.llm_manager.generate(
             prompt=full_prompt,
             model_id=model_id,
@@ -539,15 +387,20 @@ class EnhancedLLMIntegration:
             **kwargs
         )
         
-        # 保存AI回复到短期记忆
-        if response.success and self.memory_manager:
-            try:
-                await self.memory_manager.add_short_term_memory(
-                    f"AI: {response.content[:500]}...",
-                    importance=0.8
-                )
-            except Exception as e:
-                logger.warning(f"保存AI回复记忆失败: {e}")
+        if response.success:
+            if self.enhanced_memory:
+                try:
+                    self.enhanced_memory.add_message("assistant", response.content)
+                except Exception as e:
+                    logger.warning(f"增强记忆记录AI回复失败: {e}")
+            elif self.memory_manager:
+                try:
+                    await self.memory_manager.add_short_term_memory(
+                        f"AI: {response.content[:500]}...",
+                        importance=0.8
+                    )
+                except Exception as e:
+                    logger.warning(f"保存AI回复记忆失败: {e}")
         
         return response
     
@@ -569,7 +422,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回分析结果。"""
 
-        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000)
         
         if response.success:
             try:
@@ -604,7 +457,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回策略。"""
 
-        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000)
         
         if response.success:
             try:
@@ -639,7 +492,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回分析结果。"""
 
-        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000)
         
         if response.success:
             try:
@@ -673,7 +526,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回风险评估。"""
 
-        response = await self.generate(prompt, provider, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000)
         
         if response.success:
             try:

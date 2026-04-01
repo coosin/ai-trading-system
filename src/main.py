@@ -14,8 +14,11 @@ from typing import Optional
 from src.modules.core.config_manager import ConfigManager
 from src.modules.main_controller import MainController
 from src.modules.api.server import APIServer
+from src.utils.process_lock import ProcessLock
 
-# 全局配置管理器实例
+APP_NAME = "openclaw-trading"
+_process_lock: Optional[ProcessLock] = None
+
 _config_manager = None
 
 async def get_config_manager() -> ConfigManager:
@@ -33,7 +36,6 @@ async def cleanup_config_manager() -> None:
         await _config_manager.cleanup()
         _config_manager = None
 
-# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -61,16 +63,13 @@ class TradingSystem:
         logger.info("🚀 启动全智能量化交易系统...")
 
         try:
-            # 1. 初始化配置管理器
             logger.info("1. 初始化配置管理器...")
             self.config_manager = await get_config_manager()
 
-            # 2. 初始化主控制器
             logger.info("2. 初始化主控制器...")
             self.main_controller = MainController(self.config_manager)
             await self.main_controller.initialize()
 
-            # 3. 初始化API服务器
             logger.info("3. 初始化API服务器...")
             api_config = await self.config_manager.get_config("api", {})
             self.api_server = APIServer(
@@ -81,7 +80,6 @@ class TradingSystem:
             )
             await self.api_server.initialize()
 
-            # 4. 设置信号处理
             logger.info("4. 设置信号处理...")
             self._setup_signal_handlers()
 
@@ -102,15 +100,12 @@ class TradingSystem:
         logger.info("🔄 启动系统主循环...")
 
         try:
-            # 启动所有模块
             await self.main_controller.start_all_modules()
 
-            # 启动API服务器
             if self.api_server:
                 await self.api_server.start()
                 logger.info(f"API服务器已启动，访问 http://{self.api_server.host}:{self.api_server.port}/docs 查看文档")
 
-            # 等待关闭信号
             await self.shutdown_event.wait()
 
             logger.info("系统正在关闭...")
@@ -130,17 +125,14 @@ class TradingSystem:
         logger.info("正在关闭系统...")
 
         try:
-            # 1. 关闭API服务器
             if self.api_server:
                 logger.info("正在关闭API服务器...")
                 await self.api_server.stop()
                 await self.api_server.cleanup()
 
-            # 2. 关闭主控制器
             if self.main_controller:
                 await self.main_controller.cleanup()
 
-            # 3. 清理配置管理器
             if self.config_manager:
                 await cleanup_config_manager()
 
@@ -152,14 +144,17 @@ class TradingSystem:
 
     def _setup_signal_handlers(self) -> None:
         """设置信号处理器"""
-        loop = asyncio.get_event_loop()
+        try:
+            loop = asyncio.get_event_loop()
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                sig, lambda s=sig: asyncio.create_task(self._handle_shutdown_signal(s))
-            )
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(
+                    sig, lambda s=sig: asyncio.create_task(self._handle_shutdown_signal(s))
+                )
 
-        logger.debug("信号处理器已设置")
+            logger.debug("信号处理器已设置")
+        except Exception as e:
+            logger.warning(f"设置信号处理器失败（可能在某些环境中不支持）: {e}")
 
     async def _handle_shutdown_signal(self, sig: signal.Signals) -> None:
         """处理关闭信号"""
@@ -170,6 +165,16 @@ class TradingSystem:
 
 async def main() -> None:
     """主函数"""
+    global _process_lock
+    
+    _process_lock = ProcessLock(APP_NAME)
+    
+    if not _process_lock.acquire():
+        logger.error("❌ 另一个实例已在运行中，请先停止现有实例")
+        print("❌ 另一个实例已在运行中，请先停止现有实例")
+        print(f"   提示: 如果确认没有其他实例，请删除 /tmp/{APP_NAME}.lock 文件后重试")
+        return
+    
     system = TradingSystem()
 
     try:
@@ -179,14 +184,14 @@ async def main() -> None:
         logger.info("用户中断")
     except Exception as e:
         logger.error(f"系统运行失败: {e}")
-        sys.exit(1)
+    finally:
+        if _process_lock:
+            _process_lock.release()
 
 
 if __name__ == "__main__":
-    # 确保日志目录存在
     Path("logs").mkdir(exist_ok=True)
 
-    # 运行主函数
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

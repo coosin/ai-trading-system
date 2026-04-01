@@ -321,15 +321,37 @@ class MainController:
         
         # 初始化AI记忆管理器
         from src.modules.core.ai_memory import AIMemoryManager
-        self.ai_memory_manager = AIMemoryManager()
+        from src.modules.core.enhanced_memory_manager import get_enhanced_memory_manager
+        import os
+        workspace_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "workspace")
+        self.ai_memory_manager = AIMemoryManager(workspace_path=workspace_path)
         logger.info("✅ AI记忆管理器初始化完成")
+        
+        # 初始化增强记忆管理器
+        try:
+            enhanced_memory = get_enhanced_memory_manager(workspace_path=workspace_path)
+            logger.info("✅ 增强记忆管理器初始化完成")
+        except Exception as e:
+            logger.warning(f"增强记忆管理器初始化失败: {e}")
+            enhanced_memory = None
         
         # 初始化大模型集成系统，使用已初始化的enhanced_llm_manager和ai_memory_manager
         self.llm_integration = EnhancedLLMIntegration(
             llm_manager=self.enhanced_llm_manager,
             memory_manager=self.ai_memory_manager
         )
+        
+        # 设置增强记忆管理器
+        if enhanced_memory:
+            self.llm_integration.enhanced_memory = enhanced_memory
+        
         logger.info("大模型集成系统已连接到增强大模型管理器和AI记忆管理器")
+        
+        # 初始化AI指令执行器
+        from src.modules.core.ai_command_executor import AICommandExecutor
+        self.ai_command_executor = AICommandExecutor(main_controller=self)
+        await self.ai_command_executor.initialize()
+        logger.info("✅ AI指令执行器初始化完成")
         
         # 初始化交易监控器
         self.trading_monitor = TradingMonitor({})
@@ -385,6 +407,16 @@ class MainController:
         # 初始化Telegram机器人（仅当有config_manager时）
         if self.config_manager:
             telegram_config = await self.config_manager.get_config("telegram", {})
+            
+            # 获取代理配置
+            proxy_config = await self.config_manager.get_config("proxy", {})
+            if proxy_config.get("enabled") and proxy_config.get("use_global_proxy"):
+                global_proxy = proxy_config.get("global_proxy", {})
+                if global_proxy.get("enabled"):
+                    proxy_url = f"{global_proxy.get('proxy_type', 'http')}://{global_proxy.get('host')}:{global_proxy.get('port')}"
+                    telegram_config["proxy"] = proxy_url
+                    logger.info(f"Telegram机器人配置代理: {proxy_url}")
+            
             self.telegram_bot = TelegramBot(
                 telegram_config,
                 nli=self.natural_language_interface,
@@ -815,6 +847,15 @@ class MainController:
         success = True
         for name in self.modules:
             if not await self.start_module(name):
+                success = False
+
+        # 启动全智能AI交易引擎
+        if self.ai_trading_engine:
+            try:
+                await self.ai_trading_engine.start()
+                logger.info("🚀 全智能AI交易引擎已启动，开始全自动交易")
+            except Exception as e:
+                logger.error(f"AI交易引擎启动失败: {e}")
                 success = False
 
         return success

@@ -81,7 +81,7 @@ class ExchangeBase(ABC):
         self.exchange_id = config.get("exchange_id")
         self.api_key = config.get("api_key")
         self.api_secret = config.get("api_secret")
-        self.api_passphrase = config.get("api_passphrase")
+        self.api_passphrase = config.get("api_passphrase") or config.get("passphrase")
         self.testnet = config.get("testnet", False)
         self._session = None
         self._ws_connection = None

@@ -98,10 +98,26 @@ class OKXExchange(ExchangeBase):
             try:
                 from src.modules.core.proxy_manager import get_proxy_manager
                 proxy_manager = await get_proxy_manager()
+                
+                # 确保proxy_manager已初始化
+                if not proxy_manager._running:
+                    # 使用传递过来的config_manager，或者创建新的
+                    if hasattr(self, '_config_manager') and self._config_manager:
+                        config_manager = self._config_manager
+                    else:
+                        from src.modules.core.config_manager import get_config_manager
+                        config_manager = await get_config_manager()
+                    
+                    proxy_config = await config_manager.get_config("proxy", {})
+                    logger.info(f"📋 加载代理配置: {proxy_config}")
+                    await proxy_manager.initialize(proxy_config)
+                else:
+                    logger.info(f"📋 proxy_manager已初始化, global_proxy={proxy_manager.global_proxy}, use_global_proxy={proxy_manager.use_global_proxy}")
+                
                 proxy = await proxy_manager.get_proxy("www.okx.com")
                 
                 if proxy:
-                    logger.info(f"使用代理: {proxy.url}")
+                    logger.info(f"✅ 使用代理: {proxy.url}")
                     if proxy.proxy_type.value in ["socks5", "socks4"]:
                         # 使用 SOCKS 代理
                         from aiohttp_socks import ProxyConnector
@@ -111,9 +127,12 @@ class OKXExchange(ExchangeBase):
                         connector = aiohttp.TCPConnector()
                         self._proxy_url = proxy.url
                 else:
+                    logger.warning("⚠️ 未找到可用代理，使用直连")
                     connector = aiohttp.TCPConnector()
             except Exception as proxy_error:
-                logger.warning(f"加载代理配置失败: {proxy_error}")
+                logger.warning(f"⚠️ 加载代理配置失败: {proxy_error}，使用直连")
+                import traceback
+                traceback.print_exc()
                 connector = aiohttp.TCPConnector()
             
             self._session = aiohttp.ClientSession(connector=connector)
@@ -178,6 +197,84 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.error(f"获取OKX市场数据失败: {e}")
         return None
+    
+    async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict[str, any]]:
+        """
+        获取K线数据
+        
+        Args:
+            symbol: 交易对，如 BTC/USDT
+            interval: 时间周期，支持 1m, 5m, 15m, 1h, 4h, 1d
+            limit: 返回数量，最大300
+            
+        Returns:
+            K线数据列表
+        """
+        # OKX的时间间隔格式转换
+        interval_map = {
+            "1m": "1m",
+            "5m": "5m",
+            "15m": "15m",
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D"
+        }
+        okx_interval = interval_map.get(interval, "1H")
+        
+        endpoint = "/api/v5/market/candles"
+        okx_symbol = symbol.replace("/", "-")
+        params = {
+            "instId": okx_symbol,
+            "bar": okx_interval,
+            "limit": min(limit, 300)
+        }
+        
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            if data:
+                klines = []
+                for candle in data:
+                    klines.append({
+                        "timestamp": int(candle[0]),
+                        "open": float(candle[1]),
+                        "high": float(candle[2]),
+                        "low": float(candle[3]),
+                        "close": float(candle[4]),
+                        "volume": float(candle[5]),
+                        "quote_volume": float(candle[7])
+                    })
+                return klines
+        except Exception as e:
+            logger.error(f"获取OKX K线数据失败: {e}")
+        return []
+    
+    async def get_multi_timeframe_klines(self, symbol: str, timeframes: List[str] = None) -> Dict[str, List[Dict]]:
+        """
+        获取多时间周期K线数据
+        
+        Args:
+            symbol: 交易对
+            timeframes: 时间周期列表，默认 ["1m", "5m", "15m", "1h", "4h", "1d"]
+            
+        Returns:
+            字典，key为时间周期，value为K线数据列表
+        """
+        if timeframes is None:
+            timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"]
+        
+        result = {}
+        
+        for tf in timeframes:
+            try:
+                klines = await self.get_klines(symbol, tf, limit=100)
+                if klines:
+                    result[tf] = klines
+                    logger.info(f"获取 {symbol} {tf} K线数据成功，共 {len(klines)} 条")
+            except Exception as e:
+                logger.error(f"获取 {symbol} {tf} K线数据失败: {e}")
+                result[tf] = []
+        
+        return result
     
     async def get_order_book(self, symbol: str, depth: int = 10) -> OrderBook:
         """获取订单簿"""
@@ -358,6 +455,32 @@ class OKXExchange(ExchangeBase):
             return balances
         except Exception as e:
             logger.error(f"获取OKX资产余额失败: {e}")
+            return []
+    
+    async def get_positions(self) -> List[Dict[str, Any]]:
+        """获取持仓信息"""
+        endpoint = "/api/v5/account/positions"
+        
+        try:
+            data = await self._make_request("GET", endpoint)
+            positions = []
+            
+            for pos_data in data:
+                positions.append({
+                    "symbol": pos_data.get("instId", "").replace("-", "/"),
+                    "side": "long" if pos_data.get("posSide") == "long" else "short",
+                    "size": float(pos_data.get("pos", 0) or 0),
+                    "entry_price": float(pos_data.get("avgPx", 0) or 0),
+                    "unrealized_pnl": float(pos_data.get("upl", 0) or 0),
+                    "leverage": float(pos_data.get("lever", 1) or 1),
+                    "margin": float(pos_data.get("margin", 0) or 0),
+                    "liquidation_price": float(pos_data.get("liqPx", 0) or 0),
+                    "timestamp": int(pos_data.get("cTime", 0) or 0)
+                })
+            
+            return positions
+        except Exception as e:
+            logger.error(f"获取OKX持仓信息失败: {e}")
             return []
     
     async def get_exchange_info(self) -> ExchangeInfo:

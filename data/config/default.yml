@@ -35,85 +35,18 @@ llm:
   enabled: true
   default_model: "astron-code-latest"
   
-  # 任务-模型映射（按任务类型选择最优模型）
   task_model_mapping:
-    market_analysis: ["astron-code-latest", "gpt-4-turbo", "claude-3-opus-20240229"]
-    strategy_generation: ["astron-code-latest", "gpt-4", "qwen-max"]
-    signal_generation: ["astron-code-latest", "gpt-4-turbo"]
-    risk_assessment: ["gpt-4", "claude-3-opus-20240229"]
-    news_analysis: ["astron-code-latest", "qwen-max"]
-    natural_language: ["astron-code-latest", "gpt-4-turbo"]
+    market_analysis: ["astron-code-latest", "llama3"]
+    strategy_generation: ["astron-code-latest", "llama3"]
+    signal_generation: ["astron-code-latest", "llama3"]
+    risk_assessment: ["astron-code-latest", "llama3"]
+    news_analysis: ["astron-code-latest", "llama3"]
+    natural_language: ["astron-code-latest", "llama3"]
   
-  # 自定义模型配置
   models:
-    # DeepSeek配置
-    - model_id: "deepseek-chat"
-      provider: "deepseek"
-      display_name: "DeepSeek Chat"
-      api_key: ""  # 请设置你的DeepSeek API密钥
-      base_url: "https://api.deepseek.com/v1/chat/completions"
-      temperature: 0.7
-      max_tokens: 2000
-      timeout: 30.0
-      cost_per_input_token: 0.000001
-      cost_per_output_token: 0.000002
-      context_window: 32768
-      enabled: true
-      priority: 8
-      fallback_models: ["gpt-4-turbo", "qwen-max"]
-    
-    - model_id: "deepseek-reasoner"
-      provider: "deepseek"
-      display_name: "DeepSeek Reasoner"
-      api_key: ""  # 请设置你的DeepSeek API密钥
-      base_url: "https://api.deepseek.com/v1/chat/completions"
-      temperature: 0.7
-      max_tokens: 2000
-      timeout: 30.0
-      cost_per_input_token: 0.000002
-      cost_per_output_token: 0.000008
-      context_window: 65536
-      supports_reasoning: true
-      enabled: true
-      priority: 7
-      fallback_models: ["deepseek-chat", "gpt-4"]
-    
-    # OpenAI配置
-    - model_id: "gpt-4-turbo"
-      provider: "openai"
-      display_name: "GPT-4 Turbo"
-      api_key: ""  # 请设置你的OpenAI API密钥
-      base_url: "https://api.openai.com/v1/chat/completions"
-      temperature: 0.7
-      max_tokens: 2000
-      timeout: 30.0
-      cost_per_input_token: 0.00001
-      cost_per_output_token: 0.00003
-      context_window: 128000
-      enabled: true
-      priority: 9
-      fallback_models: ["claude-3-opus-20240229"]
-    
-    # Qwen配置
-    - model_id: "qwen-max"
-      provider: "qwen"
-      display_name: "Qwen Max"
-      api_key: ""  # 请设置你的Qwen API密钥
-      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-      temperature: 0.7
-      max_tokens: 2000
-      timeout: 30.0
-      cost_per_input_token: 0.000008
-      cost_per_output_token: 0.00002
-      context_window: 32768
-      enabled: true
-      priority: 5
-      fallback_models: ["deepseek-chat"]
-    
-    # 本地模型配置
     - model_id: "llama3"
       provider: "local"
-      display_name: "Llama 3"
+      display_name: "Llama 3 (本地)"
       base_url: "http://localhost:11434/api/chat"
       temperature: 0.7
       max_tokens: 2000
@@ -121,10 +54,9 @@ llm:
       cost_per_input_token: 0.0
       cost_per_output_token: 0.0
       context_window: 8192
-      enabled: false  # 默认禁用，需要时启用
-      priority: 1
+      enabled: false
+      priority: 5
 
-# 交易模式配置
 trading:
   mode: "simulation"  # 交易模式: simulation(模拟交易), paper(纸面交易), live(实盘交易)
   
@@ -238,8 +170,8 @@ notifications:
 
 # Telegram机器人配置
 telegram:
-  enabled: false
-  bot_token: ""  # 请设置你的Telegram Bot Token
+  enabled: true
+  bot_token: "8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60"  # Telegram Bot Token
   chat_ids: []  # 接收通知的聊天ID列表
   allowed_users: []  # 允许使用机器人的用户名列表（为空则允许所有）
   
@@ -248,7 +180,7 @@ telegram:
     trade_signals: true  # 交易信号通知
     risk_alerts: true  # 风险警报通知
     system_alerts: true  # 系统警报通知
-    daily_report: false  # 每日报告通知
+    daily_report: true  # 每日报告通知
   
   # 命令前缀
   command_prefix: "/"

@@ -19,6 +19,11 @@ from enum import Enum
 
 import pandas as pd
 
+from .technical_indicators import TechnicalIndicatorCalculator, TechnicalIndicators
+from .historical_data_storage import HistoricalDataStorage, TradeRecord, IndicatorRecord, get_historical_storage
+from .account_risk_monitor import AccountRiskMonitor, AccountRisk, PositionRisk, RiskLevel
+from .strategy_optimizer import StrategyOptimizer, StrategyType, StrategyPerformance
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,6 +111,9 @@ class AITradingEngine:
         self.llm_integration = None
         self.exchange = None
         self.risk_manager = None
+        self.data_storage: Optional[HistoricalDataStorage] = None
+        self.risk_monitor: Optional[AccountRiskMonitor] = None
+        self.strategy_optimizer: Optional[StrategyOptimizer] = None
         
         # 交易状态
         self.state = TradingState.IDLE
@@ -130,6 +138,10 @@ class AITradingEngine:
         self._tasks: List[asyncio.Task] = []
         self._lock = asyncio.Lock()
         
+        # 风险事件去重 - 记录最近一次风险事件时间
+        self._last_risk_events: Dict[str, float] = {}
+        self._risk_event_cooldown = 300  # 相同风险事件冷却时间（秒）
+        
         logger.info("全智能AI交易引擎初始化完成")
     
     async def initialize(self) -> None:
@@ -141,17 +153,59 @@ class AITradingEngine:
             self.llm_integration = self.main_controller.llm_integration
             logger.info("✅ LLM集成已连接")
         
-        # 连接交易所
-        if self.main_controller and hasattr(self.main_controller, 'exchange_factory'):
-            exchange_factory = self.main_controller.exchange_factory
-            if exchange_factory:
-                self.exchange = await exchange_factory.create_exchange("okx")
-                logger.info("✅ 交易所已连接")
+        # 连接交易所 - 直接创建OKX交易所实例
+        try:
+            if self.main_controller and self.main_controller.config_manager:
+                # 获取exchanges配置
+                exchanges_config = await self.main_controller.config_manager.get_config("exchanges", {})
+                okx_config = exchanges_config.get("okx", {})
+                logger.info(f"📋 OKX配置: {okx_config}")
+                if okx_config and okx_config.get('api_key'):
+                    from src.modules.exchanges.okx import OKXExchange
+                    self.exchange = OKXExchange(okx_config)
+                    # 传递config_manager给OKXExchange
+                    self.exchange._config_manager = self.main_controller.config_manager
+                    await self.exchange.initialize()
+                    logger.info("✅ OKX交易所已连接")
+                else:
+                    logger.warning("⚠️ OKX配置不完整，使用模拟数据")
+            else:
+                logger.warning("⚠️ 配置管理器未找到，使用模拟数据")
+        except Exception as e:
+            logger.warning(f"⚠️ 交易所连接失败: {e}，将使用模拟数据")
         
         # 连接风险管理器
         if self.main_controller and hasattr(self.main_controller, 'risk_manager'):
             self.risk_manager = self.main_controller.risk_manager
             logger.info("✅ 风险管理器已连接")
+        
+        # 初始化历史数据存储
+        try:
+            self.data_storage = await get_historical_storage()
+            logger.info("✅ 历史数据存储已连接")
+        except Exception as e:
+            logger.warning(f"⚠️ 历史数据存储初始化失败: {e}")
+        
+        # 初始化账户风险监控
+        try:
+            self.risk_monitor = AccountRiskMonitor(
+                exchange=self.exchange,
+                data_storage=self.data_storage
+            )
+            self.risk_monitor.add_callback(self._on_risk_warning)
+            logger.info("✅ 账户风险监控已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 账户风险监控初始化失败: {e}")
+        
+        # 初始化策略优化器
+        try:
+            self.strategy_optimizer = StrategyOptimizer(
+                memory_manager=self.llm_integration,
+                data_storage=self.data_storage
+            )
+            logger.info("✅ 策略优化器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 策略优化器初始化失败: {e}")
         
         # 加载配置
         if self.main_controller and self.main_controller.config_manager:
@@ -174,12 +228,28 @@ class AITradingEngine:
         # 启动优化任务
         self._tasks.append(asyncio.create_task(self._optimization_loop()))
         
+        # 启动账户风险监控
+        if self.risk_monitor:
+            await self.risk_monitor.start()
+        
+        # 启动策略优化器
+        if self.strategy_optimizer:
+            await self.strategy_optimizer.start()
+        
         logger.info("✅ 全智能AI交易引擎已启动")
     
     async def stop(self) -> None:
         """停止AI交易引擎"""
         logger.info("🛑 停止全智能AI交易引擎...")
         self._running = False
+        
+        # 停止风险监控
+        if self.risk_monitor:
+            await self.risk_monitor.stop()
+        
+        # 停止策略优化器
+        if self.strategy_optimizer:
+            await self.strategy_optimizer.stop()
         
         for task in self._tasks:
             if not task.done():
@@ -252,20 +322,49 @@ class AITradingEngine:
             if not self.exchange:
                 return None
             
-            # 获取K线数据
-            klines = await self.exchange.get_klines(symbol, interval="1h", limit=100)
+            # 获取多时间周期K线数据
+            multi_timeframe_klines = await self.exchange.get_multi_timeframe_klines(
+                symbol, 
+                timeframes=["1m", "5m", "15m", "1h", "4h", "1d"]
+            )
+            
+            # 保存K线数据到历史存储
+            if self.data_storage and multi_timeframe_klines:
+                for tf, klines in multi_timeframe_klines.items():
+                    if klines:
+                        await self.data_storage.save_klines(symbol, tf, klines)
             
             # 获取当前价格
             ticker = await self.exchange.get_ticker(symbol)
             
             # 获取订单簿
-            order_book = await self.exchange.get_order_book(symbol, limit=20)
+            order_book = await self.exchange.get_order_book(symbol, depth=20)
+            
+            # 获取账户余额
+            balance = await self.exchange.get_balance()
+            
+            # 获取持仓信息
+            positions = await self.exchange.get_positions()
+            
+            # 保存账户快照
+            if self.data_storage and balance:
+                total_equity = sum(balance.values())
+                await self.data_storage.save_account_snapshot({
+                    "timestamp": datetime.now().isoformat(),
+                    "total_equity": total_equity,
+                    "available_balance": balance.get("USDT", 0),
+                    "margin_used": 0,
+                    "unrealized_pnl": 0,
+                    "positions": positions
+                })
             
             return {
                 "symbol": symbol,
-                "klines": klines,
+                "multi_timeframe_klines": multi_timeframe_klines,
                 "ticker": ticker,
                 "order_book": order_book,
+                "balance": balance,
+                "positions": positions,
                 "timestamp": datetime.now().isoformat()
             }
         except Exception as e:
@@ -275,28 +374,47 @@ class AITradingEngine:
     async def _analyze_market(self, symbol: str, market_data: Dict) -> MarketContext:
         """AI市场分析"""
         try:
+            # 计算技术指标
+            technical_indicators = self._calculate_technical_indicators(market_data)
+            
+            # 保存技术指标到历史存储
+            if self.data_storage and technical_indicators.trend:
+                await self.data_storage.save_indicator(IndicatorRecord(
+                    symbol=symbol,
+                    timestamp=datetime.now().isoformat(),
+                    trend=technical_indicators.trend,
+                    trend_strength=technical_indicators.trend_strength,
+                    ma5=technical_indicators.ma5,
+                    ma20=technical_indicators.ma20,
+                    rsi=technical_indicators.rsi,
+                    macd=technical_indicators.macd,
+                    bollinger_upper=technical_indicators.bollinger_upper,
+                    bollinger_lower=technical_indicators.bollinger_lower,
+                    atr=technical_indicators.atr
+                ))
+            
             if not self.llm_integration:
-                # 如果没有LLM，使用基础分析
-                return self._basic_analysis(symbol, market_data)
+                return self._basic_analysis(symbol, market_data, technical_indicators)
+            
+            # 构建包含技术指标的分析数据
+            analysis_data = {
+                "symbol": symbol,
+                "price": market_data["ticker"].get("last", 0),
+                "ticker": market_data["ticker"],
+                "order_book": self._summarize_order_book(market_data.get("order_book")),
+                "technical_indicators": TechnicalIndicatorCalculator.indicators_to_dict(technical_indicators),
+                "multi_timeframe": self._summarize_multi_timeframe(market_data.get("multi_timeframe_klines", {}))
+            }
             
             # 使用AI进行深度分析
-            analysis_prompt = self._build_analysis_prompt(symbol, market_data)
-            
-            ai_analysis = await self.llm_integration.analyze_market(
-                {
-                    "symbol": symbol,
-                    "price": market_data["ticker"].get("last", 0),
-                    "data": market_data["klines"]
-                },
-                model_id=self.ai_config["model_id"]
-            )
+            ai_analysis = await self.llm_integration.analyze_market(analysis_data)
             
             # 解析AI分析结果
             context = MarketContext(
                 symbol=symbol,
                 price=market_data["ticker"].get("last", 0),
-                trend=ai_analysis.get("trend", "sideways"),
-                volatility=ai_analysis.get("volatility", 0.5),
+                trend=ai_analysis.get("trend", technical_indicators.trend),
+                volatility=ai_analysis.get("volatility", self._calculate_volatility(technical_indicators)),
                 volume_24h=market_data["ticker"].get("volume", 0),
                 sentiment=ai_analysis.get("sentiment", "neutral"),
                 support_levels=ai_analysis.get("support_levels", []),
@@ -308,51 +426,161 @@ class AITradingEngine:
             
         except Exception as e:
             logger.error(f"AI市场分析失败 {symbol}: {e}")
-            return self._basic_analysis(symbol, market_data)
+            return self._basic_analysis(symbol, market_data, None)
     
-    def _basic_analysis(self, symbol: str, market_data: Dict) -> MarketContext:
-        """基础市场分析（备用）"""
-        klines = market_data.get("klines", [])
-        if not klines:
-            return MarketContext(
-                symbol=symbol,
-                price=0,
-                trend="sideways",
-                volatility=0.5,
-                volume_24h=0,
-                sentiment="neutral"
-            )
+    def _calculate_technical_indicators(self, market_data: Dict) -> TechnicalIndicators:
+        """计算技术指标"""
+        try:
+            # 使用1小时K线计算主要指标
+            klines_1h = market_data.get("multi_timeframe_klines", {}).get("1h", [])
+            
+            if not klines_1h or len(klines_1h) < 50:
+                logger.warning("K线数据不足，返回默认指标")
+                return TechnicalIndicators()
+            
+            # 计算所有技术指标
+            indicators = TechnicalIndicatorCalculator.calculate_all_indicators(klines_1h)
+            
+            logger.info(f"📊 技术指标: MA5={indicators.ma5:.2f}, MA20={indicators.ma20:.2f}, "
+                       f"RSI={indicators.rsi:.2f}, 趋势={indicators.trend}")
+            
+            return indicators
+            
+        except Exception as e:
+            logger.error(f"计算技术指标失败: {e}")
+            return TechnicalIndicators()
+    
+    def _summarize_order_book(self, order_book: Any) -> Dict:
+        """总结订单簿数据"""
+        if not order_book:
+            return {"bid_depth": 0, "ask_depth": 0, "spread": 0}
         
-        # 计算基础指标
-        prices = [k["close"] for k in klines[-20:]]
-        if len(prices) < 2:
-            trend = "sideways"
-        elif prices[-1] > prices[0] * 1.02:
-            trend = "bullish"
-        elif prices[-1] < prices[0] * 0.98:
-            trend = "bearish"
+        try:
+            bids = getattr(order_book, 'bids', [])
+            asks = getattr(order_book, 'asks', [])
+            
+            bid_depth = sum(qty for _, qty in bids[:10]) if bids else 0
+            ask_depth = sum(qty for _, qty in asks[:10]) if asks else 0
+            
+            spread = 0
+            if bids and asks:
+                best_bid = bids[0][0] if bids else 0
+                best_ask = asks[0][0] if asks else 0
+                spread = (best_ask - best_bid) / best_bid * 100 if best_bid > 0 else 0
+            
+            return {
+                "bid_depth": bid_depth,
+                "ask_depth": ask_depth,
+                "spread": round(spread, 4),
+                "imbalance": round((bid_depth - ask_depth) / (bid_depth + ask_depth), 2) if (bid_depth + ask_depth) > 0 else 0
+            }
+        except Exception as e:
+            logger.error(f"总结订单簿失败: {e}")
+            return {"bid_depth": 0, "ask_depth": 0, "spread": 0}
+    
+    def _summarize_multi_timeframe(self, multi_tf_klines: Dict[str, List]) -> Dict:
+        """总结多时间周期数据"""
+        summary = {}
+        
+        for tf, klines in multi_tf_klines.items():
+            if not klines:
+                continue
+            
+            try:
+                closes = [k.get("close", 0) for k in klines]
+                if closes:
+                    summary[tf] = {
+                        "open": klines[0].get("open", 0) if klines else 0,
+                        "close": closes[-1],
+                        "high": max([k.get("high", 0) for k in klines]),
+                        "low": min([k.get("low", 0) for k in klines]),
+                        "change_percent": round((closes[-1] - closes[0]) / closes[0] * 100, 2) if closes[0] > 0 else 0
+                    }
+            except Exception as e:
+                logger.error(f"总结{tf}时间周期数据失败: {e}")
+        
+        return summary
+    
+    def _calculate_volatility(self, indicators: TechnicalIndicators) -> float:
+        """计算波动率"""
+        if indicators.atr and indicators.bollinger_middle:
+            return min(indicators.atr / indicators.bollinger_middle, 1.0)
+        return 0.5
+    
+    def _basic_analysis(self, symbol: str, market_data: Dict, indicators: Optional[TechnicalIndicators] = None) -> MarketContext:
+        """基础市场分析（备用）"""
+        ticker = market_data.get("ticker", {})
+        price = ticker.get("last", 0)
+        
+        # 如果有技术指标，使用技术指标判断趋势
+        if indicators:
+            trend = indicators.trend
+            volatility = self._calculate_volatility(indicators)
+            logger.info(f"📈 基于技术指标分析: 趋势={trend}, 强度={indicators.trend_strength:.2f}")
         else:
-            trend = "sideways"
+            # 使用多时间周期K线数据判断趋势
+            multi_tf = market_data.get("multi_timeframe_klines", {})
+            klines_1h = multi_tf.get("1h", [])
+            
+            if klines_1h and len(klines_1h) >= 2:
+                closes = [k.get("close", 0) for k in klines_1h]
+                if closes[-1] > closes[0] * 1.02:
+                    trend = "bullish"
+                elif closes[-1] < closes[0] * 0.98:
+                    trend = "bearish"
+                else:
+                    trend = "sideways"
+            else:
+                trend = "sideways"
+            
+            volatility = 0.3
         
         return MarketContext(
             symbol=symbol,
-            price=prices[-1] if prices else 0,
+            price=price,
             trend=trend,
-            volatility=0.3,
-            volume_24h=market_data.get("ticker", {}).get("volume", 0),
+            volatility=volatility,
+            volume_24h=ticker.get("volume", 0),
             sentiment="neutral"
         )
     
-    def _build_analysis_prompt(self, symbol: str, market_data: Dict) -> str:
+    def _build_analysis_prompt(self, symbol: str, market_data: Dict, indicators: Optional[TechnicalIndicators] = None) -> str:
         """构建AI分析提示词"""
         ticker = market_data.get("ticker", {})
-        return f"""请分析 {symbol} 的市场情况：
+        order_book = market_data.get("order_book", {})
+        
+        prompt = f"""请分析 {symbol} 的市场情况：
 
 当前价格: {ticker.get('last', 'N/A')}
 24h最高: {ticker.get('high', 'N/A')}
 24h最低: {ticker.get('low', 'N/A')}
 24h成交量: {ticker.get('volume', 'N/A')}
+24h涨跌幅: {ticker.get('change', 'N/A')}%
 
+订单簿深度:
+- 买盘深度: {order_book.get('bid_depth', 0)}
+- 卖盘深度: {order_book.get('ask_depth', 0)}
+- 价差: {order_book.get('spread', 0)}%
+- 买卖失衡: {order_book.get('imbalance', 0)}
+"""
+        
+        if indicators:
+            prompt += f"""
+技术指标:
+- 趋势: {indicators.trend} (强度: {indicators.trend_strength:.2f})
+- MA5: {indicators.ma5}
+- MA20: {indicators.ma20}
+- MA50: {indicators.ma50}
+- RSI: {indicators.rsi}
+- MACD: {indicators.macd}
+- MACD信号线: {indicators.macd_signal}
+- 布林带上轨: {indicators.bollinger_upper}
+- 布林带中轨: {indicators.bollinger_middle}
+- 布林带下轨: {indicators.bollinger_lower}
+- ATR: {indicators.atr}
+"""
+        
+        prompt += """
 请提供：
 1. 趋势判断 (bullish/bearish/sideways)
 2. 波动率评估 (0-1)
@@ -362,6 +590,8 @@ class AITradingEngine:
 6. 交易建议
 
 请以JSON格式返回。"""
+        
+        return prompt
     
     async def _make_decision(self, symbol: str, context: MarketContext, 
                            current_position: Optional[Position]) -> Optional[AIDecision]:
@@ -381,8 +611,7 @@ class AITradingEngine:
                     "trend": context.trend,
                     "sentiment": context.sentiment,
                     "volatility": context.volatility
-                },
-                model_id=self.ai_config["model_id"]
+                }
             )
             
             # 解析决策
@@ -594,28 +823,39 @@ class AITradingEngine:
             logger.info(f"🚀 执行交易: {decision.action.value} {decision.symbol} "
                        f"@ {decision.price}, 数量={decision.quantity}")
             
-            # 构建订单
             order = {
                 "symbol": decision.symbol,
                 "side": "buy" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "sell",
-                "type": "market",  # 使用市价单快速执行
+                "type": "market",
                 "quantity": decision.quantity
             }
             
-            # 执行订单
             result = await self.exchange.place_order(order)
             
             if result:
                 logger.info(f"✅ 订单执行成功: {result.get('id', 'N/A')}")
                 
-                # 记录交易
-                self.trade_history.append({
+                trade_record = {
                     "timestamp": datetime.now().isoformat(),
                     "decision": decision.__dict__,
                     "order_result": result
-                })
+                }
+                self.trade_history.append(trade_record)
                 
-                # 更新持仓
+                if self.data_storage:
+                    await self.data_storage.save_trade(TradeRecord(
+                        symbol=decision.symbol,
+                        side="buy" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "sell",
+                        order_type="market",
+                        quantity=decision.quantity,
+                        price=decision.price,
+                        timestamp=datetime.now().isoformat(),
+                        order_id=result.get("order_id", ""),
+                        reasoning=decision.reasoning
+                    ))
+                
+                await self._save_trade_to_memory(decision, result)
+                
                 await self._update_positions()
                 
                 return True
@@ -626,6 +866,60 @@ class AITradingEngine:
         except Exception as e:
             logger.error(f"执行决策失败: {e}")
             return False
+    
+    async def _save_trade_to_memory(self, decision: AIDecision, result: Dict) -> None:
+        """保存交易记录到增强记忆"""
+        try:
+            if not self.llm_integration or not hasattr(self.llm_integration, 'enhanced_memory'):
+                return
+            
+            memory = self.llm_integration.enhanced_memory
+            if not memory:
+                return
+            
+            is_open = decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]
+            side = "long" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "short"
+            
+            if is_open:
+                memory.save_trade_open(
+                    symbol=decision.symbol,
+                    side=side,
+                    price=decision.price,
+                    quantity=decision.quantity,
+                    reason=decision.reasoning,
+                    stop_loss=decision.stop_loss,
+                    take_profit=decision.take_profit,
+                    strategy=decision.metadata.get("strategy", "AI智能决策")
+                )
+            else:
+                existing = self.positions.get(decision.symbol)
+                open_price = existing.entry_price if existing else decision.price
+                pnl = 0
+                pnl_percent = 0
+                
+                if existing:
+                    if side == "long":
+                        pnl = (decision.price - open_price) * decision.quantity
+                        pnl_percent = (decision.price - open_price) / open_price * 100
+                    else:
+                        pnl = (open_price - decision.price) * decision.quantity
+                        pnl_percent = (open_price - decision.price) / open_price * 100
+                
+                memory.save_trade_close(
+                    symbol=decision.symbol,
+                    side=side,
+                    open_price=open_price,
+                    close_price=decision.price,
+                    quantity=decision.quantity,
+                    pnl=pnl,
+                    pnl_percent=pnl_percent,
+                    reason=decision.reasoning
+                )
+                
+                logger.info(f"💾 交易记录已保存到记忆库")
+                
+        except Exception as e:
+            logger.error(f"保存交易到记忆失败: {e}")
     
     async def _update_positions(self) -> None:
         """更新持仓信息"""
@@ -716,7 +1010,29 @@ class AITradingEngine:
     async def _optimize_strategy(self) -> None:
         """策略优化"""
         try:
-            # 计算胜率
+            # 使用策略优化器进行分析
+            if self.strategy_optimizer:
+                logger.info("📊 使用策略优化器分析交易表现...")
+                
+                # 分析所有策略
+                performances = await self.strategy_optimizer._analyze_all_strategies()
+                
+                # 发现新策略
+                new_proposals = await self.strategy_optimizer._discover_new_patterns()
+                
+                if new_proposals:
+                    logger.info(f"💡 发现 {len(new_proposals)} 个新策略提案")
+                
+                # 处理新策略提案
+                await self.strategy_optimizer._process_new_strategy_proposals()
+                
+                # 保存优化结果
+                await self.strategy_optimizer._save_optimization_results()
+                
+                logger.info("✅ 策略优化完成")
+                return
+            
+            # 备用：原有的简单优化逻辑
             profitable_trades = sum(1 for t in self.trade_history 
                                    if t.get("decision", {}).get("pnl", 0) > 0)
             total_trades = len(self.trade_history)
@@ -724,22 +1040,112 @@ class AITradingEngine:
             
             logger.info(f"📊 策略性能: 胜率={win_rate:.2%}, 总交易={total_trades}")
             
-            # 根据胜率调整参数
+            old_confidence = self.ai_config["min_confidence"]
+            optimization_reason = ""
+            expected_improvement = ""
+            
             if win_rate < 0.4:
-                # 胜率低，提高置信度阈值
                 self.ai_config["min_confidence"] = min(0.8, self.ai_config["min_confidence"] + 0.05)
+                optimization_reason = f"胜率过低({win_rate:.1%})，需要提高决策质量"
+                expected_improvement = "减少低质量交易，提高胜率"
                 logger.info(f"📈 调整参数: 提高置信度阈值到 {self.ai_config['min_confidence']}")
             elif win_rate > 0.6:
-                # 胜率高，可以适当降低阈值捕捉更多机会
                 self.ai_config["min_confidence"] = max(0.5, self.ai_config["min_confidence"] - 0.02)
+                optimization_reason = f"胜率良好({win_rate:.1%})，可以捕捉更多机会"
+                expected_improvement = "增加交易机会，保持较高胜率"
                 logger.info(f"📉 调整参数: 降低置信度阈值到 {self.ai_config['min_confidence']}")
+            
+            if old_confidence != self.ai_config["min_confidence"]:
+                await self._save_strategy_optimization(
+                    strategy_name="AI交易策略",
+                    optimization_type="parameter",
+                    old_params={"min_confidence": old_confidence},
+                    new_params={"min_confidence": self.ai_config["min_confidence"]},
+                    reason=optimization_reason,
+                    expected_improvement=expected_improvement
+                )
+            
+            if total_trades >= 10:
+                await self._save_periodic_pnl_record()
             
         except Exception as e:
             logger.error(f"策略优化失败: {e}")
     
+    async def _save_strategy_optimization(self, strategy_name: str, optimization_type: str,
+                                          old_params: Dict, new_params: Dict,
+                                          reason: str, expected_improvement: str) -> None:
+        """保存策略优化记录到记忆库"""
+        try:
+            if not self.llm_integration or not hasattr(self.llm_integration, 'enhanced_memory'):
+                return
+            
+            memory = self.llm_integration.enhanced_memory
+            if not memory:
+                return
+            
+            memory.save_strategy_optimization(
+                strategy_name=strategy_name,
+                optimization_type=optimization_type,
+                old_params=old_params,
+                new_params=new_params,
+                reason=reason,
+                expected_improvement=expected_improvement
+            )
+            
+            logger.info(f"� 策略优化记录已保存到记忆库")
+            
+        except Exception as e:
+            logger.error(f"保存策略优化记录失败: {e}")
+    
+    async def _save_periodic_pnl_record(self) -> None:
+        """保存周期性盈亏统计记录"""
+        try:
+            if not self.llm_integration or not hasattr(self.llm_integration, 'enhanced_memory'):
+                return
+            
+            memory = self.llm_integration.enhanced_memory
+            if not memory:
+                return
+            
+            close_trades = [t for t in self.trade_history 
+                          if t.get("decision", {}).get("action", "").startswith("close")]
+            
+            if not close_trades:
+                return
+            
+            total_pnl = sum(t.get("decision", {}).get("pnl", 0) for t in close_trades)
+            win_count = sum(1 for t in close_trades if t.get("decision", {}).get("pnl", 0) > 0)
+            lose_count = len(close_trades) - win_count
+            win_rate = win_count / len(close_trades) if close_trades else 0
+            
+            best_trade = max(close_trades, key=lambda t: t.get("decision", {}).get("pnl", 0))
+            worst_trade = min(close_trades, key=lambda t: t.get("decision", {}).get("pnl", 0))
+            
+            memory.save_pnl_record(
+                period="hourly",
+                total_pnl=total_pnl,
+                trade_count=len(close_trades),
+                win_count=win_count,
+                lose_count=lose_count,
+                win_rate=win_rate,
+                best_trade={
+                    "symbol": best_trade.get("decision", {}).get("symbol"),
+                    "pnl": best_trade.get("decision", {}).get("pnl", 0)
+                },
+                worst_trade={
+                    "symbol": worst_trade.get("decision", {}).get("symbol"),
+                    "pnl": worst_trade.get("decision", {}).get("pnl", 0)
+                }
+            )
+            
+            logger.info(f"📊 盈亏统计记录已保存到记忆库")
+            
+        except Exception as e:
+            logger.error(f"保存盈亏统计记录失败: {e}")
+    
     def get_status(self) -> Dict:
         """获取引擎状态"""
-        return {
+        status = {
             "state": self.state.value,
             "running": self._running,
             "positions": len(self.positions),
@@ -747,3 +1153,78 @@ class AITradingEngine:
             "symbols": self.symbols,
             "ai_config": self.ai_config
         }
+        
+        if self.risk_monitor:
+            status["risk_monitor"] = self.risk_monitor.get_status()
+        
+        return status
+    
+    async def _on_risk_warning(self, account_risk: AccountRisk) -> None:
+        """风险预警回调"""
+        logger.warning(f"⚠️ 风险预警: {account_risk.risk_level.value}")
+        
+        if account_risk.risk_level == RiskLevel.CRITICAL:
+            logger.critical("🚨 严重风险! 考虑减仓或平仓")
+            
+            for pos_risk in account_risk.position_risks:
+                if pos_risk.risk_level == RiskLevel.CRITICAL:
+                    logger.critical(f"🚨 持仓 {pos_risk.symbol} 风险严重，建议立即处理")
+                    
+                    await self._save_risk_event_to_memory(
+                        event_type="critical_risk",
+                        symbol=pos_risk.symbol,
+                        description=f"持仓风险严重: 浮亏{pos_risk.unrealized_pnl_percent:.1f}%, "
+                                   f"距离强平{pos_risk.distance_to_liquidation:.1%}",
+                        action_taken="预警通知",
+                        impact=f"未实现盈亏: {pos_risk.unrealized_pnl:.2f} USDT"
+                    )
+        
+        elif account_risk.risk_level == RiskLevel.HIGH:
+            for warning in account_risk.warnings:
+                logger.warning(f"⚠️ {warning}")
+            
+            await self._save_risk_event_to_memory(
+                event_type="high_risk",
+                symbol="account",
+                description=f"账户风险较高: 保证金占用率{account_risk.margin_ratio:.1%}",
+                action_taken="监控中",
+                impact=f"总权益: {account_risk.total_equity:.2f} USDT"
+            )
+    
+    async def _save_risk_event_to_memory(self, event_type: str, symbol: str,
+                                         description: str, action_taken: str,
+                                         impact: str) -> None:
+        """保存风险事件到记忆库（带去重）"""
+        try:
+            import time
+            
+            event_key = f"{event_type}_{symbol}"
+            current_time = time.time()
+            
+            if event_key in self._last_risk_events:
+                last_time = self._last_risk_events[event_key]
+                if current_time - last_time < self._risk_event_cooldown:
+                    logger.debug(f"风险事件 {event_key} 在冷却期内，跳过记录")
+                    return
+            
+            self._last_risk_events[event_key] = current_time
+            
+            if not self.llm_integration or not hasattr(self.llm_integration, 'enhanced_memory'):
+                return
+            
+            memory = self.llm_integration.enhanced_memory
+            if not memory:
+                return
+            
+            memory.save_risk_event(
+                event_type=event_type,
+                symbol=symbol,
+                description=description,
+                action_taken=action_taken,
+                impact=impact
+            )
+            
+            logger.info(f"⚠️ 风险事件已保存到记忆库: {event_key}")
+            
+        except Exception as e:
+            logger.error(f"保存风险事件失败: {e}")

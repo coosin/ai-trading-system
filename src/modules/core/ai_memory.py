@@ -17,8 +17,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-import pandas as pd
-
 logger = logging.getLogger(__name__)
 
 
@@ -53,17 +51,23 @@ class AIMemoryManager:
     2. 历史交易记忆和总结
     3. 用户偏好和工作指令记忆
     4. 记忆检索和总结
+    5. 文件化长期记忆（SOUL.md, IDENTITY.md, USER.md等）
     """
     
-    def __init__(self, storage_path: Optional[str] = None):
+    def __init__(self, storage_path: Optional[str] = None, workspace_path: Optional[str] = None):
         """
         初始化AI记忆管理器
         
         Args:
             storage_path: 记忆存储路径
+            workspace_path: 工作区路径（包含记忆文件）
         """
         self.storage_path = Path(storage_path) if storage_path else Path("data/memory")
         self.storage_path.mkdir(parents=True, exist_ok=True)
+        
+        # 工作区路径（包含SOUL.md, IDENTITY.md等文件）
+        self.workspace_path = Path(workspace_path) if workspace_path else Path("workspace")
+        self.workspace_path.mkdir(parents=True, exist_ok=True)
         
         # 内存中的记忆存储
         self.short_term_memory: List[MemoryItem] = []
@@ -71,6 +75,9 @@ class AIMemoryManager:
         
         # 记忆索引
         self.memory_index: Dict[str, MemoryItem] = {}
+        
+        # 文件化记忆缓存
+        self.workspace_memory: Dict[str, str] = {}
         
         # 配置
         self.config = {
@@ -81,8 +88,20 @@ class AIMemoryManager:
             "memory_decay_rate": 0.01,    # 记忆衰减率
         }
         
+        # 需要加载的工作区记忆文件
+        self.memory_files = [
+            "SOUL.md",
+            "IDENTITY.md", 
+            "USER.md",
+            "TRADING.md",
+            "INSTRUCTIONS.md"
+        ]
+        
         # 加载持久化记忆
         self._load_memory()
+        
+        # 加载工作区文件化记忆
+        self._load_workspace_memory()
         
         logger.info("✅ AI记忆管理器初始化完成")
     
@@ -100,6 +119,10 @@ class AIMemoryManager:
         Returns:
             记忆ID
         """
+        if self._is_garbage_content(content):
+            logger.debug(f"🚫 过滤垃圾记忆: {content[:50]}...")
+            return None
+        
         memory_id = f"st_{datetime.now().timestamp()}"
         
         item = MemoryItem(
@@ -114,14 +137,39 @@ class AIMemoryManager:
         self.short_term_memory.append(item)
         self.memory_index[memory_id] = item
         
-        # 清理过期的短期记忆
         self._cleanup_short_term()
         
-        # 持久化
         self._save_memory()
         
         logger.debug(f"📝 添加短期记忆: {content[:50]}...")
         return memory_id
+    
+    def _is_garbage_content(self, content: str) -> bool:
+        """判断是否为垃圾内容（不应保存的记忆）"""
+        garbage_patterns = [
+            "分析以下市场数据",
+            "请提供：",
+            "市场趋势分析",
+            "关键支撑位和阻力位",
+            "技术指标解读",
+            "市场情绪分析",
+            "请以JSON格式返回",
+            "MarketData(symbol=",
+            "'symbol': '",
+            "'price': ",
+            "'trend': '",
+            "'sentiment': '",
+        ]
+        
+        garbage_count = sum(1 for pattern in garbage_patterns if pattern in content)
+        
+        if garbage_count >= 3:
+            return True
+        
+        if "分析以下市场数据" in content and len(content) > 200:
+            return True
+        
+        return False
     
     async def add_long_term_memory(self, content: str, 
                                    memory_type: MemoryType = MemoryType.LONG_TERM,
@@ -325,62 +373,6 @@ class AIMemoryManager:
         
         return result
     
-    async def build_memory_context(self, query: str = "") -> str:
-        """
-        构建记忆上下文，用于注入到AI提示词中
-        
-        Args:
-            query: 查询关键词
-            
-        Returns:
-            记忆上下文字符串
-        """
-        context_parts = []
-        
-        # 1. 添加系统指令（最重要）
-        system_instructions = [m for m in self.long_term_memory 
-                              if m.memory_type == MemoryType.SYSTEM_INSTRUCTION]
-        if system_instructions:
-            context_parts.append("📋 系统指令:")
-            for inst in system_instructions[-5:]:  # 最近的5条
-                context_parts.append(f"  - {inst.content}")
-        
-        # 2. 添加用户偏好
-        user_prefs = [m for m in self.long_term_memory 
-                     if m.memory_type == MemoryType.USER_PREF]
-        if user_prefs:
-            context_parts.append("\n👤 用户偏好:")
-            for pref in user_prefs[-10:]:
-                context_parts.append(f"  - {pref.content}")
-        
-        # 3. 添加交易历史总结
-        trade_memories = [m for m in self.long_term_memory 
-                         if m.memory_type == MemoryType.TRADE_HISTORY]
-        if trade_memories:
-            context_parts.append("\n💹 交易历史:")
-            trade_summary = self._summarize_trades(trade_memories[-20:])
-            context_parts.append(f"  {trade_summary}")
-            
-            # 添加最近的几笔交易
-            for trade in trade_memories[-5:]:
-                context_parts.append(f"  - {trade.content}")
-        
-        # 4. 添加短期对话记忆
-        if self.short_term_memory:
-            context_parts.append("\n💬 最近对话:")
-            for item in self.short_term_memory[-10:]:
-                context_parts.append(f"  - {item.content}")
-        
-        # 5. 根据查询检索相关记忆
-        if query:
-            relevant = await self.retrieve_memory(query, top_k=3)
-            if relevant:
-                context_parts.append("\n🔍 相关记忆:")
-                for item in relevant:
-                    context_parts.append(f"  - {item.content}")
-        
-        return "\n".join(context_parts)
-    
     async def summarize_trade_history(self, days: int = 30) -> str:
         """
         总结交易历史
@@ -576,5 +568,159 @@ class AIMemoryManager:
                                   if m.memory_type == MemoryType.USER_PREF),
             "system_instruction_count": sum(1 for m in self.long_term_memory 
                                            if m.memory_type == MemoryType.SYSTEM_INSTRUCTION),
-            "storage_path": str(self.storage_path)
+            "workspace_memory_files": list(self.workspace_memory.keys()),
+            "storage_path": str(self.storage_path),
+            "workspace_path": str(self.workspace_path)
         }
+    
+    def _load_workspace_memory(self) -> None:
+        """加载工作区中的记忆文件"""
+        for filename in self.memory_files:
+            file_path = self.workspace_path / filename
+            if file_path.exists():
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        self.workspace_memory[filename] = content
+                        logger.info(f"📄 加载记忆文件: {filename} ({len(content)} 字符)")
+                except Exception as e:
+                    logger.error(f"加载记忆文件 {filename} 失败: {e}")
+    
+    def get_workspace_memory(self, filename: Optional[str] = None) -> Dict[str, str]:
+        """
+        获取工作区记忆
+        
+        Args:
+            filename: 指定文件名，None则返回所有
+            
+        Returns:
+            记忆内容字典
+        """
+        if filename:
+            return {filename: self.workspace_memory.get(filename, "")}
+        return self.workspace_memory.copy()
+    
+    async def update_workspace_memory(self, filename: str, content: str, 
+                                      notify_user: bool = True) -> bool:
+        """
+        更新工作区记忆文件
+        
+        Args:
+            filename: 文件名
+            content: 新内容
+            notify_user: 是否通知用户
+            
+        Returns:
+            是否成功
+        """
+        if filename not in self.memory_files:
+            logger.warning(f"尝试更新未注册的记忆文件: {filename}")
+            return False
+        
+        try:
+            file_path = self.workspace_path / filename
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            
+            self.workspace_memory[filename] = content
+            logger.info(f"✏️ 更新记忆文件: {filename}")
+            
+            if notify_user:
+                await self.add_short_term_memory(
+                    f"已更新记忆文件 {filename}，我的长期记忆已改变",
+                    importance=0.7
+                )
+            
+            return True
+        except Exception as e:
+            logger.error(f"更新记忆文件 {filename} 失败: {e}")
+            return False
+    
+    async def build_memory_context(self, query: str = "") -> str:
+        """
+        构建记忆上下文，用于注入到AI提示词中
+        
+        Args:
+            query: 查询关键词
+            
+        Returns:
+            记忆上下文字符串
+        """
+        context_parts = []
+        
+        # 1. 添加工作区文件化记忆（最重要的长期记忆）
+        if self.workspace_memory:
+            context_parts.append("═══════════════════════════════════════════")
+            context_parts.append("📚 【我的长期记忆 - 核心文件】")
+            context_parts.append("═══════════════════════════════════════════")
+            
+            # SOUL.md - 核心灵魂
+            if "SOUL.md" in self.workspace_memory:
+                context_parts.append("\n【SOUL.md - 我的核心信念】")
+                context_parts.append(self.workspace_memory["SOUL.md"])
+            
+            # IDENTITY.md - 身份定义
+            if "IDENTITY.md" in self.workspace_memory:
+                context_parts.append("\n【IDENTITY.md - 我是谁】")
+                context_parts.append(self.workspace_memory["IDENTITY.md"])
+            
+            # USER.md - 用户信息
+            if "USER.md" in self.workspace_memory:
+                context_parts.append("\n【USER.md - 关于我的用户】")
+                context_parts.append(self.workspace_memory["USER.md"])
+            
+            # TRADING.md - 交易知识
+            if "TRADING.md" in self.workspace_memory:
+                context_parts.append("\n【TRADING.md - 我的交易知识库】")
+                context_parts.append(self.workspace_memory["TRADING.md"])
+            
+            # INSTRUCTIONS.md - 工作指令
+            if "INSTRUCTIONS.md" in self.workspace_memory:
+                context_parts.append("\n【INSTRUCTIONS.md - 我的工作指令】")
+                context_parts.append(self.workspace_memory["INSTRUCTIONS.md"])
+            
+            context_parts.append("\n═══════════════════════════════════════════")
+        
+        # 2. 添加系统指令
+        system_instructions = [m for m in self.long_term_memory 
+                              if m.memory_type == MemoryType.SYSTEM_INSTRUCTION]
+        if system_instructions:
+            context_parts.append("\n📋 【近期系统指令】:")
+            for inst in system_instructions[-5:]:
+                context_parts.append(f"  - {inst.content}")
+        
+        # 3. 添加用户偏好
+        user_prefs = [m for m in self.long_term_memory 
+                     if m.memory_type == MemoryType.USER_PREF]
+        if user_prefs:
+            context_parts.append("\n👤 【用户偏好记录】:")
+            for pref in user_prefs[-10:]:
+                context_parts.append(f"  - {pref.content}")
+        
+        # 4. 添加交易历史总结
+        trade_memories = [m for m in self.long_term_memory 
+                         if m.memory_type == MemoryType.TRADE_HISTORY]
+        if trade_memories:
+            context_parts.append("\n💹 【交易历史】:")
+            trade_summary = self._summarize_trades(trade_memories[-20:])
+            context_parts.append(f"  {trade_summary}")
+            
+            for trade in trade_memories[-5:]:
+                context_parts.append(f"  - {trade.content}")
+        
+        # 5. 添加短期对话记忆
+        if self.short_term_memory:
+            context_parts.append("\n💬 【最近对话】:")
+            for item in self.short_term_memory[-10:]:
+                context_parts.append(f"  - {item.content}")
+        
+        # 6. 根据查询检索相关记忆
+        if query:
+            relevant = await self.retrieve_memory(query, top_k=3)
+            if relevant:
+                context_parts.append("\n🔍 【相关记忆】:")
+                for item in relevant:
+                    context_parts.append(f"  - {item.content}")
+        
+        context_parts.append("\n═══════════════════════════════════════════")
+        return "\n".join(context_parts)

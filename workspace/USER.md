@@ -1,47 +1,203 @@
-# USER.md - 交易系统用户配置
+# USER.md - 关于用户
 
 ## 基本信息
-- **账户持有人**：sin coo
-- **交易风格**：量化交易 / 趋势跟踪
-- **风险偏好**：中等风险
-- **投资周期**：中长期持有 + 日内交易
 
-## 交易所配置
-### Binance
-- API类型：SPOT交易（现货）
-- 权限：交易、查询、提现（如果需要）
-- 备注：主要交易平台
+- **称呼:** 亲爱的主人
+- **交易偏好:**
+  - 交易模式: 模拟合约交易
+  - 交易所: OKX
+  - 风险偏好: 激进型
+- 关注币种: BTC, ETH 等主流币种和流动性大的山寨币
 
-### OKX
-- API类型：现货和合约
-- 权限：交易、查询
-- 备注：备用交易平台
+## 交易指令
 
-## 资产配置偏好
-1. **主流币种**：BTC, ETH (60%)
-2. **山寨币种**：SOL, ADA, DOT等 (30%)
-3. **稳定币**：USDT, USDC (10%)
+用户通过前端交互窗口给我下达交易指令和工作要求。我必须：
 
-## 交易策略偏好
-1. **趋势交易**：跟随市场主要趋势
-2. **均值回归**：在价格偏离时入场
-3. **网格交易**：设置价格网格自动交易
-4. **对冲策略**：使用永续合约对冲风险
+1. 认真理解每一条指令
+2. 记住用户的偏好和要求
+3. 严格按照指令执行
+4. 及时向用户反馈执行结果
+5. 在没有指令的情况下，自动监控市场行情，捕捉和发现机会和行情，抓住时机开仓并盈利。
 
-## 风险控制参数
-- **最大回撤容忍**：20%
-- **年化收益率目标**：≥30%
-- **夏普比率目标**：≥1.5
-- **最大仓位杠杆**：3倍（仅限合约）
+## 记忆要点
 
-## 通信偏好
-- **交易确认**：需要人工确认大额交易（> $1000）
-- **预警通知**：价格异常、系统异常、亏损达到阈值
-- **报告频率**：每日绩效报告 + 实时重要事件
-- **沉默时间**：00:00-08:00 UTC（除非紧急）
+（随着对话深入，我会在这里记录用户的交易偏好、风险承受能力、特殊要求等信息）
 
-## 特殊要求
-1. **周末保护**：周六日降低交易频率和仓位
-2. **重大事件**：美联储会议、比特币减半等时期谨慎操作
-3. **监管关注**：避免频繁小额交易触发风控
-4. **税务准备**：记录完整交易历史用于税务申报
+***
+
+*我会不断学习和了解用户，以便提供更好的交易服务。*
+
+
+## 更新于 2026-04-01 02:05
+
+交易偏好: 中短线/超短线交易，当前建议以观望为主，等待确定性机会"\n    }\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** 短期市场偏跌，但中长期仍看好。当前最重要的是**控制风险**，特别是您已有的ETH高风险仓位。\n\n**关键提醒：**\n1. ⚠️ ETH已多次触发强平预警，必须优先处理\n2. BTC短期支撑67000，跌破可能进一步回调\n3. 建议保持轻仓或空仓，等待确定性机会\n4. 严格执行2%单笔亏损限制\n\n**记忆已更新：** 记住您的交易
+
+
+## 更新于 2026-04-01 02:06
+
+交易偏好: ：中短线/超短线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "已记录风险事件：ETH多次触发强平预警",\n    "交易风格：不做长线交易"\n  ]\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** 短期市场偏跌，**风险极高**，建议以观望为主。\n\n**关键提醒：**\n1. ⚠️ **最高优先级**：ETH已多次触发强平预警（距离强平仅7.4%-7.8%），必须优先处理仓位风险\n2. 📉 短期趋势看跌，可能进一步回调\n3. 💡 建议保持轻仓或空仓，等待价格企稳\n4. 🛡️ 严格执行2%单笔亏损限制\n\n**交易
+
+
+## 更新于 2026-04-01 02:08
+
+交易偏好: 中短线/超短线，当前应以观望为主"\n    ],\n    "entry_conditions": {\n      "long": {\n        "price": ">85.50",\n        "confirm": "突破85.00且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<78.00",\n        "confirm": "跌破80.00且伴随放量下跌"\n      }\n    },\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，需优先处理。SOL建议等待明确突破信号后再考虑开仓。"\n  },\n  "memory_update": {\n    "note": "已记录SOL/USDT分析结果，建议观望，等待突破机会",\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%"\n    ]\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** SOL/USDT当前处于横盘整理状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在82.78美元附近震荡，波动率较低（0.69%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑78-80.5美元，关键阻力85-88美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易建议：** 保持观望，等待价格突破关键位（向上突破85或向下突破80）后再考虑开仓。同时建议优先处理ETH高风险仓位。', 'provider': 'openai'}
+
+
+## 更新于 2026-04-01 02:17
+
+交易偏好: ，当前建议以观望为主，等待确定性机会。同时需优先处理ETH高风险仓位。",\n    "risk_warning": "⚠️ 最高优先级：ETH已有高风险仓位，距离强平仅7.4%-7.8%，必须优先处理仓位风险",\n    "entry_conditions": {\n      "long": {\n        "price": ">2200",\n        "confirm": "站稳2200且伴随成交量放大，MACD金叉确认"\n      },\n      "short": {\n        "price": "<2000",\n        "confirm": "跌破2000且伴随放量下跌，可考虑轻仓追空"\n      }\n    },\n    "position_management": {\n      "max_positions": "5笔以内",\n      "single_loss_limit": "2%",\n      "current_priority": "优先处理ETH高风险仓位，建议减仓或平仓"\n    },\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线，不做长线",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%"\n    ]\n  },\n  \n  "memory_update": {\n    "action": "已记录本次ETH/USDT分析结果",\n    "reminders": [\n      "ETH高风险仓位需优先处理",\n      "用户偏好：中短线/超短线，当前建议观望",\n      "保持风险控制意识"\n    ]\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** ETH/USDT短期趋势偏跌，建议保持观望，优先处理高风险仓位。\n\n**关键提醒：**\n1. ⚠️ **最高优先级**：ETH已多次触发强平预警（距离强平仅7.4%-7.8%），建议优先减仓或平仓\n2. 📉 短期趋势看跌，可能下探2000整数关口\n3. 💡 建议保持轻仓或空仓，等待价格企稳\n4. 🛡️ 严格执行2%单笔亏损限制\n\n**交易
+
+
+## 更新于 2026-04-01 02:21
+
+交易偏好: 中短线/超短线，当前以观望为主。', 'provider': 'openai'}
+
+
+## 更新于 2026-04-01 02:23
+
+交易偏好: ，我为您生成以下交易策略：\n\n```json\n{\n  "strategy_name": "BNB横盘突破策略",\n  "strategy_description": "针对BNB/USDT横盘整理状态的突破交易策略，等待价格突破关键位后顺势入场，适合中短线/超短线操作",\n  "symbol": "BNB/USDT",\n  "current_price": 616.0,\n  "trend": "sideways",\n  \n  "entry_conditions": {\n    "long": {\n      "entry_price": ">640",\n      "confirmation": "价格突破640美元且站稳15分钟以上，伴随成交量明显放大（较前一交易日放大1.5倍以上）",\n      "stop_loss": "630",\n      "take_profit_levels": [\n        {"price": 650, "percentage": 30},\n        {"price": 660, "percentage": 30},\n        {"price": 680, "percentage": 40}\n      ]\n    },\n    "short": {\n      "entry_price": "<600",\n      "confirmation": "价格跌破600美元且伴随放量下跌（成交量放大1.5倍以上）",\n      "stop_loss": "610",\n      "take_profit_levels": [\n        {"price": 590, "percentage": 30},\n        {"price": 580, "percentage": 30},\n        {"price": 560, "percentage": 40}\n      ]\n    }\n  },\n  \n  "exit_conditions": {\n    "time_based": "持仓超过4小时未触及止盈且无明显趋势，考虑保本退出",\n    "signal_based": "价格回撤至入场成本价附近且出现反转信号时主动退出",\n    "trailing_stop": "当价格朝有利方向移动3%以上时，将止损移动至成本价"\n  },\n  \n  "risk_management": {\n    "single_trade_risk": "不超过总资金的2%",\n    "max_open_positions": "当前建议保持1-2笔持仓，总持仓不超过3笔",\n    "position_size": "按2%风险计算仓位：若止损幅度为10美元，则仓位 = 总资金×2%÷10",\n    "priority": "⚠️ 优先处理ETH高风险仓位，BNB建议观望或轻仓尝试"\n  },\n  \n  "risk_warnings": [\n    "⚠️ 当前已有ETH高风险仓位（距离强平仅7.4%-7.8%），必须优先处理",\n    "⚠️ BNB当前处于横盘整理，趋势不明，建议以观望为主",\n    "⚠️ 严格执行2%单笔亏损限制，不超过此上限",\n    "⚠️ 不做长线，专注于中短线机会",\n    "📵 建议等待明确突破信号后再入场，切勿追涨杀跌"\n  ],\n  \n  "memory_update": {\n    "note": "已生成BNB/USDT交易策略，建议观望或轻仓",\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%",\n      "已有风险事件：ETH高风险仓位需优先处理"\n    ]\n  }\n}\n```\n\n---\n\n## 📊 策略总结\n\n| 项目 | 内容 |\n|------|------|\n| **策略名称** | BNB横盘突破策略 |\n| **当前建议** | 观望为主，等待突破 |\n| **关键支撑** | 600 / 580 / 560 |\n| **关键阻力** | 640 / 660 / 680 |\n| **操作原则** | 突破640做多，跌破600做空 |\n| **最高优先级** | ⚠️ 优先处理ETH高风险仓位 |\n\n**记忆已更新：** 记住您的交易
+
+
+## 更新于 2026-04-01 02:25
+
+交易偏好: 中短线/超短线，当前应等待确定性机会\\n4. 已有ETH高风险仓位需优先处理",\n    "entry_conditions": {\n      "long": {\n        "price": ">68500",\n        "confirm": "突破68500且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<67000",\n        "confirm": "跌破67000且伴随放量下跌"\n      }\n    },\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位(距离强平仅7.4%-7.8%)，建议优先处理ETH仓位风险"\n  },\n  "memory_update": {\n    "note": "已记录BTC/USDT分析结果，短期偏跌，建议观望，等待突破机会",\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%",\n      "已有ETH高风险仓位需优先处理"\n    ]\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** 短期市场偏跌，但幅度有限，建议观望等待确定性机会。\n\n**关键要点：**\n1. 📉 短期趋势：偏跌，价格在67000-68500区间震荡\n2. 📊 波动率：较低(0.45%)，市场观望情绪浓厚\n3. 🎯 关键支撑：67000 / 66000 / 65000\n4. 🎯 关键阻力：68500 / 69500 / 70000\n5. 🛡️ 交易建议：保持观望，等待突破关键位后再入场\n\n**⚠️ 风险提醒：** 您的ETH仓位仍处于高风险状态（距离强平仅7.4%-7.8%），建议优先处理ETH仓位风险后再考虑新开BTC仓位。', 'provider': 'openai'}
+
+
+## 更新于 2026-04-01 02:27
+
+交易偏好: 中短线/超短线，当前应等待确定性机会",\n    "entry_conditions": {\n      "long": {\n        "price": ">2150",\n        "confirm": "突破2150且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<2000",\n        "confirm": "跌破2000且伴随放量下跌"\n      }\n    },\n    "risk_warning": "⚠️ 最高优先级：ETH已有高风险仓位，距离强平仅7.4%-7.8%，必须优先处理仓位风险。建议：1. 如有持仓需设置止损 2. 避免在此位置新开仓位 3. 等待价格企稳后再考虑入场"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有风险事件：ETH多次触发强平预警"\n  ]\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** ETH/USDT短期趋势偏跌，当前建议观望为主。\n\n**关键要点：**\n1. 📉 **趋势**：短期看跌，价格承压于2100美元关口\n2. 📊 **支撑位**：2000、2050美元，关键支撑在2000\n3. 🎯 **阻力位**：2100、2150、2200美元\n4. ⚠️ **风险警示**：**最高优先级** - 您已有的ETH仓位距离强平仅7.4%-7.8%，必须优先处理！\n\n**交易
+
+
+## 更新于 2026-04-01 02:35
+
+仓位设置: 根据行情灵活处理",\n      "已有ETH高风险仓位需优先处理"\n    ]\n  }\n}\n```\n\n**策略说明：**\n\n1. **当前状态**：SOL/USDT处于横盘整理（82.5美元附近），波动率低（0.69%），多空力量均衡，建议观望等待突破。\n\n2. **入场逻辑**：\n   - 🔼 **多单**：突破85.50美元且企稳，伴随放量\n   - 🔽 **空单**：跌破78.00美元，伴随放量下跌\n\n3. **风险管理**：\n   - 严格遵守2%单笔亏损限制\n   - 优先处理ETH高风险仓位（当前最高优先级）\n   - 不建议在当前横盘期间盲目开仓\n\n4. **仓位建议**：保持轻仓或空仓，等待确定性机会。', 'provider': 'openai'}
+
+
+## 更新于 2026-04-01 02:37
+
+交易偏好: -中短线交易、以观望为主、等待确定性机会。",\n  \n  "entry_conditions": {\n    "long": {\n      "price_condition": ">630",\n      "confirmation": "突破630美元且站稳，伴随成交量放大",\n      "additional_requirement": "需等待收盘价确认突破有效"\n    },\n    "short": {\n      "price_condition": "<600",\n      "confirmation": "跌破600美元且伴随放量下跌",\n      "additional_requirement": "需等待收盘价确认跌破有效"\n    }\n  },\n  \n  "exit_conditions": {\n    "long_exit": {\n      "take_profit": [\n        "640-650美元区间（第一目标）",\n        "660-680美元区间（第二目标）"\n      ],\n      "condition": "分批止盈，保留部分仓位博取更大涨幅"\n    },\n    "short_exit": {\n      "take_profit": [\n        "580-590美元区间（第一目标）",\n        "560-570美元区间（第二目标）"\n      ],\n      "condition": "分批止盈，保留部分仓位博取更大跌幅"\n    }\n  },\n  \n  "stop_loss_take_profit": {\n    "stop_loss": {\n      "long_stop_loss": "600美元以下（建议598美元）",\n      "short_stop_loss": "630美元以上（建议632美元）",\n      "max_loss_percentage": "2%（严格遵守用户单笔亏损限制）"\n    },\n    "take_profit": {\n      "risk_reward_ratio": "1:2以上",\n      "description": "止盈点位至少是止损距离的2倍"\n    }\n  },\n  \n  "position_management": {\n    "max_positions": "不超过5笔（当前已有ETH高风险仓位，需优先处理）",\n    "position_size": "建议轻仓操作",\n    "max_single_position_risk": "2%",\n    "recommendation": "由于ETH已有高风险仓位，建议BNB保持观望或极轻仓（不超过1%风险）"\n  },\n  \n  "risk_warning": {\n    "priority_warning": "⚠️ 最高优先级：ETH/USDT已有高风险仓位，距离强平仅7.8%-8.0%，必须优先处理ETH仓位风险",\n    "market_warning": "⚠️ BNB当前处于横盘整理，趋势不明，波动率较低（0.4%），不适合激进操作",\n    "behavior_warning": "⚠️ 严格遵守用户偏好：中短线/超短线交易，不做长线，当前建议以观望为主",\n    "risk_control": "🛡️ 任何入场都必须设置止损，严格执行2%单笔亏损限制"\n  },\n  \n  "memory_update": {\n    "note": "已记录BNB/USDT交易策略，建议观望为主，等待突破信号",\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%",\n      "交易模式：模拟合约交易
+
+
+## 更新于 2026-04-01 02:39
+
+交易偏好: ，不做长线交易
+
+
+## 更新于 2026-04-01 02:43
+
+风险偏好: 200U（2%），则：做多止损150U时，可开仓位200/150*10000=1.33U合约价值（20倍杠杆约26.6U）",\n    "recommendation": "建议使用10-15%仓位，剩余资金保持流动性以应对ETH仓位风险"\n  },\n  "risk_alerts": [\n    "⚠️ 最高优先级：ETH已有高风险仓位，必须优先处理",\n    "⚠️ 当前市场波动率较低（0.4%），可能蓄势待发，需密切关注突破信号",\n    "🛡️ 严格执行2%单笔亏损限制",\n    "📊 建议等待明确突破信号后再入场，避免被假突破误导"\n  ],\n  "memory_update": {\n    "note": "已记录BNB/USDT观望策略，建议优先处理ETH高风险仓位",\n    "user_preferences_remembered": [\n      "交易类型：合约交易 + 网格交易 - 不做现货",\n      "交易风格：中短线/超短线 - 不做长线交易",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%",\n      "最高风险事件：ETH/USDT距离强平仅7.4%-8.0%"\n    ]\n  }\n}\n```\n\n## 📊 策略总结\n\n**核心思路：** 当前BNB/USDT处于横盘整理状态，根据您的交易偏好，建议保持观望，等待价格突破关键位（650美元向上或580美元向下）后再顺势入场。\n\n**关键提醒：**\n1. 🚨 **最高优先级**：必须优先处理ETH高风险仓位，这是当前最重要的任务\n2. 📊 BNB当前波动率低（0.4%），建议等待突破信号明确后再入场\n3. 🛡️ 严格执行2%单笔亏损限制\n4. 💡 如果ETH风险解除且BNB出现突破信号，可考虑轻仓入场\n\n**记忆已更新：** 记住您的交易偏好和当前市场分析结果。', 'provider': 'openai'}
+
+
+## 更新于 2026-04-01 02:46
+
+交易偏好: ，以下是详细的交易策略：\n\n```json\n{\n  "strategy_name": "BTC/USDT 谨慎观望策略",\n  "strategy_description": "基于当前市场分析，短期趋势偏跌，建议保持谨慎，以观望为主。等待价格突破关键位后再考虑开仓。同时需优先处理ETH高风险仓位。",\n  \n  "market_context": {\n    "current_price": 67632.6,\n    "trend": "bearish",\n    "sentiment": "neutral",\n    "volatility": "0.45% - 中等波动"\n  },\n  \n  "entry_conditions": {\n    "long": {\n      "price_condition": "价格 < 66000",\n      "confirmation": "在66000以下企稳，伴随成交量放大，且日线收出看涨信号",\n      "risk_level": "高"\n    },\n    "short": {\n      "price_condition": "价格 > 68500",\n      "confirmation": "突破68500失败且回落，伴随放量下跌",\n      "risk_level": "中"\n    },\n    "no_position": {\n      "action": "观望",\n      "reason": "当前市场趋势不明，建议等待突破后再入场"\n    }\n  },\n  \n  "exit_conditions": {\n    "take_profit": {\n      "long": {\n        "conditions": [\n          "价格达到68500附近",\n          "涨幅达到3-5%",\n          "出现明显的反转信号"\n        ]\n      },\n      "short": {\n        "conditions": [\n          "价格跌至66000附近",\n          "跌幅达到3-5%",\n          "出现明显的反转信号"\n        ]\n      }\n    },\n    "stop_loss": {\n      "long": {\n        "entry_price": "根据实际入场价",\n        "stop_loss_price": "入场价 - 2%",\n        "note": "严格执行2%单笔亏损限制"\n      },\n      "short": {\n        "entry_price": "根据实际入场价",\n        "stop_loss_price": "入场价 + 2%",\n        "note": "严格执行2%单笔亏损限制"\n      }\n    }\n  },\n  \n  "position_management": {\n    "max_positions": 5,\n    "current_recommendation": "保持轻仓或空仓",\n    "priority_action": "优先处理ETH高风险仓位",\n    "position_size": {\n      "max_single_position": "不超过总资金的10%",\n      "risk_per_trade": "不超过2%"\n    }\n  },\n  \n  "risk_warning": {\n    "current_risk_level": "高",\n    "key_warnings": [\n      "⚠️ 最高优先级：ETH已有高风险仓位，距离强平仅7.4%-7.8%，必须优先处理",\n      "📉 BTC短期趋势看跌，可能进一步回调",\n      "🛡️ 建议保持轻仓或空仓，等待价格企稳",\n      "⚡ 严格执行2%单笔亏损限制"\n    ],\n    "market_factors": [\n      "价格处于关键位置67000-68500区间",\n      "多空双方力量均衡",\n      "等待更多信号确认趋势"\n    ]\n  },\n  \n  "user_preferences_applied": {\n    "trading_style": "中短线/超短线交易",\n    "current_recommendation": "观望为主，等待确定性机会",\n    "max_positions": "5笔以内",\n    "single_loss_limit": "2%",\n    "priority": "处理ETH高风险仓位"\n  },\n  \n  "memory_update": {\n    "note": "已记录BTC/USDT交易
+
+
+## 更新于 2026-04-01 02:48
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "SOL/USDT",\n  "price": 82.72,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  "volatility": 0.0069,\n  "analysis": {\n    "market_trend": "横盘整理 - 价格在80-85美元区间内震荡，趋势不明朗",\n    "key_levels": {\n      "support": [\n        "80.00 (心理支撑位)",\n        "78.00 (关键支撑位)",\n        "75.00 (强支撑位)"\n      ],\n      "resistance": [\n        "85.00 (心理阻力位)",\n        "88.00 (关键阻力位)",\n        "92.00 (强阻力位)"\n      ]\n    },\n    "technical_indicators": {\n      "volatility": "低波动率(0.69%)，表明市场观望情绪浓厚",\n      "price_position": "价格位于区间中部(82.72)，无明显方向信号",\n      "momentum": "多空力量均衡，等待突破信号"\n    },\n    "market_sentiment": {\n      "overall": "中性",\n      "fear_greed_index": "适中",\n      "trader_sentiment": "观望为主，等待突破"\n    }\n  },\n  "trading_recommendation": {\n    "signal": "NO_SIGNAL",\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">85.50",\n        "confirm": "突破85.00且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<78.00",\n        "confirm": "跌破80.00且伴随放量下跌"\n      }\n    },\n    "risk_management": {\n      "stop_loss": "必须设置止损",\n      "max_loss": "单笔不超过2%总资金"\n    }\n  },\n  "memory_update": {\n    "note": "已记录SOL/USDT分析结果，建议观望，等待突破机会",\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%"\n    ]\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** SOL/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在82.72美元附近震荡，波动率较低（0.69%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑78-80美元，关键阻力85-88美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易
+
+
+## 更新于 2026-04-01 02:49
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "BNB/USDT",\n  "price": 615.1,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  "volatility": 0.00399247133975932,\n  "analysis": {\n    "market_trend": {\n      "current_trend": "横盘整理",\n      "trend_description": "价格在小幅区间内波动，暂无明显方向性",\n      "timeframe": "短期横盘，中长期趋势需进一步观察"\n    },\n    "key_levels": {\n      "resistance": [\n        {"level": 625.0, "description": "短期阻力位"},\n        {"level": 640.0, "description": "中期阻力位"},\n        {"level": 660.0, "description": "强阻力位"}\n      ],\n      "support": [\n        {"level": 605.0, "description": "短期支撑位"},\n        {"level": 590.0, "description": "关键支撑位"},\n        {"level": 570.0, "description": "强支撑位"}\n      ]\n    },\n    "technical_indicators": {\n      "volatility": {\n        "value": "0.40%",\n        "interpretation": "波动率较低，市场处于观望状态"\n      },\n      "price_position": "中位震荡",\n      "momentum": "中性，暂无明显方向"\n    },\n    "market_sentiment": {\n      "overall": "中性",\n      "fear_greed_index_estimate": "50左右",\n      "investor_sentiment": "观望情绪浓厚，等待突破信号"\n    }\n  },\n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理"\n  ],\n  "trading_recommendation": {\n    "signal": "NO_SIGNAL",\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">625.0",\n        "confirm": "突破625且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<590.0",\n        "confirm": "跌破590且伴随放量下跌"\n      }\n    },\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，需优先处理。BNB建议等待明确突破信号后再考虑开仓。",\n    "priority": "低 - 优先处理ETH风险仓位"\n  },\n  "memory_update": {\n    "note": "已记录BNB/USDT分析结果，建议观望，等待突破机会",\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%"\n    ]\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** BNB/USDT当前处于横盘整理状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在615.1美元附近震荡，波动率较低（0.40%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑590-605美元，关键阻力625-640美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易
+
+
+## 更新于 2026-04-01 02:51
+
+交易偏好: 和记忆信息，以下是具体交易策略：\n\n```json\n{\n  "strategy_name": "BTC/USDT 观望策略",\n  "strategy_description": "当前市场短期偏跌，建议保持观望，等待价格突破关键位后再考虑开仓。最高优先级是处理ETH高风险仓位。",\n  "symbol": "BTC/USDT",\n  "timestamp": "2026-04-01 02:17:00",\n  "market_analysis": {\n    "current_trend": "bearish",\n    "price": 67662.0,\n    "support_levels": [67000, 65000, 63000],\n    "resistance_levels": [69000, 70000, 72000],\n    "volatility": 0.00452,\n    "market_sentiment": "neutral"\n  },\n  "entry_conditions": {\n    "long": {\n      "price_condition": ">69000",\n      "confirmation": "突破69000且站稳，伴随成交量放大",\n      "priority": "low"\n    },\n    "short": {\n      "price_condition": "<67000",\n      "confirmation": "跌破67000且伴随放量下跌",\n      "priority": "low"\n    }\n  },\n  "exit_conditions": {\n    "take_profit": "根据行情灵活处理，不设固定止盈位",\n    "stop_loss": "根据2%单笔亏损限制灵活设置",\n    "time_based": "中短线/超短线持仓，不过夜或持单时间不超过24小时"\n  },\n  "position_management": {\n    "recommended_action": "观望",\n    "max_positions": 5,\n    "position_size": "建议轻仓或空仓",\n    "risk_per_trade": "不超过总资金的2%"\n  },\n  "risk_management": {\n    "max_risk_per_trade": "2%",\n    "stop_loss_strategy": "根据市场波动率动态调整",\n    "priority_task": "⚠️ 优先处理ETH高风险仓位（距离强平仅7.4%-8.0%）"\n  },\n  "risk_warning": "⚠️ 当前已有ETH高风险仓位需优先处理；BTC短期趋势偏跌，可能进一步回调测试67000支撑；建议保持观望，等待价格企稳或突破关键位后再考虑开仓",\n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "不做长线交易"\n  ],\n  "memory_update": {\n    "note": "已记录BTC/USDT交易
+
+
+## 更新于 2026-04-01 02:54
+
+交易偏好: 。",\n  "entry_conditions": {\n    "long": {\n      "price_condition": "价格突破85.50美元且站稳",\n      "confirmation": "突破85.00美元且伴随成交量放大",\n      "timeframe": "1小时级别"\n    },\n    "short": {\n      "price_condition": "价格跌破78.00美元",\n      "confirmation": "跌破80.00美元且伴随放量下跌",\n      "timeframe": "1小时级别"\n    }\n  },\n  "exit_conditions": {\n    "take_profit": {\n      "long": "上涨5-8%或触及第一目标位90美元",\n      "short": "下跌5-8%或触及第一目标位75美元",\n      "note": "根据行情灵活处理，不设固定限制"\n    },\n    "stop_loss": {\n      "long": "跌破82.00美元止损",\n      "short": "突破86.00美元止损",\n      "max_loss": "单笔不超过总资金的2%"\n    }\n  },\n  "position_management": {\n    "max_positions": "不超过5笔同时持仓",\n    "position_size": "建议轻仓操作，单笔仓位控制在10-20%",\n    "total_exposure": "总仓位不超过50%",\n    "note": "考虑到当前已有ETH高风险仓位，SOL建议保持轻仓"\n  },\n  "risk_warning": "⚠️ 最高优先级：ETH已有高风险仓位，距离强平仅7.4%-8.0%，必须优先处理ETH仓位风险。SOL当前建议观望为主，等待明确突破信号。",\n  "memory_update": {\n    "note": "已记录SOL/USDT观望策略",\n    "user_preferences_remembered": [\n      "交易
+
+
+## 更新于 2026-04-01 02:55
+
+交易偏好: ，以下是具体的交易策略：\n\n```json\n{\n  "strategy_name": "BNB/USDT 观望策略",\n  "strategy_description": "当前市场处于横盘整理状态，波动率较低，多空力量均衡，建议保持观望，等待突破信号后再考虑入场。同时需优先处理ETH高风险仓位。",\n  \n  "symbol": "BNB/USDT",\n  "signal_type": "观望",\n  "direction": null,\n  "confidence": "低",\n  \n  "entry_conditions": {\n    "long": {\n      "price": ">640",\n      "confirm": "突破640美元且站稳，伴随成交量放大",\n      "additional": "需等待日线收盘确认"\n    },\n    "short": {\n      "price": "<590",\n      "confirm": "跌破590美元且伴随放量下跌",\n      "additional": "需等待日线收盘确认"\n    }\n  },\n  \n  "exit_conditions": {\n    "note": "当前建议观望，暂不入场"\n  },\n  \n  "risk_management": {\n    "stop_loss": "若突破后入场，止损设置在2%以内",\n    "take_profit": "根据行情灵活处理",\n    "max_loss_per_trade": "2%"\n  },\n  \n  "position_management": {\n    "recommended_position": "0",\n    "max_positions": "5笔以内",\n    "position_size": "建议轻仓或观望",\n    "note": "当前不建议开仓，优先处理ETH高风险仓位"\n  },\n  \n  "risk_warning": "⚠️ 最高优先级：ETH已有高风险仓位（距离强平仅7.4%-8.0%），必须优先处理ETH仓位风险。BNB建议观望为主，等待明确突破信号后再考虑。",\n  \n  "user_preferences_applied": [\n    "交易风格：中短线/超短线",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录BNB/USDT交易
+
+
+## 更新于 2026-04-01 03:10
+
+交易偏好: 记忆，我为您生成以下交易策略：\n\n```json\n{\n  "strategy_name": "BTC/USDT 观望策略 - 等待确定性机会",\n  "strategy_description": "当前市场处于短期下降趋势，建议保持观望，等待价格突破关键位后再考虑开仓。同时需优先处理ETH高风险仓位。",\n  \n  "entry_conditions": {\n    "long": {\n      "price_condition": "价格 > 69000",\n      "confirmation": "站稳69000美元上方，且伴随成交量放大（量价齐升）",\n      "stop_loss": "68500（入场价下方约0.7%处）"\n    },\n    "short": {\n      "price_condition": "价格 < 67000",\n      "confirmation": "跌破67000美元，且伴随放量下跌",\n      "stop_loss": "67500（入场价上方约0.7%处）"\n    }\n  },\n  \n  "exit_conditions": {\n    "long_exit": [\n      "价格触及69500-70000区间，可考虑部分止盈",\n      "价格跌破67000，触发止损",\n      "价格出现明显反转信号（如长上影线、MACD死叉）"\n    ],\n    "short_exit": [\n      "价格触及66500-66000区间，可考虑部分止盈",\n      "价格突破69000，触发止损",\n      "价格出现明显反转信号（如长下影线、MACD金叉）"\n    ]\n  },\n  \n  "risk_management": {\n    "stop_loss": {\n      "type": "固定百分比",\n      "max_loss_per_trade": "2%（严格执行）",\n      "long_stop": "68500（-0.7%）",\n      "short_stop": "67500（-0.7%）"\n    },\n    "take_profit": {\n      "type": "移动止盈",\n      "first_target": "盈亏比1:1.5（风险收益比1:1.5）",\n      "second_target": "盈亏比1:2.5（部分止盈）",\n      "trailing_stop": "启用追踪止盈，保护利润"\n    },\n    "position_management": {\n      "max_position_size": "总资金的10%（轻仓操作）",\n      "max_open_positions": "5笔以内",\n      "current_risk": "⚠️ ETH已有高风险仓位，优先处理"\n    }\n  },\n  \n  "position_sizing": {\n    "recommended_position": "5-10%",\n    "reason": "当前市场趋势不明，保持轻仓以控制风险",\n    "calculation": "假设总资金10000U，单笔最大亏损200U（2%），止损0.7%，则仓位=200/0.007≈28500U（约42%仓位，但建议保守操作取10%即1000U）"\n  },\n  \n  "risk_warning": [\n    "⚠️ 最高优先级：ETH已有高风险仓位，距离强平仅7.4%-7.8%，必须优先处理",\n    "📉 短期趋势偏跌，可能进一步回调至65000-66000区间",\n    "🛡️ 严格执行2%单笔亏损限制",\n    "💡 建议保持轻仓或空仓，等待确定性机会",\n    "📊 关键支撑67000一旦跌破，可能开启新一轮下跌"\n  ],\n  \n  "memory_update": {\n    "user_preferences_remembered": [\n      "交易
+
+
+## 更新于 2026-04-01 03:11
+
+仓位设置: 根据行情灵活处理"\n    ]\n  }\n}\n```\n\n## 📊 策略总结\n\n**核心策略：观望为主，优先处理风险仓位**\n\n1. **当前状态**：ETH已有高风险仓位，距离强平仅7.4%-8.0%，这是最高优先级需要处理的问题\n\n2. **入场条件**：\n   - 🟢 **做多**：突破2150且站稳，伴随成交量放大\n   - 🔴 **做空**：跌破2000且伴随放量下跌\n   - ⏸️ **当前**：不建议开新仓\n\n3. **仓位管理**：\n   - 当前首要任务：处理ETH高风险仓位\n   - 若开新仓：1-2%仓位，严格执行2%止损\n\n4. **风险控制**：\n   - 单笔亏损不超过总资金的2%\n   - 不逆势操作\n   - 不做长线，专注中短线', 'provider': 'openai'}
+
+
+## 更新于 2026-04-01 03:13
+
+交易偏好: 中短线/超短线交易，当前建议以观望为主，等待确定性机会"\n  },\n  \n  "memory_update": {\n    "note": "已生成SOL/USDT观望突破策略，建议等待突破信号",\n    "user_preferences_remembered": [\n      "交易
+
+
+## 更新于 2026-04-01 03:33
+
+交易偏好: ，当前BNB处于横盘整理状态，**不建议开仓**，建议保持观望。\n\n```json\n{\n  "strategy_name": "BNB横盘观望策略",\n  "strategy_description": "当前BNB/USDT处于横盘整理状态，波动率较低，多空力量均衡。建议保持观望，等待价格突破关键位后再考虑开仓。同时需优先处理ETH高风险仓位。",\n  \n  "symbol": "BNB/USDT",\n  "current_price": 616.7,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  \n  "entry_conditions": {\n    "long": {\n      "price": ">630",\n      "confirm": "突破630且站稳，伴随成交量放大",\n      "stop_loss": "625",\n      "risk_ratio": "1:2"\n    },\n    "short": {\n      "price": "<590",\n      "confirm": "跌破590且伴随放量下跌",\n      "stop_loss": "595",\n      "risk_ratio": "1:2"\n    }\n  },\n  \n  "exit_conditions": {\n    "take_profit": [\n      {"condition": "price_reach", "level": 650, "description": "达到强阻力位650美元"},\n      {"condition": "price_reach", "level": 570, "description": "跌破支撑位590后继续下跌至570"}\n    ],\n    "stop_loss": [\n      {"condition": "price_reach", "level": 625, "description": "多单止损625美元"},\n      {"condition": "price_reach", "level": 595, "description": "空单止损595美元"}\n    ]\n  },\n  \n  "position_management": {\n    "action": "观望",\n    "max_positions": "5笔以内",\n    "current_positions": "已有ETH高风险仓位，需优先处理",\n    "recommended_size": "0% - 保持观望",\n    "reason": "横盘整理状态，趋势不明，等待突破信号"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，不建议开新仓"\n  },\n  \n  "market_context": {\n    "btc_trend": "偏跌",\n    "bnb_observation": "在BTC整体偏跌的背景下，BNB保持相对抗跌，但缺乏明确方向",\n    "timing": "等待BTC企稳后，BNB可能跟随突破"\n  },\n  \n  "memory_update": {\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线，不做长线交易",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%",\n      "已有ETH高风险仓位需优先处理",\n      "交易模式：模拟合约交易"\n    ],\n    "note": "已记录BNB/USDT分析结果，建议观望"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** BNB/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在616.7美元附近震荡，波动率较低（0.42%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑590-600美元，关键阻力630-650美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易
+
+
+## 更新于 2026-04-01 03:36
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "ETH/USDT",\n  "current_price": 2096.76,\n  "trend": "bearish",\n  "sentiment": "neutral",\n  "volatility": 0.0066,\n  \n  "market_analysis": {\n    "trend_analysis": "短期趋势偏跌，价格在2100美元附近承压，呈现弱势震荡格局",\n    "key_support": {\n      "level_1": 2050,\n      "level_2": 2000,\n      "level_3": 1950\n    },\n    "key_resistance": {\n      "level_1": 2150,\n      "level_2": 2200,\n      "level_3": 2250\n    },\n    "technical_indicators": {\n      "volatility": "0.66%，波动率较低，注意变盘风险",\n      "rsi": "偏弱区域，可能进一步下探",\n      "moving_averages": "价格位于均线下方，短期均线向下运行"\n    },\n    "sentiment_analysis": "市场情绪中性偏谨慎，多空双方观望为主"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">2150",\n        "confirm": "突破2150且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<2000",\n        "confirm": "跌破2000且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "当前市场趋势偏跌，且已有高风险仓位，不建议开新仓"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "已有ETH高风险仓位，必须优先处理仓位风险，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录ETH/USDT分析结果，建议观望，优先处理高风险仓位"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** ETH/USDT短期趋势**偏跌**，当前建议**观望为主**。\n\n**关键要点：**\n1. 📉 **趋势**：短期看跌，价格在2100美元附近承压\n2. 📊 **波动率**：较低（0.66%），注意变盘风险\n3. 🎯 **关键位**：支撑2050/2000，阻力2150/2200\n4. ⚖️ **情绪**：中性偏谨慎，多空观望\n\n**交易
+
+
+## 更新于 2026-04-01 03:37
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "SOL/USDT",\n  "current_price": 83.08,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  "volatility": 0.0076,\n  \n  "market_analysis": {\n    "trend_analysis": "当前处于横盘整理状态，价格在82-85美元区间窄幅震荡，波动率较低（0.76%），多空力量暂时均衡，等待突破信号",\n    "key_support": {\n      "level_1": 80,\n      "level_2": 78,\n      "level_3": 75\n    },\n    "key_resistance": {\n      "level_1": 85,\n      "level_2": 88,\n      "level_3": 92\n    },\n    "technical_indicators": {\n      "volatility": "0.76%，波动率较低，注意变盘风险",\n      "rsi": "中性区域，多空观望",\n      "moving_averages": "价格位于均线附近，短期均线走平"\n    },\n    "sentiment_analysis": "市场情绪中性，多空双方观望为主，等待突破方向明确"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">85.50",\n        "confirm": "突破85美元且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<78.00",\n        "confirm": "跌破80美元且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "横盘整理状态，趋势不明，等待突破信号"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录SOL/USDT分析结果，建议观望，等待突破机会"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** SOL/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在83.08美元附近震荡，波动率较低（0.76%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑78-80美元，关键阻力85-88美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易
+
+
+## 更新于 2026-04-01 03:39
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "BNB/USDT",\n  "current_price": 616.5,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  "volatility": 0.0042,\n  \n  "market_analysis": {\n    "trend_analysis": "当前处于横盘整理状态，价格在615-620美元区间窄幅震荡，波动率较低（0.42%），多空力量暂时均衡，等待突破信号",\n    "key_support": {\n      "level_1": 600,\n      "level_2": 590,\n      "level_3": 570\n    },\n    "key_resistance": {\n      "level_1": 630,\n      "level_2": 650,\n      "level_3": 680\n    },\n    "technical_indicators": {\n      "volatility": "0.42%，波动率较低，注意变盘风险",\n      "rsi": "中性区域，多空观望",\n      "moving_averages": "价格位于均线附近，短期均线走平"\n    },\n    "sentiment_analysis": "市场情绪中性，多空双方观望为主，等待突破方向明确"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">630",\n        "confirm": "突破630且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<590",\n        "confirm": "跌破590且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "横盘整理状态，趋势不明，等待突破信号"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录BNB/USDT分析结果，建议观望"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** BNB/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在616.5美元附近震荡，波动率较低（0.42%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑590-600美元，关键阻力630-650美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易
+
+
+## 更新于 2026-04-01 03:42
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "ETH/USDT",\n  "current_price": 2097.54,\n  "trend": "bearish",\n  "sentiment": "neutral",\n  "volatility": 0.0066,\n  \n  "market_analysis": {\n    "trend_analysis": "短期趋势偏跌，价格在2100美元附近承压，呈现弱势震荡格局，后市可能进一步下探",\n    "key_support": {\n      "level_1": 2050,\n      "level_2": 2000,\n      "level_3": 1950\n    },\n    "key_resistance": {\n      "level_1": 2150,\n      "level_2": 2200,\n      "level_3": 2250\n    },\n    "technical_indicators": {\n      "volatility": "0.66%，波动率较低，注意变盘风险",\n      "rsi": "偏弱区域，可能进一步下探",\n      "moving_averages": "价格位于均线下方，短期均线向下运行"\n    },\n    "sentiment_analysis": "市场情绪中性偏谨慎，多空双方观望为主"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">2150",\n        "confirm": "突破2150且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<2000",\n        "confirm": "跌破2000且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "当前市场趋势偏跌，且已有高风险仓位，不建议开新仓"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "已有ETH高风险仓位，必须优先处理仓位风险，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录ETH/USDT分析结果，建议观望，优先处理高风险仓位"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** ETH/USDT短期趋势**偏跌**，当前建议**观望为主**。\n\n**关键要点：**\n1. 📉 **趋势**：短期看跌，价格在2100美元附近承压\n2. 📊 **波动率**：较低（0.66%），注意变盘风险\n3. 🎯 **关键位**：支撑2050/2000，阻力2150/2200\n4. ⚖️ **情绪**：中性偏谨慎，多空观望\n\n**交易
+
+
+## 更新于 2026-04-01 03:43
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "SOL/USDT",\n  "current_price": 83.21,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  "volatility": 0.0076,\n  \n  "market_analysis": {\n    "trend_analysis": "当前处于横盘整理状态，价格在82-85美元区间窄幅震荡，波动率较低（0.76%），多空力量暂时均衡，等待突破信号",\n    "key_support": {\n      "level_1": 80,\n      "level_2": 78,\n      "level_3": 75\n    },\n    "key_resistance": {\n      "level_1": 85,\n      "level_2": 88,\n      "level_3": 92\n    },\n    "technical_indicators": {\n      "volatility": "0.76%，波动率较低，注意变盘风险",\n      "rsi": "中性区域，多空观望",\n      "moving_averages": "价格位于均线附近，短期均线走平"\n    },\n    "sentiment_analysis": "市场情绪中性，多空双方观望为主，等待突破方向明确"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">85.50",\n        "confirm": "突破85美元且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<78.00",\n        "confirm": "跌破80美元且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "横盘整理状态，趋势不明，等待突破信号"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录SOL/USDT分析结果，建议观望，等待突破机会"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** SOL/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在83.21美元附近震荡，波动率较低（0.76%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑78-80美元，关键阻力85-88美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易
+
+
+## 更新于 2026-04-01 03:45
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "BNB/USDT",\n  "current_price": 617.0,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  "volatility": 0.0042,\n  \n  "market_analysis": {\n    "trend_analysis": "当前处于横盘整理状态，价格在615-620美元区间窄幅震荡，波动率较低（0.42%），多空力量暂时均衡，等待突破信号",\n    "key_support": {\n      "level_1": 600,\n      "level_2": 590,\n      "level_3": 570\n    },\n    "key_resistance": {\n      "level_1": 630,\n      "level_2": 650,\n      "level_3": 680\n    },\n    "technical_indicators": {\n      "volatility": "0.42%，波动率较低，注意变盘风险",\n      "rsi": "中性区域，多空观望",\n      "moving_averages": "价格位于均线附近，短期均线走平"\n    },\n    "sentiment_analysis": "市场情绪中性，多空双方观望为主，等待突破方向明确"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">630",\n        "confirm": "突破630且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<590",\n        "confirm": "跌破590且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "横盘整理状态，趋势不明，等待突破信号"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录BNB/USDT分析结果，建议观望"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** BNB/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在617美元附近震荡，波动率较低（0.42%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑590-600美元，关键阻力630-650美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易
+
+
+## 更新于 2026-04-01 03:48
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "BTC/USDT",\n  "current_price": 68172.2,\n  "trend": "bearish",\n  "sentiment": "neutral",\n  "volatility": 0.0048,\n  \n  "market_analysis": {\n    "trend_analysis": "短期趋势偏跌，价格在68000美元附近承压，呈现弱势震荡格局，后市可能进一步下探测试支撑位",\n    "key_support": {\n      "level_1": 67000,\n      "level_2": 65000,\n      "level_3": 63000\n    },\n    "key_resistance": {\n      "level_1": 70000,\n      "level_2": 72000,\n      "level_3": 75000\n    },\n    "technical_indicators": {\n      "volatility": "0.48%，波动率较低，注意变盘风险",\n      "rsi": "偏弱区域，可能进一步下探",\n      "moving_averages": "价格位于均线下方，短期均线向下运行"\n    },\n    "sentiment_analysis": "市场情绪中性偏谨慎，多空双方观望为主"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">70000",\n        "confirm": "突破70000且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<67000",\n        "confirm": "跌破67000且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "当前市场趋势偏跌，且已有ETH高风险仓位需优先处理，不建议开新仓"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "已有ETH高风险仓位，必须优先处理仓位风险，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录BTC/USDT分析结果，建议观望，优先处理高风险仓位"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** BTC/USDT短期趋势**偏跌**，当前建议**观望为主**。\n\n**关键要点：**\n1. 📉 **趋势**：短期看跌，价格在68000美元附近承压\n2. 📊 **波动率**：较低（0.48%），注意变盘风险\n3. 🎯 **关键位**：支撑67000/65000，阻力70000/72000\n4. ⚖️ **情绪**：中性偏谨慎，多空观望\n\n**交易
+
+
+## 更新于 2026-04-01 03:49
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "ETH/USDT",\n  "current_price": 2105.58,\n  "trend": "bearish",\n  "sentiment": "neutral",\n  "volatility": 0.0066,\n  \n  "market_analysis": {\n    "trend_analysis": "短期趋势偏跌，价格在2100美元附近承压，呈现弱势震荡格局，后市可能进一步下探测试支撑位",\n    "key_support": {\n      "level_1": 2050,\n      "level_2": 2000,\n      "level_3": 1950\n    },\n    "key_resistance": {\n      "level_1": 2150,\n      "level_2": 2200,\n      "level_3": 2250\n    },\n    "technical_indicators": {\n      "volatility": "0.66%，波动率适中",\n      "rsi": "偏弱区域，可能进一步下探",\n      "moving_averages": "价格位于均线下方，短期均线向下运行"\n    },\n    "sentiment_analysis": "市场情绪中性偏谨慎，多空双方观望为主"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">2150",\n        "confirm": "突破2150且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<2000",\n        "confirm": "跌破2000且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "当前市场趋势偏跌，且已有ETH高风险仓位需优先处理，不建议开新仓"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "已有ETH高风险仓位，必须优先处理仓位风险，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录ETH/USDT分析结果，建议观望，优先处理高风险仓位"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** ETH/USDT短期趋势**偏跌**，当前建议**观望为主**。\n\n**关键要点：**\n1. 📉 **趋势**：短期看跌，价格在2105.58美元承压\n2. 📊 **波动率**：适中（0.66%）\n3. 🎯 **关键位**：支撑2050/2000，阻力2150/2200\n4. ⚖️ **情绪**：中性偏谨慎\n\n**交易建议：**\n- 🛡️ 保持观望，等待价格企稳或突破关键位后再考虑入场\n- ⚠️ **最高优先级**：您已有ETH高风险仓位（距离强平仅约8%），**必须优先处理仓位风险**\n- 💡 建议考虑减仓或平仓，降低风险敞口\n- 📊 严格执行2%单笔亏损限制\n\n**记忆已更新：** 记住您的交易
+
+
+## 更新于 2026-04-01 03:50
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "SOL/USDT",\n  "current_price": 83.36,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  "volatility": 0.0076,\n  \n  "market_analysis": {\n    "trend_analysis": "当前处于横盘整理状态，价格在83美元附近窄幅震荡，波动率适中（0.76%），多空力量暂时均衡，等待突破信号",\n    "key_support": {\n      "level_1": 80,\n      "level_2": 78,\n      "level_3": 75\n    },\n    "key_resistance": {\n      "level_1": 85,\n      "level_2": 88,\n      "level_3": 92\n    },\n    "technical_indicators": {\n      "volatility": "0.76%，波动率适中",\n      "rsi": "中性区域，多空观望",\n      "moving_averages": "价格位于均线附近，短期均线走平"\n    },\n    "sentiment_analysis": "市场情绪中性，多空双方观望为主，等待突破方向明确"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">85",\n        "confirm": "突破85且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<78",\n        "confirm": "跌破78且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "横盘整理状态，趋势不明，等待突破信号"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，必须优先处理仓位风险，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录SOL/USDT分析结果，建议观望"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** SOL/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在83.36美元附近震荡，波动率适中（0.76%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑78-80美元，关键阻力85-88美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易建议：**\n- 🛡️ 保持观望，等待价格突破关键位（向上突破85或向下突破78）后再考虑开仓\n- ⚠️ **最高优先级**：优先处理ETH高风险仓位（距离强平仅约8%）\n- 📊 严格执行2%单笔亏损限制\n\n**记忆已更新：** 记住您的交易
+
+
+## 更新于 2026-04-01 03:51
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "BNB/USDT",\n  "current_price": 616.9,\n  "trend": "sideways",\n  "sentiment": "neutral",\n  "volatility": 0.0042,\n  \n  "market_analysis": {\n    "trend_analysis": "当前处于横盘整理状态，价格在616美元附近窄幅震荡，波动率较低（0.42%），多空力量暂时均衡，等待突破信号",\n    "key_support": {\n      "level_1": 600,\n      "level_2": 580,\n      "level_3": 550\n    },\n    "key_resistance": {\n      "level_1": 640,\n      "level_2": 660,\n      "level_3": 700\n    },\n    "technical_indicators": {\n      "volatility": "0.42%，波动率较低，注意变盘风险",\n      "rsi": "中性区域，多空观望",\n      "moving_averages": "价格位于均线附近，短期均线走平"\n    },\n    "sentiment_analysis": "市场情绪中性，多空双方观望为主，等待突破方向明确"\n  },\n  \n  "trading_recommendation": {\n    "action": "观望",\n    "entry_conditions": {\n      "long": {\n        "price": ">640",\n        "confirm": "突破640且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<600",\n        "confirm": "跌破600且伴随放量下跌"\n      }\n    },\n    "position_size": "0% - 保持观望",\n    "reason": "横盘整理状态，趋势不明，等待突破信号"\n  },\n  \n  "risk_management": {\n    "single_loss_limit": "2%",\n    "max_positions": 5,\n    "priority_action": "⚠️ 最高优先级：优先处理ETH高风险仓位（距离强平仅约8%）",\n    "risk_warning": "⚠️ 当前已有ETH高风险仓位，必须优先处理仓位风险，不建议开新仓"\n  },\n  \n  "user_preferences_remembered": [\n    "交易风格：中短线/超短线，不做长线交易",\n    "当前建议：以观望为主，等待确定性机会",\n    "最大持仓数：5笔以内",\n    "单笔亏损限制：2%",\n    "已有ETH高风险仓位需优先处理",\n    "交易模式：模拟合约交易"\n  ],\n  \n  "memory_update": {\n    "note": "已记录BNB/USDT分析结果，建议观望"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** BNB/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在616.9美元附近震荡，波动率较低（0.42%），注意变盘风险\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑600/580美元，关键阻力640/660美元\n4. 🛡️ 建议等待突破后再入场，严格设置止损\n\n**交易建议：**\n- 🛡️ 保持观望，等待价格突破关键位（向上突破640或向下突破600）后再考虑开仓\n- ⚠️ **最高优先级**：优先处理ETH高风险仓位（距离强平仅约8%）\n- 📊 严格执行2%单笔亏损限制\n\n**记忆已更新：** 记住您的交易
+
+
+## 更新于 2026-04-01 03:53
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "BTC/USDT",\n  "current_price": 68124.3,\n  "trend": "bearish",\n  "sentiment": "neutral",\n  "volatility": 0.48,\n  \n  "technical_analysis": {\n    "trend": "短期看跌，价格在67000-69000区间震荡",\n    "key_support": [67000, 65000],\n    "key_resistance": [68500, 69000, 70000],\n    "volatility_level": "较低",\n    "indicators": {\n      "rsi": "中性区域",\n      "macd": "偏弱",\n      "moving_averages": "价格位于均线下方，短期均线向下"\n    }\n  },\n  \n  "market_sentiment": {\n    "overall": "中性偏谨慎",\n    "trader_position": "多空观望",\n    "fear_greed_index": "中性区间"\n  },\n  \n  "trading_signal": {\n    "direction": "观望",\n    "confidence": "low",\n    "entry_conditions": {\n      "long": {\n        "price": ">69000",\n        "confirm": "突破69000且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<67000",\n        "confirm": "跌破67000且伴随放量下跌"\n      }\n    },\n    "stop_loss": "若强行开仓，止损设置在2%以内"\n  },\n  \n  "recommended_actions": [\n    "🛡️ 保持轻仓或空仓",\n    "⏰ 等待价格突破关键位后再考虑开仓",\n    "⚠️ 最高优先级：优先处理ETH高风险仓位",\n    "🛡️ 严格执行2%单笔亏损限制"\n  ],\n  \n  "memory_update": {\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线，不做长线交易",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%",\n      "已有ETH高风险仓位需优先处理"\n    ],\n    "note": "已更新BTC/USDT分析结果"\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** BTC/USDT短期偏跌，**建议观望为主**。\n\n**关键要点：**\n1. 📉 **趋势**：短期看跌，价格在67000-69000区间震荡\n2. 🎯 **关键位**：支撑67000（短期）/ 65000（中期），阻力68500-69000\n3. ⚖️ **情绪**：中性偏谨慎，多空观望\n4. 📊 **波动率**：较低（0.48%），注意变盘风险\n\n**交易
+
+
+## 更新于 2026-04-01 03:55
+
+交易偏好: ，以下是详细分析：\n\n```json\n{\n  "symbol": "ETH/USDT",\n  "current_price": 2102.75,\n  "timestamp": "2026-04-01T02:17:00Z",\n\n  "market_analysis": {\n    "trend": "bearish",\n    "sentiment": "neutral",\n    "volatility": 0.0066,\n    "volatility_level": "低波动率市场"\n  },\n\n  "key_levels": {\n    "resistance": [\n      {"price": 2150, "strength": "强阻力"},\n      {"price": 2200, "strength": "关键阻力"}\n    ],\n    "support": [\n      {"price": 2050, "strength": "第一支撑"},\n      {"price": 2000, "strength": "强支撑"},\n      {"price": 1950, "strength": "关键支撑"}\n    ]\n  },\n\n  "technical_indicators": {\n    "rsi": "待计算",\n    "macd": "待计算",\n    "note": "短期趋势偏跌，需关注2000-2050支撑区间"\n  },\n\n  "risk_assessment": {\n    "position_risk": "高风险",\n    "liquidation_distance": "7.4%-7.8%",\n    "warning": "⚠️ 已有ETH高风险仓位，距离强平仅7.4%-7.8%，必须优先处理"\n  },\n\n  "trading_signal": {\n    "recommendation": "观望",\n    "action": "优先处理现有ETH高风险仓位",\n    "entry_conditions": {\n      "long": {\n        "price": ">2150",\n        "confirm": "突破2150且站稳，伴随成交量放大"\n      },\n      "short": {\n        "price": "<2000",\n        "confirm": "跌破2000且伴随放量下跌"\n      }\n    }\n  },\n\n  "user_preferences_applied": {\n    "trading_style": "中短线/超短线",\n    "max_positions": 5,\n    "single_loss_limit": "2%",\n    "current_guidance": "以观望为主，等待确定性机会",\n    "mode": "模拟合约交易"\n  },\n\n  "recommended_actions": [\n    "⚠️ 最高优先级：优先处理ETH高风险仓位",\n    "🛡️ 建议减仓或平仓ETH，降低强平风险",\n    "⏰ 保持观望，等待价格企稳后再考虑新仓位",\n    "🛡️ 严格执行2%单笔亏损限制"\n  ],\n\n  "memory_update": {\n    "note": "已记录ETH/USDT分析结果，建议观望，优先处理高风险仓位",\n    "user_preferences_remembered": [\n      "交易风格：中短线/超短线，不做长线交易",\n      "当前建议：以观望为主，等待确定性机会",\n      "最大持仓数：5笔以内",\n      "单笔亏损限制：2%",\n      "已有ETH高风险仓位需优先处理",\n      "交易模式：模拟合约交易"\n    ]\n  }\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** ETH/USDT短期趋势偏跌，当前建议**观望为主**，但**最高优先级是处理已有高风险仓位**。\n\n**关键要点：**\n1. 📉 **趋势**：短期看跌，价格在2000-2150区间波动\n2. ⚠️ **风险**：已有ETH仓位距离强平仅7.4%-7.8%，必须优先处理\n3. 📊 **波动率**：较低（0.66%），但需注意变盘风险\n4. 🎯 **关键位**：支撑2000/2050，阻力2150/2200\n\n**交易
+
+
+## 更新于 2026-04-01 03:56
+
+交易偏好: （中短线/超短线），此策略强调高确定性机会的把握。",\n  \n  "market_analysis": {\n    "current_price": 83.44,\n    "trend": "横盘整理",\n    "sentiment": "中性偏谨慎",\n    "volatility": "低 (0.76%)",\n    "key_resistance": ["85.00", "88.00"],\n    "key_support": ["80.00", "78.00"]\n  },\n  \n  "entry_conditions": {\n    "long": {\n      "trigger_price": ">85.50",\n      "confirmation": "突破85.00且站稳，伴随成交量放大",\n      "priority": "低"\n    },\n    "short": {\n      "trigger_price": "<78.00",\n      "confirmation": "跌破80.00且伴随放量下跌",\n      "priority": "低"\n    }\n  },\n  \n  "exit_conditions": {\n    "take_profit": "根据入场点位灵活设置，保守目标：突破后回踩确认时止盈",\n    "stop_loss": "根据入场点位灵活设置，严格执行2%亏损限制",\n    "time_based": "如4小时内未突破关键位，建议离场观望"\n  },\n  \n  "position_management": {\n    "recommendation": "保持轻仓或空仓",\n    "max_position_size": "不超过总资金的10%（如执行）",\n    "max_positions": "5笔以内",\n    "current_positions": "优先处理ETH高风险仓位"\n  },\n  \n  "risk_warning": {\n    "priority": "⚠️ 最高优先级",\n    "critical": "已有ETH高风险仓位，距离强平仅约8%，必须优先处理",\n    "general": "当前市场趋势不明，建议观望为主，等待确定性机会",\n    "risk_limit": "单笔亏损不超过2%"\n  },\n  \n  "user_preferences_remembered": {\n    "trading_style": "中短线/超短线，不做长线交易",\n    "current_recommendation": "观望为主，等待确定性机会",\n    "max_positions": "5笔以内",\n    "risk_limit": "单笔亏损不超过2%",\n    "special_note": "已有ETH高风险仓位需优先处理"\n  },\n  \n  "action_items": [\n    "🛡️ 保持观望，不急于开新仓",\n    "⚠️ 优先处理ETH高风险仓位",\n    "⏰ 等待价格突破关键位（85或78）后再考虑入场",\n    "📊 严格执行2%单笔亏损限制"\n  ]\n}\n```\n\n## 📊 分析总结\n\n**核心观点：** SOL/USDT当前处于**横盘整理**状态，趋势不明，建议观望。\n\n**关键要点：**\n1. 📊 价格在83.44美元附近震荡，波动率较低（0.76%）\n2. 🎯 技术指标显示多空力量均衡，等待突破信号\n3. ⚠️ 关键支撑78-80美元，关键阻力85-88美元\n\n**交易
