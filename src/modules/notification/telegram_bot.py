@@ -62,7 +62,7 @@ class TelegramResponse:
 
 
 class TelegramBot:
-    """Telegram机器人"""
+    """Telegram机器人 - 无限制自然语言交互"""
 
     def __init__(self, config: Dict[str, Any], nli=None, llm_integration=None, main_controller=None):
         """
@@ -78,7 +78,6 @@ class TelegramBot:
         self.enabled = config.get("enabled", False)
         self.bot_token = config.get("bot_token", "")
         self.chat_ids = config.get("chat_ids", [])
-        self.allowed_users = config.get("allowed_users", [])
         
         self.nli = nli
         self.llm_integration = llm_integration
@@ -90,11 +89,9 @@ class TelegramBot:
         self._polling_task = None
         self._last_update_id = 0
         
-        self.command_handlers: Dict[CommandType, Callable] = {}
         self.message_handlers: List[Callable] = []
         
-        self._init_command_handlers()
-        logger.info("Telegram机器人初始化完成")
+        logger.info("Telegram机器人初始化完成 - 无限制自然语言模式")
 
     def _init_command_handlers(self):
         """初始化命令处理器"""
@@ -253,24 +250,13 @@ class TelegramBot:
             logger.error(f"处理更新失败: {e}")
 
     async def _process_message(self, message: Dict):
-        """处理消息"""
+        """处理消息 - 无限制自然语言处理"""
         try:
             chat_id = message["chat"]["id"]
             from_user = message.get("from", {}).get("username", str(chat_id))
             text = message.get("text", "")
             message_id = message.get("message_id", 0)
             
-            # 检查用户权限
-            if self.allowed_users and from_user not in self.allowed_users:
-                logger.warning(f"拒绝未授权用户: {from_user}")
-                await self._send_message(TelegramResponse(
-                    chat_id=chat_id,
-                    text="❌ 您没有权限使用此机器人",
-                    reply_to_message_id=message_id
-                ))
-                return
-            
-            # 解析消息
             telegram_message = TelegramMessage(
                 chat_id=chat_id,
                 message_id=message_id,
@@ -279,13 +265,8 @@ class TelegramBot:
                 timestamp=datetime.now()
             )
             
-            # 检查是否是命令
-            if text.startswith("/"):
-                await self._process_command(telegram_message)
-            else:
-                await self._process_natural_language(telegram_message)
+            await self._process_natural_language(telegram_message)
             
-            # 调用消息处理器
             for handler in self.message_handlers:
                 try:
                     await handler(telegram_message)

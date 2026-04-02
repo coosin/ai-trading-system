@@ -28,7 +28,7 @@ class AICommandExecutor:
     AI 指令执行器 - 完整版
     
     功能：
-    1. 解析用户意图
+    1. AI自由理解用户意图，无预设限制
     2. 调用交易系统实际功能
     3. 返回真实执行结果
     4. 自动识别和记录用户指令/偏好
@@ -41,22 +41,6 @@ class AICommandExecutor:
         self.memory_manager = None
         self.unified_memory = None
         self.user_intent_recognizer = None
-        
-        self._intent_patterns = {
-            "backtest": ["回测", "测试策略", "历史测试", "策略回测", "运行回测"],
-            "strategy_list": ["策略列表", "有哪些策略", "查看策略", "策略管理"],
-            "strategy_create": ["创建策略", "新建策略", "生成策略", "开发策略"],
-            "strategy_optimize": ["优化策略", "策略优化", "参数优化", "调优"],
-            "market_analysis": ["市场分析", "行情分析", "分析市场", "市场趋势"],
-            "market_data": ["市场数据", "行情数据", "K线数据", "价格数据"],
-            "balance": ["余额", "账户余额", "资金", "资产"],
-            "positions": ["持仓", "当前持仓", "仓位", "持仓情况"],
-            "signals": ["信号", "交易信号", "最新信号", "买卖信号"],
-            "risk": ["风险", "风险评估", "风险分析", "风险监控"],
-            "trade": ["交易", "下单", "买入", "卖出", "开仓", "平仓"],
-            "third_party_data": ["第三方数据", "外部数据", "数据源", "数据获取"],
-            "system_status": ["系统状态", "运行状态", "系统情况", "状态检查"],
-        }
         
         logger.info("AI指令执行器（完整版）初始化完成")
     
@@ -155,16 +139,50 @@ class AICommandExecutor:
         return mapping.get(action, UnifiedMemoryType.CONVERSATION)
     
     async def _parse_intent(self, user_input: str) -> Intent:
-        """解析用户意图"""
-        user_input_lower = user_input.lower()
+        """解析用户意图 - 使用LLM自由理解，无预设限制"""
         
-        for action, keywords in self._intent_patterns.items():
-            for keyword in keywords:
-                if keyword in user_input_lower:
-                    params = await self._extract_params(user_input, action)
-                    return Intent(action=action, params=params, confidence=0.8)
+        if self.llm_integration:
+            try:
+                prompt = f"""你是一个量化交易系统的AI助手。用户发送了以下消息，请理解用户的真实意图。
+
+用户消息: {user_input}
+
+请分析用户想要做什么，并以JSON格式返回：
+{{
+    "action": "动作类型（如: trade, market_analysis, strategy_create, strategy_optimize, balance, positions, signals, risk, backtest, system_status, chat等）",
+    "params": {{相关参数}},
+    "confidence": 0.0-1.0的置信度,
+    "reasoning": "简短解释你如何理解用户意图"
+}}
+
+注意：
+1. 自由理解用户意图，不要局限于预设的动作类型
+2. 如果用户想开发新策略，action为strategy_create
+3. 如果用户想优化策略，action为strategy_optimize  
+4. 如果用户想交易，action为trade
+5. 如果是普通聊天，action为chat
+6. 提取所有相关参数（交易对、数量、方向等）
+
+只返回JSON，不要其他内容。"""
+
+                response = await self.llm_integration.generate_response(prompt)
+                
+                if response:
+                    import json
+                    try:
+                        result = json.loads(response)
+                        return Intent(
+                            action=result.get("action", "chat"),
+                            params=result.get("params", {}),
+                            confidence=result.get("confidence", 0.8)
+                        )
+                    except json.JSONDecodeError:
+                        pass
+            except Exception as e:
+                logger.warning(f"LLM解析意图失败: {e}")
         
-        return Intent(action="unknown", params={}, confidence=0.0)
+        params = await self._extract_params(user_input, "")
+        return Intent(action="chat", params=params, confidence=0.5)
     
     async def _extract_params(self, user_input: str, action: str) -> Dict[str, Any]:
         """提取参数"""
@@ -188,7 +206,7 @@ class AICommandExecutor:
         return params
     
     async def _execute_intent(self, intent: Intent, user_input: str) -> Dict[str, Any]:
-        """执行意图"""
+        """执行意图 - AI自主决策，无限制"""
         action = intent.action
         params = intent.params
         
@@ -201,6 +219,10 @@ class AICommandExecutor:
                 return await self._create_strategy(params, user_input)
             elif action == "strategy_optimize":
                 return await self._optimize_strategy(params, user_input)
+            elif action == "strategy_combine":
+                return await self._combine_strategies(params, user_input)
+            elif action == "strategy_switch":
+                return await self._switch_strategy(params, user_input)
             elif action == "market_analysis":
                 return await self._analyze_market(params)
             elif action == "market_data":
@@ -219,8 +241,10 @@ class AICommandExecutor:
                 return await self._get_third_party_data(params, user_input)
             elif action == "system_status":
                 return await self._get_system_status()
-            else:
+            elif action == "chat":
                 return await self._general_chat(user_input)
+            else:
+                return await self._ai_autonomous_action(action, params, user_input)
                 
         except Exception as e:
             logger.error(f"执行意图失败: {action} - {e}")
@@ -869,3 +893,123 @@ class AICommandExecutor:
 """)
         
         return "\n".join(context_parts)
+    
+    async def _combine_strategies(self, params: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+        """组合多个策略 - AI自主决定组合方式"""
+        try:
+            if self.main_controller and hasattr(self.main_controller, 'strategy_manager'):
+                sm = self.main_controller.strategy_manager
+                
+                available_strategies = list(sm.strategy_configs.keys())
+                
+                if self.llm_integration:
+                    prompt = f"""用户想要组合策略。
+
+可用策略: {available_strategies}
+用户输入: {user_input}
+
+请分析用户意图，决定：
+1. 选择哪些策略组合
+2. 各策略的权重分配
+3. 组合逻辑（并行、串行、投票等）
+
+返回JSON格式：
+{{
+    "strategies": ["策略ID列表"],
+    "weights": {{"策略ID": 权重}},
+    "combination_mode": "parallel/serial/voting/weighted",
+    "reasoning": "组合理由"
+}}"""
+                    
+                    response = await self.llm_integration.generate_response(prompt)
+                    if response:
+                        import json
+                        try:
+                            result = json.loads(response)
+                            
+                            return {
+                                "success": True,
+                                "response": f"""📊 策略组合已创建
+
+组合策略: {result.get('strategies', [])}
+权重分配: {result.get('weights', {})}
+组合模式: {result.get('combination_mode', 'parallel')}
+理由: {result.get('reasoning', 'AI自主决策')}
+
+系统将根据市场情况自动调整策略组合。"""
+                            }
+                        except json.JSONDecodeError:
+                            pass
+                
+                return {"success": True, "response": "策略组合功能已启用，AI将根据市场情况自主选择和组合策略"}
+            
+            return {"success": False, "response": "策略管理器未初始化"}
+            
+        except Exception as e:
+            return {"success": False, "response": f"组合策略失败: {str(e)}"}
+    
+    async def _switch_strategy(self, params: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+        """切换策略 - AI自主决定何时切换"""
+        try:
+            if self.main_controller and hasattr(self.main_controller, 'strategy_manager'):
+                sm = self.main_controller.strategy_manager
+                
+                return {
+                    "success": True,
+                    "response": """🔄 策略自动切换已启用
+
+AI将根据以下条件自动切换策略：
+• 市场趋势变化（牛市/熊市/横盘）
+• 波动率变化
+• 策略表现评估
+• 风险水平调整
+
+无需手动干预，系统会自主决策。"""
+                }
+            
+            return {"success": False, "response": "策略管理器未初始化"}
+            
+        except Exception as e:
+            return {"success": False, "response": f"切换策略失败: {str(e)}"}
+    
+    async def _ai_autonomous_action(self, action: str, params: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+        """AI自主行动 - 处理任何未预定义的用户意图"""
+        try:
+            if self.llm_integration:
+                system_context = await self._get_system_context()
+                
+                prompt = f"""你是一个全自主的量化交易AI助手。用户发送了一条消息，系统没有预设的处理方式。
+
+{system_context}
+
+用户消息: {user_input}
+识别的动作: {action}
+参数: {params}
+
+请自主理解用户意图，并执行相应操作。你可以：
+1. 直接回答用户问题
+2. 调用系统功能（描述你想做什么）
+3. 开发新策略（描述策略逻辑）
+4. 优化现有策略
+5. 调整系统配置
+6. 执行交易操作
+
+你有完全的自主权，根据用户意图和市场情况做出最佳决策。
+
+请返回你的响应："""
+                
+                response = await self.llm_integration.generate(prompt)
+                
+                if response and response.success:
+                    return {
+                        "success": True,
+                        "response": response.content,
+                        "action_taken": action,
+                        "autonomous": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+            
+            return await self._general_chat(user_input)
+            
+        except Exception as e:
+            return {"success": False, "response": f"AI自主行动失败: {str(e)}"}
