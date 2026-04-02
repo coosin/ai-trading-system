@@ -605,17 +605,17 @@ class AITradingEngine:
                 try:
                     from src.modules.ai.reinforcement_learning_optimizer import State
                     current_state = State(
-                        price=market_data["ticker"].get("last", 0),
-                        volume=market_data["ticker"].get("volume", 0),
-                        trend=technical_indicators.trend,
-                        volatility=self._calculate_volatility(technical_indicators),
+                        price=float(market_data["ticker"].get("last", 0)),
+                        volume=float(market_data["ticker"].get("volume", 0)),
+                        trend=str(technical_indicators.trend),
+                        volatility=float(self._calculate_volatility(technical_indicators)),
                         position=0.0,
                         balance=10000.0,
                         indicators={
-                            "rsi": technical_indicators.rsi,
-                            "macd": technical_indicators.macd,
-                            "ma_20": technical_indicators.ma20,
-                            "ma_50": technical_indicators.ma50
+                            "rsi": float(technical_indicators.rsi),
+                            "macd": float(technical_indicators.macd),
+                            "ma_20": float(technical_indicators.ma20),
+                            "ma_50": float(technical_indicators.ma50)
                         }
                     )
                     rl_action = await self.rl_agent.get_action_recommendation(current_state)

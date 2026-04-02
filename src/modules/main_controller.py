@@ -357,7 +357,7 @@ class MainController:
         try:
             from src.modules.core.ai_learning_engine import AILearningEngine
             self.ai_learning_engine = AILearningEngine(
-                memory_manager=self.enhanced_memory_manager,
+                memory_manager=self.ai_memory_manager,
                 llm_integration=self.llm_integration
             )
             await self.ai_learning_engine.start()

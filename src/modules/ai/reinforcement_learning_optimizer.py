@@ -253,18 +253,18 @@ class ReinforcementLearningAgent:
     async def select_action(self, state: State) -> Action:
         """选择动作"""
         
-        # Epsilon-greedy策略
+        action_types = list(ActionType)
+        
         if np.random.random() < self.epsilon:
-            # 探索：随机选择
-            action_type = np.random.choice(list(ActionType))
-            quantity = np.random.uniform(0.1, 1.0)
+            idx = np.random.randint(0, len(action_types))
+            action_type = action_types[idx]
+            quantity = float(np.random.uniform(0.1, 1.0))
         else:
-            # 利用：选择最优动作
             state_array = state.to_array()
             q_values = self.q_network.forward(state_array)
-            action_idx = np.argmax(q_values)
-            action_type = list(ActionType)[action_idx]
-            quantity = 0.5  # 固定仓位
+            action_idx = int(np.argmax(q_values))
+            action_type = action_types[action_idx]
+            quantity = 0.5
         
         return Action(
             type=action_type,
@@ -395,9 +395,9 @@ class ReinforcementLearningAgent:
         action = await self.select_action(state)
         
         return {
-            "action": action.type.value,
-            "quantity": action.quantity,
-            "confidence": action.confidence,
+            "action": str(action.type.value),
+            "quantity": float(action.quantity),
+            "confidence": float(action.confidence),
             "reason": f"基于强化学习模型，当前探索率: {self.epsilon:.3f}",
             "training_stats": self.training_stats
         }
