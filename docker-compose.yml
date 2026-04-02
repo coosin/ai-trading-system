@@ -5,58 +5,62 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: openclaw-trading:latest
     container_name: openclaw-trading
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./config:/app/config
-      - ./.env:/app/.env:ro
     environment:
       - MODE=${MODE:-simulation}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - XUNFEI_API_KEY=${XUNFEI_API_KEY:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - OKX_API_KEY=${OKX_API_KEY:-}
+      - OKX_SECRET=${OKX_SECRET:-}
+      - OKX_PASSPHRASE=${OKX_PASSPHRASE:-}
     networks:
       - trading-network
-    depends_on:
-      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 60s
       timeout: 30s
       retries: 3
-      start_period: 10s
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   redis:
-    image: redis:7-alpine
+    image: docker.m.daocloud.io/library/redis:7-alpine
     container_name: openclaw-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     networks:
       - trading-network
-    command: redis-server --appendonly yes
-
-  # 可选：PostgreSQL数据库
-  # postgres:
-  #   image: postgres:15-alpine
-  #   container_name: openclaw-postgres
-  #   restart: unless-stopped
-  #   ports:
-  #     - "5432:5432"
-  #   environment:
-  #     - POSTGRES_USER=${POSTGRES_USER:-trader}
-  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
-  #     - POSTGRES_DB=${POSTGRES_DB:-trading_db}
-  #   volumes:
-  #     - postgres-data:/var/lib/postgresql/data
-  #   networks:
-  #     - trading-network
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
 
 networks:
   trading-network:
@@ -64,4 +68,3 @@ networks:
 
 volumes:
   redis-data:
-  # postgres-data:

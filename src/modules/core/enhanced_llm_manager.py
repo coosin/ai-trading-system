@@ -115,7 +115,16 @@ class BaseLLMProvider(ABC):
 
     async def initialize(self):
         """初始化"""
-        self.session = httpx.AsyncClient(timeout=self.config.timeout)
+        import os
+        proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+        if proxy:
+            self.session = httpx.AsyncClient(
+                timeout=self.config.timeout,
+                proxy=proxy
+            )
+            logger.info(f"LLM Provider 使用代理: {proxy}")
+        else:
+            self.session = httpx.AsyncClient(timeout=self.config.timeout)
 
     async def cleanup(self):
         """清理"""

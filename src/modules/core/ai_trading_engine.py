@@ -227,6 +227,24 @@ class AITradingEngine:
         except Exception as e:
             logger.warning(f"⚠️ 多源数据融合分析器初始化失败: {e}")
         
+        # 初始化第三方数据集成器
+        try:
+            from src.modules.data.third_party_data_integrator import ThirdPartyDataIntegrator
+            self.third_party_data = ThirdPartyDataIntegrator()
+            logger.info("✅ 第三方数据集成器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 第三方数据集成器初始化失败: {e}")
+            self.third_party_data = None
+        
+        # 初始化链上数据集成器
+        try:
+            from src.modules.data.onchain_integrator import OnChainDataIntegrator
+            self.onchain_data = OnChainDataIntegrator()
+            logger.info("✅ 链上数据集成器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 链上数据集成器初始化失败: {e}")
+            self.onchain_data = None
+        
         # 加载配置
         if self.main_controller and self.main_controller.config_manager:
             config = await self.main_controller.config_manager.get_config("ai_trading", {})
@@ -456,6 +474,24 @@ class AITradingEngine:
                 except Exception as e:
                     logger.warning(f"多源数据分析失败，使用基础分析: {e}")
             
+            # 获取第三方数据（社交媒体、新闻等）
+            third_party_sentiment = None
+            if hasattr(self, 'third_party_data') and self.third_party_data:
+                try:
+                    third_party_sentiment = await self.third_party_data.get_comprehensive_sentiment(symbol.replace("/USDT", ""))
+                    logger.info(f"📊 第三方数据获取完成: {symbol}, 综合情绪={third_party_sentiment.overall_sentiment:.2f}")
+                except Exception as e:
+                    logger.warning(f"第三方数据获取失败: {e}")
+            
+            # 获取链上数据
+            onchain_metrics = None
+            if hasattr(self, 'onchain_data') and self.onchain_data:
+                try:
+                    onchain_metrics = await self.onchain_data.get_onchain_metrics(symbol.replace("/USDT", ""))
+                    logger.info(f"📊 链上数据获取完成: {symbol}")
+                except Exception as e:
+                    logger.warning(f"链上数据获取失败: {e}")
+            
             if not self.llm_integration:
                 return self._enhanced_basic_analysis(symbol, market_data, technical_indicators, fused_intelligence)
             
@@ -472,6 +508,29 @@ class AITradingEngine:
             # 如果有多源数据，添加到分析中
             if fused_intelligence:
                 analysis_data["fused_intelligence"] = fused_intelligence.to_dict()
+            
+            # 添加第三方数据（社交媒体情绪、新闻等）
+            if third_party_sentiment:
+                analysis_data["third_party_sentiment"] = {
+                    "overall_sentiment": third_party_sentiment.overall_sentiment,
+                    "fear_greed_index": third_party_sentiment.fear_greed_index,
+                    "social_sentiment": third_party_sentiment.social_sentiment,
+                    "news_sentiment": third_party_sentiment.news_sentiment,
+                    "trend": third_party_sentiment.trend,
+                    "confidence": third_party_sentiment.confidence,
+                    "details": third_party_sentiment.details
+                }
+            
+            # 添加链上数据
+            if onchain_metrics:
+                analysis_data["onchain_metrics"] = {
+                    metric: {
+                        "value": data.value,
+                        "change_24h": data.change_24h,
+                        "change_7d": data.change_7d
+                    }
+                    for metric, data in onchain_metrics.items()
+                }
             
             # 使用AI进行深度分析
             ai_analysis = await self.llm_integration.analyze_market(analysis_data)
