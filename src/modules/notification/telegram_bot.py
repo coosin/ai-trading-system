@@ -340,7 +340,6 @@ class TelegramBot:
         try:
             logger.info(f"处理自然语言消息: {message.text[:50]}...")
             
-            # 优先使用AI指令执行器（具备完整的系统感知能力）
             ai_executor = getattr(self.main_controller, 'ai_command_executor', None) if self.main_controller else None
             
             if ai_executor:
@@ -348,9 +347,15 @@ class TelegramBot:
                 result = await ai_executor.process_input(message.text)
                 
                 if result.get("success"):
+                    response_text = result.get("response", "处理完成")
+                    
+                    memory_info = result.get("memory_recorded")
+                    if memory_info:
+                        response_text += f"\n\n📝 {memory_info}"
+                    
                     await self._send_message(TelegramResponse(
                         chat_id=message.chat_id,
-                        text=result.get("response", "处理完成"),
+                        text=response_text,
                         reply_to_message_id=message.message_id
                     ))
                 else:

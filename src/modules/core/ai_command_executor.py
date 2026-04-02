@@ -1,6 +1,7 @@
 """
 AI 指令执行器 - 完整版
 能够真正调用交易系统的各个功能模块
+集成统一记忆系统和用户意图识别
 """
 
 import asyncio
@@ -30,12 +31,16 @@ class AICommandExecutor:
     1. 解析用户意图
     2. 调用交易系统实际功能
     3. 返回真实执行结果
+    4. 自动识别和记录用户指令/偏好
+    5. 集成统一记忆系统
     """
     
     def __init__(self, main_controller=None):
         self.main_controller = main_controller
         self.llm_integration = None
         self.memory_manager = None
+        self.unified_memory = None
+        self.user_intent_recognizer = None
         
         self._intent_patterns = {
             "backtest": ["回测", "测试策略", "历史测试", "策略回测", "运行回测"],
@@ -66,15 +71,31 @@ class AICommandExecutor:
             if hasattr(self.main_controller, 'ai_memory_manager'):
                 self.memory_manager = self.main_controller.ai_memory_manager
         
+        try:
+            from .unified_intelligent_memory import get_unified_memory
+            from .user_intent_recognizer import UserIntentRecognizer
+            
+            self.unified_memory = get_unified_memory()
+            self.user_intent_recognizer = UserIntentRecognizer
+            logger.info("✅ 统一记忆系统和用户意图识别器已加载")
+        except Exception as e:
+            logger.warning(f"加载统一记忆系统失败: {e}")
+        
         logger.info("✅ AI指令执行器（完整版）初始化完成")
     
     async def process_input(self, user_input: str) -> Dict[str, Any]:
         """
         处理用户输入 - 解析意图并执行实际功能
+        自动识别和记录用户指令/偏好
         """
         logger.info(f"处理用户输入: {user_input}")
         
         try:
+            if self.unified_memory:
+                memory_result = await self.unified_memory.process_user_input(user_input)
+                if memory_result.get("recorded"):
+                    logger.info(f"📝 自动记录用户意图: {memory_result.get('message')}")
+            
             intent = await self._parse_intent(user_input)
             
             if intent.action != "unknown":
@@ -82,7 +103,22 @@ class AICommandExecutor:
             else:
                 result = await self._general_chat(user_input)
             
-            if self.memory_manager:
+            if self.unified_memory:
+                await self.unified_memory.add_memory(
+                    memory_type=self._get_memory_type_from_intent(intent.action),
+                    content=f"用户: {user_input}",
+                    summary=f"用户指令: {user_input[:100]}",
+                    metadata={"intent": intent.action, "params": intent.params},
+                    source_module="ai_command_executor"
+                )
+                await self.unified_memory.add_memory(
+                    memory_type=self._get_memory_type_from_intent(intent.action),
+                    content=f"AI响应: {result.get('response', '')[:300]}",
+                    summary=f"AI响应: {result.get('response', '')[:100]}",
+                    metadata={"intent": intent.action},
+                    source_module="ai_command_executor"
+                )
+            elif self.memory_manager:
                 await self.memory_manager.add_short_term_memory(
                     f"用户: {user_input}",
                     importance=0.7
@@ -103,6 +139,20 @@ class AICommandExecutor:
                 "response": f"执行过程中出错：{str(e)}",
                 "timestamp": datetime.now().isoformat()
             }
+    
+    def _get_memory_type_from_intent(self, action: str):
+        """根据意图类型获取记忆类型"""
+        from .unified_intelligent_memory import UnifiedMemoryType
+        
+        mapping = {
+            "trade": UnifiedMemoryType.TRADING_DECISION,
+            "signals": UnifiedMemoryType.AI_PREDICTION,
+            "market_analysis": UnifiedMemoryType.MARKET_INSIGHT,
+            "risk": UnifiedMemoryType.RISK_SETTING,
+            "strategy_create": UnifiedMemoryType.STRATEGY_GENERATED,
+            "strategy_optimize": UnifiedMemoryType.RL_OPTIMIZATION,
+        }
+        return mapping.get(action, UnifiedMemoryType.CONVERSATION)
     
     async def _parse_intent(self, user_input: str) -> Intent:
         """解析用户意图"""
