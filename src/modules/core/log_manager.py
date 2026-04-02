@@ -1355,9 +1355,9 @@ async def example_usage():
 
         # 获取最近日志
         recent_logs = await log_manager.get_recent_logs(limit=5)
-        print(f"最近 {len(recent_logs)} 条日志:")
+        logger.info(f"最近 {len(recent_logs)} 条日志:")
         for log in recent_logs:
-            print(
+            logger.info(
                 f"  [{log.timestamp.strftime('%H:%M:%S')}] {log.level.value.upper()}: {log.message}"
             )
 
@@ -1365,23 +1365,23 @@ async def example_usage():
         query = LogQuery(level=LogLevel.ERROR, source=LogSource.API, limit=10)
 
         error_logs = await log_manager.query_logs(query)
-        print(f"API错误日志: {len(error_logs)} 条")
+        logger.info(f"API错误日志: {len(error_logs)} 条")
 
         # 获取统计
         stats = await log_manager.get_log_statistics()
-        print(f"日志统计: 总数={stats.total_logs}, 错误率={stats.error_rate*100:.1f}%")
+        logger.info(f"日志统计: 总数={stats.total_logs}, 错误率={stats.error_rate*100:.1f}%")
 
         # 获取内存缓冲区
         buffer = await log_manager.get_memory_buffer()
-        print(f"内存缓冲区大小: {len(buffer)}")
+        logger.info(f"内存缓冲区大小: {len(buffer)}")
 
         # 获取配置
         config = await log_manager.get_config()
-        print(f"日志配置: 级别={config.log_level.value}, 输出={[o.value for o in config.outputs]}")
+        logger.info(f"日志配置: 级别={config.log_level.value}, 输出={[o.value for o in config.outputs]}")
 
         # 获取管理器统计
         mgr_stats = await log_manager.get_statistics()
-        print(f"管理器统计: {mgr_stats}")
+        logger.info(f"管理器统计: {mgr_stats}")
 
     finally:
         await log_manager.cleanup()

@@ -572,19 +572,19 @@ async def example_usage():
         
         # 检查数据源
         report = await dqs.check_data_source("binance_btc", data)
-        print(f"数据质量报告: {report['data_source']}")
-        print(f"整体质量: {report['overall_level']} (分数: {report['overall_score']:.2f})")
-        print(f"问题统计: {report['summary']}")
+        logger.info(f"数据质量报告: {report['data_source']}")
+        logger.info(f"整体质量: {report['overall_level']} (分数: {report['overall_score']:.2f})")
+        logger.info(f"问题统计: {report['summary']}")
         
         # 检查关键问题
         if report['issues']['critical']:
-            print("\n关键问题:")
+            logger.info("\n关键问题:")
             for issue in report['issues']['critical']:
-                print(f"- {issue['description']}")
+                logger.info(f"- {issue['description']}")
         
         # 获取报告历史
         history = dqs.get_report_history("binance_btc")
-        print(f"\n报告历史数量: {len(history)}")
+        logger.info(f"\n报告历史数量: {len(history)}")
         
     finally:
         await dqs.cleanup()

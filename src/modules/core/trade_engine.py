@@ -997,7 +997,7 @@ async def example_usage():
         )
 
         if buy_order:
-            print(f"创建买单: {buy_order.id} {buy_order.quantity} BTC @ 市价")
+            logger.info(f"创建买单: {buy_order.id} {buy_order.quantity} BTC @ 市价")
 
         # 等待执行
         await asyncio.sleep(1)
@@ -1005,23 +1005,23 @@ async def example_usage():
         # 获取订单状态
         if buy_order:
             order_status = await engine.get_order(buy_order.id)
-            print(f"订单状态: {order_status.status.value if order_status else 'N/A'}")
+            logger.info(f"订单状态: {order_status.status.value if order_status else 'N/A'}")
 
         # 获取仓位
         positions = await engine.get_positions()
-        print(f"仓位数量: {len(positions)}")
+        logger.info(f"仓位数量: {len(positions)}")
 
         for position in positions:
-            print(
+            logger.info(
                 f"  {position.symbol}: {position.quantity} @ {position.avg_entry_price:.2f}, "
                 f"当前价: {position.current_price:.2f}, PnL: ${position.total_pnl:.2f}"
             )
 
         # 获取投资组合统计
         stats = await engine.get_portfolio_stats()
-        print(f"投资组合价值: ${stats.total_value:,.2f}")
-        print(f"现金余额: ${stats.cash_balance:,.2f}")
-        print(f"总盈亏: ${stats.total_pnl:,.2f}")
+        logger.info(f"投资组合价值: ${stats.total_value:,.2f}")
+        logger.info(f"现金余额: ${stats.cash_balance:,.2f}")
+        logger.info(f"总盈亏: ${stats.total_pnl:,.2f}")
 
         # 创建限价卖单
         sell_order = await engine.create_order(
@@ -1034,11 +1034,11 @@ async def example_usage():
         )
 
         if sell_order:
-            print(f"创建卖单: {sell_order.id} {sell_order.quantity} BTC @ {sell_order.price:.2f}")
+            logger.info(f"创建卖单: {sell_order.id} {sell_order.quantity} BTC @ {sell_order.price:.2f}")
 
         # 计算盈亏
         pnl_stats = await engine.calculate_pnl()
-        print(f"盈亏统计: {pnl_stats}")
+        logger.info(f"盈亏统计: {pnl_stats}")
 
     finally:
         await engine.cleanup()

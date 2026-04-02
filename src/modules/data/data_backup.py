@@ -500,13 +500,13 @@ if __name__ == "__main__":
         
         # 创建备份
         backup_file = await backup_manager.create_backup()
-        print(f"创建备份: {backup_file}")
+        logger.info(f"创建备份: {backup_file}")
         
         # 列出备份
         backups = await backup_manager.list_backups()
-        print("备份列表:")
+        logger.info("备份列表:")
         for backup in backups:
-            print(f"  - {backup['name']} ({backup['size']} bytes) - {backup['created_at']}")
+            logger.info(f"  - {backup['name']} ({backup['size']} bytes) - {backup['created_at']}")
         
         # 关闭资源
         backup_manager.close()

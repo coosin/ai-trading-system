@@ -1089,7 +1089,7 @@ async def example_usage():
     """数据库管理器使用示例"""
 
     if not HAS_SQLALCHEMY:
-        print("SQLAlchemy未安装，跳过示例")
+        logger.info("SQLAlchemy未安装，跳过示例")
         return
 
     # 创建数据库管理器
@@ -1119,7 +1119,7 @@ async def example_usage():
         # 查询数据
         query = select(TradingSession).where(TradingSession.symbol == "BTC/USDT")
         sessions = await db_manager.fetch_all(query)
-        print(f"交易会话: {len(sessions)} 条记录")
+        logger.info(f"交易会话: {len(sessions)} 条记录")
 
         # 更新数据
         await db_manager.update(
@@ -1130,23 +1130,23 @@ async def example_usage():
 
         # 统计数量
         count = await db_manager.count(TradingSession, {"status": "active"})
-        print(f"活跃会话数量: {count}")
+        logger.info(f"活跃会话数量: {count}")
 
         # 获取统计信息
         stats = await db_manager.get_connection_stats()
-        print(f"数据库统计: {json.dumps(stats, indent=2, default=str)}")
+        logger.info(f"数据库统计: {json.dumps(stats, indent=2, default=str)}")
 
         # 健康检查
         health = await db_manager.health_check()
-        print(f"数据库健康状态: {health.value}")
+        logger.info(f"数据库健康状态: {health.value}")
 
         # 手动创建备份
         backup_result = await db_manager.create_backup()
-        print(f"手动备份结果: {backup_result}")
+        logger.info(f"手动备份结果: {backup_result}")
 
         # 获取备份状态
         backup_status = await db_manager.get_backup_status()
-        print(f"备份状态: {json.dumps(backup_status, indent=2, default=str)}")
+        logger.info(f"备份状态: {json.dumps(backup_status, indent=2, default=str)}")
 
     finally:
         await db_manager.cleanup()

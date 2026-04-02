@@ -171,8 +171,8 @@ async def main() -> None:
     
     if not _process_lock.acquire():
         logger.error("❌ 另一个实例已在运行中，请先停止现有实例")
-        print("❌ 另一个实例已在运行中，请先停止现有实例")
-        print(f"   提示: 如果确认没有其他实例，请删除 /tmp/{APP_NAME}.lock 文件后重试")
+        logger.info("❌ 另一个实例已在运行中，请先停止现有实例")
+        logger.info(f"   提示: 如果确认没有其他实例，请删除 /tmp/{APP_NAME}.lock 文件后重试")
         return
     
     system = TradingSystem()
@@ -195,7 +195,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 再见！")
+        logger.info("\n👋 再见！")
     except Exception as e:
-        print(f"❌ 系统崩溃: {e}")
+        logger.info(f"❌ 系统崩溃: {e}")
         sys.exit(1)

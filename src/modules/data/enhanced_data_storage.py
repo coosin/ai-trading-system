@@ -411,19 +411,19 @@ if __name__ == "__main__":
                                          datetime(2024, 1, 1, 0, 0, 0), 
                                          datetime(2024, 1, 1, 23, 59, 59), 
                                          '1m')
-    print(f"加载的数据行数: {len(loaded_data)}")
+    logger.info(f"加载的数据行数: {len(loaded_data)}")
     
     # 获取可用交易对
     symbols = storage.get_available_symbols()
-    print(f"可用交易对: {symbols}")
+    logger.info(f"可用交易对: {symbols}")
     
     # 获取可用时间周期
     timeframes = storage.get_available_timeframes('BTC/USDT')
-    print(f"可用时间周期: {timeframes}")
+    logger.info(f"可用时间周期: {timeframes}")
     
     # 获取数据范围
     start_time, end_time = storage.get_data_range('BTC/USDT', '1m')
-    print(f"数据范围: {start_time} 到 {end_time}")
+    logger.info(f"数据范围: {start_time} 到 {end_time}")
     
     # 优化存储
     storage.optimize_storage('BTC/USDT', '1m')

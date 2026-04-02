@@ -762,17 +762,17 @@ async def example_usage():
     
     try:
         # 启动服务器
-        print("API服务器已启动，访问 http://localhost:8000/docs 查看文档")
+        logger.info("API服务器已启动，访问 http://localhost:8000/docs 查看文档")
         # api_server.run()
         
         # 测试API
         exchange = api_server.exchange_manager.get_exchange("binance")
         if exchange:
             ticker = await exchange.get_ticker("BTC/USDT")
-            print(f"Binance BTC/USDT 价格: {ticker['price']}")
+            logger.info(f"Binance BTC/USDT 价格: {ticker['price']}")
             
             balance = await exchange.get_balance()
-            print(f"账户余额: {balance}")
+            logger.info(f"账户余额: {balance}")
             
     finally:
         await api_server.cleanup()

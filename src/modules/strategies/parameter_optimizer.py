@@ -45,7 +45,7 @@ class ParameterOptimizer:
             # 返回夏普比率作为优化目标
             return results.get('sharpe_ratio', 0.0)
         except Exception as e:
-            print(f"评估策略时出错: {e}")
+            logger.info(f"评估策略时出错: {e}")
             return 0.0
     
     def grid_search(self, param_space: Dict[str, List[float]], backtest_data: pd.DataFrame) -> Dict[str, Any]:
@@ -126,7 +126,7 @@ class ParameterOptimizer:
             最优参数和性能
         """
         if not HAS_BAYES_OPT:
-            print("警告: bayes_opt 未安装，跳过贝叶斯优化")
+            logger.info("警告: bayes_opt 未安装，跳过贝叶斯优化")
             return {
                 'best_params': {},
                 'best_score': 0.0,

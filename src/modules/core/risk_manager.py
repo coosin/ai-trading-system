@@ -1929,29 +1929,29 @@ async def example_usage():
         }
 
         check_result = await risk_manager.check_order(order_data)
-        print(f"订单风险检查: {'通过' if check_result['passed'] else '拒绝'}")
+        logger.info(f"订单风险检查: {'通过' if check_result['passed'] else '拒绝'}")
 
         if check_result["violations"]:
-            print("违反规则:")
+            logger.info("违反规则:")
             for violation in check_result["violations"]:
-                print(f"  - {violation}")
+                logger.info(f"  - {violation}")
 
         if check_result["warnings"]:
-            print("警告:")
+            logger.info("警告:")
             for warning in check_result["warnings"]:
-                print(f"  - {warning}")
+                logger.info(f"  - {warning}")
 
         # 获取风险指标
         metrics = await risk_manager.get_risk_metrics()
-        print(f"风险指标: VaR95=${metrics.var_95:.2f}, 最大回撤={metrics.max_drawdown*100:.1f}%")
+        logger.info(f"风险指标: VaR95=${metrics.var_95:.2f}, 最大回撤={metrics.max_drawdown*100:.1f}%")
 
         # 获取警报
         alerts = await risk_manager.get_alerts()
-        print(f"活跃警报: {len(alerts)} 个")
+        logger.info(f"活跃警报: {len(alerts)} 个")
 
         # 获取统计
         stats = await risk_manager.get_stats()
-        print(f"风险统计: {stats}")
+        logger.info(f"风险统计: {stats}")
 
     finally:
         await risk_manager.cleanup()

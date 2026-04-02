@@ -285,6 +285,6 @@ if __name__ == "__main__":
     EnvConfig.print_env_summary()
     
     # 获取配置
-    print(f"XUNFEI_API_KEY: {EnvConfig.get('XUNFEI_API_KEY', 'not_set')}")
-    print(f"OKX_API_KEY: {EnvConfig.get('OKX_API_KEY', 'not_set')}")
-    print(f"TRADING_SYMBOLS: {EnvConfig.get_list('TRADING_SYMBOLS', default=['BTC/USDT'])}")
+    logger.info(f"XUNFEI_API_KEY: {EnvConfig.get('XUNFEI_API_KEY', 'not_set')}")
+    logger.info(f"OKX_API_KEY: {EnvConfig.get('OKX_API_KEY', 'not_set')}")
+    logger.info(f"TRADING_SYMBOLS: {EnvConfig.get_list('TRADING_SYMBOLS', default=['BTC/USDT'])}")

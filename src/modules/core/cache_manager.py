@@ -906,18 +906,18 @@ async def example_usage():
 
         # 获取缓存
         user = await cache.get("user:1")
-        print(f"用户缓存: {user}")
+        logger.info(f"用户缓存: {user}")
 
         product = await cache.get("product:100")
-        print(f"产品缓存: {product}")
+        logger.info(f"产品缓存: {product}")
 
         # 检查是否存在
         exists = await cache.exists("user:1")
-        print(f"用户缓存是否存在: {exists}")
+        logger.info(f"用户缓存是否存在: {exists}")
 
         # 获取统计信息
         stats = await cache.get_stats()
-        print(f"缓存统计: {stats}")
+        logger.info(f"缓存统计: {stats}")
 
         # 批量操作
         for i in range(10):

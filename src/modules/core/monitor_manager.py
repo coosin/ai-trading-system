@@ -1554,34 +1554,34 @@ async def example_usage():
 
         # 获取系统摘要
         system_summary = await monitor_manager.get_system_summary()
-        print("系统摘要:")
-        print(f"  CPU: {system_summary.get('cpu', {}).get('percent', 0)}%")
-        print(f"  内存: {system_summary.get('memory', {}).get('percent', 0)}%")
-        print(f"  磁盘: {system_summary.get('disk', {}).get('percent', 0)}%")
+        logger.info("系统摘要:")
+        logger.info(f"  CPU: {system_summary.get('cpu', {}).get('percent', 0)}%")
+        logger.info(f"  内存: {system_summary.get('memory', {}).get('percent', 0)}%")
+        logger.info(f"  磁盘: {system_summary.get('disk', {}).get('percent', 0)}%")
 
         # 获取服务健康
         service_health = await monitor_manager.get_service_health()
-        print(f"服务健康: {len(service_health)} 个服务")
+        logger.info(f"服务健康: {len(service_health)} 个服务")
 
         for name, health in service_health.items():
-            print(f"  {name}: {health.status.value} (响应时间: {health.response_time}ms)")
+            logger.info(f"  {name}: {health.status.value} (响应时间: {health.response_time}ms)")
 
         # 获取活跃告警
         active_alerts = await monitor_manager.get_alerts(unresolved=True)
-        print(f"活跃告警: {len(active_alerts)} 个")
+        logger.info(f"活跃告警: {len(active_alerts)} 个")
 
         for alert in active_alerts[:3]:  # 显示前3个
-            print(f"  [{alert.alert_level.value}] {alert.message}")
+            logger.info(f"  [{alert.alert_level.value}] {alert.message}")
 
         # 获取仪表板数据
         dashboard = await monitor_manager.get_dashboard_data()
-        print(
+        logger.info(
             f"仪表板数据: 系统健康={dashboard.get('system', {}).get('cpu', {}).get('status', 'unknown')}"
         )
 
         # 获取统计
         stats = await monitor_manager.get_statistics()
-        print(f"监控统计: {stats}")
+        logger.info(f"监控统计: {stats}")
 
         # 手动收集一个业务指标
         await monitor_manager.collect_metric(
@@ -1597,7 +1597,7 @@ async def example_usage():
             metric_stats = await monitor_manager.get_metric_statistics(
                 monitor_id="custom_business", name="trade_success_rate"
             )
-            print(f"交易成功率统计: 平均值={metric_stats.get('mean', 0):.1f}%")
+            logger.info(f"交易成功率统计: 平均值={metric_stats.get('mean', 0):.1f}%")
 
     finally:
         await monitor_manager.cleanup()

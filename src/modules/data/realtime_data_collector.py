@@ -558,7 +558,7 @@ async def example_usage():
 
         # 注册数据回调
         def callback(source, data):
-            print(f"收到数据: {source} - {data['close']}")
+            logger.info(f"收到数据: {source} - {data['close']}")
 
         collector.register_data_callback(callback)
 
@@ -567,7 +567,7 @@ async def example_usage():
 
         # 获取状态
         status = await collector.get_collector_status()
-        print(f"采集器状态: {status}")
+        logger.info(f"采集器状态: {status}")
 
     finally:
         await collector.shutdown()

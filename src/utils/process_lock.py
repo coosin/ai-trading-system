@@ -13,7 +13,7 @@
         ...
         lock.release()
     else:
-        print("另一个实例已在运行中")
+        logger.info("另一个实例已在运行中")
 """
 
 import os
@@ -47,7 +47,7 @@ class ProcessLock:
             finally:
                 lock.release()
         else:
-            print("另一个实例已在运行中")
+            logger.info("另一个实例已在运行中")
     """
     
     def __init__(self, app_name: str, lock_dir: Optional[str] = None):

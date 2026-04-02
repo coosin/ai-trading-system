@@ -662,18 +662,18 @@ async def example_usage():
         
         # 分析市场
         analysis = await llm_integration.analyze_market(market_data)
-        print("市场分析:")
-        print(analysis)
+        logger.info("市场分析:")
+        logger.info(analysis)
         
         # 生成策略
         strategy = await llm_integration.generate_strategy(analysis)
-        print("\n交易策略:")
-        print(strategy)
+        logger.info("\n交易策略:")
+        logger.info(strategy)
         
         # 生成交易信号
         signal = await llm_integration.generate_trading_signal(market_data)
-        print("\n交易信号:")
-        print(signal)
+        logger.info("\n交易信号:")
+        logger.info(signal)
         
         # 分析新闻
         news = [
@@ -682,8 +682,8 @@ async def example_usage():
             "大型机构开始配置加密资产"
         ]
         news_analysis = await llm_integration.analyze_news(news)
-        print("\n新闻分析:")
-        print(news_analysis)
+        logger.info("\n新闻分析:")
+        logger.info(news_analysis)
         
         # 评估风险
         position = {
@@ -694,8 +694,8 @@ async def example_usage():
             "take_profit": 55000
         }
         risk_evaluation = await llm_integration.evaluate_risk(position)
-        print("\n风险评估:")
-        print(risk_evaluation)
+        logger.info("\n风险评估:")
+        logger.info(risk_evaluation)
         
     finally:
         await llm_integration.cleanup()

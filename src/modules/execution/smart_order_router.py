@@ -620,12 +620,12 @@ async def example_usage():
         
         # 执行订单
         result = await router.route_order(twap_order)
-        print(f"TWAP订单执行结果:")
-        print(f"  成功: {result.success}")
-        print(f"  成交数量: {result.executed_quantity}")
-        print(f"  平均价格: {result.avg_price}")
-        print(f"  手续费: {result.total_fee}")
-        print(f"  切片数量: {len(result.slices)}")
+        logger.info(f"TWAP订单执行结果:")
+        logger.info(f"  成功: {result.success}")
+        logger.info(f"  成交数量: {result.executed_quantity}")
+        logger.info(f"  平均价格: {result.avg_price}")
+        logger.info(f"  手续费: {result.total_fee}")
+        logger.info(f"  切片数量: {len(result.slices)}")
         
         # 创建VWAP订单
         vwap_order = {
@@ -637,9 +637,9 @@ async def example_usage():
         }
         
         result = await router.route_order(vwap_order)
-        print(f"\nVWAP订单执行结果:")
-        print(f"  成功: {result.success}")
-        print(f"  成交数量: {result.executed_quantity}")
+        logger.info(f"\nVWAP订单执行结果:")
+        logger.info(f"  成功: {result.success}")
+        logger.info(f"  成交数量: {result.executed_quantity}")
         
         # 创建冰山订单
         iceberg_order = {
@@ -651,13 +651,13 @@ async def example_usage():
         }
         
         result = await router.route_order(iceberg_order)
-        print(f"\n冰山订单执行结果:")
-        print(f"  成功: {result.success}")
-        print(f"  切片数量: {len(result.slices)}")
+        logger.info(f"\n冰山订单执行结果:")
+        logger.info(f"  成功: {result.success}")
+        logger.info(f"  切片数量: {len(result.slices)}")
         
         # 获取统计
         stats = router.get_stats()
-        print(f"\n路由器统计: {stats}")
+        logger.info(f"\n路由器统计: {stats}")
         
     finally:
         await router.cleanup()

@@ -712,7 +712,7 @@ async def example_usage():
 
     # 注册数据消费者
     def print_consumer(point: DataPoint):
-        print(f"收到数据: {point.symbol} @ {point.timestamp}: {point.data}")
+        logger.info(f"收到数据: {point.symbol} @ {point.timestamp}: {point.data}")
 
     pipeline.register_consumer("print", print_consumer)
 
@@ -725,7 +725,7 @@ async def example_usage():
 
         # 获取统计数据
         stats = await pipeline.get_stats()
-        print(f"统计数据: {stats}")
+        logger.info(f"统计数据: {stats}")
 
     finally:
         # 清理

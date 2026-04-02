@@ -684,17 +684,17 @@ class EnhancedLLMManager:
 
     async def switch_model(self, model_id: str) -> bool:
         """切换默认模型"""
-        print(f"[DEBUG switch_model] model_id: {model_id}", flush=True)
-        print(f"[DEBUG switch_model] models keys: {list(self.models.keys())}", flush=True)
+        logger.info(f"[DEBUG switch_model] model_id: {model_id}", flush=True)
+        logger.info(f"[DEBUG switch_model] models keys: {list(self.models.keys())}", flush=True)
         exists = model_id in self.models
-        print(f"[DEBUG switch_model] model_id in models: {exists}", flush=True)
+        logger.info(f"[DEBUG switch_model] model_id in models: {exists}", flush=True)
         if exists:
-            print(f"[DEBUG switch_model] model enabled: {self.models[model_id].enabled}", flush=True)
+            logger.info(f"[DEBUG switch_model] model enabled: {self.models[model_id].enabled}", flush=True)
         if model_id in self.models and self.models[model_id].enabled:
             self.default_model = model_id
             logger.info(f"默认模型已切换为: {model_id}")
             return True
-        print(f"[DEBUG switch_model] returning False", flush=True)
+        logger.info(f"[DEBUG switch_model] returning False", flush=True)
         return False
 
     async def set_model_api_key(self, model_id: str, api_key: str) -> bool:

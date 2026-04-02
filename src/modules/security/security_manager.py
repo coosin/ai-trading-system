@@ -605,20 +605,20 @@ async def example_usage():
         # 认证用户
         user = await security.authenticate_user("admin", "admin123")
         if user:
-            print(f"认证成功: {user.username}")
+            logger.info(f"认证成功: {user.username}")
 
             # 创建会话
             session = await security.create_session(user)
-            print(f"会话令牌: {session.token[:50]}...")
+            logger.info(f"会话令牌: {session.token[:50]}...")
 
             # 验证会话
             validated_session = await security.validate_session(session.token)
             if validated_session:
-                print(f"会话验证成功")
+                logger.info(f"会话验证成功")
 
             # 检查权限
             has_perm = await security.check_permission(user, Permission.MANAGE_USERS)
-            print(f"具有管理用户权限: {has_perm}")
+            logger.info(f"具有管理用户权限: {has_perm}")
 
             # 创建API密钥
             api_key = await security.create_api_key(
@@ -627,8 +627,8 @@ async def example_usage():
                 [Permission.READ_TRADING, Permission.WRITE_TRADING]
             )
             if api_key:
-                print(f"API密钥创建: {api_key.api_key}")
-                print(f"API密钥密码: {api_key.metadata.get('plain_secret')}")
+                logger.info(f"API密钥创建: {api_key.api_key}")
+                logger.info(f"API密钥密码: {api_key.metadata.get('plain_secret')}")
 
     finally:
         await security.shutdown()

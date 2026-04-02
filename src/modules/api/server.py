@@ -1296,7 +1296,7 @@ class APIServer:
             """更新系统设置"""
             # 这里应该保存设置到配置管理器
             # 为简化，返回成功消息
-            print("保存设置:", settings)
+            logger.info("保存设置:", settings)
             return {
                 "status": "success",
                 "message": "设置保存成功",
@@ -1347,7 +1347,7 @@ class APIServer:
             """训练模型"""
             # 这里应该调用模型管理器训练模型
             # 为简化，返回成功消息
-            print("训练模型:", model_data)
+            logger.info("训练模型:", model_data)
             return {
                 "status": "success",
                 "message": "模型训练成功",
@@ -1360,7 +1360,7 @@ class APIServer:
             """更新模型"""
             # 这里应该调用模型管理器更新模型
             # 为简化，返回成功消息
-            print("更新模型:", id, model_data)
+            logger.info("更新模型:", id, model_data)
             return {
                 "status": "success",
                 "message": "模型更新成功",
@@ -1372,7 +1372,7 @@ class APIServer:
             """删除模型"""
             # 这里应该调用模型管理器删除模型
             # 为简化，返回成功消息
-            print("删除模型:", id)
+            logger.info("删除模型:", id)
             return {
                 "status": "success",
                 "message": "模型删除成功",
@@ -1400,14 +1400,11 @@ class APIServer:
         @api_v1_router.get("/ai-models", tags=["ai-models"])
         async def get_ai_models():
             """获取AI模型列表"""
-            # 从主控制器获取已经初始化的LLM管理器实例
             llm_manager = self.main_controller.enhanced_llm_manager
             
-            # 调试信息：打印真实的模型列表
-            print(f"[DEBUG] llm_manager.models keys: {list(llm_manager.models.keys())}")
-            print(f"[DEBUG] llm_manager.models count: {len(llm_manager.models)}")
+            logger.debug(f"llm_manager.models keys: {list(llm_manager.models.keys())}")
+            logger.debug(f"llm_manager.models count: {len(llm_manager.models)}")
             
-            # 从LLM管理器获取真实AI模型配置
             models = []
             for i, model_config in enumerate(llm_manager.models.values(), 1):
                 models.append({
@@ -1420,19 +1417,16 @@ class APIServer:
                     "base_url": model_config.base_url,
                     "enabled": model_config.enabled
                 })
-            print(f"[DEBUG] Returning {len(models)} models: {[m['model'] for m in models]}")
+            logger.debug(f"Returning {len(models)} models: {[m['model'] for m in models]}")
             return models
 
         @api_v1_router.post("/ai-models", tags=["ai-models"])
         async def add_ai_model(model_data: Dict[str, Any]):
             """添加AI模型"""
-            # 从主控制器获取已经初始化的LLM管理器实例
             llm_manager = self.main_controller.enhanced_llm_manager
             
-            # 调试信息：打印添加前的模型列表
-            print(f"[DEBUG] Before add - models keys: {list(llm_manager.models.keys())}")
+            logger.debug(f"Before add - models keys: {list(llm_manager.models.keys())}")
             
-            # 调用LLM管理器添加AI模型
             try:
                 model_config = {
                     "model_id": model_data.get("model"),
@@ -1443,16 +1437,14 @@ class APIServer:
                     "enabled": model_data.get("enabled", True)
                 }
                 
-                print(f"[DEBUG] Registering model with config: {model_config}")
+                logger.debug(f"Registering model with config: {model_config}")
                 await llm_manager._register_model_from_config(model_config)
                 
-                # 调试信息：打印添加后的模型列表
-                print(f"[DEBUG] After register - models keys: {list(llm_manager.models.keys())}")
+                logger.debug(f"After register - models keys: {list(llm_manager.models.keys())}")
                 
-                # 初始化模型提供者
                 await llm_manager._initialize_provider(model_config["model_id"])
                 
-                print(f"[DEBUG] Model added successfully. Total models: {len(llm_manager.models)}")
+                logger.info(f"Model added successfully. Total models: {len(llm_manager.models)}")
                 return {
                     "status": "success",
                     "message": "AI模型添加成功",
@@ -1460,9 +1452,8 @@ class APIServer:
                     "timestamp": datetime.now().isoformat()
                 }
             except Exception as e:
-                print(f"[DEBUG] 添加AI模型失败: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.error(f"添加AI模型失败: {e}")
+                logger.exception("添加AI模型详细错误")
                 return {
                     "status": "error",
                     "message": f"AI模型添加失败: {str(e)}",
@@ -1506,23 +1497,21 @@ class APIServer:
             llm_manager = self.main_controller.enhanced_llm_manager
             
             # 调试信息
-            print(f"[DEBUG] set_default_ai_model called with: {default_data}", flush=True)
-            print(f"[DEBUG] Available models: {list(llm_manager.models.keys())}", flush=True)
-            sys.stdout.flush()
+            logger.debug(f"set_default_ai_model called with: {default_data}")
+            logger.debug(f"Available models: {list(llm_manager.models.keys())}")
             
-            # 调用LLM管理器设置默认AI模型
             try:
                 model_id = default_data.get("model_id")
-                print(f"[DEBUG] model_id from request: {model_id}", flush=True)
+                logger.debug(f"model_id from request: {model_id}")
                 if model_id:
                     exists = model_id in llm_manager.models
-                    print(f"[DEBUG] model_id exists in models: {exists}", flush=True)
+                    logger.debug(f"model_id exists in models: {exists}")
                     if exists:
-                        print(f"[DEBUG] model enabled: {llm_manager.models[model_id].enabled}", flush=True)
+                        logger.debug(f"model enabled: {llm_manager.models[model_id].enabled}")
                     success = await llm_manager.switch_model(model_id)
-                    print(f"[DEBUG] switch_model returned: {success}", flush=True)
+                    logger.debug(f"switch_model returned: {success}")
                     if success:
-                        print("[DEBUG] 设置默认AI模型成功:", default_data, flush=True)
+                        logger.info(f"设置默认AI模型成功: {default_data}")
                         return {
                             "status": "success",
                             "message": "默认AI模型设置成功",
@@ -1541,9 +1530,8 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
             except Exception as e:
-                print("[DEBUG] 设置默认AI模型失败:", e, flush=True)
-                import traceback
-                traceback.print_exc()
+                logger.error(f"设置默认AI模型失败: {e}")
+                logger.exception("设置默认AI模型详细错误")
                 return {
                     "status": "error",
                     "message": f"默认AI模型设置失败: {str(e)}",
@@ -1577,7 +1565,7 @@ class APIServer:
                             await llm_manager.providers[model_id].cleanup()
                             del llm_manager.providers[model_id]
                     
-                    print("更新AI模型:", id, model_data)
+                    logger.info("更新AI模型:", id, model_data)
                     return {
                         "status": "success",
                         "message": "AI模型更新成功",
@@ -1590,7 +1578,7 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
             except Exception as e:
-                print("更新AI模型失败:", e)
+                logger.info("更新AI模型失败:", e)
                 return {
                     "status": "error",
                     "message": f"AI模型更新失败: {str(e)}",
@@ -1602,7 +1590,7 @@ class APIServer:
             """删除AI模型"""
             # 这里应该调用LLM管理器删除AI模型
             # 为简化，返回成功消息
-            print("删除AI模型:", id)
+            logger.info("删除AI模型:", id)
             return {
                 "status": "success",
                 "message": "AI模型删除成功",
@@ -1628,7 +1616,7 @@ class APIServer:
                 ai_executor = getattr(self.main_controller, 'ai_command_executor', None)
                 
                 if ai_executor:
-                    print(f"[DEBUG] 使用AICommandExecutor处理: {message[:50]}...")
+                    logger.debug(f"使用AICommandExecutor处理: {message[:50]}...")
                     result = await ai_executor.process_input(message)
                     
                     if result.get("success"):
@@ -1662,7 +1650,7 @@ class APIServer:
                 if not model_id:
                     model_id = llm_integration.llm_manager.default_model
                 
-                print(f"[DEBUG] 回退到直接LLM调用: {message[:50]}...")
+                logger.debug(f"回退到直接LLM调用: {message[:50]}...")
                 
                 response = await llm_integration.generate(
                     prompt=message,
@@ -1692,7 +1680,7 @@ class APIServer:
                     }
                     
             except Exception as e:
-                print(f"[ERROR] AI对话失败: {e}")
+                logger.error(f"AI对话失败: {e}")
                 import traceback
                 traceback.print_exc()
                 return {
@@ -1727,7 +1715,7 @@ class APIServer:
                 }
                     
             except Exception as e:
-                print(f"[ERROR] 自然语言查询失败: {e}")
+                logger.error(f"自然语言查询失败: {e}")
                 import traceback
                 traceback.print_exc()
                 return {
@@ -2338,7 +2326,7 @@ async def example_usage():
     """API服务器使用示例"""
 
     if not HAS_FASTAPI:
-        print("FastAPI未安装，跳过示例")
+        logger.info("FastAPI未安装，跳过示例")
         return
 
     # 创建API服务器
@@ -2348,7 +2336,7 @@ async def example_usage():
     try:
         # 启动服务器
         success = await api_server.start()
-        print(f"API服务器启动: {'成功' if success else '失败'}")
+        logger.info(f"API服务器启动: {'成功' if success else '失败'}")
 
         if success:
             # 注册自定义路由
@@ -2365,10 +2353,10 @@ async def example_usage():
             # 获取统计信息
             await asyncio.sleep(1)
             stats = await api_server.get_api_stats()
-            print(f"API统计: {json.dumps(stats, indent=2, default=str)}")
+            logger.info(f"API统计: {json.dumps(stats, indent=2, default=str)}")
 
             # 模拟运行一段时间
-            print("API服务器运行中...按Ctrl+C停止")
+            logger.info("API服务器运行中...按Ctrl+C停止")
             await asyncio.sleep(5)
 
             # 停止服务器

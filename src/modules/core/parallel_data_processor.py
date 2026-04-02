@@ -560,8 +560,8 @@ async def example_usage():
         results = await processor.process_batch(test_data, process_data)
         elapsed = time.time() - start_time
         
-        print(f"处理 {len(test_data)} 条数据，耗时: {elapsed:.3f}秒")
-        print(f"成功率: {sum(1 for r in results if r.success) / len(results) * 100:.1f}%")
+        logger.info(f"处理 {len(test_data)} 条数据，耗时: {elapsed:.3f}秒")
+        logger.info(f"成功率: {sum(1 for r in results if r.success) / len(results) * 100:.1f}%")
         
         # 处理DataFrame
         df = pd.DataFrame({
@@ -574,11 +574,11 @@ async def example_usage():
             return chunk
         
         result_df = await processor.process_dataframe(df, process_df, chunk_size=1000)
-        print(f"DataFrame处理完成，形状: {result_df.shape}")
+        logger.info(f"DataFrame处理完成，形状: {result_df.shape}")
         
         # 获取统计
         stats = processor.get_stats()
-        print(f"统计信息: {stats}")
+        logger.info(f"统计信息: {stats}")
         
     finally:
         await processor.cleanup()

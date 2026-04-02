@@ -542,11 +542,11 @@ if __name__ == "__main__":
         # 获取配置
         host = await config.get_config("database", "host")
         port = await config.get_config("database", "port")
-        print(f"数据库配置: {host}:{port}")
+        logger.info(f"数据库配置: {host}:{port}")
 
         # 监听配置变更
         async def on_database_change(section, key, old_value, new_value):
-            print(f"数据库配置变更: {section}.{key} = {old_value} -> {new_value}")
+            logger.info(f"数据库配置变更: {section}.{key} = {old_value} -> {new_value}")
 
         await config.watch_config("database", "host", on_database_change)
 
@@ -560,7 +560,7 @@ if __name__ == "__main__":
 
         # 获取所有配置
         all_configs = await config.get_all_configs()
-        print("所有配置:", json.dumps(all_configs, indent=2))
+        logger.info("所有配置:", json.dumps(all_configs, indent=2))
 
         # 清理
         await config.cleanup()

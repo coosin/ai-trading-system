@@ -2349,16 +2349,16 @@ async def example_usage():
         # 注册模块（模拟）
         class MockModule:
             async def initialize(self):
-                print("MockModule initialized")
+                logger.info("MockModule initialized")
 
             async def start(self):
-                print("MockModule started")
+                logger.info("MockModule started")
 
             async def stop(self):
-                print("MockModule stopped")
+                logger.info("MockModule stopped")
 
             async def cleanup(self):
-                print("MockModule cleaned up")
+                logger.info("MockModule cleaned up")
 
         # 注册模块
         controller.register_module("data_pipeline", MockModule())
@@ -2369,14 +2369,14 @@ async def example_usage():
 
         # 注册事件处理器
         def custom_event_handler(event: SystemEvent):
-            print(f"Custom handler: {event.type.value} - {event.data}")
+            logger.info(f"Custom handler: {event.type.value} - {event.data}")
 
         controller.register_event_handler(EventType.DATA_RECEIVED, custom_event_handler)
         controller.register_event_handler(EventType.TRADE_SIGNAL, custom_event_handler)
 
         # 启动系统
         success = await controller.start_system()
-        print(f"系统启动: {'成功' if success else '失败'}")
+        logger.info(f"系统启动: {'成功' if success else '失败'}")
 
         if success:
             # 运行一段时间
@@ -2384,7 +2384,7 @@ async def example_usage():
 
             # 获取系统状态
             status = await controller.get_system_status()
-            print(f"系统状态: {json.dumps(status, indent=2, default=str)}")
+            logger.info(f"系统状态: {json.dumps(status, indent=2, default=str)}")
 
             # 发送测试事件
             await controller.emit_event(

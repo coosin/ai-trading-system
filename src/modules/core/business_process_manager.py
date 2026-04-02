@@ -609,7 +609,7 @@ async def example_usage():
 
         # 获取状态
         status = await bp_manager.get_pipeline_status()
-        print(f"管道状态: {status}")
+        logger.info(f"管道状态: {status}")
 
         # 运行一段时间
         await asyncio.sleep(5)

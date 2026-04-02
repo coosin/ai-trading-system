@@ -528,10 +528,10 @@ async def example_usage():
     try:
         # 定义事件处理器
         async def handle_trade_signal(event: Event):
-            print(f"收到交易信号: {event.data}")
+            logger.info(f"收到交易信号: {event.data}")
         
         async def handle_system_error(event: Event):
-            print(f"系统错误: {event.data}")
+            logger.info(f"系统错误: {event.data}")
         
         # 订阅事件
         event_system.subscribe(EventType.TRADE_SIGNAL, handle_trade_signal)

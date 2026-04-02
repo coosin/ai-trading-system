@@ -916,7 +916,7 @@ async def example_usage():
 
     try:
         # 在不同交易所创建订单
-        print("=== 在不同交易所创建订单 ===")
+        logger.info("=== 在不同交易所创建订单 ===")
         
         # 在Binance创建市价单
         binance_order = await engine.create_order_with_exchange(
@@ -926,7 +926,7 @@ async def example_usage():
             order_type=OrderType.MARKET,
             quantity=0.01
         )
-        print(f"在Binance创建订单: {binance_order.order_id}")
+        logger.info(f"在Binance创建订单: {binance_order.order_id}")
         
         # 在Coinbase创建限价单
         coinbase_order = await engine.create_order_with_exchange(
@@ -937,20 +937,20 @@ async def example_usage():
             quantity=0.005,
             price=40000.0
         )
-        print(f"在Coinbase创建订单: {coinbase_order.order_id}")
+        logger.info(f"在Coinbase创建订单: {coinbase_order.order_id}")
 
         # 等待执行
         await asyncio.sleep(2)
 
         # 获取订单状态
-        print("\n=== 订单执行状态 ===")
+        logger.info("\n=== 订单执行状态 ===")
         updated_binance_order = engine.get_order(binance_order.order_id)
-        print(f"Binance订单状态: {updated_binance_order.status.value}")
-        print(f"成交数量: {updated_binance_order.filled_quantity}")
-        print(f"平均价格: {updated_binance_order.avg_fill_price}")
+        logger.info(f"Binance订单状态: {updated_binance_order.status.value}")
+        logger.info(f"成交数量: {updated_binance_order.filled_quantity}")
+        logger.info(f"平均价格: {updated_binance_order.avg_fill_price}")
 
         # 测试智能执行算法
-        print("\n=== 测试智能执行算法 ===")
+        logger.info("\n=== 测试智能执行算法 ===")
         
         # 创建TWAP订单
         twap_order = await engine.create_order(
@@ -961,15 +961,15 @@ async def example_usage():
             twap_duration=timedelta(minutes=1),
             twap_interval=timedelta(seconds=10)
         )
-        print(f"创建TWAP订单: {twap_order.order_id}")
+        logger.info(f"创建TWAP订单: {twap_order.order_id}")
 
         # 等待TWAP执行
         await asyncio.sleep(70)  # 等待1分10秒
 
         # 获取TWAP订单状态
         updated_twap_order = engine.get_order(twap_order.order_id)
-        print(f"TWAP订单状态: {updated_twap_order.status.value}")
-        print(f"TWAP成交数量: {updated_twap_order.filled_quantity}/{updated_twap_order.quantity}")
+        logger.info(f"TWAP订单状态: {updated_twap_order.status.value}")
+        logger.info(f"TWAP成交数量: {updated_twap_order.filled_quantity}/{updated_twap_order.quantity}")
 
         # 创建冰山订单
         iceberg_order = await engine.create_order(
@@ -980,34 +980,34 @@ async def example_usage():
             price=42000.0,
             iceberg_visible_size=0.005
         )
-        print(f"\n创建冰山订单: {iceberg_order.order_id}")
+        logger.info(f"\n创建冰山订单: {iceberg_order.order_id}")
 
         # 等待冰山订单执行
         await asyncio.sleep(40)
 
         # 获取冰山订单状态
         updated_iceberg_order = engine.get_order(iceberg_order.order_id)
-        print(f"冰山订单状态: {updated_iceberg_order.status.value}")
-        print(f"冰山成交数量: {updated_iceberg_order.filled_quantity}/{updated_iceberg_order.quantity}")
+        logger.info(f"冰山订单状态: {updated_iceberg_order.status.value}")
+        logger.info(f"冰山成交数量: {updated_iceberg_order.filled_quantity}/{updated_iceberg_order.quantity}")
 
         # 分析交易成本
-        print("\n=== 交易成本分析 ===")
+        logger.info("\n=== 交易成本分析 ===")
         cost = await engine.analyze_trading_costs(binance_order.order_id)
         if cost:
-            print(f"Binance订单成本分析:")
-            print(f"  佣金: {cost.commission_cost}")
-            print(f"  滑点: {cost.slippage_cost}")
-            print(f"  市场冲击: {cost.market_impact_cost}")
-            print(f"  总成本: {cost.total_cost}")
-            print(f"  成本占比: {cost.cost_percentage:.2f}%")
+            logger.info(f"Binance订单成本分析:")
+            logger.info(f"  佣金: {cost.commission_cost}")
+            logger.info(f"  滑点: {cost.slippage_cost}")
+            logger.info(f"  市场冲击: {cost.market_impact_cost}")
+            logger.info(f"  总成本: {cost.total_cost}")
+            logger.info(f"  成本占比: {cost.cost_percentage:.2f}%")
 
         # 获取执行引擎状态
         status = await engine.get_execution_engine_status()
-        print("\n=== 执行引擎状态 ===")
-        print(f"运行状态: {status['running']}")
-        print(f"活跃订单: {status['active_orders']}")
-        print(f"总订单数: {status['total_orders']}")
-        print(f"总交易数: {status['total_trades']}")
+        logger.info("\n=== 执行引擎状态 ===")
+        logger.info(f"运行状态: {status['running']}")
+        logger.info(f"活跃订单: {status['active_orders']}")
+        logger.info(f"总订单数: {status['total_orders']}")
+        logger.info(f"总交易数: {status['total_trades']}")
 
     finally:
         await engine.shutdown()

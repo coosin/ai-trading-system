@@ -639,11 +639,11 @@ async def example_usage():
             use_circuit_breaker=True,
             use_retry=True
         )
-        print(f"执行结果: {result}")
+        logger.info(f"执行结果: {result}")
         
         # 获取统计
         stats = ft.get_stats()
-        print(f"容错统计: {stats}")
+        logger.info(f"容错统计: {stats}")
         
     finally:
         await ft.cleanup()
