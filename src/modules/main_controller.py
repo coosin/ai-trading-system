@@ -461,6 +461,54 @@ class MainController:
         self.business_process_manager = BusinessProcessManager(self)
         await self.business_process_manager.initialize()
         
+        # 初始化紧急停止系统
+        try:
+            from src.modules.safety.emergency_stop import EmergencyStopSystem
+            self.emergency_stop = EmergencyStopSystem()
+            logger.info("✅ 紧急停止系统已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 紧急停止系统初始化失败: {e}")
+            self.emergency_stop = None
+        
+        # 初始化智能监控系统
+        try:
+            from src.modules.monitoring.intelligent_monitoring import IntelligentMonitoringSystem
+            self.intelligent_monitoring = IntelligentMonitoringSystem()
+            logger.info("✅ 智能监控系统已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 智能监控系统初始化失败: {e}")
+            self.intelligent_monitoring = None
+        
+        # 初始化安全管理器
+        try:
+            from src.modules.security.security_manager import SecurityManager
+            self.security_manager = SecurityManager()
+            logger.info("✅ 安全管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 安全管理器初始化失败: {e}")
+            self.security_manager = None
+        
+        # 初始化智能资金管理器
+        try:
+            from src.modules.core.intelligent_fund_manager import IntelligentFundManager
+            from src.modules.core.risk_manager import RiskManager
+            fund_config = {
+                "initial_funds": 10000,
+                "risk_per_trade": 0.02,
+                "max_leverage": 3
+            }
+            risk_mgr = RiskManager()
+            self.fund_manager = IntelligentFundManager(
+                db_manager=self.database_manager,
+                risk_manager=risk_mgr,
+                config=fund_config
+            )
+            await self.fund_manager.initialize()
+            logger.info("✅ 智能资金管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 智能资金管理器初始化失败: {e}")
+            self.fund_manager = None
+        
         # 初始化全智能AI交易引擎
         from src.modules.core.ai_trading_engine import AITradingEngine
         self.ai_trading_engine = AITradingEngine(self)
@@ -573,6 +621,23 @@ class MainController:
         if self.business_process_manager:
             await self.business_process_manager.shutdown()
             self.business_process_manager = None
+        
+        # 清理紧急停止系统
+        if hasattr(self, 'emergency_stop') and self.emergency_stop:
+            self.emergency_stop = None
+        
+        # 清理智能监控系统
+        if hasattr(self, 'intelligent_monitoring') and self.intelligent_monitoring:
+            self.intelligent_monitoring = None
+        
+        # 清理安全管理器
+        if hasattr(self, 'security_manager') and self.security_manager:
+            self.security_manager = None
+        
+        # 清理智能资金管理器
+        if hasattr(self, 'fund_manager') and self.fund_manager:
+            await self.fund_manager.shutdown()
+            self.fund_manager = None
             
         self._initialized = False
 

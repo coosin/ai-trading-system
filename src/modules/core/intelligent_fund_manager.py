@@ -55,7 +55,7 @@ class PositionSizing:
 class IntelligentFundManager:
     """智能资金管理系统"""
 
-    def __init__(self, db_manager: DatabaseManager, risk_manager: AdvancedRiskManager, config: Dict[str, Any]):
+    def __init__(self, db_manager: DatabaseManager, risk_manager: RiskManager, config: Dict[str, Any]):
         """初始化智能资金管理系统
 
         Args:

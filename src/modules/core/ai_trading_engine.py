@@ -245,6 +245,51 @@ class AITradingEngine:
             logger.warning(f"⚠️ 链上数据集成器初始化失败: {e}")
             self.onchain_data = None
         
+        # 初始化深度学习集成器
+        try:
+            from src.modules.ai.deep_learning_integrator import DeepLearningIntegrator
+            self.dl_integrator = DeepLearningIntegrator()
+            logger.info(f"✅ 深度学习集成器已初始化，模型: {list(self.dl_integrator.models.keys())}")
+        except Exception as e:
+            logger.warning(f"⚠️ 深度学习集成器初始化失败: {e}")
+            self.dl_integrator = None
+        
+        # 初始化强化学习优化器
+        try:
+            from src.modules.ai.reinforcement_learning_optimizer import ReinforcementLearningAgent
+            self.rl_agent = ReinforcementLearningAgent()
+            logger.info("✅ 强化学习优化器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 强化学习优化器初始化失败: {e}")
+            self.rl_agent = None
+        
+        # 初始化智能缓存
+        try:
+            from src.modules.core.intelligent_cache import IntelligentCacheSystem
+            self.intelligent_cache = IntelligentCacheSystem()
+            logger.info("✅ 智能缓存已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 智能缓存初始化失败: {e}")
+            self.intelligent_cache = None
+        
+        # 初始化自动恢复系统
+        try:
+            from src.modules.core.auto_recovery import AutoRecoverySystem
+            self.auto_recovery = AutoRecoverySystem()
+            logger.info("✅ 自动恢复系统已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 自动恢复系统初始化失败: {e}")
+            self.auto_recovery = None
+        
+        # 初始化增强风险控制器
+        try:
+            from src.modules.core.enhanced_risk_controller import EnhancedRiskController
+            self.enhanced_risk = EnhancedRiskController()
+            logger.info("✅ 增强风险控制器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 增强风险控制器初始化失败: {e}")
+            self.enhanced_risk = None
+        
         # 加载配置
         if self.main_controller and self.main_controller.config_manager:
             config = await self.main_controller.config_manager.get_config("ai_trading", {})
@@ -531,6 +576,67 @@ class AITradingEngine:
                     }
                     for metric, data in onchain_metrics.items()
                 }
+            
+            # 深度学习预测
+            dl_prediction = None
+            if hasattr(self, 'dl_integrator') and self.dl_integrator:
+                try:
+                    import numpy as np
+                    # 准备输入数据
+                    klines = market_data.get("multi_timeframe_klines", {}).get("1h", [])
+                    if klines:
+                        close_prices = np.array([[k.get("close", 0)] for k in klines[-60:]])
+                        if len(close_prices) >= 60:
+                            dl_prediction = await self.dl_integrator.predict(close_prices, model_id="ensemble")
+                            if dl_prediction:
+                                analysis_data["dl_prediction"] = {
+                                    "direction": dl_prediction.direction,
+                                    "confidence": dl_prediction.confidence,
+                                    "predicted_change": dl_prediction.predicted_change,
+                                    "model_id": dl_prediction.model_id
+                                }
+                                logger.info(f"📊 深度学习预测: {dl_prediction.direction}, 置信度={dl_prediction.confidence:.2f}")
+                except Exception as e:
+                    logger.warning(f"深度学习预测失败: {e}")
+            
+            # 强化学习策略优化
+            rl_optimization = None
+            if hasattr(self, 'rl_agent') and self.rl_agent:
+                try:
+                    from src.modules.ai.reinforcement_learning_optimizer import State
+                    current_state = State(
+                        price=market_data["ticker"].get("last", 0),
+                        volume=market_data["ticker"].get("volume", 0),
+                        trend=technical_indicators.trend,
+                        volatility=self._calculate_volatility(technical_indicators),
+                        position=0.0,
+                        balance=10000.0,
+                        indicators={
+                            "rsi": technical_indicators.rsi,
+                            "macd": technical_indicators.macd,
+                            "ma_20": technical_indicators.ma20,
+                            "ma_50": technical_indicators.ma50
+                        }
+                    )
+                    rl_action = await self.rl_agent.get_action_recommendation(current_state)
+                    if rl_action:
+                        analysis_data["rl_recommendation"] = rl_action
+                        logger.info(f"📊 强化学习建议: {rl_action.get('action', 'N/A')}")
+                except Exception as e:
+                    logger.warning(f"强化学习优化失败: {e}")
+            
+            # 风险评估（增强版）
+            if hasattr(self, 'enhanced_risk') and self.enhanced_risk:
+                try:
+                    risk_assessment = await self.enhanced_risk.check_pre_trade_risk(
+                        symbol=symbol,
+                        action="buy",
+                        quantity=0,
+                        price=market_data["ticker"].get("last", 0)
+                    )
+                    analysis_data["enhanced_risk"] = risk_assessment
+                except Exception as e:
+                    logger.warning(f"增强风险评估失败: {e}")
             
             # 使用AI进行深度分析
             ai_analysis = await self.llm_integration.analyze_market(analysis_data)

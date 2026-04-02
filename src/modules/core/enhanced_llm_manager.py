@@ -445,6 +445,7 @@ class EnhancedLLMManager:
         
         # 从环境变量读取API密钥
         xunfei_api_key = os.getenv("XUNFEI_API_KEY", "")
+        qianfan_api_key = os.getenv("QIANFAN_API_KEY", "")
         
         predefined = [
             ModelConfig(
@@ -457,6 +458,17 @@ class EnhancedLLMManager:
                 cost_per_output_token=0.0,
                 context_window=32768,
                 priority=10
+            ),
+            ModelConfig(
+                provider=ModelProvider.OPENAI,
+                model_id="qianfan-code-latest",
+                display_name="百度千帆 qianfan-code-latest",
+                base_url="https://qianfan.baidubce.com/v2/coding",
+                api_key=qianfan_api_key,  # 从环境变量读取
+                cost_per_input_token=0.0,
+                cost_per_output_token=0.0,
+                context_window=32768,
+                priority=9
             ),
             ModelConfig(
                 provider=ModelProvider.LOCAL,
