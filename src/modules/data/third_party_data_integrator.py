@@ -69,12 +69,24 @@ class MarketSentiment:
 
 
 class BaseDataProvider(ABC):
-    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None, proxy_url: Optional[str] = None):
         self.api_key = api_key or os.getenv(self._get_env_key(), "")
         self.api_secret = api_secret or os.getenv(self._get_env_secret(), "")
         self.session: Optional[aiohttp.ClientSession] = None
         self._rate_limit_remaining = 100
         self._rate_limit_reset = datetime.now()
+        self._proxy_url = proxy_url
+    
+    async def _init_proxy(self):
+        """初始化代理"""
+        if self._proxy_url is None:
+            try:
+                from src.utils.proxy_utils import get_proxy_url
+                self._proxy_url = await get_proxy_url()
+                if self._proxy_url:
+                    logger.info(f"📊 {self.__class__.__name__} 使用代理: {self._proxy_url}")
+            except Exception as e:
+                logger.debug(f"获取代理失败: {e}")
     
     @abstractmethod
     def _get_env_key(self) -> str:
@@ -92,8 +104,10 @@ class BaseDataProvider(ABC):
         if not self.session:
             self.session = aiohttp.ClientSession()
         
+        await self._init_proxy()
+        
         try:
-            async with self.session.get(url, headers=headers, params=params, timeout=30) as response:
+            async with self.session.get(url, headers=headers, params=params, proxy=self._proxy_url, timeout=30) as response:
                 if response.status == 200:
                     return await response.json()
                 elif response.status == 429:

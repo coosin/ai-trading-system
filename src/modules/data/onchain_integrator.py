@@ -65,6 +65,22 @@ class WhaleActivity:
 class OnChainDataProvider:
     """链上数据提供者基类"""
     
+    def __init__(self, proxy_url: Optional[str] = None):
+        self._proxy_url = proxy_url
+        self._session: Optional[aiohttp.ClientSession] = None
+    
+    async def _get_proxy(self) -> Optional[str]:
+        """获取代理URL"""
+        if self._proxy_url:
+            return self._proxy_url
+        try:
+            from src.utils.proxy_utils import get_proxy_url
+            self._proxy_url = await get_proxy_url()
+            return self._proxy_url
+        except Exception as e:
+            logger.debug(f"获取代理失败: {e}")
+            return None
+    
     async def get_metric(self, symbol: str, metric: OnChainMetric) -> Optional[OnChainData]:
         """获取链上指标"""
         raise NotImplementedError
@@ -73,14 +89,14 @@ class OnChainDataProvider:
 class GlassnodeProvider(OnChainDataProvider):
     """Glassnode数据提供者"""
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, proxy_url: Optional[str] = None):
+        super().__init__(proxy_url)
         self.api_key = api_key
         self.base_url = "https://api.glassnode.com/v1/metrics"
     
     async def get_metric(self, symbol: str, metric: OnChainMetric) -> Optional[OnChainData]:
         """获取链上指标"""
         try:
-            # 映射指标名称
             metric_map = {
                 OnChainMetric.ACTIVE_ADDRESSES: "addresses/active_count",
                 OnChainMetric.TRANSACTION_VOLUME: "transactions/transfers_volume_sum",
@@ -99,22 +115,26 @@ class GlassnodeProvider(OnChainDataProvider):
                 "i": "24h"
             }
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
+            proxy = await self._get_proxy()
+            
+            if not self._session:
+                self._session = aiohttp.ClientSession()
+            
+            async with self._session.get(url, params=params, proxy=proxy, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if data and len(data) > 0:
+                        latest = data[-1]
                         
-                        if data and len(data) > 0:
-                            latest = data[-1]
-                            
-                            return OnChainData(
-                                symbol=symbol,
-                                metric=metric,
-                                value=float(latest.get("v", 0)),
-                                change_24h=0.0,  # 需要计算
-                                change_7d=0.0,   # 需要计算
-                                timestamp=datetime.fromtimestamp(latest.get("t", 0) / 1000)
-                            )
+                        return OnChainData(
+                            symbol=symbol,
+                            metric=metric,
+                            value=float(latest.get("v", 0)),
+                            change_24h=0.0,
+                            change_7d=0.0,
+                            timestamp=datetime.fromtimestamp(latest.get("t", 0) / 1000)
+                        )
             
             return None
             
@@ -126,14 +146,14 @@ class GlassnodeProvider(OnChainDataProvider):
 class CryptoQuantProvider(OnChainDataProvider):
     """CryptoQuant数据提供者"""
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, proxy_url: Optional[str] = None):
+        super().__init__(proxy_url)
         self.api_key = api_key
         self.base_url = "https://api.cryptoquant.com/v1"
     
     async def get_metric(self, symbol: str, metric: OnChainMetric) -> Optional[OnChainData]:
         """获取链上指标"""
         try:
-            # 映射指标名称
             metric_map = {
                 OnChainMetric.EXCHANGE_FLOWS: "exchange-flows/netflow",
                 OnChainMetric.MINER_ACTIVITY: "miner/outflow",
@@ -155,22 +175,26 @@ class CryptoQuantProvider(OnChainDataProvider):
                 "window": "day"
             }
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
+            proxy = await self._get_proxy()
+            
+            if not self._session:
+                self._session = aiohttp.ClientSession()
+            
+            async with self._session.get(url, headers=headers, params=params, proxy=proxy, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if data and "result" in data and len(data["result"]) > 0:
+                        latest = data["result"][-1]
                         
-                        if data and "result" in data and len(data["result"]) > 0:
-                            latest = data["result"][-1]
-                            
-                            return OnChainData(
-                                symbol=symbol,
-                                metric=metric,
-                                value=float(latest.get("value", 0)),
-                                change_24h=0.0,
-                                change_7d=0.0,
-                                timestamp=datetime.now()
-                            )
+                        return OnChainData(
+                            symbol=symbol,
+                            metric=metric,
+                            value=float(latest.get("value", 0)),
+                            change_24h=0.0,
+                            change_7d=0.0,
+                            timestamp=datetime.now()
+                        )
             
             return None
             
