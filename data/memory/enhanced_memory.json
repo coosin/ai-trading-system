@@ -2,6 +2,19 @@
   "short_term": [],
   "long_term": [
     {
+      "id": "mem_1775124963.578043",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: {'analysis': '\\n\\n```json\\n{\\n  \"symbol\": \"BNB/USDT\",\\n  \"analysis_timestamp\": \"2026-04-02T10:20:00\",\\n  \"current_price\": 583.7,\\n  \"trend\": \"bullish\",\\n  \"sentiment\": \"neutral\",\\n  \"volatility\": 0.0038,\\n\\n  \"1_market_trend_analysis\": {\\n    \"trend_direction\": \"看涨\",\\n    \"analysis\": \"价格呈现小幅上涨趋势，但波动率极低（0.38%），表明市场处于观望状态。趋势为bullish但动能较弱，可能只是技术性反弹而非强势上涨趋势。\",\\n    \"confidence\": \"中等\"\\n  },\\n\\n  \"2_key_levels\": {\\n    \"resistance_levels\": [\\n      {\"price\": 600.0, \"significance\": \"整数关口心理阻力\"},\\n      {\"price\": 615.0, \"significance\": \"近期高点阻力\"},\\n      {\"price\": 630.0, \"significance\": \"更强",
+      "metadata": {
+        "original": "基于以下市场分析，生成交易策略：\n\n{'analysis': '\\n\\n```json\\n{\\n  \"symbol\": \"BNB/USDT\",\\n  \"analysis_timestamp\": \"2026-04-02T10:20:00\",\\n  \"current_price\": 583.7,\\n  \"trend\": \"bullish\",\\n  \"sentiment\": \"neutral\",\\n  \"volatility\": 0.0038,\\n\\n  \"1_market_trend_analysis\": {\\n    \"trend_direction\": \"看涨\",\\n    \"analysis\": \"价格呈现小幅上涨趋势，但波动率极低（0.38%），表明市场处于观望状态。趋势为bullish但动能较弱，可能只是技术性反弹而非强势上涨趋势。\",\\n    \"confidence\": \"中等\"\\n  },\\n\\n  \"2_key_levels\": {\\n    \"resistance_levels\": [\\n      {\"price\": 600.0, \"significance\": \"整"
+      },
+      "created_at": "2026-04-02T10:16:03.578073",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
       "id": "mem_1775124943.370841",
       "category": "market_insight",
       "priority": 2,
@@ -6487,21 +6500,8 @@
       "last_accessed": null,
       "access_count": 0,
       "expires_at": null
-    },
-    {
-      "id": "mem_1775101349.765575",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66724.8, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.004675018964123076}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-02T03:42:29.765581",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
     }
   ],
   "session_id": null,
-  "updated_at": "2026-04-02T10:15:43.373932"
+  "updated_at": "2026-04-02T10:16:28.943415"
 }
