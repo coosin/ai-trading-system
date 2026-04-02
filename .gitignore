@@ -44,8 +44,8 @@ logs/
 *.log
 *.log.*
 
-# Data
-data/
+# Data (root level only)
+/data/
 *.db
 *.sqlite
 *.sqlite3
