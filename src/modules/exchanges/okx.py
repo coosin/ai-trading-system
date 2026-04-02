@@ -594,3 +594,245 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.error(f"获取OKX行情失败: {e}")
         return {}
+    
+    async def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "cross") -> Dict[str, Any]:
+        """设置杠杆倍数
+        
+        Args:
+            symbol: 交易对，如 BTC/USDT
+            leverage: 杠杆倍数
+            margin_mode: 保证金模式 cross(全仓) 或 isolated(逐仓)
+        """
+        endpoint = "/api/v5/account/set-leverage"
+        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
+        body = {
+            "instId": okx_symbol,
+            "lever": str(leverage),
+            "mgnMode": margin_mode
+        }
+        
+        try:
+            data = await self._make_request("POST", endpoint, body=body)
+            logger.info(f"✅ 设置杠杆成功: {symbol} {leverage}x ({margin_mode})")
+            return {
+                "success": True,
+                "symbol": symbol,
+                "leverage": leverage,
+                "margin_mode": margin_mode,
+                "data": data
+            }
+        except Exception as e:
+            logger.error(f"设置杠杆失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def open_swap_position(self, symbol: str, side: str, size: float, 
+                                  leverage: int = 20, price: float = None,
+                                  margin_mode: str = "cross") -> Dict[str, Any]:
+        """开永续合约仓位
+        
+        Args:
+            symbol: 交易对，如 BTC/USDT
+            side: 方向 long/short
+            size: 仓位大小（张数或币数）
+            leverage: 杠杆倍数
+            price: 限价单价格，None为市价单
+            margin_mode: 保证金模式
+        """
+        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
+        await self.set_leverage(symbol, leverage, margin_mode)
+        
+        order_type = "market" if price is None else "limit"
+        
+        body = {
+            "instId": okx_symbol,
+            "tdMode": margin_mode,
+            "side": "buy" if side == "long" else "sell",
+            "posSide": side,
+            "ordType": order_type,
+            "sz": str(size)
+        }
+        
+        if price:
+            body["px"] = str(price)
+        
+        endpoint = "/api/v5/trade/order"
+        
+        try:
+            data = await self._make_request("POST", endpoint, body=body)
+            logger.info(f"✅ 开仓成功: {symbol} {side} {size} @ {leverage}x")
+            return {
+                "success": True,
+                "order_id": data.get("ordId"),
+                "symbol": symbol,
+                "side": side,
+                "size": size,
+                "leverage": leverage,
+                "data": data
+            }
+        except Exception as e:
+            logger.error(f"开仓失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def close_swap_position(self, symbol: str, side: str, size: float = None) -> Dict[str, Any]:
+        """平永续合约仓位
+        
+        Args:
+            symbol: 交易对
+            side: 方向 long/short
+            size: 平仓数量，None为全部平仓
+        """
+        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
+        if size is None:
+            positions = await self.get_positions()
+            for pos in positions:
+                if pos["symbol"].replace("/USDT", "") == symbol.replace("/USDT", ""):
+                    size = abs(float(pos["size"]))
+                    break
+        
+        if size is None or size <= 0:
+            return {"success": False, "error": "未找到持仓或数量为0"}
+        
+        body = {
+            "instId": okx_symbol,
+            "tdMode": "cross",
+            "side": "sell" if side == "long" else "buy",
+            "posSide": side,
+            "ordType": "market",
+            "sz": str(size)
+        }
+        
+        endpoint = "/api/v5/trade/order"
+        
+        try:
+            data = await self._make_request("POST", endpoint, body=body)
+            logger.info(f"✅ 平仓成功: {symbol} {side} {size}")
+            return {
+                "success": True,
+                "order_id": data.get("ordId"),
+                "symbol": symbol,
+                "side": side,
+                "size": size,
+                "data": data
+            }
+        except Exception as e:
+            logger.error(f"平仓失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def get_swap_ticker(self, symbol: str) -> Dict[str, Any]:
+        """获取永续合约行情"""
+        endpoint = "/api/v5/market/ticker"
+        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        params = {"instId": okx_symbol}
+        
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            if data and len(data) > 0:
+                ticker = data[0]
+                return {
+                    "symbol": symbol,
+                    "last": float(ticker.get("last", 0)),
+                    "bid": float(ticker.get("bidPx", 0)),
+                    "ask": float(ticker.get("askPx", 0)),
+                    "high": float(ticker.get("high24h", 0)),
+                    "low": float(ticker.get("low24h", 0)),
+                    "volume": float(ticker.get("vol24h", 0)),
+                    "change": float(ticker.get("change24h", 0)),
+                    "funding_rate": float(ticker.get("fundingRate", 0)),
+                    "timestamp": int(ticker.get("ts", 0))
+                }
+        except Exception as e:
+            logger.error(f"获取永续合约行情失败: {e}")
+        return {}
+    
+    async def get_swap_klines(self, symbol: str, interval: str = "1H", limit: int = 100) -> List[Dict[str, Any]]:
+        """获取永续合约K线数据"""
+        endpoint = "/api/v5/market/candles"
+        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
+        interval_map = {
+            "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+            "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W"
+        }
+        bar = interval_map.get(interval, "1H")
+        
+        params = {
+            "instId": okx_symbol,
+            "bar": bar,
+            "limit": str(limit)
+        }
+        
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            klines = []
+            
+            for candle in data:
+                klines.append({
+                    "timestamp": int(candle[0]),
+                    "open": float(candle[1]),
+                    "high": float(candle[2]),
+                    "low": float(candle[3]),
+                    "close": float(candle[4]),
+                    "volume": float(candle[5])
+                })
+            
+            return list(reversed(klines))
+        except Exception as e:
+            logger.error(f"获取永续合约K线失败: {e}")
+            return []
+    
+    async def create_grid_order(self, symbol: str, grid_levels: int = 10, 
+                                 grid_spacing: float = 0.01, total_size: float = 1.0,
+                                 leverage: int = 20, side: str = "long") -> Dict[str, Any]:
+        """创建网格交易订单
+        
+        Args:
+            symbol: 交易对
+            grid_levels: 网格层数
+            grid_spacing: 网格间距（百分比）
+            total_size: 总仓位大小
+            leverage: 杠杆倍数
+            side: 方向 long/short
+        """
+        ticker = await self.get_swap_ticker(symbol)
+        if not ticker:
+            return {"success": False, "error": "无法获取行情"}
+        
+        current_price = ticker["last"]
+        size_per_grid = total_size / grid_levels
+        
+        orders = []
+        
+        for i in range(1, grid_levels + 1):
+            if side == "long":
+                price = current_price * (1 - grid_spacing * i)
+            else:
+                price = current_price * (1 + grid_spacing * i)
+            
+            result = await self.open_swap_position(
+                symbol=symbol,
+                side=side,
+                size=size_per_grid,
+                leverage=leverage,
+                price=round(price, 2),
+                margin_mode="cross"
+            )
+            
+            orders.append({
+                "level": i,
+                "price": price,
+                "size": size_per_grid,
+                "result": result
+            })
+        
+        logger.info(f"✅ 创建网格订单: {symbol} {grid_levels}层 间距{grid_spacing*100}%")
+        return {
+            "success": True,
+            "symbol": symbol,
+            "current_price": current_price,
+            "grid_levels": grid_levels,
+            "grid_spacing": grid_spacing,
+            "orders": orders
+        }

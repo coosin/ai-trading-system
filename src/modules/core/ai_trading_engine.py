@@ -126,14 +126,30 @@ class AITradingEngine:
         # 交易对黑名单 (ETH已被用户禁用)
         self.symbol_blacklist = ["ETH/USDT"]
         
+        # 永续合约交易配置
+        self.contract_config = {
+            "enabled": True,                    # 启用合约交易
+            "trade_type": "swap",               # 永续合约
+            "leverage_min": 10,                 # 最小杠杆倍数
+            "leverage_max": 50,                 # 最大杠杆倍数
+            "default_leverage": 20,             # 默认杠杆倍数
+            "max_positions": 5,                 # 最大同时持仓数
+            "min_positions": 3,                 # 最小同时持仓数
+            "margin_mode": "cross",             # 全仓模式
+            "grid_trading": True,               # 启用网格交易
+            "grid_levels": 10,                  # 网格层数
+            "grid_spacing": 0.01,               # 网格间距 1%
+        }
+        
         # AI配置
         self.ai_config = {
             "enabled": True,
             "model_id": "astron-code-latest",
             "analysis_interval": 60,  # 分析间隔（秒）
             "min_confidence": 0.65,   # 最小置信度
-            "max_positions": 3,       # 最大持仓数
+            "max_positions": 5,       # 最大持仓数 (合约)
             "risk_per_trade": 0.02,   # 单笔交易风险（2%）
+            "trade_mode": "real",     # 实盘交易模式
         }
         
         # 运行状态

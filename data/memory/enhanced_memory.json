@@ -2,6 +2,240 @@
   "short_term": [],
   "long_term": [
     {
+      "id": "mem_1775143628.216563",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66799.9, 'ticker': {'symbol': 'BTC/USDT', 'last': 66799.9, 'bid': 66799.9, 'ask': 66800.0, 'high': 69176.3, 'low': 65701.7, 'volume': 7106.66552303, 'change': 0.0, 'timestamp': 1775143613813}, 'order_book': {'bid_depth': 1.68835578, 'ask_depth': 1.19493869, 'spread': 0.0001, 'imbalance': 0.17}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 66606.58, 'ma10': 66551.84, 'ma20': 66732.79000000001, 'ma50': 67023.562, 'em"
+      },
+      "created_at": "2026-04-02T23:27:08.216586",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143568.16069",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 78.63, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.012730866193219545}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-02T23:26:08.160703",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143547.131406",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 78.63, 'ticker': {'symbol': 'SOL/USDT', 'last': 78.63, 'bid': 78.62, 'ask': 78.63, 'high': 86.62, 'low': 76.7, 'volume': 1496668.952535, 'change': 0.0, 'timestamp': 1775143531116}, 'order_book': {'bid_depth': 2536.165225, 'ask_depth': 2461.817613, 'spread': 0.0127, 'imbalance': 0.01}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 81.958, 'ma10': 81.88199999999999, 'ma20': 82.36449999999999, 'ma50': 82.79780000000001"
+      },
+      "created_at": "2026-04-02T23:25:47.131445",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143489.374209",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66773.4, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.008892501401056798}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-02T23:24:49.374231",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143470.448797",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66773.4, 'ticker': {'symbol': 'BTC/USDT', 'last': 66773.4, 'bid': 66772.9, 'ask': 66773.0, 'high': 69176.3, 'low': 65701.7, 'volume': 7132.49277368, 'change': 0.0, 'timestamp': 1775143459260}, 'order_book': {'bid_depth': 0.9870224400000001, 'ask_depth': 0.99357535, 'spread': 0.0001, 'imbalance': -0.0}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 66606.58, 'ma10': 66551.84, 'ma20': 66732.79000000001, 'ma50': 67023."
+      },
+      "created_at": "2026-04-02T23:24:30.448826",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143354.673727",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 573.0, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.00782196735320972}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-02T23:22:34.673738",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143330.66862",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 573.0, 'ticker': {'symbol': 'BNB/USDT', 'last': 573.0, 'bid': 572.9, 'ask': 573.0, 'high': 619.7, 'low': 570.8, 'volume': 18544.018468, 'change': 0.0, 'timestamp': 1775143320314}, 'order_book': {'bid_depth': 364.958825, 'ask_depth': 220.66871899999998, 'spread': 0.0175, 'imbalance': 0.25}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 610.44, 'ma10': 610.0699999999999, 'ma20': 611.8299999999999, 'ma50': 612.40600000"
+      },
+      "created_at": "2026-04-02T23:22:10.668652",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143278.533581",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 78.58, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.012730866193219545}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-02T23:21:18.533592",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143262.335648",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 78.58, 'ticker': {'symbol': 'SOL/USDT', 'last': 78.58, 'bid': 78.58, 'ask': 78.59, 'high': 86.62, 'low': 76.7, 'volume': 1498512.78823, 'change': 0.0, 'timestamp': 1775143250508}, 'order_book': {'bid_depth': 1934.715135, 'ask_depth': 2100.637743, 'spread': 0.0127, 'imbalance': -0.04}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 81.958, 'ma10': 81.88199999999999, 'ma20': 82.36449999999999, 'ma50': 82.79780000000001"
+      },
+      "created_at": "2026-04-02T23:21:02.335672",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143212.524856",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66853.6, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.008892501401056798}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-02T23:20:12.524867",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143193.181645",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66853.6, 'ticker': {'symbol': 'BTC/USDT', 'last': 66853.6, 'bid': 66849.7, 'ask': 66849.8, 'high': 69176.3, 'low': 65701.7, 'volume': 7170.12423975, 'change': 0.0, 'timestamp': 1775143182318}, 'order_book': {'bid_depth': 0.29510453999999997, 'ask_depth': 3.61210205, 'spread': 0.0001, 'imbalance': -0.85}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 66606.58, 'ma10': 66551.84, 'ma20': 66732.79000000001, 'ma50': 6702"
+      },
+      "created_at": "2026-04-02T23:19:53.181673",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143081.172179",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 575.3, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.00782196735320972}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-02T23:18:01.172190",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143060.909708",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 575.3, 'ticker': {'symbol': 'BNB/USDT', 'last': 575.3, 'bid': 575.2, 'ask': 575.3, 'high': 619.7, 'low': 570.8, 'volume': 18283.736296, 'change': 0.0, 'timestamp': 1775143047910}, 'order_book': {'bid_depth': 307.85645800000003, 'ask_depth': 254.939913, 'spread': 0.0174, 'imbalance': 0.09}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 610.44, 'ma10': 610.0699999999999, 'ma20': 611.8299999999999, 'ma50': 612.40600000"
+      },
+      "created_at": "2026-04-02T23:17:40.909748",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775143010.813046",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 78.88, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.012730866193219545}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-02T23:16:50.813057",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775142994.19308",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 78.88, 'ticker': {'symbol': 'SOL/USDT', 'last': 78.88, 'bid': 78.88, 'ask': 78.89, 'high': 86.62, 'low': 76.7, 'volume': 1486859.443601, 'change': 0.0, 'timestamp': 1775142979608}, 'order_book': {'bid_depth': 2576.116095, 'ask_depth': 2124.920902, 'spread': 0.0127, 'imbalance': 0.1}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 81.958, 'ma10': 81.88199999999999, 'ma20': 82.36449999999999, 'ma50': 82.79780000000001,"
+      },
+      "created_at": "2026-04-02T23:16:34.193096",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775142953.825639",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: {'analysis': '\\n\\n```json\\n{\\n  \"analysis\": {\\n    \"market_trend\": {\\n      \"overall\": \"中性偏弱\",\\n      \"short_term\": \"短期偏跌，价格在66892.1美元附近震荡\",\\n      \"medium_term\": \"中期趋势不明，等待方向选择\",\\n      \"volatility_level\": \"低波动率(0.89%)，震荡整理为主\"\\n    },\\n    \"key_levels\": {\\n      \"current_price\": 66892.1,\\n      \"support_levels\": [\\n        {\"price\": 66000, \"strength\": \"强支撑\", \"description\": \"关键心理关口\"},\\n        {\"price\": 65000, \"strength\": \"强支撑\", \"description\": \"前期密集成交区\"},\\n        {\"price\": 64000, \"strength\": \"中等支撑\", \"description\": \"重要",
+      "metadata": {
+        "original": "基于以下市场分析，生成交易策略：\n\n{'analysis': '\\n\\n```json\\n{\\n  \"analysis\": {\\n    \"market_trend\": {\\n      \"overall\": \"中性偏弱\",\\n      \"short_term\": \"短期偏跌，价格在66892.1美元附近震荡\",\\n      \"medium_term\": \"中期趋势不明，等待方向选择\",\\n      \"volatility_level\": \"低波动率(0.89%)，震荡整理为主\"\\n    },\\n    \"key_levels\": {\\n      \"current_price\": 66892.1,\\n      \"support_levels\": [\\n        {\"price\": 66000, \"strength\": \"强支撑\", \"description\": \"关键心理关口\"},\\n        {\"price\": 65000, \"strength\": \"强支撑\", \"description\": \"前期密集成交区\"},\\n        {\"price\": 640"
+      },
+      "created_at": "2026-04-02T23:15:53.825660",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775142942.508112",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66892.1, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.008892501401056798}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-02T23:15:42.508124",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775142921.657682",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66892.1, 'ticker': {'symbol': 'BTC/USDT', 'last': 66892.1, 'bid': 66892.1, 'ask': 66892.2, 'high': 69176.3, 'low': 65701.7, 'volume': 7157.39113551, 'change': 0.0, 'timestamp': 1775142906912}, 'order_book': {'bid_depth': 0.49923155, 'ask_depth': 3.1660750799999997, 'spread': 0.0001, 'imbalance': -0.73}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 66606.58, 'ma10': 66551.84, 'ma20': 66732.79000000001, 'ma50': 67023"
+      },
+      "created_at": "2026-04-02T23:15:21.657711",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
       "id": "mem_1775142847.171658",
       "category": "market_insight",
       "priority": 2,
@@ -6266,242 +6500,8 @@
       "last_accessed": null,
       "access_count": 0,
       "expires_at": null
-    },
-    {
-      "id": "mem_1775119143.382286",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2048.0, 'ticker': {'symbol': 'ETH/USDT', 'last': 2048.0, 'bid': 2048.0, 'ask': 2048.01, 'high': 2168.0, 'low': 2038.5, 'volume': 180498.479136, 'change': 0.0, 'timestamp': 1775119112615}, 'order_book': {'bid_depth': 1.417055, 'ask_depth': 75.27993, 'spread': 0.0005, 'imbalance': -0.96}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 2004.014, 'ma10': 2000.363, 'ma20': 1997.4414999999997, 'ma50': 2029.5256000000002, '"
-      },
-      "created_at": "2026-04-02T08:39:03.382304",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775119070.615992",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: {'analysis': '\\n\\n# BTC/USDT 市场分析\\n\\n```json\\n{\\n  \"symbol\": \"BTC/USDT\",\\n  \"price\": 66626.1,\\n  \"timestamp\": \"2026-04-02\",\\n  \"analysis\": {\\n    \"trend\": {\\n      \"direction\": \"bullish\",\\n      \"strength\": \"moderate\",\\n      \"note\": \"短期趋势偏多，但需注意上方压力\"\\n    },\\n    \"price_levels\": {\\n      \"resistance\": [\\n        {\"level\": 67000, \"type\": \"first_resistance\", \"note\": \"短期心理关口\"},\\n        {\"level\": 68000, \"type\": \"second_resistance\", \"note\": \"关键",
-      "metadata": {
-        "original": "基于以下市场分析，生成交易策略：\n\n{'analysis': '\\n\\n# BTC/USDT 市场分析\\n\\n```json\\n{\\n  \"symbol\": \"BTC/USDT\",\\n  \"price\": 66626.1,\\n  \"timestamp\": \"2026-04-02\",\\n  \"analysis\": {\\n    \"trend\": {\\n      \"direction\": \"bullish\",\\n      \"strength\": \"moderate\",\\n      \"note\": \"短期趋势偏多，但需注意上方压力\"\\n    },\\n    \"price_levels\": {\\n      \"resistance\": [\\n        {\"level\": 67000, \"type\": \"first_resistance\", \"note\": \"短期心理关口\"},\\n        {\"level\": 68000, \"type\": \"second_resistance\", \"note\": \"关键阻力位\"},\\n        {\"level\": 70000, \"typ"
-      },
-      "created_at": "2026-04-02T08:37:50.616008",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775119050.333188",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66626.1, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.004609136218904409}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-02T08:37:30.333194",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775119024.746728",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66626.1, 'ticker': {'symbol': 'BTC/USDT', 'last': 66626.1, 'bid': 66625.3, 'ask': 66625.4, 'high': 69176.3, 'low': 66222.0, 'volume': 6900.2878887, 'change': 0.0, 'timestamp': 1775119004111}, 'order_book': {'bid_depth': 0.73551378, 'ask_depth': 4.26838344, 'spread': 0.0002, 'imbalance': -0.71}, 'technical_indicators': {'trend': {'direction': 'bullish', 'strength': 0.75, 'ma5': 66707.31999999999, 'ma10': 66686.06, 'ma20': 66526.255, 'ma50': 67014.8, 'ema"
-      },
-      "created_at": "2026-04-02T08:37:04.746752",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118866.712245",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 590.7, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.003730470577228951}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-02T08:34:26.712254",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118853.212959",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 590.7, 'ticker': {'symbol': 'BNB/USDT', 'last': 590.7, 'bid': 590.7, 'ask': 590.8, 'high': 619.7, 'low': 587.6, 'volume': 13211.437916, 'change': 0.0, 'timestamp': 1775118832809}, 'order_book': {'bid_depth': 269.7023, 'ask_depth': 260.97781399999997, 'spread': 0.0169, 'imbalance': 0.02}, 'technical_indicators': {'trend': {'direction': 'bullish', 'strength': 0.75, 'ma5': 613.82, 'ma10': 612.8, 'ma20': 610.8, 'ma50': 613.402, 'ema12': 612.7757500311128, '"
-      },
-      "created_at": "2026-04-02T08:34:13.212982",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118768.215476",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 79.3, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.007142029712585565}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-02T08:32:48.215482",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118735.137898",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 79.3, 'ticker': {'symbol': 'SOL/USDT', 'last': 79.3, 'bid': 79.29, 'ask': 79.3, 'high': 86.62, 'low': 78.31, 'volume': 1323519.783575, 'change': 0.0, 'timestamp': 1775118717230}, 'order_book': {'bid_depth': 2559.561158, 'ask_depth': 3547.4337, 'spread': 0.0126, 'imbalance': -0.16}, 'technical_indicators': {'trend': {'direction': 'bullish', 'strength': 0.75, 'ma5': 82.486, 'ma10': 82.34, 'ma20': 82.00950000000002, 'ma50': 82.9422, 'ema12': 82.35377552493"
-      },
-      "created_at": "2026-04-02T08:32:15.137922",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118641.016017",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2048.93, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.0063885296694367825}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-02T08:30:41.016023",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118593.157768",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'ETH/USDT', 'price': 2048.93, 'ticker': {'symbol': 'ETH/USDT', 'last': 2048.93, 'bid': 2048.92, 'ask': 2048.93, 'high': 2168.0, 'low': 2038.5, 'volume': 180969.851564, 'change': 0.0, 'timestamp': 1775118568918}, 'order_book': {'bid_depth': 40.134712, 'ask_depth': 4.177869, 'spread': 0.0005, 'imbalance': 0.81}, 'technical_indicators': {'trend': {'direction': 'sideways', 'strength': 0.5, 'ma5': 2004.014, 'ma10': 2000.363, 'ma20': 1997.4414999999997, 'ma50': 2029.5256000000002"
-      },
-      "created_at": "2026-04-02T08:29:53.157790",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118533.971691",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: {'analysis': '\\n\\n```json\\n{\\n  \"symbol\": \"BTC/USDT\",\\n  \"analysis_timestamp\": \"2026-04-02T08:30:00\",\\n  \"current_price\": 66642.5,\\n  \"trend\": \"bullish\",\\n  \"sentiment\": \"neutral\",\\n  \"volatility\": 0.0046,\\n  \\n  \"analysis\": {\\n    \"market_trend\": {\\n      \"direction\": \"短期看涨，但需谨慎\",\\n      \"note\": \"虽然当前显示bullish趋势，但根据记忆数据显示BTC近7日跌幅-4.79%，仍处于回调趋势中\",\\n      \"timeframe\": \"4小时级别偏多，日线级别偏回调\"\\n    },\\n    \\n    \"key_levels\": {\\n      \"resistance\": [\\n        {\"price\": 68000, \"strength\": \"强阻力\", \"note\": \"前期高点密集区\"},\\n        {\"price\": 69500, \"strength\": \"关键阻力\", \"note\": \"心理关口\"},\\n        {\"price\": 71000, \"strength\": \"强阻力\", \"note\": \"前轮下跌起点\"}\\n      ],\\n      \"support\": [\\n        {\"price\": 66000, \"strength\": \"短期支撑\", \"note\": \"当前价格附近\"},\\n        {\"price\": 65000, \"strength\": \"关键支撑\", \"note\": \"重要心理关口\"},\\n        {\"price\": 63500, \"strength\": \"强支撑\", \"note\": \"前期",
-      "metadata": {
-        "original": "基于以下市场分析和策略，生成具体的交易信号：\n\n市场分析：\n{'analysis': '\\n\\n```json\\n{\\n  \"symbol\": \"BTC/USDT\",\\n  \"analysis_timestamp\": \"2026-04-02T08:30:00\",\\n  \"current_price\": 66642.5,\\n  \"trend\": \"bullish\",\\n  \"sentiment\": \"neutral\",\\n  \"volatility\": 0.0046,\\n  \\n  \"analysis\": {\\n    \"market_trend\": {\\n      \"direction\": \"短期看涨，但需谨慎\",\\n      \"note\": \"虽然当前显示bullish趋势，但根据记忆数据显示BTC近7日跌幅-4.79%，仍处于回调趋势中\",\\n      \"timeframe\": \"4小时级别偏多，日线级别偏回调\"\\n    },\\n    \\n    \"key_levels\": {\\n      \"resistance\": [\\n        {\"price\": 68000"
-      },
-      "created_at": "2026-04-02T08:28:53.971706",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118504.200938",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: {'analysis': '\\n\\n```json\\n{\\n  \"symbol\": \"BTC/USDT\",\\n  \"analysis_timestamp\": \"2026-04-02T08:30:00\",\\n  \"current_price\": 66642.5,\\n  \"trend\": \"bullish\",\\n  \"sentiment\": \"neutral\",\\n  \"volatility\": 0.0046,\\n  \\n  \"analysis\": {\\n    \"market_trend\": {\\n      \"direction\": \"短期看涨，但需谨慎\",\\n      \"note\": \"虽然当前显示bullish趋势，但根据记忆数据显示BTC近7日跌幅-4.79%，仍处于回调趋势中\",\\n      \"timeframe\": \"4小时级别偏多，日线级别偏回调\"\\n    },\\n    \\n    \"key_levels\": {\\n      \"resistance\": [\\n        {\"price\": 68000, \"strength\": \"强阻力\", \"note\": \"前期高点密集区\"},\\n        {\"price\": 69500, \"strength\": \"关键阻力\", \"note\": \"心理关口\"},\\n        {\"price\": 71000, \"strength\": \"强阻力\", \"note\": \"前轮下跌起点\"}\\n      ],\\n      \"support\": [\\n        {\"price\": 66000, \"strength\": \"短期支撑\", \"note\": \"当前价格附近\"},\\n        {\"price\": 65000, \"strength\": \"关键支撑\", \"note\": \"重要心理关口\"},\\n        {\"price\": 63500, \"strength\": \"强支撑\", \"note\": \"前期",
-      "metadata": {
-        "original": "基于以下市场分析，生成交易策略：\n\n{'analysis': '\\n\\n```json\\n{\\n  \"symbol\": \"BTC/USDT\",\\n  \"analysis_timestamp\": \"2026-04-02T08:30:00\",\\n  \"current_price\": 66642.5,\\n  \"trend\": \"bullish\",\\n  \"sentiment\": \"neutral\",\\n  \"volatility\": 0.0046,\\n  \\n  \"analysis\": {\\n    \"market_trend\": {\\n      \"direction\": \"短期看涨，但需谨慎\",\\n      \"note\": \"虽然当前显示bullish趋势，但根据记忆数据显示BTC近7日跌幅-4.79%，仍处于回调趋势中\",\\n      \"timeframe\": \"4小时级别偏多，日线级别偏回调\"\\n    },\\n    \\n    \"key_levels\": {\\n      \"resistance\": [\\n        {\"price\": 68000, \"strength\""
-      },
-      "created_at": "2026-04-02T08:28:24.200952",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118486.441737",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66642.5, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.004609136218904409}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-02T08:28:06.441743",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118453.845659",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66642.5, 'ticker': {'symbol': 'BTC/USDT', 'last': 66642.5, 'bid': 66642.4, 'ask': 66642.5, 'high': 69176.3, 'low': 66222.0, 'volume': 6905.23021283, 'change': 0.0, 'timestamp': 1775118425418}, 'order_book': {'bid_depth': 1.53727552, 'ask_depth': 2.70704066, 'spread': 0.0002, 'imbalance': -0.28}, 'technical_indicators': {'trend': {'direction': 'bullish', 'strength': 0.75, 'ma5': 66707.31999999999, 'ma10': 66686.06, 'ma20': 66526.255, 'ma50': 67014.8, 'em"
-      },
-      "created_at": "2026-04-02T08:27:33.845684",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118364.29678",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66646.8, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.004609136218904409}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-02T08:26:04.296788",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118339.349945",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66646.8, 'ticker': {'symbol': 'BTC/USDT', 'last': 66646.8, 'bid': 66643.5, 'ask': 66643.6, 'high': 69176.3, 'low': 66222.0, 'volume': 6910.51352332, 'change': 0.0, 'timestamp': 1775118311817}, 'order_book': {'bid_depth': 2.3275361099999996, 'ask_depth': 2.68202723, 'spread': 0.0002, 'imbalance': -0.07}, 'technical_indicators': {'trend': {'direction': 'bullish', 'strength': 0.75, 'ma5': 66707.31999999999, 'ma10': 66686.06, 'ma20': 66526.255, 'ma50': 6701"
-      },
-      "created_at": "2026-04-02T08:25:39.349967",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775118006.181272",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66690.4, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.004609136218904409}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-02T08:20:06.181287",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775117975.611402",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66690.4, 'ticker': {'symbol': 'BTC/USDT', 'last': 66690.4, 'bid': 66690.3, 'ask': 66690.4, 'high': 69176.3, 'low': 66222.0, 'volume': 6919.31980471, 'change': 0.0, 'timestamp': 1775117951015}, 'order_book': {'bid_depth': 2.29361686, 'ask_depth': 1.34276597, 'spread': 0.0001, 'imbalance': 0.26}, 'technical_indicators': {'trend': {'direction': 'bullish', 'strength': 0.75, 'ma5': 66707.31999999999, 'ma10': 66686.06, 'ma20': 66526.255, 'ma50': 67014.8, 'ema"
-      },
-      "created_at": "2026-04-02T08:19:35.611419",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
     }
   ],
   "session_id": null,
-  "updated_at": "2026-04-02T23:14:22.299564"
+  "updated_at": "2026-04-02T23:27:08.218996"
 }
