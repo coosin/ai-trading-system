@@ -7,8 +7,7 @@ from .onchain_integrator import (
     OnChainDataProvider,
     GlassnodeProvider,
     CryptoQuantProvider,
-    OnChainData,
-    onchain_integrator
+    OnChainData
 )
 
 from .third_party_data_integrator import (
@@ -31,7 +30,6 @@ __all__ = [
     "GlassnodeProvider",
     "CryptoQuantProvider",
     "OnChainData",
-    "onchain_integrator",
     "ThirdPartyDataIntegrator",
     "TwitterProvider",
     "RedditProvider",

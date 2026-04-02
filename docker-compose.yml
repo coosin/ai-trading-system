@@ -1,128 +1,67 @@
 version: '3.8'
 
-networks:
-  trading-network:
-    driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 172.28.0.0/16
-
-volumes:
-  postgres-data:
-  redis-data:
-  prometheus-data:
-  grafana-data:
-  trading-logs:
-  trading-data:
-
 services:
-  # 主应用服务
-  trading-app:
-    build: .
-    container_name: trading-app
+  trading-system:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openclaw-trading
+    restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
-      - trading-data:/app/data
-      - trading-logs:/app/logs
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+      - ./.env:/app/.env:ro
     environment:
-      - LOG_LEVEL=INFO
-      - TRADING_ENV=production
-      - DATABASE_URL=postgresql://admin:password@postgres:5432/trading
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=your-secret-key-change-in-production
-      - PYTHONPATH=/app
+      - MODE=${MODE:-simulation}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+    networks:
+      - trading-network
     depends_on:
-      - postgres
       - redis
-    restart: unless-stopped
-    networks:
-      - trading-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 30s
       retries: 3
-      start_period: 30s
+      start_period: 10s
 
-  # PostgreSQL数据库
-  postgres:
-    image: postgres:15-alpine
-    container_name: trading-postgres
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_USER=admin
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=trading
-      - POSTGRES_INITDB_ARGS=--encoding=UTF8
-    restart: unless-stopped
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d trading"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # Redis缓存
   redis:
     image: redis:7-alpine
-    container_name: trading-redis
+    container_name: openclaw-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
+    networks:
+      - trading-network
     command: redis-server --appendonly yes
-    restart: unless-stopped
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
-  # Prometheus监控
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: trading-prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    restart: unless-stopped
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+  # 可选：PostgreSQL数据库
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: openclaw-postgres
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5432:5432"
+  #   environment:
+  #     - POSTGRES_USER=${POSTGRES_USER:-trader}
+  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+  #     - POSTGRES_DB=${POSTGRES_DB:-trading_db}
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   networks:
+  #     - trading-network
 
-  # Grafana监控面板
-  grafana:
-    image: grafana/grafana:latest
-    container_name: trading-grafana
-    ports:
-      - "3000:3000"
-    volumes:
-      - grafana-data:/var/lib/grafana
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_INSTALL_PLUGINS=grafana-prometheus-datasource
-    restart: unless-stopped
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    depends_on:
-      - prometheus
+networks:
+  trading-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  # postgres-data:
