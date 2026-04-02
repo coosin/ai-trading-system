@@ -4,6 +4,7 @@ import {
   AreaChart, Area, 
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
+import MultiSourceAnalysis from './MultiSourceAnalysis';
 
 const COLORS = ['#1890ff', '#52c41a', '#faad14', '#722ed1', '#eb2f96'];
 
@@ -1338,6 +1339,15 @@ function ProfessionalDashboard({ activeView }) {
     </div>
   );
 
+  const renderAnalysis = () => (
+    <MultiSourceAnalysis 
+      symbol={selectedSymbol}
+      onAnalysisComplete={(analysis) => {
+        console.log('分析完成:', analysis);
+      }}
+    />
+  );
+
   const renderReports = () => (
     <div className="panel-row">
       <div className="panel" style={{ gridColumn: 'span 2' }}>
@@ -1516,6 +1526,7 @@ function ProfessionalDashboard({ activeView }) {
       case 'positions': return renderPositions();
       case 'history': return renderHistory();
       case 'ai': return renderAI();
+      case 'analysis': return renderAnalysis();
       case 'strategies': return renderStrategies();
       case 'risk': return renderRisk();
       case 'reports': return renderReports();

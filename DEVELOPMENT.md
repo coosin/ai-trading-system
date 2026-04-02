@@ -1,261 +1,581 @@
-# 全智能量化交易系统 - 开发文档
+# OpenClaw Trading - 开发文档
 
-## 📋 系统概述
+## 目录
 
-全智能量化交易系统是一个完全自动化的加密货币交易平台，具备AI智能决策、多源数据融合分析、自我学习和进化能力。
-
-## 🚀 核心功能
-
-### 1. 多源数据融合分析
-- **数据源**：Binance, CoinGecko, Etherscan, Twitter, NewsAPI, Coinbase, Kraken
-- **分析维度**：技术分析 + 市场情绪 + 链上数据 + 新闻 + 社交媒体
-- **输出**：综合市场情报、情绪分析、信号强度评估
-
-### 2. AI智能决策
-- **决策框架**：基于多源数据的AI分析
-- **交易信号**：开平仓判断、仓位大小计算、止损止盈设置
-- **风险控制**：实时风险评估、自动止损
-
-### 3. 自我学习与进化
-- **经验提取**：自动总结交易经验教训
-- **模式识别**：识别成功和失败的交易模式
-- **规则优化**：基于学习结果自动优化决策规则
-- **学习报告**：定期生成学习报告和改进建议
-
-### 4. 策略管理
-- **策略开发**：AI自动发现和创建新策略
-- **策略回测**：历史数据回测验证
-- **策略优化**：参数自动优化
-- **策略评估**：性能分析和改进建议
-
-### 5. 交易执行
-- **全自动执行**：7x24小时自动交易
-- **多交易所支持**：OKX为主，支持其他交易所
-- **订单管理**：智能订单执行和管理
-- **交易记录**：完整的交易历史记录
-
-### 6. 风险管理
-- **实时监控**：账户风险实时监控
-- **预警机制**：风险预警和自动处理
-- **资金管理**：智能资金分配
-- **风险报告**：定期风险评估报告
-
-### 7. 记忆系统
-- **长期记忆**：交易经验、市场洞察、用户偏好
-- **工作区文件**：核心知识存储
-- **记忆压缩**：自动记忆管理和压缩
-- **上下文感知**：智能记忆检索和应用
-
-## 🏗️ 系统架构
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    全智能量化交易系统                              │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ AI交易引擎   │  │ 多源数据分析 │  │ AI学习引擎   │          │
-│  │ (自动执行)   │←→│ (数据融合)   │←→│ (自我进化)   │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-│         ↑                ↑                ↑                    │
-│  ┌──────┴──────┐  ┌─────┴──────┐  ┌──────┴──────┐           │
-│  │ 策略优化器  │  │ 记忆系统   │  │ 风险监控    │           │
-│  └─────────────┘  └────────────┘  └─────────────┘           │
-│         ↑                ↑                ↑                    │
-│  ┌──────┴────────────────┴────────────────┴──────┐           │
-│  │              第三方数据源 (7个)                  │           │
-│  │ Binance | CoinGecko | Etherscan | Twitter      │           │
-│  │ NewsAPI | Coinbase  | Kraken                  │           │
-│  └────────────────────────────────────────────────┘           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## 📁 模块结构
-
-### 核心模块
-- `ai_trading_engine.py` - 全智能AI交易引擎
-- `ai_learning_engine.py` - AI自我学习引擎
-- `multi_source_data_fusion.py` - 多源数据融合分析器
-- `ai_command_executor.py` - AI指令执行器
-- `strategy_optimizer.py` - 策略优化器
-- `account_risk_monitor.py` - 账户风险监控
-
-### 数据模块
-- `data_integration.py` - 数据整合
-- `multi_source_data_fusion.py` - 多源数据融合
-- `historical_data_storage.py` - 历史数据存储
-- `technical_indicators.py` - 技术指标计算
-
-### 智能模块
-- `large_model_interface.py` - 大模型接口
-- `decision_engine` - 决策引擎
-- `signal_generator` - 信号生成器
-- `sentiment_analyzer` - 情感分析器
-- `machine_learning` - 机器学习模块
-
-### 交易所模块
-- `okx.py` - OKX交易所接口
-- `binance.py` - Binance交易所接口
-
-### 通知模块
-- `telegram_bot.py` - Telegram机器人
-
-## 🔧 技术栈
-
-| 类别 | 技术 | 版本 | 用途 |
-|------|------|------|------|
-| 开发语言 | Python | 3.8+ | 核心开发 |
-| 数据处理 | Pandas | 最新 | 数据分析 |
-| 异步处理 | Asyncio | 内置 | 并发处理 |
-| API框架 | FastAPI | 最新 | 后端API |
-| 前端 | React + Vite | 最新 | 前端界面 |
-| 数据库 | SQLite | 内置 | 数据存储 |
-| 大模型 | ASTROn | 最新 | AI决策 |
-| 代理 | Clash | 最新 | 网络代理 |
-
-## 🛠️ 开发指南
-
-### 环境设置
-```bash
-# 克隆仓库
-git clone <repository-url>
-cd openclaw-trading
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 前端依赖
-cd frontend
-npm install
-```
-
-### 配置文件
-- `data/config/default.yml` - 主配置文件
-- `data/config/proxy.json` - 代理配置
-- `data/config/telegram.json` - Telegram配置
-- `data/config/exchanges.json` - 交易所API配置
-
-### 启动服务
-```bash
-# 启动后端
-python -m src.main
-
-# 启动前端
-cd frontend
-npm run dev
-```
-
-### 访问地址
-- **后端API**: http://localhost:8000/docs
-- **前端界面**: http://localhost:3001
-
-## 📊 核心功能使用
-
-### 1. 多源数据融合分析
-```python
-from src.modules.data.multi_source_data_fusion import MultiSourceDataFusion
-
-fusion = MultiSourceDataFusion()
-intelligence = await fusion.analyze_market("BTC/USDT")
-print(intelligence.overall_sentiment)
-print(intelligence.recommendation)
-```
-
-### 2. AI自我学习
-```python
-from src.modules.core.ai_learning_engine import AILearningEngine
-
-learning_engine = AILearningEngine()
-await learning_engine.start()
-
-# 记录交易结果
-await learning_engine.record_trade_result({
-    "symbol": "BTC/USDT",
-    "side": "long",
-    "entry_price": 60000,
-    "exit_price": 62000,
-    "pnl": 2000,
-    "pnl_percent": 3.33,
-    "strategy": "trend_following",
-    "reason": "突破阻力位"
-})
-```
-
-### 3. AI交易引擎
-```python
-from src.modules.core.ai_trading_engine import AITradingEngine
-
-engine = AITradingEngine()
-await engine.initialize()
-await engine.start()
-
-# 获取引擎状态
-status = engine.get_status()
-print(status)
-```
-
-## 📈 性能指标
-
-| 指标 | 目标值 | 实际值 | 状态 |
-|------|--------|--------|------|
-| 数据更新频率 | 1次/分钟 | ✅ 1次/分钟 | 达标 |
-| 决策响应时间 | <1秒 | ✅ <500ms | 优秀 |
-| 回测速度 | 1年数据 <5分钟 | ✅ 1年数据 <3分钟 | 优秀 |
-| 系统稳定性 | 99.9% | ⏳ 测试中 | 待验证 |
-| 策略胜率 | >55% | ⏳ 测试中 | 待验证 |
-
-## 🚩 开发路线图
-
-### 已完成
-- ✅ 多源数据融合分析器
-- ✅ AI自我学习引擎
-- ✅ 全智能交易引擎
-- ✅ 策略优化器
-- ✅ 风险监控系统
-- ✅ 记忆系统
-- ✅ 前端界面
-
-### 计划中
-- ⏳ 实盘测试
-- ⏳ 性能优化
-- ⏳ 更多交易所支持
-- ⏳ 更复杂的AI模型
-- ⏳ 高级风险管理
-- ⏳ 社区功能
-
-## 🐛 常见问题
-
-### 1. 服务启动失败
-- 检查端口是否被占用
-- 检查配置文件是否正确
-- 检查网络连接和代理设置
-
-### 2. 数据获取失败
-- 检查API密钥是否正确
-- 检查代理连接是否正常
-- 检查数据源是否可用
-
-### 3. 交易执行失败
-- 检查交易所API权限
-- 检查账户余额
-- 检查网络连接
-
-### 4. AI决策异常
-- 检查LLM配置
-- 检查数据质量
-- 检查学习数据
-
-## 📞 技术支持
-
-- **GitHub Issues**: 提交bug报告和功能请求
-- **文档**: 详细的API文档和开发指南
-- **社区**: 加入社区讨论和交流
-
-## 📄 许可证
-
-MIT License - 详见 LICENSE 文件
+- [开发环境设置](#开发环境设置)
+- [项目结构](#项目结构)
+- [核心模块说明](#核心模块说明)
+- [开发规范](#开发规范)
+- [测试指南](#测试指南)
+- [调试技巧](#调试技巧)
+- [性能优化](#性能优化)
+- [常见问题](#常见问题)
 
 ---
 
-**版本**: v1.0.0
-**更新时间**: 2026-04-02
-**开发团队**: OpenClaw Trading Team
+## 开发环境设置
+
+### 系统要求
+
+- Python 3.8+
+- pip 21.0+
+- Git
+- 虚拟环境 (推荐)
+
+### 环境搭建
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/your-username/openclaw-trading.git
+cd openclaw-trading
+
+# 2. 创建虚拟环境
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# 或
+venv\Scripts\activate  # Windows
+
+# 3. 安装依赖
+pip install -r requirements.txt
+pip install -r requirements-dev.txt  # 开发依赖
+
+# 4. 配置环境变量
+cp .env.example .env
+nano .env  # 填写必需的API密钥
+
+# 5. 初始化数据库
+python scripts/init_db.py
+
+# 6. 运行测试
+pytest tests/
+
+# 7. 启动开发服务器
+python start.py
+```
+
+### IDE配置
+
+推荐使用 VSCode 或 PyCharm
+
+**VSCode扩展:**
+- Python
+- Pylance
+- Python Docstring Generator
+- GitLens
+
+**推荐设置:**
+```json
+{
+  "python.linting.enabled": true,
+  "python.linting.pylintEnabled": true,
+  "python.formatting.provider": "black",
+  "editor.formatOnSave": true
+}
+```
+
+---
+
+## 项目结构
+
+```
+openclaw-trading/
+├── config/                    # 配置文件
+│   ├── config.yaml           # 主配置文件
+│   └── logging.yaml          # 日志配置
+│
+├── src/                      # 源代码
+│   ├── modules/              # 功能模块
+│   │   ├── core/            # 核心模块
+│   │   │   ├── ai_trading_engine.py      # AI交易引擎
+│   │   │   ├── ai_learning_engine.py     # AI学习引擎
+│   │   │   ├── ai_memory.py              # AI记忆管理
+│   │   │   ├── enhanced_llm_manager.py   # LLM管理器
+│   │   │   ├── llm_integration.py        # LLM集成
+│   │   │   ├── main_controller.py        # 主控制器
+│   │   │   ├── config_manager.py         # 配置管理
+│   │   │   ├── event_system.py           # 事件系统
+│   │   │   └── risk_manager.py           # 风险管理
+│   │   │
+│   │   ├── data/            # 数据模块
+│   │   │   ├── data_pipeline.py          # 数据管道
+│   │   │   ├── historical_data_storage.py # 历史数据存储
+│   │   │   └── multi_source_data_fusion.py # 多源数据融合
+│   │   │
+│   │   ├── strategies/       # 策略模块
+│   │   │   ├── strategy_base.py          # 策略基类
+│   │   │   ├── strategy_manager.py       # 策略管理器
+│   │   │   └── strategy_optimizer.py     # 策略优化器
+│   │   │
+│   │   ├── exchanges/        # 交易所接口
+│   │   │   ├── exchange_base.py          # 交易所基类
+│   │   │   ├── okx.py                    # OKX交易所
+│   │   │   └── binance.py                # Binance交易所
+│   │   │
+│   │   ├── monitoring/       # 监控模块
+│   │   │   ├── trading_monitor.py        # 交易监控
+│   │   │   └── account_risk_monitor.py   # 账户风险监控
+│   │   │
+│   │   ├── notification/     # 通知模块
+│   │   │   ├── telegram_bot.py           # Telegram机器人
+│   │   │   └── notification_manager.py   # 通知管理器
+│   │   │
+│   │   ├── api/              # API接口
+│   │   │   ├── server.py                 # API服务器
+│   │   │   └── routes/                   # API路由
+│   │   │
+│   │   └── intelligence/     # 智能模块
+│   │       ├── natural_language_interface.py # 自然语言接口
+│   │       └── anomaly_detection.py      # 异常检测
+│   │
+│   ├── utils/                # 工具函数
+│   │   ├── env_config.py                 # 环境变量配置
+│   │   ├── logger.py                     # 日志工具
+│   │   └── helpers.py                    # 辅助函数
+│   │
+│   └── main.py               # 主入口
+│
+├── workspace/                # AI记忆文件
+│   ├── SOUL.md              # 核心信念
+│   ├── IDENTITY.md          # 身份定义
+│   ├── USER.md              # 用户信息
+│   ├── TRADING.md           # 交易知识库
+│   └── INSTRUCTIONS.md      # 工作指令
+│
+├── data/                    # 数据存储
+│   ├── historical/          # 历史数据
+│   ├── memory/              # AI记忆数据
+│   └── events.db            # 事件数据库
+│
+├── logs/                    # 日志文件
+│   ├── trading.log          # 交易日志
+│   ├── error.log            # 错误日志
+│   └── system.log           # 系统日志
+│
+├── tests/                   # 测试文件
+│   ├── unit/                # 单元测试
+│   ├── integration/         # 集成测试
+│   └── e2e/                 # 端到端测试
+│
+├── docs/                    # 文档
+│   ├── ARCHITECTURE.md      # 架构文档
+│   ├── DEPLOYMENT.md        # 部署文档
+│   ├── API.md               # API文档
+│   └── FAQ.md               # 常见问题
+│
+├── scripts/                 # 脚本工具
+│   ├── init_db.py           # 初始化数据库
+│   ├── backup.py            # 备份脚本
+│   └── health_check.py      # 健康检查
+│
+├── .env.example             # 环境变量模板
+├── requirements.txt         # 生产依赖
+├── requirements-dev.txt     # 开发依赖
+├── start.py                # 启动脚本
+├── README.md               # 主文档
+└── DEVELOPMENT.md          # 开发文档
+```
+
+---
+
+## 核心模块说明
+
+### 1. AI交易引擎 (ai_trading_engine.py)
+
+**功能:**
+- 完全自动化的交易流程
+- AI驱动的市场分析
+- 智能决策生成
+- 自动订单执行
+
+**关键方法:**
+```python
+async def _trading_loop(self) -> None:
+    """主交易循环"""
+    while self._running:
+        for symbol in self.symbols:
+            # 1. 数据采集
+            market_data = await self._collect_market_data(symbol)
+            
+            # 2. AI分析
+            context = await self._analyze_market(symbol, market_data)
+            
+            # 3. AI决策
+            decision = await self._make_decision(symbol, context, position)
+            
+            # 4. 风险检查
+            if await self._risk_check(decision):
+                # 5. 执行交易
+                await self._execute_decision(decision)
+```
+
+### 2. LLM管理器 (enhanced_llm_manager.py)
+
+**功能:**
+- 多模型支持和管理
+- 动态模型切换
+- 负载均衡和故障转移
+- 使用统计和性能监控
+
+**使用示例:**
+```python
+# 初始化
+llm_manager = EnhancedLLMManager()
+await llm_manager.initialize(config)
+
+# 生成文本
+response = await llm_manager.generate(
+    prompt="分析BTC/USDT市场趋势",
+    model_id="astron-code-latest",
+    task_type=TaskType.MARKET_ANALYSIS
+)
+```
+
+### 3. AI记忆管理 (ai_memory.py)
+
+**功能:**
+- 短期记忆: 对话上下文
+- 长期记忆: 交易历史、用户偏好
+- 文件化记忆: SOUL.md等
+- 记忆检索和注入
+
+**使用示例:**
+```python
+# 添加记忆
+await memory_manager.add_long_term_memory(
+    content="用户偏好保守策略",
+    memory_type=MemoryType.USER_PREF,
+    importance=0.8
+)
+
+# 检索记忆
+memories = await memory_manager.retrieve_memory(
+    query="交易策略",
+    top_k=5
+)
+```
+
+### 4. 风险管理 (risk_manager.py)
+
+**功能:**
+- 账户级风险控制
+- 仓位级风险控制
+- 实时风险监控
+- 自动预警机制
+
+**风险检查流程:**
+```python
+async def _risk_check(self, decision: AIDecision) -> bool:
+    # 1. 检查最大持仓数
+    if len(self.positions) >= self.max_positions:
+        return False
+    
+    # 2. 检查仓位大小
+    if decision.quantity > self.max_position_size:
+        return False
+    
+    # 3. 检查风险敞口
+    total_risk = self._calculate_total_risk()
+    if total_risk > self.max_risk:
+        return False
+    
+    return True
+```
+
+---
+
+## 开发规范
+
+### 代码风格
+
+遵循 PEP 8 规范，使用以下工具:
+
+```bash
+# 代码格式化
+black src/
+
+# 代码检查
+flake8 src/
+
+# 类型检查
+mypy src/
+```
+
+### 命名规范
+
+- **模块名**: 小写下划线 `ai_trading_engine.py`
+- **类名**: 大驼峰 `AITradingEngine`
+- **函数名**: 小写下划线 `make_decision`
+- **常量**: 大写下划线 `MAX_POSITIONS`
+- **变量**: 小写下划线 `market_data`
+
+### 文档字符串
+
+使用Google风格文档字符串:
+
+```python
+def calculate_position_size(self, symbol: str, risk: float) -> float:
+    """计算仓位大小
+    
+    Args:
+        symbol: 交易对符号
+        risk: 风险比例 (0-1)
+    
+    Returns:
+        仓位大小
+    
+    Raises:
+        ValueError: 如果risk不在0-1范围内
+    
+    Example:
+        >>> size = calculate_position_size("BTC/USDT", 0.02)
+        >>> print(size)
+        0.001
+    """
+    pass
+```
+
+### 异步编程规范
+
+- 所有IO操作使用async/await
+- 使用asyncio.gather()并发执行
+- 避免阻塞操作
+- 正确处理异常和取消
+
+```python
+# 好的做法
+async def fetch_data(self):
+    try:
+        async with asyncio.timeout(30):
+            data = await self.api.get_data()
+            return data
+    except asyncio.TimeoutError:
+        logger.error("请求超时")
+        return None
+
+# 不好的做法
+async def fetch_data(self):
+    data = await self.api.get_data()  # 没有超时处理
+    return data
+```
+
+---
+
+## 测试指南
+
+### 测试结构
+
+```
+tests/
+├── unit/                    # 单元测试
+│   ├── test_ai_engine.py
+│   ├── test_llm_manager.py
+│   └── test_risk_manager.py
+│
+├── integration/             # 集成测试
+│   ├── test_trading_flow.py
+│   └── test_data_pipeline.py
+│
+└── e2e/                     # 端到端测试
+    └── test_full_system.py
+```
+
+### 编写测试
+
+```python
+import pytest
+from unittest.mock import Mock, AsyncMock, patch
+
+@pytest.mark.asyncio
+async def test_ai_decision():
+    """测试AI决策生成"""
+    # 准备
+    engine = AITradingEngine()
+    engine.llm_integration = Mock()
+    engine.llm_integration.generate_trading_signal = AsyncMock(
+        return_value={"signal": "buy", "confidence": 0.8}
+    )
+    
+    # 执行
+    context = MarketContext(
+        symbol="BTC/USDT",
+        price=50000,
+        trend="bullish"
+    )
+    decision = await engine._make_decision("BTC/USDT", context, None)
+    
+    # 验证
+    assert decision is not None
+    assert decision.action == TradeAction.OPEN_LONG
+    assert decision.confidence >= 0.65
+```
+
+### 运行测试
+
+```bash
+# 运行所有测试
+pytest tests/
+
+# 运行特定测试
+pytest tests/unit/test_ai_engine.py
+
+# 运行并生成覆盖率报告
+pytest --cov=src tests/
+
+# 运行异步测试
+pytest tests/ -v --asyncio-mode=auto
+```
+
+---
+
+## 调试技巧
+
+### 日志调试
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 不同级别的日志
+logger.debug("调试信息")
+logger.info("一般信息")
+logger.warning("警告信息")
+logger.error("错误信息")
+```
+
+### 断点调试
+
+在VSCode中设置断点，使用F5启动调试
+
+**launch.json配置:**
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Current File",
+      "type": "python",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
+```
+
+### 性能分析
+
+```python
+import cProfile
+import pstats
+
+# 性能分析
+profiler = cProfile.Profile()
+profiler.enable()
+
+# 运行代码
+await main_function()
+
+profiler.disable()
+stats = pstats.Stats(profiler)
+stats.sort_stats('cumulative')
+stats.print_stats(10)
+```
+
+---
+
+## 性能优化
+
+### 异步优化
+
+```python
+# 并发执行
+results = await asyncio.gather(
+    fetch_data_1(),
+    fetch_data_2(),
+    fetch_data_3()
+)
+
+# 使用连接池
+async with aiohttp.TCPConnector(limit=100) as connector:
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # 使用session
+        pass
+```
+
+### 缓存优化
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def calculate_indicator(klines_hash: str) -> Dict:
+    """缓存技术指标计算结果"""
+    return calculate(klines_hash)
+```
+
+### 数据库优化
+
+- 使用索引
+- 批量插入
+- 连接池
+- 查询优化
+
+---
+
+## 常见问题
+
+### Q: 如何添加新的AI模型？
+
+A: 在 `enhanced_llm_manager.py` 中添加新的Provider类:
+
+```python
+class NewAIProvider(BaseLLMProvider):
+    async def generate(self, prompt: str, **kwargs) -> LLMResponse:
+        # 实现生成逻辑
+        pass
+```
+
+### Q: 如何添加新的交易所？
+
+A: 继承 `ExchangeBase` 类并实现所有方法:
+
+```python
+class NewExchange(ExchangeBase):
+    async def get_market_data(self, symbol: str) -> MarketData:
+        # 实现获取市场数据
+        pass
+```
+
+### Q: 如何调试AI决策？
+
+A: 启用详细日志并检查AI响应:
+
+```python
+logging.getLogger("src.modules.core.ai_trading_engine").setLevel(logging.DEBUG)
+```
+
+### Q: 如何优化性能？
+
+A: 
+1. 使用异步IO
+2. 添加缓存
+3. 优化数据库查询
+4. 使用连接池
+
+---
+
+## 贡献代码
+
+请参考 [贡献指南](CONTRIBUTING.md)
+
+---
+
+## 更新日志
+
+请参考 [更新日志](docs/CHANGELOG.md)
+
+---
+
+**Happy Coding! 🚀**

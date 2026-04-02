@@ -1,12 +1,8 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -20,210 +16,97 @@ parts/
 sdist/
 var/
 wheels/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
-
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-poetry.lock
-
-# pdm
-pdm.lock
-.pdm.toml
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
+# Virtual Environment
 venv/
 ENV/
-env.bak/
-venv.bak/
+env/
+.venv
 
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-.idea/
-*.iml
-*.iws
-*.ipr
-
-# VS Code
+# IDE
 .vscode/
-*.code-workspace
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
 
-# Eclipse
-.project
-.pydevproject
-.settings/
+# Environment Variables
+.env
+.env.local
+.env.*.local
 
-# Jupyter
-.ipynb
-.ipynb_checkpoints/
+# Logs
+logs/
+*.log
+*.log.*
 
-# Docker
-docker-compose.override.yml
-
-# Database
+# Data
+data/
 *.db
 *.sqlite
 *.sqlite3
 
-# Redis
-dump.rdb
+# Cache
+.cache/
+*.cache
 
-# Logs
-*.log
-logs/
-*.logs
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
 
-# Secrets
-*.key
-*.pem
-*.cert
-*.crt
-*.secret
-*.priv
-*.password
-secrets/
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# Backup files
+# Distribution
+*.manifest
+*.spec
+
+# Backup
 *.bak
 *.backup
-backups/
+*.old
 
-# Temp files
+# Temporary
 *.tmp
 *.temp
 tmp/
 temp/
 
-# IDE specific
-.DS_Store
+# OS
 Thumbs.db
+Desktop.ini
 
-# Project specific
-openclaw-trading.json
-openclaw-trading.json.bak
-openclaw-trading.json.clobbered.*
-update-check.json
-openclaw-trading-backup.json
+# Project Specific
+workspace/memory/*.json
+data/historical/*.csv
+data/historical/*.json
 
-# Config overrides
-config/local*
-.env.local
-.env.*.local
+# Secrets (never commit these!)
+secrets/
+.secrets/
+*.pem
+*.key
 
-# Test data
-test-data/
-fixtures/
+# Build
+*.pyc
+*.pyo
 
-# Coverage
-.coverage
-htmlcov/
+# Documentation builds
+docs/_build/
 
-# Profiling data
-profiles/
-*.prof
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre
+.pyre/
+
+# Pytype
+.pytype/

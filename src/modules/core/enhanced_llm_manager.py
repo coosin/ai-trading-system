@@ -432,13 +432,18 @@ class EnhancedLLMManager:
 
     def _load_predefined_models(self):
         """加载预定义模型"""
+        import os
+        
+        # 从环境变量读取API密钥
+        xunfei_api_key = os.getenv("XUNFEI_API_KEY", "")
+        
         predefined = [
             ModelConfig(
                 provider=ModelProvider.OPENAI,
                 model_id="astron-code-latest",
                 display_name="讯飞 astron-code-latest",
                 base_url="https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
-                api_key="243e9f47189b02df7d63322146e7c1d2:MGZjNWQzNTk3Mzg5MTM0MTNhYmNmZDhl",
+                api_key=xunfei_api_key,  # 从环境变量读取
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=32768,

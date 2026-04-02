@@ -178,6 +178,13 @@ export const api = {
     getSignals: (symbol) => apiClient.get(`/external-data/signals/${symbol}`),
   },
 
+  // 多源数据融合分析
+  dataFusion: {
+    analyzeMarket: (symbol) => apiClient.get(`/data-fusion/analyze/${symbol.replace('/', '-')}`),
+    getSources: () => apiClient.get('/data-fusion/sources'),
+    getAnalysisHistory: () => apiClient.get('/data-fusion/history'),
+  },
+
   // 链上数据
   onchain: {
     getTransactions: (address, params) => apiClient.post('/onchain/transactions', { address, ...params }),

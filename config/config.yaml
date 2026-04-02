@@ -1,0 +1,422 @@
+# OpenClaw Trading - 主配置文件
+# 版本: 1.0.0
+
+# ======================
+# 系统配置
+# ======================
+system:
+  name: "OpenClaw Trading"
+  version: "1.0.0"
+  mode: "simulation"  # simulation, paper_trading, live_trading
+  debug: false
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# ======================
+# AI模型配置
+# ======================
+llm:
+  default_model: "astron-code-latest"
+  
+  models:
+    - provider: "xunfei"
+      model_id: "astron-code-latest"
+      display_name: "讯飞 astron-code-latest"
+      api_key_env: "XUNFEI_API_KEY"  # 从环境变量读取
+      base_url: "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions"
+      temperature: 0.7
+      max_tokens: 2000
+      timeout: 60.0
+      max_retries: 3
+      cost_per_input_token: 0.0
+      cost_per_output_token: 0.0
+      context_window: 32768
+      supports_vision: false
+      supports_reasoning: true
+      enabled: true
+      priority: 10
+      fallback_models: []
+    
+    - provider: "openai"
+      model_id: "gpt-4-turbo"
+      display_name: "OpenAI GPT-4 Turbo"
+      api_key_env: "OPENAI_API_KEY"
+      base_url: "https://api.openai.com/v1/chat/completions"
+      temperature: 0.7
+      max_tokens: 2000
+      timeout: 60.0
+      max_retries: 3
+      cost_per_input_token: 0.00001
+      cost_per_output_token: 0.00003
+      context_window: 128000
+      supports_vision: true
+      supports_reasoning: true
+      enabled: false
+      priority: 8
+    
+    - provider: "anthropic"
+      model_id: "claude-3-opus-20240229"
+      display_name: "Anthropic Claude 3 Opus"
+      api_key_env: "ANTHROPIC_API_KEY"
+      base_url: "https://api.anthropic.com/v1/messages"
+      temperature: 0.7
+      max_tokens: 2000
+      timeout: 60.0
+      max_retries: 3
+      cost_per_input_token: 0.000015
+      cost_per_output_token: 0.000075
+      context_window: 200000
+      supports_vision: true
+      supports_reasoning: true
+      enabled: false
+      priority: 9
+    
+    - provider: "local"
+      model_id: "llama3"
+      display_name: "Llama 3 (本地)"
+      base_url: "http://localhost:11434/api/chat"
+      temperature: 0.7
+      max_tokens: 2000
+      timeout: 120.0
+      max_retries: 2
+      cost_per_input_token: 0.0
+      cost_per_output_token: 0.0
+      context_window: 8192
+      supports_vision: false
+      supports_reasoning: false
+      enabled: false
+      priority: 5
+
+  # 任务-模型映射
+  task_model_mapping:
+    market_analysis: ["astron-code-latest", "gpt-4-turbo", "claude-3-opus-20240229"]
+    strategy_generation: ["astron-code-latest", "gpt-4-turbo"]
+    signal_generation: ["astron-code-latest"]
+    risk_assessment: ["astron-code-latest", "gpt-4-turbo"]
+    news_analysis: ["astron-code-latest", "gpt-4-turbo"]
+    code_generation: ["gpt-4-turbo", "claude-3-opus-20240229"]
+    natural_language: ["astron-code-latest", "gpt-4-turbo"]
+
+# ======================
+# 交易配置
+# ======================
+trading:
+  symbols:
+    - "BTC/USDT"
+    - "ETH/USDT"
+    - "SOL/USDT"
+    - "BNB/USDT"
+  
+  analysis_interval: 60  # 分析间隔(秒)
+  min_confidence: 0.65   # 最小置信度阈值
+  max_positions: 3       # 最大持仓数
+  risk_per_trade: 0.02   # 单笔交易风险(2%)
+  
+  # 订单配置
+  order:
+    type: "market"  # market, limit
+    time_in_force: "GTC"  # GTC, IOC, FOK
+    post_only: false
+  
+  # 止损止盈
+  stop_loss:
+    enabled: true
+    percent: 0.03  # 3%
+    trailing: false
+  
+  take_profit:
+    enabled: true
+    percent: 0.06  # 6%
+    partial:
+      enabled: false
+      levels:
+        - percent: 0.03
+          close_percent: 0.5
+        - percent: 0.06
+          close_percent: 0.5
+
+# ======================
+# 风险管理配置
+# ======================
+risk:
+  # 账户级风险
+  max_drawdown: 0.15  # 最大回撤15%
+  max_leverage: 3.0   # 最大杠杆
+  margin_call_level: 0.8  # 保证金催缴水平
+  liquidation_level: 0.9  # 强平水平
+  
+  # 仓位风险
+  max_position_size_percent: 0.2  # 单仓位最大占比20%
+  max_correlation: 0.7  # 最大相关性
+  
+  # 风险监控
+  monitoring:
+    enabled: true
+    interval: 10  # 监控间隔(秒)
+    alert_channels:
+      - "telegram"
+      - "log"
+  
+  # 风险限制
+  limits:
+    daily_loss_limit: 0.05  # 日损失限制5%
+    weekly_loss_limit: 0.10  # 周损失限制10%
+    monthly_loss_limit: 0.15  # 月损失限制15%
+
+# ======================
+# 交易所配置
+# ======================
+exchanges:
+  okx:
+    enabled: true
+    api_key_env: "OKX_API_KEY"
+    secret_env: "OKX_SECRET"
+    passphrase_env: "OKX_PASSPHRASE"
+    testnet: true  # 使用测试网
+    rate_limit: 20  # 请求限制(次/秒)
+    timeout: 30
+  
+  binance:
+    enabled: false
+    api_key_env: "BINANCE_API_KEY"
+    secret_env: "BINANCE_SECRET"
+    testnet: true
+    rate_limit: 20
+    timeout: 30
+
+# ======================
+# 数据配置
+# ======================
+data:
+  # 历史数据
+  historical:
+    enabled: true
+    storage_path: "data/historical"
+    max_days: 365  # 最大保存天数
+    cleanup_interval: 86400  # 清理间隔(秒)
+  
+  # 实时数据
+  realtime:
+    enabled: true
+    buffer_size: 1000
+    update_interval: 1  # 更新间隔(秒)
+  
+  # 多时间框架
+  timeframes:
+    - "1m"
+    - "5m"
+    - "15m"
+    - "1h"
+    - "4h"
+    - "1d"
+  
+  # 数据源
+  sources:
+    - provider: "binance"
+      enabled: true
+      priority: 1
+    - provider: "coingecko"
+      enabled: true
+      priority: 2
+
+# ======================
+# 策略配置
+# ======================
+strategies:
+  # 策略管理
+  max_strategies: 10
+  optimization_interval: 3600  # 优化间隔(秒)
+  
+  # 默认策略
+  default:
+    name: "AI智能策略"
+    enabled: true
+    type: "ai_driven"
+  
+  # 策略评估
+  evaluation:
+    min_trades: 10  # 最小交易次数
+    lookback_days: 30  # 回看天数
+    metrics:
+      - "sharpe_ratio"
+      - "win_rate"
+      - "max_drawdown"
+      - "profit_factor"
+
+# ======================
+# 监控配置
+# ======================
+monitoring:
+  # 性能监控
+  performance:
+    enabled: true
+    interval: 60  # 监控间隔(秒)
+    metrics:
+      - "cpu_usage"
+      - "memory_usage"
+      - "network_io"
+      - "disk_io"
+  
+  # 交易监控
+  trading:
+    enabled: true
+    track_positions: true
+    track_orders: true
+    track_pnl: true
+  
+  # 告警配置
+  alerts:
+    enabled: true
+    channels:
+      telegram:
+        enabled: true
+        bot_token_env: "TELEGRAM_BOT_TOKEN"
+        chat_id_env: "TELEGRAM_CHAT_ID"
+      
+      email:
+        enabled: false
+        smtp_host: "smtp.gmail.com"
+        smtp_port: 587
+        smtp_user_env: "SMTP_USER"
+        smtp_password_env: "SMTP_PASSWORD"
+        from_addr: "noreply@openclaw-trading.com"
+        to_addrs: []
+
+# ======================
+# API配置
+# ======================
+api:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+  reload: false
+  debug: false
+  
+  # CORS配置
+  cors:
+    enabled: true
+    allow_origins: ["*"]
+    allow_methods: ["*"]
+    allow_headers: ["*"]
+  
+  # 认证配置
+  auth:
+    enabled: false
+    api_key_header: "X-API-Key"
+    api_key_env: "API_KEY"
+
+# ======================
+# 数据库配置
+# ======================
+database:
+  # SQLite (默认)
+  type: "sqlite"
+  path: "data/trading.db"
+  
+  # PostgreSQL (可选)
+  # type: "postgresql"
+  # host: "localhost"
+  # port: 5432
+  # database: "trading_db"
+  # user_env: "POSTGRES_USER"
+  # password_env: "POSTGRES_PASSWORD"
+  
+  # 连接池
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+
+# ======================
+# 缓存配置
+# ======================
+cache:
+  enabled: true
+  type: "memory"  # memory, redis
+  
+  # Redis配置(如果type=redis)
+  redis:
+    host: "localhost"
+    port: 6379
+    db: 0
+    password_env: "REDIS_PASSWORD"
+  
+  # 缓存设置
+  default_ttl: 300  # 默认过期时间(秒)
+  max_size: 1000  # 最大缓存数量
+
+# ======================
+# 日志配置
+# ======================
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # 文件日志
+  file:
+    enabled: true
+    path: "logs/trading.log"
+    max_size: "10MB"
+    backup_count: 5
+  
+  # 控制台日志
+  console:
+    enabled: true
+    colorize: true
+
+# ======================
+# 代理配置
+# ======================
+proxy:
+  enabled: false
+  use_global_proxy: false
+  
+  global_proxy:
+    enabled: false
+    proxy_type: "http"  # http, https, socks5
+    host: "127.0.0.1"
+    port: 7890
+    username_env: "PROXY_USER"
+    password_env: "PROXY_PASSWORD"
+  
+  # 域名特定代理
+  domain_proxies: []
+
+# ======================
+# 备份配置
+# ======================
+backup:
+  enabled: true
+  interval: 86400  # 备份间隔(秒)
+  retention_days: 30  # 保留天数
+  include:
+    - "data"
+    - "config"
+    - "logs"
+  exclude:
+    - "*.tmp"
+    - "*.log"
+
+# ======================
+# 插件配置
+# ======================
+plugins:
+  enabled: true
+  auto_load: true
+  directory: "plugins"
+  
+  # 插件列表
+  loaded: []
+
+# ======================
+# 开发配置
+# ======================
+development:
+  debug: false
+  use_mock_data: false
+  mock_data_size: 1000
+  
+  # 测试配置
+  testing:
+    enabled: false
+    mock_exchange: true
+    mock_llm: true

@@ -353,6 +353,18 @@ class MainController:
         await self.ai_command_executor.initialize()
         logger.info("✅ AI指令执行器初始化完成")
         
+        # 初始化AI学习引擎
+        try:
+            from src.modules.core.ai_learning_engine import AILearningEngine
+            self.ai_learning_engine = AILearningEngine(
+                memory_manager=self.enhanced_memory_manager,
+                llm_integration=self.llm_integration
+            )
+            await self.ai_learning_engine.start()
+            logger.info("✅ AI学习引擎初始化完成")
+        except Exception as e:
+            logger.warning(f"⚠️ AI学习引擎初始化失败: {e}")
+        
         # 初始化交易监控器
         self.trading_monitor = TradingMonitor({})
         await self.trading_monitor.initialize()
@@ -532,6 +544,11 @@ class MainController:
         if self.trading_monitor:
             await self.trading_monitor.shutdown()
             self.trading_monitor = None
+        
+        # 清理AI学习引擎
+        if hasattr(self, 'ai_learning_engine') and self.ai_learning_engine:
+            await self.ai_learning_engine.stop()
+            self.ai_learning_engine = None
         
         # 清理多策略管理器
         self.strategy_manager = None

@@ -111,6 +111,7 @@ function App() {
     { id: 'positions', icon: '📋', label: '持仓管理' },
     { id: 'history', icon: '📜', label: '交易历史' },
     { id: 'ai', icon: '🤖', label: 'AI 分析' },
+    { id: 'analysis', icon: '🧠', label: '多源数据分析' },
     { id: 'strategies', icon: '⚙️', label: '策略管理' },
     { id: 'risk', icon: '🛡️', label: '风险控制' },
     { id: 'reports', icon: '📑', label: '分析报告' },
