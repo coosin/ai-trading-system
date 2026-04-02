@@ -338,45 +338,79 @@ class AITradingEngine:
     
     async def _collect_market_data(self, symbol: str) -> Optional[Dict]:
         """采集市场数据"""
+        from src.utils.timeout_handler import run_with_timeout, Timeouts
+        
         try:
             if not self.exchange:
                 return None
             
-            # 获取多时间周期K线数据
-            multi_timeframe_klines = await self.exchange.get_multi_timeframe_klines(
-                symbol, 
-                timeframes=["1m", "5m", "15m", "1h", "4h", "1d"]
+            # 获取多时间周期K线数据 (带超时)
+            multi_timeframe_klines = await run_with_timeout(
+                self.exchange.get_multi_timeframe_klines(
+                    symbol, 
+                    timeframes=["1m", "5m", "15m", "1h", "4h", "1d"]
+                ),
+                timeout_seconds=Timeouts.MARKET_DATA_FETCH,
+                default_value=None
             )
+            
+            if not multi_timeframe_klines:
+                logger.warning(f"获取{symbol}多时间框架数据超时")
+                return None
             
             # 保存K线数据到历史存储
             if self.data_storage and multi_timeframe_klines:
                 for tf, klines in multi_timeframe_klines.items():
                     if klines:
-                        await self.data_storage.save_klines(symbol, tf, klines)
+                        await run_with_timeout(
+                            self.data_storage.save_klines(symbol, tf, klines),
+                            timeout_seconds=Timeouts.DATABASE_WRITE,
+                            default_value=None
+                        )
             
-            # 获取当前价格
-            ticker = await self.exchange.get_ticker(symbol)
+            # 获取当前价格 (带超时)
+            ticker = await run_with_timeout(
+                self.exchange.get_ticker(symbol),
+                timeout_seconds=Timeouts.ORDERBOOK_FETCH,
+                default_value={}
+            )
             
-            # 获取订单簿
-            order_book = await self.exchange.get_order_book(symbol, depth=20)
+            # 获取订单簿 (带超时)
+            order_book = await run_with_timeout(
+                self.exchange.get_order_book(symbol, depth=20),
+                timeout_seconds=Timeouts.ORDERBOOK_FETCH,
+                default_value={}
+            )
             
-            # 获取账户余额
-            balance = await self.exchange.get_balance()
+            # 获取账户余额 (带超时)
+            balance = await run_with_timeout(
+                self.exchange.get_balance(),
+                timeout_seconds=Timeouts.ACCOUNT_INFO_FETCH,
+                default_value={}
+            )
             
-            # 获取持仓信息
-            positions = await self.exchange.get_positions()
+            # 获取持仓信息 (带超时)
+            positions = await run_with_timeout(
+                self.exchange.get_positions(),
+                timeout_seconds=Timeouts.ACCOUNT_INFO_FETCH,
+                default_value=[]
+            )
             
             # 保存账户快照
             if self.data_storage and balance:
                 total_equity = sum(balance.values())
-                await self.data_storage.save_account_snapshot({
-                    "timestamp": datetime.now().isoformat(),
-                    "total_equity": total_equity,
-                    "available_balance": balance.get("USDT", 0),
-                    "margin_used": 0,
-                    "unrealized_pnl": 0,
-                    "positions": positions
-                })
+                await run_with_timeout(
+                    self.data_storage.save_account_snapshot({
+                        "timestamp": datetime.now().isoformat(),
+                        "total_equity": total_equity,
+                        "available_balance": balance.get("USDT", 0),
+                        "margin_used": 0,
+                        "unrealized_pnl": 0,
+                        "positions": positions
+                    }),
+                    timeout_seconds=Timeouts.DATABASE_WRITE,
+                    default_value=None
+                )
             
             return {
                 "symbol": symbol,
