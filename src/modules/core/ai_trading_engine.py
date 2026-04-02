@@ -123,6 +123,9 @@ class AITradingEngine:
         # 监控的交易对
         self.symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
         
+        # 交易对黑名单 (ETH已被用户禁用)
+        self.symbol_blacklist = ["ETH/USDT"]
+        
         # AI配置
         self.ai_config = {
             "enabled": True,
@@ -296,7 +299,9 @@ class AITradingEngine:
             self.ai_config.update(config)
         
         self._running = True
-        logger.info("✅ 全智能AI交易引擎初始化完成")
+        logger.info(f"✅ 全智能AI交易引擎初始化完成")
+        logger.info(f"📊 监控交易对: {self.symbols}")
+        logger.info(f"🚫 黑名单交易对: {self.symbol_blacklist}")
     
     async def start(self) -> None:
         """启动AI交易引擎"""
@@ -360,6 +365,11 @@ class AITradingEngine:
                 for symbol in self.symbols:
                     if not self._running:
                         break
+                    
+                    # 检查黑名单
+                    if symbol in self.symbol_blacklist:
+                        logger.debug(f"⏭️ {symbol} 在黑名单中，跳过")
+                        continue
                     
                     self.state = TradingState.ANALYZING
                     logger.info(f"🔍 AI正在分析 {symbol}...")
