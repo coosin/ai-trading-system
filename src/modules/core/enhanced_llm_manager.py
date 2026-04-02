@@ -61,7 +61,8 @@ class ModelConfig:
     base_url: str = ""
     temperature: float = 0.7
     max_tokens: int = 2000
-    timeout: float = 30.0
+    timeout: float = 60.0
+    max_retries: int = 3
     cost_per_input_token: float = 0.0
     cost_per_output_token: float = 0.0
     context_window: int = 8192
@@ -131,73 +132,147 @@ class OpenAIProvider(BaseLLMProvider):
     """OpenAI兼容API提供者（支持OpenAI、DeepSeek等）"""
 
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
-        """生成文本"""
+        """生成文本（带重试机制）"""
         start_time = time.time()
+        max_retries = kwargs.get('max_retries', self.config.max_retries)
+        last_error = None
         
-        try:
-            # 构建完整的URL
-            base_url = self.config.base_url or "https://api.openai.com/v1"
-            # 如果base_url已经包含/chat/completions，则不再添加
-            if base_url.endswith('/chat/completions'):
-                url = base_url
-            elif base_url.endswith('/v1'):
-                url = f"{base_url}/chat/completions"
-            else:
-                # 对于其他情况，尝试添加/chat/completions
-                url = f"{base_url}/chat/completions"
-            
-            # 讯飞API使用完整的API Key（ID:SECRET格式）
-            api_key = self.config.api_key
-            
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            data = {
-                "model": self.config.model_id,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": kwargs.get("temperature", self.config.temperature),
-                "max_tokens": kwargs.get("max_tokens", self.config.max_tokens)
-            }
-            
-            response = await self.session.post(url, headers=headers, json=data)
-            response.raise_for_status()
-            result = response.json()
-            
-            content = result["choices"][0]["message"]["content"]
-            usage = result.get("usage", {})
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
-            total_tokens = usage.get("total_tokens", 0)
-            
-            cost = (input_tokens * self.config.cost_per_input_token + 
-                   output_tokens * self.config.cost_per_output_token)
-            
-            latency_ms = (time.time() - start_time) * 1000
-            
-            return LLMResponse(
-                content=content,
-                model_id=self.config.model_id,
-                provider=self.config.provider,
-                latency_ms=latency_ms,
-                tokens_used=total_tokens,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost=cost,
-                success=True
-            )
-        except Exception as e:
-            latency_ms = (time.time() - start_time) * 1000
-            logger.error(f"OpenAI API调用失败: {e}")
-            return LLMResponse(
-                content="",
-                model_id=self.config.model_id,
-                provider=self.config.provider,
-                latency_ms=latency_ms,
-                success=False,
-                error_message=str(e)
-            )
+        for retry in range(max_retries):
+            try:
+                base_url = self.config.base_url or "https://api.openai.com/v1"
+                if base_url.endswith('/chat/completions'):
+                    url = base_url
+                elif base_url.endswith('/v1'):
+                    url = f"{base_url}/chat/completions"
+                else:
+                    url = f"{base_url}/chat/completions"
+                
+                api_key = self.config.api_key
+                
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                data = {
+                    "model": self.config.model_id,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": kwargs.get("temperature", self.config.temperature),
+                    "max_tokens": kwargs.get("max_tokens", self.config.max_tokens)
+                }
+                
+                response = await self.session.post(url, headers=headers, json=data)
+                
+                if response.status_code != 200:
+                    error_text = response.text
+                    logger.error(f"OpenAI API返回错误: status={response.status_code}, url={url}, response={error_text[:500]}")
+                    last_error = f"API返回错误: {response.status_code}"
+                    if retry < max_retries - 1:
+                        logger.warning(f"LLM API重试 ({retry + 2}/{max_retries})...")
+                        await asyncio.sleep(1)
+                        continue
+                    return LLMResponse(
+                        content="",
+                        model_id=self.config.model_id,
+                        provider=self.config.provider,
+                        latency_ms=(time.time() - start_time) * 1000,
+                        success=False,
+                        error_message=last_error
+                    )
+                
+                result = response.json()
+                
+                content = result["choices"][0]["message"]["content"]
+                usage = result.get("usage", {})
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
+                total_tokens = usage.get("total_tokens", 0)
+                
+                cost = (input_tokens * self.config.cost_per_input_token + 
+                       output_tokens * self.config.cost_per_output_token)
+                
+                latency_ms = (time.time() - start_time) * 1000
+                
+                return LLMResponse(
+                    content=content,
+                    model_id=self.config.model_id,
+                    provider=self.config.provider,
+                    latency_ms=latency_ms,
+                    tokens_used=total_tokens,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost=cost,
+                    success=True
+                )
+            except httpx.ReadTimeout as e:
+                latency_ms = (time.time() - start_time) * 1000
+                logger.warning(f"OpenAI API超时 (重试 {retry + 1}/{max_retries}): {type(e).__name__}")
+                last_error = f"请求超时"
+                if retry < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return LLMResponse(
+                    content="",
+                    model_id=self.config.model_id,
+                    provider=self.config.provider,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error_message=last_error
+                )
+            except httpx.HTTPStatusError as e:
+                latency_ms = (time.time() - start_time) * 1000
+                logger.error(f"OpenAI API HTTP错误: {e.response.status_code} - {e.response.text[:200]}")
+                last_error = f"HTTP错误: {e.response.status_code}"
+                if retry < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                return LLMResponse(
+                    content="",
+                    model_id=self.config.model_id,
+                    provider=self.config.provider,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error_message=last_error
+                )
+            except httpx.RequestError as e:
+                latency_ms = (time.time() - start_time) * 1000
+                logger.warning(f"OpenAI API网络错误 (重试 {retry + 1}/{max_retries}): {type(e).__name__}: {e}")
+                last_error = f"网络错误: {type(e).__name__}"
+                if retry < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return LLMResponse(
+                    content="",
+                    model_id=self.config.model_id,
+                    provider=self.config.provider,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error_message=last_error
+                )
+            except Exception as e:
+                latency_ms = (time.time() - start_time) * 1000
+                logger.error(f"OpenAI API调用失败: {type(e).__name__}: {e}")
+                last_error = str(e)
+                if retry < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                return LLMResponse(
+                    content="",
+                    model_id=self.config.model_id,
+                    provider=self.config.provider,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error_message=last_error
+                )
+        
+        return LLMResponse(
+            content="",
+            model_id=self.config.model_id,
+            provider=self.config.provider,
+            latency_ms=(time.time() - start_time) * 1000,
+            success=False,
+            error_message=last_error or "未知错误"
+        )
 
 
 class AnthropicProvider(BaseLLMProvider):

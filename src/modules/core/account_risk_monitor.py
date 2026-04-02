@@ -238,11 +238,12 @@ class AccountRiskMonitor:
         if account.margin_ratio >= self.risk_config["margin_ratio_warning"]:
             return RiskLevel.HIGH
         
-        if account.unrealized_pnl / account.total_equity <= self.risk_config["unrealized_loss_critical"]:
-            return RiskLevel.CRITICAL
-        
-        if account.unrealized_pnl / account.total_equity <= self.risk_config["unrealized_loss_warning"]:
-            return RiskLevel.HIGH
+        if account.total_equity > 0:
+            pnl_ratio = account.unrealized_pnl / account.total_equity
+            if pnl_ratio <= self.risk_config["unrealized_loss_critical"]:
+                return RiskLevel.CRITICAL
+            if pnl_ratio <= self.risk_config["unrealized_loss_warning"]:
+                return RiskLevel.HIGH
         
         for pos_risk in account.position_risks:
             if pos_risk.risk_level == RiskLevel.CRITICAL:

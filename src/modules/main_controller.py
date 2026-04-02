@@ -420,7 +420,8 @@ class MainController:
             self.telegram_bot = TelegramBot(
                 telegram_config,
                 nli=self.natural_language_interface,
-                llm_integration=self.llm_integration
+                llm_integration=self.llm_integration,
+                main_controller=self
             )
             await self.telegram_bot.initialize()
             # 启动Telegram机器人轮询
@@ -453,6 +454,15 @@ class MainController:
         self.ai_trading_engine = AITradingEngine(self)
         await self.ai_trading_engine.initialize()
         logger.info("✅ 全智能AI交易引擎初始化完成")
+        
+        # 设置便捷引用（用于AICommandExecutor等模块访问）
+        if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'exchange'):
+            self.okx_exchange = self.ai_trading_engine.exchange
+            logger.info("✅ OKX交易所引用已设置")
+        
+        if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'risk_monitor'):
+            self.risk_monitor = self.ai_trading_engine.risk_monitor
+            logger.info("✅ 风险监控引用已设置")
 
         # 注册默认事件处理器
         self._register_default_handlers()

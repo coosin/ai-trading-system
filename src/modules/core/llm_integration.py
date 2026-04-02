@@ -613,7 +613,7 @@ class EnhancedLLMIntegration:
                 logger.error(f"解析交易信号失败: {signal.get('error')}")
                 return {"error": "信号生成失败", "detail": signal.get("error")}
             signal["timestamp"] = datetime.now().isoformat()
-            signal["provider"] = provider or self.llm_manager.default_provider
+            signal["provider"] = response.provider.value if response.provider else provider or self.llm_manager.default_model
             return signal
         except Exception as e:
             logger.error(f"解析交易信号失败: {e}")

@@ -1,0 +1,39 @@
+{
+    "enabled": true,
+    "use_global_proxy": true,
+    "global_proxy": {
+        "name": "clash-http",
+        "proxy_type": "http",
+        "host": "127.0.0.1",
+        "port": 7890,
+        "enabled": true,
+        "priority": 0,
+        "timeout": 30,
+        "retry_count": 3,
+        "health_check_url": "https://www.okx.com"
+    },
+    "proxies": [
+        {
+            "name": "clash-http",
+            "proxy_type": "http",
+            "host": "127.0.0.1",
+            "port": 7890,
+            "enabled": true,
+            "priority": 0,
+            "timeout": 30,
+            "retry_count": 3
+        },
+        {
+            "name": "clash-socks5",
+            "proxy_type": "socks5",
+            "host": "127.0.0.1",
+            "port": 7891,
+            "enabled": true,
+            "priority": 1,
+            "timeout": 30,
+            "retry_count": 3
+        }
+    ],
+    "whitelist_domains": ["www.okx.com", "okx.com", "api.okx.com", "api.telegram.org", "telegram.org", "openai.com", "api.openai.com"],
+    "blacklist_domains": []
+}

@@ -207,6 +207,26 @@ class AITradingEngine:
         except Exception as e:
             logger.warning(f"⚠️ 策略优化器初始化失败: {e}")
         
+        # 初始化多源数据融合分析器
+        try:
+            from src.modules.data.multi_source_data_fusion import MultiSourceDataFusion
+            from src.modules.data.data_integration import BinanceDataSource, CoinGeckoDataSource
+            
+            self.data_fusion = MultiSourceDataFusion(
+                data_integration=self,
+                llm_integration=self.llm_integration
+            )
+            
+            binance_source = BinanceDataSource(proxy_url="http://127.0.0.1:7890")
+            coingecko_source = CoinGeckoDataSource(proxy_url="http://127.0.0.1:7890")
+            
+            await self.data_fusion.register_data_source("binance", binance_source)
+            await self.data_fusion.register_data_source("coingecko", coingecko_source)
+            
+            logger.info("✅ 多源数据融合分析器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 多源数据融合分析器初始化失败: {e}")
+        
         # 加载配置
         if self.main_controller and self.main_controller.config_manager:
             config = await self.main_controller.config_manager.get_config("ai_trading", {})
@@ -372,7 +392,7 @@ class AITradingEngine:
             return None
     
     async def _analyze_market(self, symbol: str, market_data: Dict) -> MarketContext:
-        """AI市场分析"""
+        """AI市场分析 - 增强版，整合多源数据"""
         try:
             # 计算技术指标
             technical_indicators = self._calculate_technical_indicators(market_data)
@@ -393,10 +413,19 @@ class AITradingEngine:
                     atr=technical_indicators.atr
                 ))
             
-            if not self.llm_integration:
-                return self._basic_analysis(symbol, market_data, technical_indicators)
+            # 使用多源数据融合分析（如果可用）
+            fused_intelligence = None
+            if hasattr(self, 'data_fusion') and self.data_fusion:
+                try:
+                    fused_intelligence = await self.data_fusion.analyze_market(symbol)
+                    logger.info(f"📊 多源数据融合分析完成: {symbol}, 情绪={fused_intelligence.overall_sentiment.value}")
+                except Exception as e:
+                    logger.warning(f"多源数据分析失败，使用基础分析: {e}")
             
-            # 构建包含技术指标的分析数据
+            if not self.llm_integration:
+                return self._enhanced_basic_analysis(symbol, market_data, technical_indicators, fused_intelligence)
+            
+            # 构建包含技术指标和多源数据的分析数据
             analysis_data = {
                 "symbol": symbol,
                 "price": market_data["ticker"].get("last", 0),
@@ -406,22 +435,43 @@ class AITradingEngine:
                 "multi_timeframe": self._summarize_multi_timeframe(market_data.get("multi_timeframe_klines", {}))
             }
             
+            # 如果有多源数据，添加到分析中
+            if fused_intelligence:
+                analysis_data["fused_intelligence"] = fused_intelligence.to_dict()
+            
             # 使用AI进行深度分析
             ai_analysis = await self.llm_integration.analyze_market(analysis_data)
             
-            # 解析AI分析结果
-            context = MarketContext(
-                symbol=symbol,
-                price=market_data["ticker"].get("last", 0),
-                trend=ai_analysis.get("trend", technical_indicators.trend),
-                volatility=ai_analysis.get("volatility", self._calculate_volatility(technical_indicators)),
-                volume_24h=market_data["ticker"].get("volume", 0),
-                sentiment=ai_analysis.get("sentiment", "neutral"),
-                support_levels=ai_analysis.get("support_levels", []),
-                resistance_levels=ai_analysis.get("resistance_levels", [])
-            )
+            # 如果有多源数据，优先使用融合分析的结论
+            if fused_intelligence:
+                context = MarketContext(
+                    symbol=symbol,
+                    price=market_data["ticker"].get("last", 0),
+                    trend=fused_intelligence.recommendation if fused_intelligence.recommendation in ["bullish", "bearish", "sideways"] else ai_analysis.get("trend", technical_indicators.trend),
+                    volatility=self._calculate_volatility(technical_indicators),
+                    volume_24h=market_data["ticker"].get("volume", 0),
+                    sentiment=fused_intelligence.overall_sentiment.value,
+                    support_levels=ai_analysis.get("support_levels", []),
+                    resistance_levels=ai_analysis.get("resistance_levels", [])
+                )
+                
+                logger.info(f"✅ AI增强分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}, "
+                           f"信号强度={fused_intelligence.signal_strength.value}")
+            else:
+                # 解析AI分析结果
+                context = MarketContext(
+                    symbol=symbol,
+                    price=market_data["ticker"].get("last", 0),
+                    trend=ai_analysis.get("trend", technical_indicators.trend),
+                    volatility=ai_analysis.get("volatility", self._calculate_volatility(technical_indicators)),
+                    volume_24h=market_data["ticker"].get("volume", 0),
+                    sentiment=ai_analysis.get("sentiment", "neutral"),
+                    support_levels=ai_analysis.get("support_levels", []),
+                    resistance_levels=ai_analysis.get("resistance_levels", [])
+                )
+                
+                logger.info(f"✅ AI分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}")
             
-            logger.info(f"✅ AI分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}")
             return context
             
         except Exception as e:
@@ -543,6 +593,21 @@ class AITradingEngine:
             volume_24h=ticker.get("volume", 0),
             sentiment="neutral"
         )
+    
+    def _enhanced_basic_analysis(self, symbol: str, market_data: Dict, 
+                                 indicators: Optional[TechnicalIndicators] = None,
+                                 fused_intelligence=None) -> MarketContext:
+        """增强基础分析（整合多源数据）"""
+        base_context = self._basic_analysis(symbol, market_data, indicators)
+        
+        if fused_intelligence:
+            base_context.sentiment = fused_intelligence.overall_sentiment.value
+            if fused_intelligence.recommendation in ["bullish", "bearish"]:
+                base_context.trend = fused_intelligence.recommendation
+            
+            logger.info(f"📈 增强基础分析 {symbol}: 趋势={base_context.trend}, 情绪={base_context.sentiment}")
+        
+        return base_context
     
     def _build_analysis_prompt(self, symbol: str, market_data: Dict, indicators: Optional[TechnicalIndicators] = None) -> str:
         """构建AI分析提示词"""

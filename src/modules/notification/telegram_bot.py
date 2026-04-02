@@ -64,7 +64,7 @@ class TelegramResponse:
 class TelegramBot:
     """Telegram机器人"""
 
-    def __init__(self, config: Dict[str, Any], nli=None, llm_integration=None):
+    def __init__(self, config: Dict[str, Any], nli=None, llm_integration=None, main_controller=None):
         """
         初始化Telegram机器人
 
@@ -72,6 +72,7 @@ class TelegramBot:
             config: 配置信息
             nli: 自然语言接口实例
             llm_integration: 大模型集成实例
+            main_controller: 主控制器实例（用于访问交易系统）
         """
         self.config = config
         self.enabled = config.get("enabled", False)
@@ -81,6 +82,7 @@ class TelegramBot:
         
         self.nli = nli
         self.llm_integration = llm_integration
+        self.main_controller = main_controller
         
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.session = None
@@ -334,12 +336,31 @@ class TelegramBot:
             logger.error(f"处理命令失败: {e}")
 
     async def _process_natural_language(self, message: TelegramMessage):
-        """处理自然语言消息"""
+        """处理自然语言消息 - 使用AICommandExecutor获取系统感知能力"""
         try:
             logger.info(f"处理自然语言消息: {message.text[:50]}...")
             
-            if self.llm_integration:
-                # 直接使用大模型
+            # 优先使用AI指令执行器（具备完整的系统感知能力）
+            ai_executor = getattr(self.main_controller, 'ai_command_executor', None) if self.main_controller else None
+            
+            if ai_executor:
+                logger.info("使用AICommandExecutor处理自然语言消息")
+                result = await ai_executor.process_input(message.text)
+                
+                if result.get("success"):
+                    await self._send_message(TelegramResponse(
+                        chat_id=message.chat_id,
+                        text=result.get("response", "处理完成"),
+                        reply_to_message_id=message.message_id
+                    ))
+                else:
+                    await self._send_message(TelegramResponse(
+                        chat_id=message.chat_id,
+                        text=f"⚠️ {result.get('response', '处理失败')}",
+                        reply_to_message_id=message.message_id
+                    ))
+            elif self.llm_integration:
+                # 回退：直接使用大模型（无系统感知）
                 prompt = f"""你是一个专业的量化交易助手。请用简洁、友好的语言回应用户的问题。
 
 用户问题：{message.text}
@@ -378,6 +399,8 @@ class TelegramBot:
                 ))
         except Exception as e:
             logger.error(f"处理自然语言失败: {e}")
+            import traceback
+            traceback.print_exc()
             await self._send_message(TelegramResponse(
                 chat_id=message.chat_id,
                 text="❌ 处理消息时出错，请稍后重试",
@@ -567,19 +590,32 @@ class TelegramBot:
 
     async def _handle_status(self, message: TelegramMessage):
         """处理 /status 命令"""
-        text = """🟢 *系统状态*
+        try:
+            status_data = {"status": "运行中", "modules": {}}
+            
+            if self.main_controller:
+                mc = self.main_controller
+                status_data["modules"] = {
+                    "数据采集": "🟢 运行中" if mc.trading_monitor else "🔴 未初始化",
+                    "策略分析": "🟢 运行中" if mc.strategy_manager else "🔴 未初始化",
+                    "AI交易引擎": "🟢 运行中" if mc.ai_trading_engine else "🔴 未初始化",
+                    "风险监控": "🟢 运行中" if mc.risk_monitor else "🔴 未初始化",
+                    "OKX交易所": "🟢 已连接" if mc.okx_exchange else "🔴 未连接",
+                }
+            
+            text = f"""🟢 *系统状态*
 
-*状态*: 运行中
-*时间*: """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """
+*状态*: {status_data['status']}
+*时间*: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 *模块状态*:
-- 数据采集: 🟢 运行中
-- 策略分析: 🟢 运行中
-- 交易执行: 🟡 待命
-- 风险监控: 🟢 运行中
+""" + "\n".join([f"- {k}: {v}" for k, v in status_data["modules"].items()]) + """
 
 使用 /balance 查看账户余额
 """
+        except Exception as e:
+            text = f"❌ 获取状态失败: {e}"
+            
         await self._send_message(TelegramResponse(
             chat_id=message.chat_id,
             text=text,
@@ -588,15 +624,36 @@ class TelegramBot:
 
     async def _handle_balance(self, message: TelegramMessage):
         """处理 /balance 命令"""
-        text = """💰 *账户余额*
+        try:
+            balance_data = {"total": 0, "available": 0, "currencies": {}}
+            
+            if self.main_controller and self.main_controller.okx_exchange:
+                okx = self.main_controller.okx_exchange
+                balance = await okx.get_account_balance()
+                if balance:
+                    balance_data = balance
+            
+            if balance_data.get("currencies"):
+                text = "💰 *账户余额*\n\n"
+                for currency, amount in balance_data.get("currencies", {}).items():
+                    text += f"*{currency}*: {amount:,.4f}\n"
+                text += f"\n*总权益*: ${balance_data.get('total', 0):,.2f}\n"
+                text += f"*可用保证金*: ${balance_data.get('available', 0):,.2f}\n"
+            else:
+                text = """💰 *账户余额*
 
-*USDT*: 10,000.00
-*BTC*: 0.5000
-*ETH*: 5.0000
+⚠️ 无法获取实时余额数据
 
-*总权益*: ~$50,000.00
-*可用保证金*: $8,000.00
+可能原因:
+- OKX API 未连接
+- API 密钥配置错误
+- 网络连接问题
+
+请检查系统配置
 """
+        except Exception as e:
+            text = f"❌ 获取余额失败: {e}"
+            
         await self._send_message(TelegramResponse(
             chat_id=message.chat_id,
             text=text,
@@ -605,24 +662,41 @@ class TelegramBot:
 
     async def _handle_positions(self, message: TelegramMessage):
         """处理 /positions 命令"""
-        text = """📊 *当前持仓*
+        try:
+            positions = []
+            
+            if self.main_controller and self.main_controller.okx_exchange:
+                okx = self.main_controller.okx_exchange
+                positions = await okx.get_positions() or []
+            
+            if positions:
+                text = "📊 *当前持仓*\n\n"
+                total_pnl = 0
+                for i, pos in enumerate(positions, 1):
+                    side_emoji = "🟢" if pos.get("side") == "long" else "🔴"
+                    pnl = pos.get("unrealized_pnl", 0)
+                    pnl_percent = pos.get("unrealized_pnl_percent", 0)
+                    total_pnl += pnl
+                    
+                    text += f"""{i}. *{pos.get('symbol', 'Unknown')}*
+   - 方向: {side_emoji} {pos.get('side', 'N/A').upper()}
+   - 数量: {pos.get('quantity', 0):.4f}
+   - 入场价: ${pos.get('entry_price', 0):,.2f}
+   - 当前价: ${pos.get('current_price', 0):,.2f}
+   - 盈亏: ${pnl:+,.2f} ({pnl_percent:+.2f}%)
 
-1. *BTC/USDT*
-   - 方向: LONG
-   - 数量: 0.1000
-   - 入场价: $50,000
-   - 当前价: $51,200
-   - 盈亏: +$1,200 (+2.4%)
-
-2. *ETH/USDT*
-   - 方向: LONG
-   - 数量: 2.0000
-   - 入场价: $3,000
-   - 当前价: $3,050
-   - 盈亏: +$100 (+1.7%)
-
-*总盈亏*: +$1,300 (+2.6%)
 """
+                text += f"*总盈亏*: ${total_pnl:+,.2f}\n"
+            else:
+                text = """📊 *当前持仓*
+
+📭 当前没有任何持仓
+
+使用 /signals 查看交易信号
+"""
+        except Exception as e:
+            text = f"❌ 获取持仓失败: {e}"
+            
         await self._send_message(TelegramResponse(
             chat_id=message.chat_id,
             text=text,
@@ -631,23 +705,34 @@ class TelegramBot:
 
     async def _handle_signals(self, message: TelegramMessage):
         """处理 /signals 命令"""
-        text = """📈 *最新交易信号*
+        try:
+            signals = []
+            
+            if self.main_controller and self.main_controller.ai_trading_engine:
+                engine = self.main_controller.ai_trading_engine
+                signals = getattr(engine, 'recent_signals', [])[:5]
+            
+            if signals:
+                text = "📈 *最新交易信号*\n\n"
+                for i, signal in enumerate(signals, 1):
+                    action_emoji = {"buy": "🟢", "sell": "🔴", "hold": "🟡"}.get(signal.get("action", "hold").lower(), "⚪")
+                    text += f"""{i}. *{signal.get('symbol', 'Unknown')}* - {action_emoji} {signal.get('action', 'N/A').upper()}
+   - 入场: ${signal.get('entry_price', 0):,.2f}
+   - 止损: ${signal.get('stop_loss', 0):,.2f}
+   - 止盈: ${signal.get('take_profit', 0):,.2f}
+   - 置信度: {signal.get('confidence', 0):.0%}
 
-1. *BTC/USDT* - 🟢 BUY
-   - 入场: $51,000
-   - 止损: $50,000
-   - 止盈: $53,000
-   - 置信度: 85%
-
-2. *ETH/USDT* - 🟡 HOLD
-   - 当前: $3,050
-   - 等待更好的入场点
-
-3. *SOL/USDT* - 🔴 SELL (已触发)
-   - 入场: $145
-   - 止损: $140 (已触发)
-   - 盈亏: -$5 (-3.4%)
 """
+            else:
+                text = """📈 *最新交易信号*
+
+📭 暂无交易信号
+
+系统正在分析市场，请稍后再查看
+"""
+        except Exception as e:
+            text = f"❌ 获取信号失败: {e}"
+            
         await self._send_message(TelegramResponse(
             chat_id=message.chat_id,
             text=text,
@@ -656,20 +741,32 @@ class TelegramBot:
 
     async def _handle_alerts(self, message: TelegramMessage):
         """处理 /alerts 命令"""
-        text = """🔔 *活跃警报*
+        try:
+            alerts = []
+            
+            if self.main_controller and self.main_controller.risk_monitor:
+                monitor = self.main_controller.risk_monitor
+                alerts = getattr(monitor, 'recent_alerts', [])[:5]
+            
+            if alerts:
+                text = "🔔 *活跃警报*\n\n"
+                for i, alert in enumerate(alerts, 1):
+                    level_emoji = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(alert.get("level", "info"), "ℹ️")
+                    text += f"""{i}. {level_emoji} *{alert.get('title', 'Unknown')}*
+   - 时间: {alert.get('time', 'N/A')}
+   - 详情: {alert.get('message', 'N/A')}
 
-1. ⚠️ *BTC波动率上升*
-   - 时间: 10分钟前
-   - 详情: 24h波动率从15%上升至22%
-
-2. ℹ️ *ETH突破阻力位*
-   - 时间: 25分钟前
-   - 详情: ETH突破$3,000阻力位
-
-3. ✅ *系统更新完成*
-   - 时间: 1小时前
-   - 详情: 策略模块已更新至v2.1
 """
+            else:
+                text = """🔔 *活跃警报*
+
+✅ 当前没有活跃警报
+
+系统运行正常
+"""
+        except Exception as e:
+            text = f"❌ 获取警报失败: {e}"
+            
         await self._send_message(TelegramResponse(
             chat_id=message.chat_id,
             text=text,
@@ -678,24 +775,32 @@ class TelegramBot:
 
     async def _handle_settings(self, message: TelegramMessage):
         """处理 /settings 命令"""
-        text = """⚙️ *系统设置*
+        try:
+            settings = {}
+            
+            if self.main_controller and self.main_controller.config_manager:
+                settings = await self.main_controller.config_manager.get_config("trading", {})
+            
+            text = f"""⚙️ *系统设置*
 
 *通知设置*:
-- 交易信号: 🔔 开启
-- 风险警报: 🔔 开启
-- 每日报告: 🔕 关闭
+- 交易信号: {'🔔 开启' if self.config.get('notifications', {}).get('trade_signals', True) else '🔕 关闭'}
+- 风险警报: {'🔔 开启' if self.config.get('notifications', {}).get('risk_alerts', True) else '🔕 关闭'}
+- 每日报告: {'🔔 开启' if self.config.get('notifications', {}).get('daily_summary', False) else '🔕 关闭'}
 
 *交易设置*:
-- 最大仓位: 10%
-- 止损比例: 2%
-- 止盈比例: 5%
-- 自动交易: ❌ 关闭
+- 交易模式: {settings.get('mode', 'simulation')}
+- 最大仓位: {settings.get('max_position', 10)}%
+- 止损比例: {settings.get('stop_loss', 2)}%
+- 止盈比例: {settings.get('take_profit', 5)}%
+- 自动交易: {'✅ 开启' if settings.get('auto_trade', False) else '❌ 关闭'}
 
 *模型设置*:
-- 主模型: GPT-4 Turbo
-- 备用模型: Claude 3 Opus
-- 温度: 0.7
+- 默认模型: {getattr(self.main_controller.enhanced_llm_manager, 'default_model', 'N/A') if self.main_controller else 'N/A'}
 """
+        except Exception as e:
+            text = f"❌ 获取设置失败: {e}"
+            
         await self._send_message(TelegramResponse(
             chat_id=message.chat_id,
             text=text,
@@ -704,26 +809,36 @@ class TelegramBot:
 
     async def _handle_analysis(self, message: TelegramMessage):
         """处理 /analysis 命令"""
-        text = """📊 *市场分析*
+        try:
+            analysis_data = {}
+            
+            if self.main_controller and self.main_controller.ai_trading_engine:
+                engine = self.main_controller.ai_trading_engine
+                analysis_data = getattr(engine, 'latest_analysis', {})
+            
+            if analysis_data:
+                text = "📊 *市场分析*\n\n"
+                text += f"*整体市场情绪*: {analysis_data.get('sentiment', 'N/A')}\n\n"
+                
+                for symbol, data in analysis_data.get('symbols', {}).items():
+                    text += f"""*{symbol}*:
+- 趋势: {data.get('trend', 'N/A')}
+- 支撑位: ${data.get('support', 0):,.2f}
+- 阻力位: ${data.get('resistance', 0):,.2f}
+- RSI: {data.get('rsi', 0):.1f}
+- 建议: {data.get('suggestion', 'N/A')}
 
-*整体市场情绪*: 🟢 乐观
-
-*BTC/USDT*:
-- 趋势: 上升趋势
-- 支撑位: $50,000
-- 阻力位: $52,000
-- RSI: 65 (中性偏多)
-- 建议: 持有，等待回调加仓
-
-*ETH/USDT*:
-- 趋势: 上升趋势
-- 支撑位: $2,950
-- 阻力位: $3,100
-- RSI: 58 (中性)
-- 建议: 可以轻仓入场
-
-*风险提示*: 整体市场风险中等，注意仓位控制
 """
+            else:
+                text = """📊 *市场分析*
+
+⏳ 正在分析市场数据...
+
+请稍后再查看，或使用 /signals 查看交易信号
+"""
+        except Exception as e:
+            text = f"❌ 获取分析失败: {e}"
+            
         await self._send_message(TelegramResponse(
             chat_id=message.chat_id,
             text=text,

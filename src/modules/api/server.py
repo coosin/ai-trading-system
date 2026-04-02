@@ -994,20 +994,30 @@ class APIServer:
         # 市场行情路由 - 支持 /api/v1/market/ticker/{symbol}
         @api_v1_router.get("/market/ticker/{symbol}", tags=["market"])
         async def get_market_ticker(symbol: str):
-            """获取市场行情 - 从OKX公开API获取真实数据（带重试机制）"""
+            """获取市场行情 - 从OKX公开API获取真实数据（带重试机制和代理支持）"""
             import aiohttp
             formatted_symbol = symbol.replace("-", "-")
             
-            # 重试机制
+            proxy_url = None
+            try:
+                from src.modules.core.proxy_manager import get_proxy_manager
+                proxy_manager = await get_proxy_manager()
+                proxy = await proxy_manager.get_proxy("www.okx.com")
+                if proxy:
+                    proxy_url = proxy.url
+                    logger.debug(f"使用代理: {proxy_url}")
+            except Exception as e:
+                logger.debug(f"获取代理配置失败: {e}")
+            
             max_retries = 3
             for retry in range(max_retries):
                 try:
-                    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+                    timeout = aiohttp.ClientTimeout(total=30, connect=10)
                     connector = aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)
                     
                     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                         url = f"https://www.okx.com/api/v5/market/ticker?instId={formatted_symbol}"
-                        async with session.get(url) as resp:
+                        async with session.get(url, proxy=proxy_url) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 if data.get("code") == "0" and data.get("data"):
@@ -1060,22 +1070,32 @@ class APIServer:
         # K线路由 - 支持 /api/v1/market/klines/{symbol}
         @api_v1_router.get("/market/klines/{symbol}", tags=["market"])
         async def get_market_klines(symbol: str, interval: str = "1H", limit: int = 100):
-            """获取K线数据 - 从OKX公开API获取真实数据（带重试机制）"""
+            """获取K线数据 - 从OKX公开API获取真实数据（带重试机制和代理支持）"""
             import aiohttp
             formatted_symbol = symbol.replace("-", "-")
             
             okx_bar_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
             okx_bar = okx_bar_map.get(interval.lower(), "1H")
             
+            proxy_url = None
+            try:
+                from src.modules.core.proxy_manager import get_proxy_manager
+                proxy_manager = await get_proxy_manager()
+                proxy = await proxy_manager.get_proxy("www.okx.com")
+                if proxy:
+                    proxy_url = proxy.url
+            except Exception as e:
+                logger.debug(f"获取代理配置失败: {e}")
+            
             max_retries = 3
             for retry in range(max_retries):
                 try:
-                    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+                    timeout = aiohttp.ClientTimeout(total=30, connect=10)
                     connector = aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)
                     
                     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                         url = f"https://www.okx.com/api/v5/market/candles?instId={formatted_symbol}&bar={okx_bar}&limit={limit}"
-                        async with session.get(url) as resp:
+                        async with session.get(url, proxy=proxy_url) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 if data.get("code") == "0" and data.get("data"):
@@ -1121,19 +1141,29 @@ class APIServer:
         # 订单簿路由 - 支持 /api/v1/market/orderbook/{symbol}
         @api_v1_router.get("/market/orderbook/{symbol}", tags=["market"])
         async def get_market_orderbook(symbol: str, depth: int = 20):
-            """获取订单簿 - 从OKX公开API获取真实数据（带重试机制）"""
+            """获取订单簿 - 从OKX公开API获取真实数据（带重试机制和代理支持）"""
             import aiohttp
             formatted_symbol = symbol.replace("-", "-")
+            
+            proxy_url = None
+            try:
+                from src.modules.core.proxy_manager import get_proxy_manager
+                proxy_manager = await get_proxy_manager()
+                proxy = await proxy_manager.get_proxy("www.okx.com")
+                if proxy:
+                    proxy_url = proxy.url
+            except Exception as e:
+                logger.debug(f"获取代理配置失败: {e}")
             
             max_retries = 3
             for retry in range(max_retries):
                 try:
-                    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+                    timeout = aiohttp.ClientTimeout(total=30, connect=10)
                     connector = aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)
                     
                     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                         url = f"https://www.okx.com/api/v5/market/books?instId={formatted_symbol}&sz={depth}"
-                        async with session.get(url) as resp:
+                        async with session.get(url, proxy=proxy_url) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 if data.get("code") == "0" and data.get("data"):
@@ -1582,7 +1612,7 @@ class APIServer:
         # AI对话API端点
         @api_v1_router.post("/ai/chat", tags=["ai"])
         async def ai_chat(chat_data: Dict[str, Any]):
-            """与AI模型对话 - 直接带记忆注入，让AI自主判断"""
+            """与AI智能助手对话 - 使用AICommandExecutor处理，具备系统感知能力"""
             try:
                 message = chat_data.get("message", "")
                 model_id = chat_data.get("model_id")
@@ -1594,7 +1624,32 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
                 
-                # 获取LLM集成（带记忆管理）
+                # 优先使用AI指令执行器（具备完整的系统感知能力）
+                ai_executor = getattr(self.main_controller, 'ai_command_executor', None)
+                
+                if ai_executor:
+                    print(f"[DEBUG] 使用AICommandExecutor处理: {message[:50]}...")
+                    result = await ai_executor.process_input(message)
+                    
+                    if result.get("success"):
+                        return {
+                            "status": "success",
+                            "message": "AI响应成功",
+                            "data": {
+                                "response": result.get("response", ""),
+                                "data": result.get("data"),
+                                "source": "ai_command_executor"
+                            },
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    else:
+                        return {
+                            "status": "error",
+                            "message": result.get("response", "AI处理失败"),
+                            "timestamp": datetime.now().isoformat()
+                        }
+                
+                # 回退：直接调用LLM集成（无系统感知）
                 llm_integration = self.main_controller.llm_integration
                 
                 if not llm_integration:
@@ -1604,14 +1659,11 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
                 
-                # 如果没有指定模型，使用默认模型
                 if not model_id:
                     model_id = llm_integration.llm_manager.default_model
                 
-                print(f"[DEBUG] Calling AI with memory: {message[:50]}...")
-                print(f"[DEBUG] Memory manager available: {llm_integration.memory_manager is not None}")
+                print(f"[DEBUG] 回退到直接LLM调用: {message[:50]}...")
                 
-                # 直接调用带记忆的LLM，让AI自己理解和判断该做什么
                 response = await llm_integration.generate(
                     prompt=message,
                     model_id=model_id
@@ -1627,7 +1679,8 @@ class APIServer:
                             "provider": response.provider.value if hasattr(response.provider, 'value') else str(response.provider),
                             "tokens_used": response.tokens_used,
                             "latency_ms": response.latency_ms,
-                            "cost": response.cost
+                            "cost": response.cost,
+                            "source": "llm_direct"
                         },
                         "timestamp": datetime.now().isoformat()
                     }

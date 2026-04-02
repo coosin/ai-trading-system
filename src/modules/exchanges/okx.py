@@ -62,7 +62,6 @@ class OKXExchange(ExchangeBase):
         try:
             timeout = aiohttp.ClientTimeout(total=60, connect=30)
             
-            # 准备代理参数
             proxy = getattr(self, '_proxy_url', None)
             
             if method == "GET":
@@ -71,23 +70,32 @@ class OKXExchange(ExchangeBase):
                     if data.get("code") == "0":
                         return data.get("data", {})
                     else:
-                        raise Exception(f"OKX API错误: {data.get('msg')}")
+                        error_msg = data.get('msg', '') or data.get('code', 'unknown')
+                        logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                        raise Exception(f"OKX API错误: {error_msg}")
             elif method == "POST":
                 async with self._session.post(url, headers=headers, json=body, timeout=timeout, proxy=proxy) as response:
                     data = await response.json()
                     if data.get("code") == "0":
                         return data.get("data", {})
                     else:
-                        raise Exception(f"OKX API错误: {data.get('msg')}")
+                        error_msg = data.get('msg', '') or data.get('code', 'unknown')
+                        logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                        raise Exception(f"OKX API错误: {error_msg}")
             elif method == "DELETE":
                 async with self._session.delete(url, headers=headers, json=body, timeout=timeout, proxy=proxy) as response:
                     data = await response.json()
                     if data.get("code") == "0":
                         return data.get("data", {})
                     else:
-                        raise Exception(f"OKX API错误: {data.get('msg')}")
+                        error_msg = data.get('msg', '') or data.get('code', 'unknown')
+                        logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                        raise Exception(f"OKX API错误: {error_msg}")
+        except aiohttp.ClientError as e:
+            logger.error(f"OKX API网络错误: {method} {endpoint} - {type(e).__name__}: {e}")
+            raise
         except Exception as e:
-            logger.error(f"OKX API请求失败: {method} {endpoint} - {e}")
+            logger.error(f"OKX API请求失败: {method} {endpoint} - {type(e).__name__}: {e}")
             raise
     
     async def initialize(self) -> bool:
