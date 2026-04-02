@@ -865,6 +865,134 @@ class UnifiedIntelligentMemory:
             context = context[:max_tokens * 4]
         
         return context
+    
+    async def process_user_input(self, user_input: str) -> Dict[str, Any]:
+        """
+        处理用户输入，自动识别并记录重要信息
+        
+        自动识别：
+        - 用户偏好（喜欢、偏好、习惯）
+        - 系统指令（记住、以后、总是）
+        - 风险设置（止损、仓位、杠杆）
+        - 交易规则（不要、必须、避免）
+        - 禁止事项（绝对不要、严禁）
+        - 目标设定（目标、期望）
+        
+        Args:
+            user_input: 用户输入文本
+            
+        Returns:
+            处理结果，包含是否记录、识别的意图等
+        """
+        from .user_intent_recognizer import UserIntentRecognizer, UserIntentType
+        
+        result = {
+            "recorded": False,
+            "intents": [],
+            "memory_ids": [],
+            "message": ""
+        }
+        
+        intents = UserIntentRecognizer.recognize(user_input)
+        
+        if not intents:
+            result["message"] = "未识别到需要记忆的重要信息"
+            return result
+        
+        result["intents"] = [
+            {
+                "type": intent.intent_type.value,
+                "content": intent.content,
+                "confidence": intent.confidence,
+                "keywords": intent.keywords
+            }
+            for intent in intents
+        ]
+        
+        for intent in intents:
+            if intent.confidence >= 0.6:
+                memory_id = await self._record_user_intent(intent)
+                if memory_id:
+                    result["memory_ids"].append(memory_id)
+                    result["recorded"] = True
+        
+        if result["recorded"]:
+            intent_types = list(set(i["type"] for i in result["intents"]))
+            result["message"] = f"✅ 已记录您的{', '.join(intent_types)}"
+        else:
+            result["message"] = "信息置信度较低，未自动记录"
+        
+        return result
+    
+    async def _record_user_intent(self, intent) -> Optional[str]:
+        """记录用户意图到记忆系统"""
+        from .user_intent_recognizer import UserIntentType
+        
+        type_mapping = {
+            UserIntentType.PREFERENCE: UnifiedMemoryType.USER_PREFERENCE,
+            UserIntentType.INSTRUCTION: UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            UserIntentType.RISK_SETTING: UnifiedMemoryType.RISK_SETTING,
+            UserIntentType.TRADING_RULE: UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            UserIntentType.REMINDER: UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            UserIntentType.PROHIBITION: UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            UserIntentType.GOAL: UnifiedMemoryType.USER_PREFERENCE,
+            UserIntentType.FEEDBACK: UnifiedMemoryType.USER_PREFERENCE,
+        }
+        
+        memory_type = type_mapping.get(intent.intent_type, UnifiedMemoryType.USER_PREFERENCE)
+        
+        if intent.confidence >= 0.85:
+            priority = MemoryPriority.CRITICAL
+        elif intent.confidence >= 0.75:
+            priority = MemoryPriority.HIGH
+        else:
+            priority = MemoryPriority.NORMAL
+        
+        summary = f"[用户{intent.intent_type.value}] {intent.content[:100]}"
+        
+        return await self.add_memory(
+            memory_type=memory_type,
+            content=intent.original_text,
+            summary=summary,
+            metadata={
+                "intent_type": intent.intent_type.value,
+                "extracted_content": intent.content,
+                "confidence": intent.confidence,
+                "keywords": intent.keywords,
+                "auto_recorded": True
+            },
+            priority=priority,
+            importance=intent.confidence,
+            source_module="user_input_auto",
+            tags=intent.keywords + [intent.intent_type.value]
+        )
+    
+    async def get_user_preferences_summary(self) -> str:
+        """获取用户偏好摘要"""
+        prefs = await self.retrieve_memories(
+            memory_types=[UnifiedMemoryType.USER_PREFERENCE, UnifiedMemoryType.RISK_SETTING],
+            min_importance=0.5,
+            limit=20
+        )
+        
+        if not prefs:
+            return "暂无用户偏好记录"
+        
+        summary_parts = ["📋 用户偏好和设置："]
+        
+        categories = {}
+        for pref in prefs:
+            intent_type = pref.metadata.get("intent_type", "other")
+            if intent_type not in categories:
+                categories[intent_type] = []
+            categories[intent_type].append(pref.summary)
+        
+        for category, items in categories.items():
+            summary_parts.append(f"\n【{category}】")
+            for item in items[:5]:
+                summary_parts.append(f"  - {item}")
+        
+        return "\n".join(summary_parts)
 
 
 _unified_memory_instance: Optional[UnifiedIntelligentMemory] = None

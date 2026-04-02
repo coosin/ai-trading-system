@@ -21,6 +21,15 @@ from .memory_migrator import (
     run_migration
 )
 
+from .user_intent_recognizer import (
+    UserIntentRecognizer,
+    UserIntentType,
+    ExtractedIntent,
+    AutoMemoryRecorder,
+    user_intent_recognizer,
+    auto_memory_recorder
+)
+
 __all__ = [
     "UnifiedIntelligentMemory",
     "UnifiedMemory",
@@ -31,5 +40,11 @@ __all__ = [
     "AIMemoryIntegration",
     "ai_memory_integration",
     "MemoryMigrator",
-    "run_migration"
+    "run_migration",
+    "UserIntentRecognizer",
+    "UserIntentType",
+    "ExtractedIntent",
+    "AutoMemoryRecorder",
+    "user_intent_recognizer",
+    "auto_memory_recorder"
 ]
