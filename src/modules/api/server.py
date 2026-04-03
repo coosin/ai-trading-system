@@ -344,6 +344,13 @@ class APIServer:
 
             # 设置路由
             await self._setup_routes()
+            
+            # 初始化模块控制API
+            try:
+                from src.modules.api.module_control_api import init_module_control_api
+                init_module_control_api(self.app, self.main_controller)
+            except Exception as e:
+                logger.warning(f"模块控制API初始化失败: {e}")
 
             # 启动任务
             self._tasks.append(asyncio.create_task(self._cleanup_inactive_websockets()))

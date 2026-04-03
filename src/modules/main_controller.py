@@ -357,7 +357,7 @@ class MainController:
         try:
             from src.modules.core.ai_learning_engine import AILearningEngine
             self.ai_learning_engine = AILearningEngine(
-                memory_manager=self.enhanced_memory_manager,
+                memory_manager=self.ai_memory_manager,
                 llm_integration=self.llm_integration
             )
             await self.ai_learning_engine.start()
@@ -436,8 +436,7 @@ class MainController:
                 main_controller=self
             )
             await self.telegram_bot.initialize()
-            # 启动Telegram机器人轮询
-            await self.telegram_bot.start_polling()
+            await self.telegram_bot.start()
         
         # 初始化模拟交易市场
         self.simulated_market = SimulatedMarket()
@@ -461,6 +460,54 @@ class MainController:
         self.business_process_manager = BusinessProcessManager(self)
         await self.business_process_manager.initialize()
         
+        # 初始化紧急停止系统
+        try:
+            from src.modules.safety.emergency_stop import EmergencyStopSystem
+            self.emergency_stop = EmergencyStopSystem()
+            logger.info("✅ 紧急停止系统已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 紧急停止系统初始化失败: {e}")
+            self.emergency_stop = None
+        
+        # 初始化智能监控系统
+        try:
+            from src.modules.monitoring.intelligent_monitoring import IntelligentMonitoringSystem
+            self.intelligent_monitoring = IntelligentMonitoringSystem()
+            logger.info("✅ 智能监控系统已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 智能监控系统初始化失败: {e}")
+            self.intelligent_monitoring = None
+        
+        # 初始化安全管理器
+        try:
+            from src.modules.security.security_manager import SecurityManager
+            self.security_manager = SecurityManager()
+            logger.info("✅ 安全管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 安全管理器初始化失败: {e}")
+            self.security_manager = None
+        
+        # 初始化智能资金管理器
+        try:
+            from src.modules.core.intelligent_fund_manager import IntelligentFundManager
+            from src.modules.core.risk_manager import RiskManager
+            fund_config = {
+                "initial_funds": 10000,
+                "risk_per_trade": 0.02,
+                "max_leverage": 3
+            }
+            risk_mgr = RiskManager()
+            self.fund_manager = IntelligentFundManager(
+                db_manager=self.database_manager,
+                risk_manager=risk_mgr,
+                config=fund_config
+            )
+            await self.fund_manager.initialize()
+            logger.info("✅ 智能资金管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 智能资金管理器初始化失败: {e}")
+            self.fund_manager = None
+        
         # 初始化全智能AI交易引擎
         from src.modules.core.ai_trading_engine import AITradingEngine
         self.ai_trading_engine = AITradingEngine(self)
@@ -475,6 +522,20 @@ class MainController:
         if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'risk_monitor'):
             self.risk_monitor = self.ai_trading_engine.risk_monitor
             logger.info("✅ 风险监控引用已设置")
+
+        # 初始化AI核心决策引擎 - AI是交易决策的核心
+        try:
+            from src.modules.core.ai_core_decision_engine import AICoreDecisionEngine
+            self.ai_core = AICoreDecisionEngine(self)
+            await self.ai_core.initialize()
+            logger.info("✅ AI核心决策引擎初始化完成 - AI全权决策模式")
+            
+            # 兼容性：保留active_trader引用
+            self.active_trader = self.ai_core
+        except Exception as e:
+            logger.error(f"❌ AI核心决策引擎初始化失败: {e}")
+            self.ai_core = None
+            self.active_trader = None
 
         # 注册默认事件处理器
         self._register_default_handlers()
@@ -573,6 +634,23 @@ class MainController:
         if self.business_process_manager:
             await self.business_process_manager.shutdown()
             self.business_process_manager = None
+        
+        # 清理紧急停止系统
+        if hasattr(self, 'emergency_stop') and self.emergency_stop:
+            self.emergency_stop = None
+        
+        # 清理智能监控系统
+        if hasattr(self, 'intelligent_monitoring') and self.intelligent_monitoring:
+            self.intelligent_monitoring = None
+        
+        # 清理安全管理器
+        if hasattr(self, 'security_manager') and self.security_manager:
+            self.security_manager = None
+        
+        # 清理智能资金管理器
+        if hasattr(self, 'fund_manager') and self.fund_manager:
+            await self.fund_manager.shutdown()
+            self.fund_manager = None
             
         self._initialized = False
 
@@ -616,6 +694,11 @@ class MainController:
                     if self.ai_trading_engine:
                         await self.ai_trading_engine.start()
                         logger.info("🚀 全智能AI交易引擎已启动，开始全自动交易")
+
+                    # 启动AI核心决策引擎 - AI全权决策
+                    if hasattr(self, 'ai_core') and self.ai_core:
+                        await self.ai_core.start()
+                        logger.info("🧠 AI核心决策引擎已启动 - AI全权决策模式")
 
                     # 发送心跳事件
                     await self.emit_event(
@@ -885,6 +968,15 @@ class MainController:
                 logger.error(f"AI交易引擎启动失败: {e}")
                 success = False
 
+        # 启动主动交易执行器
+        if hasattr(self, 'active_trader') and self.active_trader:
+            try:
+                await self.active_trader.start()
+                logger.info("🎯 主动交易执行器已启动，开始实盘交易")
+            except Exception as e:
+                logger.error(f"主动交易执行器启动失败: {e}")
+                success = False
+
         return success
 
     async def stop_all_modules(self, reverse: bool = False) -> bool:
@@ -898,6 +990,14 @@ class MainController:
             是否所有模块都停止成功
         """
         logger.info("停止所有模块..." + (" (逆序)" if reverse else ""))
+
+        # 先停止AI核心决策引擎
+        if hasattr(self, 'ai_core') and self.ai_core:
+            try:
+                await self.ai_core.stop()
+                logger.info("🛑 AI核心决策引擎已停止")
+            except Exception as e:
+                logger.error(f"AI核心决策引擎停止失败: {e}")
 
         success = True
         module_names = list(self.modules.keys())

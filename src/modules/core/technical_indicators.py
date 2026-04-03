@@ -5,7 +5,7 @@
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import numpy as np
 
@@ -22,9 +22,12 @@ class TechnicalIndicators:
     ma50: Optional[float] = None
     ema12: Optional[float] = None
     ema26: Optional[float] = None
+    ema50: Optional[float] = None
+    ema200: Optional[float] = None
     
     # 动量指标
     rsi: Optional[float] = None
+    rsi_divergence: Optional[str] = None
     macd: Optional[float] = None
     macd_signal: Optional[float] = None
     macd_histogram: Optional[float] = None
@@ -35,11 +38,19 @@ class TechnicalIndicators:
     bollinger_upper: Optional[float] = None
     bollinger_middle: Optional[float] = None
     bollinger_lower: Optional[float] = None
+    bollinger_width: Optional[float] = None
     atr: Optional[float] = None
     
     # 成交量指标
     obv: Optional[float] = None
     volume_ma: Optional[float] = None
+    vwap: Optional[float] = None
+    volume_profile: Optional[Dict] = None
+    
+    # 市场情绪指标
+    funding_rate: Optional[float] = None
+    open_interest: Optional[float] = None
+    long_short_ratio: Optional[Dict] = None
     
     # 趋势判断
     trend: str = "sideways"  # bullish, bearish, sideways
@@ -129,8 +140,8 @@ class TechnicalIndicatorCalculator:
     
     @staticmethod
     def calculate_bollinger_bands(prices: List[float], 
-                                   period: int = 20, 
-                                   std_dev: float = 2.0) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+                                       period: int = 20, 
+                                       std_dev: float = 2.0) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """计算布林带"""
         if len(prices) < period:
             return None, None, None
@@ -224,6 +235,90 @@ class TechnicalIndicatorCalculator:
         return float(np.mean(volumes[-period:]))
     
     @staticmethod
+    def calculate_vwap(highs: List[float], 
+                       lows: List[float], 
+                       closes: List[float], 
+                       volumes: List[float]) -> Optional[float]:
+        """计算成交量加权平均价"""
+        if len(highs) < 1 or len(lows) < 1 or len(closes) < 1 or len(volumes) < 1:
+            return None
+        
+        typical_prices = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
+        total_value = sum(tp * v for tp, v in zip(typical_prices, volumes))
+        total_volume = sum(volumes)
+        
+        if total_volume == 0:
+            return None
+        
+        return total_value / total_volume
+    
+    @staticmethod
+    def calculate_all(klines: List[Dict]) -> TechnicalIndicators:
+        """计算所有技术指标"""
+        if not klines or len(klines) < 50:
+            return TechnicalIndicators()
+        
+        closes = [float(k.get("close", 0)) for k in klines]
+        highs = [float(k.get("high", 0)) for k in klines]
+        lows = [float(k.get("low", 0)) for k in klines]
+        volumes = [float(k.get("volume", 0)) for k in klines]
+        
+        # 趋势指标
+        ma5 = TechnicalIndicatorCalculator.calculate_sma(closes, 5)
+        ma10 = TechnicalIndicatorCalculator.calculate_sma(closes, 10)
+        ma20 = TechnicalIndicatorCalculator.calculate_sma(closes, 20)
+        ma50 = TechnicalIndicatorCalculator.calculate_sma(closes, 50)
+        ema12 = TechnicalIndicatorCalculator.calculate_ema(closes, 12)
+        ema26 = TechnicalIndicatorCalculator.calculate_ema(closes, 26)
+        ema50 = TechnicalIndicatorCalculator.calculate_ema(closes, 50)
+        ema200 = TechnicalIndicatorCalculator.calculate_ema(closes, 200)
+        
+        # 动量指标
+        rsi = TechnicalIndicatorCalculator.calculate_rsi(closes)
+        macd, macd_signal, macd_histogram = TechnicalIndicatorCalculator.calculate_macd(closes)
+        stochastic_k, stochastic_d = TechnicalIndicatorCalculator.calculate_stochastic(highs, lows, closes)
+        
+        # 波动指标
+        bollinger_upper, bollinger_middle, bollinger_lower = TechnicalIndicatorCalculator.calculate_bollinger_bands(closes)
+        atr = TechnicalIndicatorCalculator.calculate_atr(highs, lows, closes)
+        
+        # 成交量指标
+        obv = TechnicalIndicatorCalculator.calculate_obv(closes, volumes)
+        volume_ma = TechnicalIndicatorCalculator.calculate_volume_ma(volumes)
+        vwap = TechnicalIndicatorCalculator.calculate_vwap(highs, lows, closes, volumes)
+        
+        # 趋势判断
+        trend, trend_strength = TechnicalIndicatorCalculator.determine_trend(
+            ma5, ma20, ma50, rsi, macd, macd_signal
+        )
+        
+        return TechnicalIndicators(
+            ma5=ma5,
+            ma10=ma10,
+            ma20=ma20,
+            ma50=ma50,
+            ema12=ema12,
+            ema26=ema26,
+            ema50=ema50,
+            ema200=ema200,
+            rsi=rsi,
+            macd=macd,
+            macd_signal=macd_signal,
+            macd_histogram=macd_histogram,
+            stochastic_k=stochastic_k,
+            stochastic_d=stochastic_d,
+            bollinger_upper=bollinger_upper,
+            bollinger_middle=bollinger_middle,
+            bollinger_lower=bollinger_lower,
+            atr=atr,
+            obv=obv,
+            volume_ma=volume_ma,
+            vwap=vwap,
+            trend=trend,
+            trend_strength=trend_strength
+        )
+    
+    @staticmethod
     def determine_trend(ma5: Optional[float], 
                         ma20: Optional[float], 
                         ma50: Optional[float],
@@ -251,7 +346,7 @@ class TechnicalIndicatorCalculator:
                 bearish_signals += 1
         
         # RSI判断
-        if rsi:
+        if rsi is not None:
             total_signals += 1
             if rsi > 60:
                 bullish_signals += 1
@@ -259,124 +354,54 @@ class TechnicalIndicatorCalculator:
                 bearish_signals += 1
         
         # MACD判断
-        if macd and macd_signal:
+        if macd is not None and macd_signal is not None:
             total_signals += 1
             if macd > macd_signal:
                 bullish_signals += 1
             else:
                 bearish_signals += 1
         
+        # 确定趋势
         if total_signals == 0:
             return "sideways", 0.0
         
-        bullish_ratio = bullish_signals / total_signals
-        bearish_ratio = bearish_signals / total_signals
-        
-        if bullish_ratio > 0.6:
-            return "bullish", bullish_ratio
-        elif bearish_ratio > 0.6:
-            return "bearish", bearish_ratio
+        if bullish_signals > bearish_signals:
+            trend = "bullish"
+            strength = bullish_signals / total_signals
+        elif bearish_signals > bullish_signals:
+            trend = "bearish"
+            strength = bearish_signals / total_signals
         else:
-            return "sideways", max(bullish_ratio, bearish_ratio)
-    
-    @classmethod
-    def calculate_all_indicators(cls, 
-                                  klines: List[Dict[str, float]]) -> TechnicalIndicators:
-        """计算所有技术指标"""
-        if not klines or len(klines) < 50:
-            logger.warning("K线数据不足，无法计算技术指标")
-            return TechnicalIndicators()
+            trend = "sideways"
+            strength = 0.5
         
-        try:
-            # 提取价格数据
-            closes = [k.get('close', 0) for k in klines]
-            highs = [k.get('high', 0) for k in klines]
-            lows = [k.get('low', 0) for k in klines]
-            volumes = [k.get('volume', 0) for k in klines]
-            
-            # 计算趋势指标
-            ma5 = cls.calculate_sma(closes, 5)
-            ma10 = cls.calculate_sma(closes, 10)
-            ma20 = cls.calculate_sma(closes, 20)
-            ma50 = cls.calculate_sma(closes, 50)
-            ema12 = cls.calculate_ema(closes, 12)
-            ema26 = cls.calculate_ema(closes, 26)
-            
-            # 计算动量指标
-            rsi = cls.calculate_rsi(closes, 14)
-            macd, macd_signal, macd_histogram = cls.calculate_macd(closes)
-            stoch_k, stoch_d = cls.calculate_stochastic(highs, lows, closes)
-            
-            # 计算波动指标
-            bb_upper, bb_middle, bb_lower = cls.calculate_bollinger_bands(closes)
-            atr = cls.calculate_atr(highs, lows, closes)
-            
-            # 计算成交量指标
-            obv = cls.calculate_obv(closes, volumes)
-            volume_ma = cls.calculate_volume_ma(volumes)
-            
-            # 判断趋势
-            trend, strength = cls.determine_trend(
-                ma5, ma20, ma50, rsi, macd, macd_signal
-            )
-            
-            return TechnicalIndicators(
-                ma5=ma5,
-                ma10=ma10,
-                ma20=ma20,
-                ma50=ma50,
-                ema12=ema12,
-                ema26=ema26,
-                rsi=rsi,
-                macd=macd,
-                macd_signal=macd_signal,
-                macd_histogram=macd_histogram,
-                stochastic_k=stoch_k,
-                stochastic_d=stoch_d,
-                bollinger_upper=bb_upper,
-                bollinger_middle=bb_middle,
-                bollinger_lower=bb_lower,
-                atr=atr,
-                obv=obv,
-                volume_ma=volume_ma,
-                trend=trend,
-                trend_strength=strength
-            )
-            
-        except Exception as e:
-            logger.error(f"计算技术指标失败: {e}")
-            return TechnicalIndicators()
+        return trend, strength
     
-    @classmethod
-    def indicators_to_dict(cls, indicators: TechnicalIndicators) -> Dict[str, any]:
+    @staticmethod
+    def indicators_to_dict(indicators: TechnicalIndicators) -> Dict[str, Any]:
         """将技术指标转换为字典"""
         return {
-            "trend": {
-                "direction": indicators.trend,
-                "strength": indicators.trend_strength,
-                "ma5": indicators.ma5,
-                "ma10": indicators.ma10,
-                "ma20": indicators.ma20,
-                "ma50": indicators.ma50,
-                "ema12": indicators.ema12,
-                "ema26": indicators.ema26
-            },
-            "momentum": {
-                "rsi": indicators.rsi,
-                "macd": indicators.macd,
-                "macd_signal": indicators.macd_signal,
-                "macd_histogram": indicators.macd_histogram,
-                "stochastic_k": indicators.stochastic_k,
-                "stochastic_d": indicators.stochastic_d
-            },
-            "volatility": {
-                "bollinger_upper": indicators.bollinger_upper,
-                "bollinger_middle": indicators.bollinger_middle,
-                "bollinger_lower": indicators.bollinger_lower,
-                "atr": indicators.atr
-            },
-            "volume": {
-                "obv": indicators.obv,
-                "volume_ma": indicators.volume_ma
-            }
+            "ma5": indicators.ma5,
+            "ma10": indicators.ma10,
+            "ma20": indicators.ma20,
+            "ma50": indicators.ma50,
+            "ema12": indicators.ema12,
+            "ema26": indicators.ema26,
+            "ema50": indicators.ema50,
+            "ema200": indicators.ema200,
+            "rsi": indicators.rsi,
+            "macd": indicators.macd,
+            "macd_signal": indicators.macd_signal,
+            "macd_histogram": indicators.macd_histogram,
+            "stochastic_k": indicators.stochastic_k,
+            "stochastic_d": indicators.stochastic_d,
+            "bollinger_upper": indicators.bollinger_upper,
+            "bollinger_middle": indicators.bollinger_middle,
+            "bollinger_lower": indicators.bollinger_lower,
+            "atr": indicators.atr,
+            "obv": indicators.obv,
+            "volume_ma": indicators.volume_ma,
+            "vwap": indicators.vwap,
+            "trend": indicators.trend,
+            "trend_strength": indicators.trend_strength
         }

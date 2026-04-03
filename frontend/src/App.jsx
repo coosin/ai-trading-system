@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import ProfessionalDashboard from './components/ProfessionalDashboard';
+import ControlCenter from './components/ControlCenter';
 import Login from './components/Login';
 import { api } from './services/api';
 import { useAuthStore } from './store';
@@ -106,6 +107,7 @@ function App() {
 
   const menuItems = [
     { id: 'dashboard', icon: '📊', label: '总览面板' },
+    { id: 'control', icon: '🎮', label: '控制中心' },
     { id: 'market', icon: '📈', label: '行情中心' },
     { id: 'trade', icon: '💱', label: '交易面板' },
     { id: 'positions', icon: '📋', label: '持仓管理' },
@@ -201,7 +203,11 @@ function App() {
         </header>
 
         <div className="content-area">
-          <ProfessionalDashboard activeView={activeView} />
+          {activeView === 'control' ? (
+            <ControlCenter />
+          ) : (
+            <ProfessionalDashboard activeView={activeView} />
+          )}
         </div>
       </main>
     </div>

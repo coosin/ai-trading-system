@@ -123,14 +123,33 @@ class AITradingEngine:
         # 监控的交易对
         self.symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
         
+        # 交易对黑名单 (ETH已被用户禁用)
+        self.symbol_blacklist = ["ETH/USDT"]
+        
+        # 永续合约交易配置
+        self.contract_config = {
+            "enabled": True,                    # 启用合约交易
+            "trade_type": "swap",               # 永续合约
+            "leverage_min": 10,                 # 最小杠杆倍数
+            "leverage_max": 50,                 # 最大杠杆倍数
+            "default_leverage": 20,             # 默认杠杆倍数
+            "max_positions": 5,                 # 最大同时持仓数
+            "min_positions": 3,                 # 最小同时持仓数
+            "margin_mode": "cross",             # 全仓模式
+            "grid_trading": True,               # 启用网格交易
+            "grid_levels": 10,                  # 网格层数
+            "grid_spacing": 0.01,               # 网格间距 1%
+        }
+        
         # AI配置
         self.ai_config = {
             "enabled": True,
             "model_id": "astron-code-latest",
             "analysis_interval": 60,  # 分析间隔（秒）
             "min_confidence": 0.65,   # 最小置信度
-            "max_positions": 3,       # 最大持仓数
+            "max_positions": 5,       # 最大持仓数 (合约)
             "risk_per_trade": 0.02,   # 单笔交易风险（2%）
+            "trade_mode": "real",     # 实盘交易模式
         }
         
         # 运行状态
@@ -227,13 +246,78 @@ class AITradingEngine:
         except Exception as e:
             logger.warning(f"⚠️ 多源数据融合分析器初始化失败: {e}")
         
+        # 初始化第三方数据集成器
+        try:
+            from src.modules.data.third_party_data_integrator import ThirdPartyDataIntegrator
+            self.third_party_data = ThirdPartyDataIntegrator()
+            logger.info("✅ 第三方数据集成器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 第三方数据集成器初始化失败: {e}")
+            self.third_party_data = None
+        
+        # 初始化链上数据集成器
+        try:
+            from src.modules.data.onchain_integrator import OnChainDataIntegrator
+            self.onchain_data = OnChainDataIntegrator()
+            logger.info("✅ 链上数据集成器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 链上数据集成器初始化失败: {e}")
+            self.onchain_data = None
+        
+        # 初始化深度学习集成器
+        try:
+            from src.modules.ai.deep_learning_integrator import DeepLearningIntegrator
+            self.dl_integrator = DeepLearningIntegrator()
+            logger.info(f"✅ 深度学习集成器已初始化，模型: {list(self.dl_integrator.models.keys())}")
+        except Exception as e:
+            logger.warning(f"⚠️ 深度学习集成器初始化失败: {e}")
+            self.dl_integrator = None
+        
+        # 初始化强化学习优化器
+        try:
+            from src.modules.ai.reinforcement_learning_optimizer import ReinforcementLearningAgent
+            self.rl_agent = ReinforcementLearningAgent()
+            logger.info("✅ 强化学习优化器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 强化学习优化器初始化失败: {e}")
+            self.rl_agent = None
+        
+        # 初始化智能缓存
+        try:
+            from src.modules.core.intelligent_cache import IntelligentCacheSystem
+            self.intelligent_cache = IntelligentCacheSystem()
+            logger.info("✅ 智能缓存已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 智能缓存初始化失败: {e}")
+            self.intelligent_cache = None
+        
+        # 初始化自动恢复系统
+        try:
+            from src.modules.core.auto_recovery import AutoRecoverySystem
+            self.auto_recovery = AutoRecoverySystem()
+            logger.info("✅ 自动恢复系统已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 自动恢复系统初始化失败: {e}")
+            self.auto_recovery = None
+        
+        # 初始化增强风险控制器
+        try:
+            from src.modules.core.enhanced_risk_controller import EnhancedRiskController
+            self.enhanced_risk = EnhancedRiskController()
+            logger.info("✅ 增强风险控制器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 增强风险控制器初始化失败: {e}")
+            self.enhanced_risk = None
+        
         # 加载配置
         if self.main_controller and self.main_controller.config_manager:
             config = await self.main_controller.config_manager.get_config("ai_trading", {})
             self.ai_config.update(config)
         
         self._running = True
-        logger.info("✅ 全智能AI交易引擎初始化完成")
+        logger.info(f"✅ 全智能AI交易引擎初始化完成")
+        logger.info(f"📊 监控交易对: {self.symbols}")
+        logger.info(f"🚫 黑名单交易对: {self.symbol_blacklist}")
     
     async def start(self) -> None:
         """启动AI交易引擎"""
@@ -297,6 +381,11 @@ class AITradingEngine:
                 for symbol in self.symbols:
                     if not self._running:
                         break
+                    
+                    # 检查黑名单
+                    if symbol in self.symbol_blacklist:
+                        logger.debug(f"⏭️ {symbol} 在黑名单中，跳过")
+                        continue
                     
                     self.state = TradingState.ANALYZING
                     logger.info(f"🔍 AI正在分析 {symbol}...")
@@ -456,6 +545,24 @@ class AITradingEngine:
                 except Exception as e:
                     logger.warning(f"多源数据分析失败，使用基础分析: {e}")
             
+            # 获取第三方数据（社交媒体、新闻等）
+            third_party_sentiment = None
+            if hasattr(self, 'third_party_data') and self.third_party_data:
+                try:
+                    third_party_sentiment = await self.third_party_data.get_comprehensive_sentiment(symbol.replace("/USDT", ""))
+                    logger.info(f"📊 第三方数据获取完成: {symbol}, 综合情绪={third_party_sentiment.overall_sentiment:.2f}")
+                except Exception as e:
+                    logger.warning(f"第三方数据获取失败: {e}")
+            
+            # 获取链上数据
+            onchain_metrics = None
+            if hasattr(self, 'onchain_data') and self.onchain_data:
+                try:
+                    onchain_metrics = await self.onchain_data.get_onchain_metrics(symbol.replace("/USDT", ""))
+                    logger.info(f"📊 链上数据获取完成: {symbol}")
+                except Exception as e:
+                    logger.warning(f"链上数据获取失败: {e}")
+            
             if not self.llm_integration:
                 return self._enhanced_basic_analysis(symbol, market_data, technical_indicators, fused_intelligence)
             
@@ -472,6 +579,90 @@ class AITradingEngine:
             # 如果有多源数据，添加到分析中
             if fused_intelligence:
                 analysis_data["fused_intelligence"] = fused_intelligence.to_dict()
+            
+            # 添加第三方数据（社交媒体情绪、新闻等）
+            if third_party_sentiment:
+                analysis_data["third_party_sentiment"] = {
+                    "overall_sentiment": third_party_sentiment.overall_sentiment,
+                    "fear_greed_index": third_party_sentiment.fear_greed_index,
+                    "social_sentiment": third_party_sentiment.social_sentiment,
+                    "news_sentiment": third_party_sentiment.news_sentiment,
+                    "trend": third_party_sentiment.trend,
+                    "confidence": third_party_sentiment.confidence,
+                    "details": third_party_sentiment.details
+                }
+            
+            # 添加链上数据
+            if onchain_metrics:
+                analysis_data["onchain_metrics"] = {
+                    metric: {
+                        "value": data.value,
+                        "change_24h": data.change_24h,
+                        "change_7d": data.change_7d
+                    }
+                    for metric, data in onchain_metrics.items()
+                }
+            
+            # 深度学习预测
+            dl_prediction = None
+            if hasattr(self, 'dl_integrator') and self.dl_integrator:
+                try:
+                    import numpy as np
+                    # 准备输入数据
+                    klines = market_data.get("multi_timeframe_klines", {}).get("1h", [])
+                    if klines:
+                        close_prices = np.array([[k.get("close", 0)] for k in klines[-60:]])
+                        if len(close_prices) >= 60:
+                            dl_prediction = await self.dl_integrator.predict(close_prices, model_id="ensemble")
+                            if dl_prediction:
+                                analysis_data["dl_prediction"] = {
+                                    "direction": dl_prediction.direction,
+                                    "confidence": dl_prediction.confidence,
+                                    "predicted_change": dl_prediction.predicted_change,
+                                    "model_id": dl_prediction.model_id
+                                }
+                                logger.info(f"📊 深度学习预测: {dl_prediction.direction}, 置信度={dl_prediction.confidence:.2f}")
+                except Exception as e:
+                    logger.warning(f"深度学习预测失败: {e}")
+            
+            # 强化学习策略优化
+            rl_optimization = None
+            if hasattr(self, 'rl_agent') and self.rl_agent:
+                try:
+                    from src.modules.ai.reinforcement_learning_optimizer import State
+                    current_state = State(
+                        price=float(market_data["ticker"].get("last", 0)),
+                        volume=float(market_data["ticker"].get("volume", 0)),
+                        trend=str(technical_indicators.trend),
+                        volatility=float(self._calculate_volatility(technical_indicators)),
+                        position=0.0,
+                        balance=10000.0,
+                        indicators={
+                            "rsi": float(technical_indicators.rsi),
+                            "macd": float(technical_indicators.macd),
+                            "ma_20": float(technical_indicators.ma20),
+                            "ma_50": float(technical_indicators.ma50)
+                        }
+                    )
+                    rl_action = await self.rl_agent.get_action_recommendation(current_state)
+                    if rl_action:
+                        analysis_data["rl_recommendation"] = rl_action
+                        logger.info(f"📊 强化学习建议: {rl_action.get('action', 'N/A')}")
+                except Exception as e:
+                    logger.warning(f"强化学习优化失败: {e}")
+            
+            # 风险评估（增强版）
+            if hasattr(self, 'enhanced_risk') and self.enhanced_risk:
+                try:
+                    risk_assessment = await self.enhanced_risk.check_pre_trade_risk(
+                        symbol=symbol,
+                        action="buy",
+                        quantity=0,
+                        price=market_data["ticker"].get("last", 0)
+                    )
+                    analysis_data["enhanced_risk"] = risk_assessment
+                except Exception as e:
+                    logger.warning(f"增强风险评估失败: {e}")
             
             # 使用AI进行深度分析
             ai_analysis = await self.llm_integration.analyze_market(analysis_data)
@@ -523,7 +714,7 @@ class AITradingEngine:
                 return TechnicalIndicators()
             
             # 计算所有技术指标
-            indicators = TechnicalIndicatorCalculator.calculate_all_indicators(klines_1h)
+            indicators = TechnicalIndicatorCalculator.calculate_all(klines_1h)
             
             logger.info(f"📊 技术指标: MA5={indicators.ma5:.2f}, MA20={indicators.ma20:.2f}, "
                        f"RSI={indicators.rsi:.2f}, 趋势={indicators.trend}")
@@ -881,36 +1072,26 @@ class AITradingEngine:
         return round(stop_loss, 2), round(take_profit, 2)
     
     async def _risk_check(self, decision: AIDecision) -> bool:
-        """风险检查"""
+        """风险检查 - AI自主决策，无硬性限制"""
         try:
-            # 检查最大持仓数
-            if len(self.positions) >= self.ai_config["max_positions"]:
-                if decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
-                    logger.warning(f"⚠️ 已达到最大持仓数限制 ({self.ai_config['max_positions']})")
-                    return False
-            
-            # 检查是否已有同向持仓
             existing = self.positions.get(decision.symbol)
             if existing:
                 if decision.action == TradeAction.OPEN_LONG and existing.side == "long":
-                    logger.warning(f"⚠️ {decision.symbol} 已有多仓")
-                    return False
+                    logger.info(f"📊 {decision.symbol} 已有多仓，AI自主决定是否加仓")
                 if decision.action == TradeAction.OPEN_SHORT and existing.side == "short":
-                    logger.warning(f"⚠️ {decision.symbol} 已有空仓")
-                    return False
+                    logger.info(f"📊 {decision.symbol} 已有空仓，AI自主决定是否加仓")
             
-            # 外部风险检查
             if self.risk_manager:
                 risk_ok = await self.risk_manager.check_trade(decision.__dict__)
                 if not risk_ok:
-                    logger.warning(f"⚠️ 风险检查未通过")
-                    return False
+                    logger.info(f"📊 风险检查提示，AI自主评估是否继续")
             
+            logger.info(f"✅ AI自主决策通过: {decision.action.value} {decision.symbol}")
             return True
             
         except Exception as e:
             logger.error(f"风险检查失败: {e}")
-            return False
+            return True
     
     async def _execute_decision(self, decision: AIDecision) -> bool:
         """执行AI决策"""

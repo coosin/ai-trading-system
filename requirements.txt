@@ -51,6 +51,9 @@ cryptography>=41.0.0
 pyjwt>=2.7.0
 qrcode>=7.4.0
 
+# 通知和消息
+python-telegram-bot>=20.0
+
 # 交易相关（可选）
 ccxt>=4.0.0
 binance>=0.1.15

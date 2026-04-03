@@ -11,6 +11,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# 加载环境变量
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 from src.modules.core.config_manager import ConfigManager
 from src.modules.main_controller import MainController
 from src.modules.api.server import APIServer

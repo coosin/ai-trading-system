@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class StrategyType(Enum):
-    """策略类型"""
+    """策略类型 - AI可自主扩展"""
 
     TREND_FOLLOWING = "trend_following"  # 趋势跟踪
     MEAN_REVERSION = "mean_reversion"  # 均值回归
@@ -46,7 +46,11 @@ class StrategyType(Enum):
     MARKET_MAKING = "market_making"  # 做市
     GRID_TRADING = "grid_trading"  # 网格交易
     ML_BASED = "ml_based"  # 机器学习策略
+    AI_GENERATED = "ai_generated"  # AI生成策略
+    COMBINATION = "combination"  # 组合策略
+    MULTI_STRATEGY = "multi_strategy"  # 多策略
     CUSTOM = "custom"  # 自定义
+    AUTO = "auto"  # AI自主决定
 
 
 class StrategyStatus(Enum):
@@ -1641,6 +1645,142 @@ class StrategyManager:
         
         logger.info(f"从模板创建策略: {strategy_id} (模板: {template_id})")
         return strategy_id
+    
+    async def create_ai_strategy(self, strategy_logic: str, name: str = None, 
+                                  strategy_type: StrategyType = StrategyType.AI_GENERATED,
+                                  symbols: List[str] = None, parameters: Dict[str, Any] = None) -> Optional[str]:
+        """
+        AI自主创建策略 - 无模板限制
+        
+        Args:
+            strategy_logic: 策略逻辑描述或代码
+            name: 策略名称
+            strategy_type: 策略类型
+            symbols: 交易对列表
+            parameters: 策略参数
+            
+        Returns:
+            策略ID或None
+        """
+        try:
+            strategy_id = f"ai_strategy_{uuid.uuid4().hex[:8]}"
+            
+            strategy_name = name or f"AI策略_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            config_data = {
+                "strategy_id": strategy_id,
+                "name": strategy_name,
+                "description": f"AI自主开发策略: {strategy_logic[:100]}...",
+                "strategy_type": strategy_type,
+                "parameters": parameters or {},
+                "symbols": symbols or ["BTC/USDT", "SOL/USDT", "BNB/USDT"],
+                "timeframe": "1h",
+                "initial_capital": 10000.0,
+                "metadata": {
+                    "ai_generated": True,
+                    "strategy_logic": strategy_logic,
+                    "created_by": "ai_autonomous",
+                    "can_modify": True
+                }
+            }
+            
+            config = await self.load_strategy_config(config_data)
+            if not config:
+                return None
+            
+            logger.info(f"✅ AI自主创建策略: {strategy_id}")
+            return strategy_id
+            
+        except Exception as e:
+            logger.error(f"AI创建策略失败: {e}")
+            return None
+    
+    async def combine_strategies(self, strategy_ids: List[str], weights: Dict[str, float] = None,
+                                  combination_mode: str = "weighted") -> Optional[str]:
+        """
+        组合多个策略
+        
+        Args:
+            strategy_ids: 要组合的策略ID列表
+            weights: 各策略权重
+            combination_mode: 组合模式 (weighted, voting, parallel, serial)
+            
+        Returns:
+            组合策略ID或None
+        """
+        try:
+            if not strategy_ids:
+                return None
+            
+            combined_id = f"combined_{uuid.uuid4().hex[:8]}"
+            
+            if weights is None:
+                weight_per_strategy = 1.0 / len(strategy_ids)
+                weights = {sid: weight_per_strategy for sid in strategy_ids}
+            
+            config_data = {
+                "strategy_id": combined_id,
+                "name": f"组合策略_{len(strategy_ids)}个",
+                "description": f"组合策略: {', '.join(strategy_ids)}",
+                "strategy_type": StrategyType.COMBINATION,
+                "parameters": {
+                    "component_strategies": strategy_ids,
+                    "weights": weights,
+                    "combination_mode": combination_mode
+                },
+                "symbols": [],
+                "timeframe": "1h",
+                "initial_capital": 10000.0,
+                "metadata": {
+                    "combination": True,
+                    "auto_rebalance": True
+                }
+            }
+            
+            for sid in strategy_ids:
+                if sid in self.strategy_configs:
+                    for symbol in self.strategy_configs[sid].symbols:
+                        if symbol not in config_data["symbols"]:
+                            config_data["symbols"].append(symbol)
+            
+            config = await self.load_strategy_config(config_data)
+            if not config:
+                return None
+            
+            logger.info(f"✅ 创建组合策略: {combined_id} = {strategy_ids}")
+            return combined_id
+            
+        except Exception as e:
+            logger.error(f"组合策略失败: {e}")
+            return None
+    
+    async def auto_switch_strategy(self, market_condition: str = None) -> bool:
+        """
+        根据市场条件自动切换策略
+        
+        Args:
+            market_condition: 市场条件描述
+            
+        Returns:
+            是否成功切换
+        """
+        try:
+            active_instances = [
+                (iid, inst) for iid, inst in self.strategy_instances.items()
+                if inst.status == StrategyStatus.RUNNING
+            ]
+            
+            if not active_instances:
+                logger.info("没有运行中的策略可切换")
+                return False
+            
+            logger.info(f"🔄 AI自动切换策略，市场条件: {market_condition}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"自动切换策略失败: {e}")
+            return False
 
     async def _monitoring_worker(self) -> None:
         """监控工作线程"""

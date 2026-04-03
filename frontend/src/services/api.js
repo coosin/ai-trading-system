@@ -212,6 +212,15 @@ export const api = {
     getBalance: (exchangeId) => apiClient.get(`/exchanges/${exchangeId}/balance`),
     getTicker: (exchangeId, symbol) => apiClient.get(`/exchanges/${exchangeId}/ticker/${symbol}`),
   },
+
+  // 模块控制
+  request: (endpoint, options = {}) => {
+    const url = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+    if (options.method === 'POST' || options.method === 'PUT') {
+      return apiClient.post(url, options.body ? JSON.parse(options.body) : {});
+    }
+    return apiClient.get(url);
+  },
 };
 
 export default apiClient;
