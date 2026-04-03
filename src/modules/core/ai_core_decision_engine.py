@@ -2060,29 +2060,33 @@ class AICoreDecisionEngine:
                     available = usdt
                 context_parts.append(f"""【账户余额】
 - 可用USDT: {available:.2f}""")
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"获取余额失败: {e}")
         
-        # 4. 当前持仓
+        # 4. 当前持仓 - 重要！
         if self.exchange:
             try:
                 positions = await self.exchange.get_positions()
                 active_pos = [p for p in positions if float(p.get('pos', 0)) != 0]
+                logger.debug(f"对话上下文获取到 {len(active_pos)} 个活跃持仓")
                 if active_pos:
                     pos_info = []
-                    for p in active_pos[:5]:
+                    for p in active_pos[:10]:
                         symbol = p.get('instId', '')
                         side = p.get('posSide', '')
                         size = p.get('pos', '')
                         pnl = float(p.get('upl', 0))
-                        pos_info.append(f"  {symbol}: {side} {size} | 盈亏: ${pnl:+.2f}")
-                    context_parts.append(f"""【当前持仓】
+                        entry_price = float(p.get('avgPx', 0))
+                        pos_info.append(f"  {symbol}: {side} {size} | 入场价: {entry_price:.4f} | 盈亏: ${pnl:+.2f}")
+                    context_parts.append(f"""【当前持仓】(共{len(active_pos)}个)
 {chr(10).join(pos_info)}""")
                 else:
                     context_parts.append("""【当前持仓】
 - 无持仓""")
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"获取持仓失败: {e}")
+                context_parts.append("""【当前持仓】
+- 获取失败，请检查交易所连接""")
         
         # 5. 最近市场数据
         if self.exchange:
@@ -2092,23 +2096,23 @@ class AICoreDecisionEngine:
                     context_parts.append(f"""【BTC行情】
 - 价格: {btc_ticker.get('last', 0)}
 - 24h涨跌: {float(btc_ticker.get('change24h', 0) or 0):.2%}""")
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"获取BTC行情失败: {e}")
         
         # 6. 从记忆获取最近的对话
         if self.memory:
             try:
                 recent_memories = await self.memory.retrieve_memories(
-                    query="用户 偏好 规则 设置",
-                    min_importance=0.7,
-                    limit=3
+                    query="用户 偏好 规则 设置 交易 持仓",
+                    min_importance=0.5,
+                    limit=5
                 )
                 if recent_memories:
-                    mem_info = [f"  - {m.content[:100]}" for m in recent_memories]
-                    context_parts.append(f"""【用户偏好/规则】
+                    mem_info = [f"  - {m.content[:150]}" for m in recent_memories]
+                    context_parts.append(f"""【用户偏好/规则/历史】
 {chr(10).join(mem_info)}""")
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"获取记忆失败: {e}")
         
         return "\n\n".join(context_parts)
     
