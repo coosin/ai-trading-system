@@ -254,18 +254,20 @@ class AICoreDecisionEngine:
             
             # 打印原始数据用于调试
             for p in positions[:3]:
-                logger.debug(f"持仓原始数据: instId={p.get('instId')}, pos={p.get('pos')}, posSide={p.get('posSide')}")
+                logger.debug(f"持仓原始数据: symbol={p.get('symbol')}, size={p.get('size')}, side={p.get('side')}")
             
-            active_positions = [p for p in positions if float(p.get('pos', 0) or 0) != 0]
+            # 注意：OKX的get_positions返回格式是 {symbol, side, size, entry_price, unrealized_pnl}
+            # 而不是 {instId, posSide, pos}
+            active_positions = [p for p in positions if float(p.get('size', 0) or 0) != 0]
             
             if active_positions:
                 logger.info(f"📊 同步到 {len(active_positions)} 个活跃持仓:")
                 for pos in active_positions:
-                    symbol = pos.get('instId', '')
-                    side = pos.get('posSide', '')
-                    size = pos.get('pos', '')
-                    pnl = float(pos.get('upl', 0) or 0)
-                    entry_price = float(pos.get('avgPx', 0) or 0)
+                    symbol = pos.get('symbol', '')
+                    side = pos.get('side', '')
+                    size = pos.get('size', 0)
+                    pnl = float(pos.get('unrealized_pnl', 0) or 0)
+                    entry_price = float(pos.get('entry_price', 0) or 0)
                     logger.info(f"   - {symbol}: {side} {size} | 入场价: {entry_price:.4f} | 盈亏: ${pnl:+.2f}")
                 
                 # 保存到记忆系统
@@ -275,11 +277,11 @@ class AICoreDecisionEngine:
                         "total_positions": len(active_positions),
                         "positions": [
                             {
-                                "symbol": p.get('instId', ''),
-                                "side": p.get('posSide', ''),
-                                "size": p.get('pos', ''),
-                                "entry_price": float(p.get('avgPx', 0)),
-                                "pnl": float(p.get('upl', 0))
+                                "symbol": p.get('symbol', ''),
+                                "side": p.get('side', ''),
+                                "size": p.get('size', 0),
+                                "entry_price": float(p.get('entry_price', 0) or 0),
+                                "pnl": float(p.get('unrealized_pnl', 0) or 0)
                             }
                             for p in active_positions
                         ]
@@ -287,7 +289,7 @@ class AICoreDecisionEngine:
                     
                     # 保存持仓快照到记忆
                     try:
-                        await self.memory.save_memory(
+                        await self.memory.add_memory(
                             content=f"系统启动时持仓同步: {json.dumps(position_summary, ensure_ascii=False)}",
                             memory_type="position_sync",
                             importance=0.9

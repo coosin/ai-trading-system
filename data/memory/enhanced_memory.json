@@ -2,6 +2,84 @@
   "short_term": [],
   "long_term": [
     {
+      "id": "mem_1775215335.027295",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 80.12, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.011225789585645353}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-03T19:22:15.027306",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775215313.563992",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 80.12, 'ticker': {'symbol': 'SOL/USDT', 'last': 80.12, 'bid': 80.12, 'ask': 80.13, 'high': 80.46, 'low': 76.7, 'volume': 889625.28153, 'change': 0.0, 'timestamp': 1775215299209}, 'order_book': {'bid_depth': 3833.400861, 'ask_depth': 2458.635772, 'spread': 0.0125, 'imbalance': 0.22}, 'technical_indicators': {'ma5': 84.264, 'ma10': 84.171, 'ma20': 83.6085, 'ma50': 83.0382, 'ema12': 83.9555227207264, 'ema26': 83.49701688777296, 'ema50': 82.86909442122676, "
+      },
+      "created_at": "2026-04-03T19:21:53.564022",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775215258.759969",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66874.3, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.007591654359780299}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-03T19:20:58.759981",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775215238.902495",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66874.3, 'ticker': {'symbol': 'BTC/USDT', 'last': 66874.3, 'bid': 66874.2, 'ask': 66874.3, 'high': 67428.5, 'low': 65701.7, 'volume': 4931.10803819, 'change': 0.0, 'timestamp': 1775215224505}, 'order_book': {'bid_depth': 4.21649169, 'ask_depth': 0.15783909999999998, 'spread': 0.0001, 'imbalance': 0.93}, 'technical_indicators': {'ma5': 67650.76000000001, 'ma10': 67541.39, 'ma20': 67324.87, 'ma50': 67550.186, 'ema12': 67472.51971730214, 'ema26': 67399.093"
+      },
+      "created_at": "2026-04-03T19:20:38.902523",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775214957.578967",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 80.07, 'trend': 'bullish', 'sentiment': 'neutral', 'volatility': 0.011225789585645353}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
+      },
+      "created_at": "2026-04-03T19:15:57.578978",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
+      "id": "mem_1775214940.036353",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 80.07, 'ticker': {'symbol': 'SOL/USDT', 'last': 80.07, 'bid': 80.07, 'ask': 80.08, 'high': 80.46, 'low': 76.7, 'volume': 894487.245798, 'change': 0.0, 'timestamp': 1775214926014}, 'order_book': {'bid_depth': 4431.344619, 'ask_depth': 2798.790224, 'spread': 0.0125, 'imbalance': 0.23}, 'technical_indicators': {'ma5': 84.264, 'ma10': 84.171, 'ma20': 83.6085, 'ma50': 83.0382, 'ema12': 83.95552271866333, 'ema26': 83.49700912851847, 'ema50': 82.86893206219878"
+      },
+      "created_at": "2026-04-03T19:15:40.036384",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
       "id": "mem_1775214896.420524",
       "category": "market_insight",
       "priority": 2,
@@ -6422,86 +6500,8 @@
       "last_accessed": null,
       "access_count": 0,
       "expires_at": null
-    },
-    {
-      "id": "mem_1775190561.550159",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66580.7, 'trend': 'bearish', 'sentiment': 'neutral', 'volatility': 0.00811454984171049}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-03T12:29:21.550172",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775190542.507555",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66580.7, 'ticker': {'symbol': 'BTC/USDT', 'last': 66580.7, 'bid': 66580.6, 'ask': 66580.7, 'high': 67428.5, 'low': 65701.7, 'volume': 5534.02772134, 'change': 0.0, 'timestamp': 1775190530812}, 'order_book': {'bid_depth': 0.7488372600000001, 'ask_depth': 2.37746125, 'spread': 0.0002, 'imbalance': -0.52}, 'technical_indicators': {'ma5': 67211.3, 'ma10': 67365.65, 'ma20': 67313.83000000002, 'ma50': 67369.24399999999, 'ema12': 67279.61921676551, 'ema26': 67"
-      },
-      "created_at": "2026-04-03T12:29:02.507578",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775190433.29641",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 585.9, 'trend': 'sideways', 'sentiment': 'neutral', 'volatility': 0.006328395021662587}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-03T12:27:13.296420",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775190411.640656",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 585.9, 'ticker': {'symbol': 'BNB/USDT', 'last': 585.9, 'bid': 585.9, 'ask': 586.0, 'high': 592.7, 'low': 570.8, 'volume': 17922.973675, 'change': 0.0, 'timestamp': 1775190400312}, 'order_book': {'bid_depth': 288.579143, 'ask_depth': 255.008736, 'spread': 0.0171, 'imbalance': 0.06}, 'technical_indicators': {'ma5': 616.28, 'ma10': 617.22, 'ma20': 616.2699999999999, 'ma50': 613.944, 'ema12': 616.4772940273236, 'ema26': 615.5525128684026, 'ema50': 612.57892"
-      },
-      "created_at": "2026-04-03T12:26:51.640695",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775190358.387724",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 79.15, 'trend': 'bearish', 'sentiment': 'neutral', 'volatility': 0.010685374606872959}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-03T12:25:58.387732",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "mem_1775190339.888376",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'SOL/USDT', 'price': 79.15, 'ticker': {'symbol': 'SOL/USDT', 'last': 79.15, 'bid': 79.15, 'ask': 79.16, 'high': 79.88, 'low': 76.7, 'volume': 898354.150869, 'change': 0.0, 'timestamp': 1775190329521}, 'order_book': {'bid_depth': 2274.689477, 'ask_depth': 2888.246188, 'spread': 0.0126, 'imbalance': -0.12}, 'technical_indicators': {'ma5': 83.34799999999998, 'ma10': 83.67800000000001, 'ma20': 83.6925, 'ma50': 82.99019999999999, 'ema12': 83.53853098348397, 'ema26': 83.460447691"
-      },
-      "created_at": "2026-04-03T12:25:39.888395",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
     }
   ],
   "session_id": null,
-  "updated_at": "2026-04-03T19:15:28.620645"
+  "updated_at": "2026-04-03T19:22:15.030601"
 }
