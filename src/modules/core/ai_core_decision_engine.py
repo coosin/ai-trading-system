@@ -1365,20 +1365,7 @@ class AICoreDecisionEngine:
         except Exception as e:
             logger.debug(f"自主市场分析失败: {e}")
         
-        # 2. 尝试从AiCoin获取特色数据(备用)
-        try:
-            from src.modules.data.aicoin_data_source import get_ai_coin_source
-            aicoin = await get_ai_coin_source()
-            if aicoin:
-                market_summary = await aicoin.get_market_summary()
-                if market_summary:
-                    result["aicoin_data"] = market_summary
-                    result["available"] = True
-                    logger.debug(f"📊 AiCoin特色数据获取完成")
-        except Exception as e:
-            logger.debug(f"AiCoin数据获取失败: {e}")
-        
-        # 3. 尝试从插件管理器获取数据
+        # 2. 尝试从插件管理器获取数据
         if self.plugin_manager:
             try:
                 plugins_info = self.plugin_manager.get_all_plugin_info()
@@ -1399,7 +1386,7 @@ class AICoreDecisionEngine:
             except Exception as e:
                 logger.error(f"从插件管理器获取数据失败: {e}")
         
-        # 4. 尝试从主控制器获取第三方数据集成器
+        # 3. 尝试从主控制器获取第三方数据集成器
         if self.main_controller and hasattr(self.main_controller, 'third_party_integrator'):
             try:
                 integrator = self.main_controller.third_party_integrator
