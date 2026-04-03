@@ -158,21 +158,33 @@ class AiCoinDataSource:
         
         url = f"{self.config.base_url}{endpoint}"
         
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+        }
+        
         try:
             proxy = self.config.proxy if self.config.proxy else None
-            async with self.session.get(url, params=full_params, timeout=self.config.timeout, proxy=proxy) as response:
+            async with self.session.get(url, params=full_params, headers=headers, timeout=self.config.timeout, proxy=proxy) as response:
                 if response.status == 200:
                     data = await response.json()
                     if data.get("success"):
                         return data.get("data")
                     else:
-                        logger.warning(f"AiCoin API错误: {data.get('error')}")
+                        logger.debug(f"AiCoin API错误: {data.get('error')}")
                         return None
+                elif response.status == 530:
+                    logger.debug(f"AiCoin API服务暂时不可用 (530)")
+                    return None
+                elif response.status == 429:
+                    logger.debug(f"AiCoin API频率限制")
+                    return None
                 else:
-                    logger.warning(f"AiCoin API请求失败: {response.status}")
+                    logger.debug(f"AiCoin API请求失败: {response.status}")
                     return None
         except asyncio.TimeoutError:
-            logger.warning(f"AiCoin API超时: {endpoint}")
+            logger.debug(f"AiCoin API超时: {endpoint}")
             return None
         except Exception as e:
             logger.debug(f"AiCoin API请求异常: {e}")
