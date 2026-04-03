@@ -1477,71 +1477,73 @@ class StrategyManager:
             except Exception as e:
                 logger.warning(f"获取策略配置失败: {e}")
 
-        # 如果没有从配置加载任何策略，加载默认示例策略
+        # 不再加载默认策略 - AI将根据市场情况动态生成策略
         if not self.strategy_configs:
-            logger.info("未加载任何策略配置，加载默认策略...")
-            await self._load_default_strategies()
+            logger.info("未加载任何策略配置，AI将根据市场情况动态生成策略")
 
-    async def _load_default_strategies(self) -> None:
-        """加载默认策略"""
-        # 示例趋势跟踪策略 - 适用于所有交易对
-        trend_strategy = StrategyConfig(
-            strategy_id="trend_following_ma",
-            name="移动平均趋势跟踪",
-            description="基于双移动平均线的趋势跟踪策略",
-            strategy_type=StrategyType.TREND_FOLLOWING,
-            parameters={
-                "fast_ma_period": 10,
-                "slow_ma_period": 30,
-                "stop_loss_pct": 0.05,
-                "take_profit_pct": 0.1,
-            },
-            symbols=[],  # 空列表表示适用于所有交易对
-            timeframe="1h",
-            initial_capital=10000.0,
-        )
+    async def create_ai_strategy(self, strategy_data: Dict) -> Optional[str]:
+        """AI动态创建策略"""
+        try:
+            strategy_id = strategy_data.get('strategy_id', f"ai_{datetime.now().strftime('%Y%m%d%H%M%S')}")
+            
+            config = StrategyConfig(
+                strategy_id=strategy_id,
+                name=strategy_data.get('name', 'AI Generated Strategy'),
+                description=strategy_data.get('description', 'AI自主生成策略'),
+                strategy_type=StrategyType(strategy_data.get('strategy_type', 'trend_following')),
+                parameters=strategy_data.get('parameters', {}),
+                symbols=strategy_data.get('symbols', []),
+                timeframe=strategy_data.get('timeframe', '1h'),
+                initial_capital=strategy_data.get('initial_capital', 10000.0),
+                enabled=True,
+            )
+            
+            self.strategy_configs[strategy_id] = config
+            logger.info(f"✅ AI创建策略成功: {config.name} ({strategy_id})")
+            
+            return strategy_id
+            
+        except Exception as e:
+            logger.error(f"AI创建策略失败: {e}")
+            return None
 
-        await self.load_strategy_config(trend_strategy.to_dict())
-
-        # 示例均值回归策略 - 适用于所有交易对
-        mean_reversion_strategy = StrategyConfig(
-            strategy_id="mean_reversion_bollinger",
-            name="布林带均值回归",
-            description="基于布林带的均值回归策略",
-            strategy_type=StrategyType.MEAN_REVERSION,
-            parameters={
-                "bb_period": 20,
-                "bb_std": 2.0,
-                "rsi_period": 14,
-                "rsi_overbought": 70,
-                "rsi_oversold": 30,
-            },
-            symbols=[],  # 空列表表示适用于所有交易对
-            timeframe="30m",
-            initial_capital=5000.0,
-        )
-
-        await self.load_strategy_config(mean_reversion_strategy.to_dict())
-
-        # 示例机器学习策略 - 适用于所有交易对
-        ml_strategy = StrategyConfig(
-            strategy_id="ml_based_strategy",
-            name="机器学习策略",
-            description="基于机器学习模型的预测策略",
-            strategy_type=StrategyType.ML_BASED,
-            parameters={
-                "model_type": "LSTM",
-                "prediction_horizon": 1,
-                "confidence_threshold": 0.6,
-            },
-            symbols=[],  # 空列表表示适用于所有交易对
-            timeframe="1h",
-            initial_capital=10000.0,
-        )
-
-        await self.load_strategy_config(ml_strategy.to_dict())
-
-        logger.info(f"加载 {len(self.strategy_configs)} 个默认策略")
+    async def combine_strategies(self, strategy_ids: List[str], combination_type: str = "parallel") -> Optional[str]:
+        """组合多个策略"""
+        try:
+            combined_id = f"combined_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            combined_name = f"组合策略_{len(strategy_ids)}个"
+            
+            combined_params = {
+                "strategies": strategy_ids,
+                "combination_type": combination_type,
+                "weights": {sid: 1.0/len(strategy_ids) for sid in strategy_ids}
+            }
+            
+            all_symbols = set()
+            for sid in strategy_ids:
+                if sid in self.strategy_configs:
+                    all_symbols.update(self.strategy_configs[sid].symbols)
+            
+            config = StrategyConfig(
+                strategy_id=combined_id,
+                name=combined_name,
+                description=f"AI组合策略 - {combination_type}模式",
+                strategy_type=StrategyType.COMBINATION,
+                parameters=combined_params,
+                symbols=list(all_symbols),
+                timeframe="1h",
+                initial_capital=10000.0,
+                enabled=True,
+            )
+            
+            self.strategy_configs[combined_id] = config
+            logger.info(f"✅ AI组合策略成功: {combined_name} ({combined_id})")
+            
+            return combined_id
+            
+        except Exception as e:
+            logger.error(f"组合策略失败: {e}")
+            return None
 
     async def _register_default_strategies(self) -> None:
         """注册默认策略类"""

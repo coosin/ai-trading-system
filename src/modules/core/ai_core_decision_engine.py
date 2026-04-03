@@ -360,16 +360,34 @@ class AICoreDecisionEngine:
                 await asyncio.sleep(5)
     
     async def _auto_select_trading_symbols(self) -> List[str]:
-        """AI自主选择交易币种 - 根据市场波动和机会"""
-        # 默认监控的主流币种
-        default_symbols = [
-            "BTC/USDT", "SOL/USDT", "BNB/USDT", 
-            "XRP/USDT", "DOGE/USDT", "ADA/USDT",
-            "AVAX/USDT", "DOT/USDT", "MATIC/USDT", "LINK/USDT"
-        ]
+        """AI自主选择交易币种 - 根据市场波动和机会，自由选择"""
+        # 尝试从交易所获取所有可用的USDT交易对
+        all_symbols = []
         
-        # 过滤黑名单
-        available_symbols = [s for s in default_symbols if s not in self.blacklist]
+        if self.exchange:
+            try:
+                if hasattr(self.exchange, 'get_symbols'):
+                    exchange_symbols = await self.exchange.get_symbols()
+                    # 过滤USDT交易对
+                    all_symbols = [s for s in exchange_symbols if '/USDT' in s or '-USDT' in s]
+                    # 标准化格式
+                    all_symbols = [s.replace('-USDT', '/USDT').replace('-SWAP', '') for s in all_symbols]
+                    # 去重
+                    all_symbols = list(set(all_symbols))
+            except:
+                pass
+        
+        # 如果无法获取交易所交易对，使用主流币种
+        if not all_symbols:
+            all_symbols = [
+                "BTC/USDT", "SOL/USDT", "BNB/USDT", 
+                "XRP/USDT", "DOGE/USDT", "ADA/USDT",
+                "AVAX/USDT", "DOT/USDT", "MATIC/USDT", "LINK/USDT",
+                "ATOM/USDT", "LTC/USDT", "TRX/USDT", "BCH/USDT"
+            ]
+        
+        # 过滤黑名单 - ETH不能交易
+        available_symbols = [s for s in all_symbols if s not in self.blacklist and 'ETH' not in s]
         
         if not self.exchange:
             return available_symbols[:5]
@@ -378,7 +396,7 @@ class AICoreDecisionEngine:
             # 获取市场数据，选择波动大的币种
             symbol_volatility = {}
             
-            for symbol in available_symbols:
+            for symbol in available_symbols[:30]:  # 最多检查30个币种
                 try:
                     ticker = await self.exchange.get_ticker(symbol.replace('/', '-'))
                     if ticker:
@@ -687,53 +705,126 @@ class AICoreDecisionEngine:
             logger.error(f"AI风险处理失败: {e}")
     
     async def _auto_generate_strategies(self) -> None:
-        """AI自动生成策略"""
+        """AI自动生成策略 - 根据市场情况动态生成"""
         if not self.llm or not self.strategy_manager:
             return
         
         try:
             strategies = getattr(self.strategy_manager, 'strategy_configs', {})
             
-            if len(strategies) < 3:
+            # AI根据市场情况决定是否需要生成新策略
+            market_overview = await self._get_market_overview()
+            
+            # 获取当前市场状态
+            should_generate = await self._should_generate_new_strategy(market_overview, strategies)
+            
+            if should_generate:
                 logger.info("📊 AI开始生成新策略...")
-                
-                market_overview = await self._get_market_overview()
                 
                 proposal = await self._ai_generate_strategy_proposal(market_overview)
                 
                 if proposal:
-                    success = await self._create_strategy_from_proposal(proposal)
-                    if success:
-                        logger.info(f"✅ AI成功创建策略: {proposal.name}")
-                        
-                        if self.telegram_bot and self.telegram_bot.chat_ids:
-                            await self.telegram_bot.send_message(
-                                chat_id=self.telegram_bot.chat_ids[0],
-                                text=f"📊 AI自主创建策略\n\n名称: {proposal.name}\n类型: {proposal.strategy_type}\n交易对: {', '.join(proposal.symbols)}\n\n理由: {proposal.reasoning}"
-                            )
-        
+                    # 过滤黑名单交易对
+                    proposal.symbols = [s for s in proposal.symbols if s not in self.blacklist]
+                    
+                    if proposal.symbols:  # 确保有可交易的币对
+                        success = await self._create_strategy_from_proposal(proposal)
+                        if success:
+                            logger.info(f"✅ AI成功创建策略: {proposal.name}")
+                            
+                            if self.telegram_bot and self.telegram_bot.chat_ids:
+                                await self.telegram_bot.send_message(
+                                    chat_id=self.telegram_bot.chat_ids[0],
+                                    text=f"📊 AI自主创建策略\n\n名称: {proposal.name}\n类型: {proposal.strategy_type}\n交易对: {', '.join(proposal.symbols)}\n\n理由: {proposal.reasoning}"
+                                )
+            
+            # 检查是否需要组合策略
+            if len(strategies) >= 2:
+                await self._try_combine_strategies(strategies, market_overview)
+                
         except Exception as e:
             logger.error(f"AI策略生成失败: {e}")
     
+    async def _should_generate_new_strategy(self, market_overview: Dict, existing_strategies: Dict) -> bool:
+        """判断是否需要生成新策略"""
+        # 如果没有策略，需要生成
+        if not existing_strategies:
+            return True
+        
+        # 如果市场有重大变化，需要生成新策略
+        for symbol, data in market_overview.items():
+            change_24h = abs(data.get('change_24h', 0))
+            if change_24h > 0.05:  # 24小时涨跌超过5%
+                return True
+        
+        # 定期生成新策略（保持策略多样性）
+        import random
+        return random.random() < 0.1  # 10%概率生成新策略
+    
+    async def _try_combine_strategies(self, strategies: Dict, market_overview: Dict) -> None:
+        """尝试组合策略"""
+        try:
+            # 检查是否有互补的策略可以组合
+            strategy_types = set()
+            for sid, config in strategies.items():
+                strategy_type = getattr(config, 'strategy_type', None)
+                if strategy_type:
+                    strategy_types.add(strategy_type.value if hasattr(strategy_type, 'value') else str(strategy_type))
+            
+            # 如果有多种不同类型的策略，考虑组合
+            if len(strategy_types) >= 2:
+                # 检查是否已有组合策略
+                has_combined = any('combined' in sid or 'combination' in sid for sid in strategies.keys())
+                
+                if not has_combined and hasattr(self.strategy_manager, 'combine_strategies'):
+                    strategy_ids = list(strategies.keys())[:3]  # 最多组合3个策略
+                    combined_id = await self.strategy_manager.combine_strategies(strategy_ids)
+                    if combined_id:
+                        logger.info(f"✅ AI组合策略成功: {combined_id}")
+                        
+        except Exception as e:
+            logger.debug(f"策略组合检查失败: {e}")
+    
     async def _get_market_overview(self) -> Dict:
-        """获取市场概览"""
+        """获取市场概览 - AI自由选择交易币对"""
         overview = {}
         
         if not self.exchange:
             return overview
         
         try:
-            for symbol in ["BTC/USDT", "SOL/USDT", "BNB/USDT"]:
-                if symbol in self.blacklist:
+            # 获取交易所支持的所有交易对
+            all_symbols = []
+            if hasattr(self.exchange, 'get_symbols'):
+                try:
+                    all_symbols = await self.exchange.get_symbols()
+                except:
+                    pass
+            
+            # 如果无法获取所有交易对，使用主流交易对
+            if not all_symbols:
+                all_symbols = [
+                    "BTC/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+                    "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "DOT/USDT",
+                    "MATIC/USDT", "LINK/USDT", "ATOM/USDT", "LTC/USDT"
+                ]
+            
+            # 过滤掉黑名单中的交易对
+            tradeable_symbols = [s for s in all_symbols if s not in self.blacklist and '/USDT' in s]
+            
+            # 获取这些交易对的行情数据
+            for symbol in tradeable_symbols[:20]:  # 最多获取20个交易对
+                try:
+                    ticker = await self.exchange.get_ticker(symbol.replace('/', '-'))
+                    if ticker:
+                        overview[symbol] = {
+                            "price": ticker.get('last', 0),
+                            "change_24h": ticker.get('change', 0),
+                            "volume": ticker.get('volume', 0),
+                        }
+                except:
                     continue
-                
-                ticker = await self.exchange.get_ticker(symbol.replace('/', '-'))
-                if ticker:
-                    overview[symbol] = {
-                        "price": ticker.get('last', 0),
-                        "change_24h": ticker.get('change', 0),
-                        "volume": ticker.get('volume', 0),
-                    }
+                    
         except Exception as e:
             logger.error(f"获取市场概览失败: {e}")
         
