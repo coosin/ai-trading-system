@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
+from src.modules.core.unified_intelligent_memory import UnifiedMemoryType
+
 logger = logging.getLogger(__name__)
 
 
@@ -290,8 +292,9 @@ class AICoreDecisionEngine:
                     # 保存持仓快照到记忆
                     try:
                         await self.memory.add_memory(
+                            UnifiedMemoryType.TRADE_RECORD,
                             content=f"系统启动时持仓同步: {json.dumps(position_summary, ensure_ascii=False)}",
-                            memory_type="position_sync",
+                            summary="持仓同步",
                             importance=0.9
                         )
                         logger.info("✅ 持仓状态已保存到记忆系统")
