@@ -913,20 +913,36 @@ class OKXExchange(ExchangeBase):
         return None
     
     async def get_long_short_ratio(self, symbol: str) -> Optional[Dict[str, float]]:
-        """获取多空比"""
-        endpoint = "/api/v5/rubik/stat/positions-long-short-account-ratio"
-        okx_symbol = symbol.replace("/", "-") + "-SWAP"
-        params = {"instId": okx_symbol}
-        
+        """获取多空比 - 使用订单簿数据计算"""
         try:
-            data = await self._make_request("GET", endpoint, params)
-            if data:
-                return {
-                    "long": float(data.get("long", 0)),
-                    "short": float(data.get("short", 0)),
-                    "timestamp": int(data.get("ts", 0))
-                }
-            return None
+            okx_symbol = symbol.replace("/", "-") + "-SWAP"
+            order_book = await self.get_order_book(okx_symbol, depth=20)
+            
+            if not order_book:
+                return None
+            
+            bids = order_book.bids if hasattr(order_book, 'bids') else []
+            asks = order_book.asks if hasattr(order_book, 'asks') else []
+            
+            if not bids or not asks:
+                return None
+            
+            bid_volume = sum(float(b[1]) if len(b) > 1 else 0 for b in bids)
+            ask_volume = sum(float(a[1]) if len(a) > 1 else 0 for a in asks)
+            
+            total = bid_volume + ask_volume
+            if total == 0:
+                return None
+            
+            long_ratio = bid_volume / total
+            short_ratio = ask_volume / total
+            
+            return {
+                "long": long_ratio,
+                "short": short_ratio,
+                "long_short_ratio": long_ratio / short_ratio if short_ratio > 0 else 1,
+                "source": "order_book"
+            }
         except Exception as e:
-            logger.error(f"获取多空比失败: {e}")
+            logger.debug(f"获取多空比失败: {e}")
         return None
