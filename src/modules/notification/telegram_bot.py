@@ -35,7 +35,7 @@ class TelegramResponse:
     """Telegram响应"""
     chat_id: int
     text: str
-    parse_mode: str = "Markdown"
+    parse_mode: Optional[str] = None  # 默认不使用Markdown，避免解析错误
     reply_to_message_id: Optional[int] = None
     disable_web_page_preview: bool = True
 
@@ -180,19 +180,20 @@ class TelegramBot:
             logger.error(f"处理消息失败: {e}")
 
     async def _process_natural_language(self, message: TelegramMessage):
-        """处理自然语言消息 - AI自由理解，无固定模式"""
+        """处理自然语言消息 - 直接调用AI核心决策引擎"""
         try:
-            ai_executor = getattr(self.main_controller, 'ai_command_executor', None) if self.main_controller else None
+            # 优先使用AI核心决策引擎 - 这是唯一的AI系统
+            ai_core = getattr(self.main_controller, 'ai_core', None) if self.main_controller else None
             
-            if ai_executor:
-                result = await ai_executor.process_input(message.text)
+            if ai_core:
+                # 直接调用AI核心处理用户指令
+                result = await ai_core.process_user_command(message.text)
                 
                 response_text = result.get("response", "处理完成")
                 
                 await self._send_message(TelegramResponse(
                     chat_id=message.chat_id,
                     text=response_text,
-                    parse_mode="Markdown",
                     reply_to_message_id=message.message_id
                 ))
             elif self.llm_integration:
@@ -221,21 +222,18 @@ class TelegramBot:
                     await self._send_message(TelegramResponse(
                         chat_id=message.chat_id,
                         text=response.content,
-                        parse_mode="Markdown",
                         reply_to_message_id=message.message_id
                     ))
                 else:
                     await self._send_message(TelegramResponse(
                         chat_id=message.chat_id,
                         text="抱歉，我现在无法处理您的请求，请稍后再试。",
-                        parse_mode="Markdown",
                         reply_to_message_id=message.message_id
                     ))
             else:
                 await self._send_message(TelegramResponse(
                     chat_id=message.chat_id,
                     text="您好！我是OpenClaw交易系统的AI助手。\n\n请直接用自然语言告诉我您想做什么，我会尽力帮助您。\n\n例如：\n• 帮我看看账户余额\n• 分析一下BTC市场\n• 开多BTC 0.01\n• 现在有什么交易机会？",
-                    parse_mode="Markdown",
                     reply_to_message_id=message.message_id
                 ))
                 
@@ -243,8 +241,7 @@ class TelegramBot:
             logger.error(f"处理自然语言失败: {e}")
             await self._send_message(TelegramResponse(
                 chat_id=message.chat_id,
-                text=f"处理消息时出错: {str(e)}",
-                parse_mode="Markdown"
+                text=f"处理消息时出错: {str(e)}"
             ))
 
     async def _get_system_context(self) -> str:
@@ -271,16 +268,60 @@ class TelegramBot:
         return "\n".join(context_parts)
 
     async def _send_message(self, response: TelegramResponse):
-        """发送消息"""
+        """发送消息 - 支持长消息分割"""
+        try:
+            text = response.text
+            
+            # Telegram消息长度限制为4096字符
+            max_length = 4000
+            
+            # 如果消息太长，分割发送
+            if len(text) > max_length:
+                messages = []
+                current_msg = ""
+                
+                # 按行分割
+                lines = text.split('\n')
+                for line in lines:
+                    if len(current_msg) + len(line) + 1 > max_length:
+                        messages.append(current_msg)
+                        current_msg = line + '\n'
+                    else:
+                        current_msg += line + '\n'
+                
+                if current_msg:
+                    messages.append(current_msg)
+                
+                # 发送分割后的消息
+                for i, msg in enumerate(messages):
+                    await self._send_single_message(TelegramResponse(
+                        chat_id=response.chat_id,
+                        text=msg,
+                        parse_mode=response.parse_mode,
+                        disable_web_page_preview=response.disable_web_page_preview,
+                        reply_to_message_id=response.reply_to_message_id if i == 0 else None
+                    ))
+                    # 消息之间稍微延迟
+                    if i < len(messages) - 1:
+                        await asyncio.sleep(0.5)
+            else:
+                await self._send_single_message(response)
+                
+        except Exception as e:
+            logger.error(f"发送消息失败: {e}")
+    
+    async def _send_single_message(self, response: TelegramResponse):
+        """发送单条消息"""
         try:
             url = f"{self.base_url}/sendMessage"
             
             payload = {
                 "chat_id": response.chat_id,
                 "text": response.text,
-                "parse_mode": response.parse_mode,
-                "disable_web_page_preview": response.disable_web_page_preview
+                "disable_web_page_preview": True
             }
+            
+            # 不使用parse_mode，避免Markdown解析错误
             
             if response.reply_to_message_id:
                 payload["reply_to_message_id"] = response.reply_to_message_id
@@ -290,13 +331,14 @@ class TelegramBot:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("ok"):
-                        logger.debug(f"消息已发送")
+                        logger.info(f"✅ 消息已发送")
                     else:
                         logger.error(f"发送消息失败: {data}")
                 else:
-                    logger.error(f"发送消息失败: {resp.status}")
+                    error_text = await resp.text()
+                    logger.error(f"发送消息失败: {resp.status} - {error_text}")
         except Exception as e:
-            logger.error(f"发送消息失败: {e}")
+            logger.error(f"发送单条消息失败: {e}")
 
     async def send_alert(self, chat_id: int, title: str, message: str, level: str = "warning"):
         """发送警报消息"""
@@ -307,20 +349,18 @@ class TelegramBot:
             "error": "❌"
         }
         
-        text = f"{emoji.get(level, 'ℹ️')} *{title}*\n\n{message}"
+        text = f"{emoji.get(level, 'ℹ️')} {title}\n\n{message}"
         
         await self._send_message(TelegramResponse(
             chat_id=chat_id,
-            text=text,
-            parse_mode="Markdown"
+            text=text
         ))
 
     async def send_notification(self, chat_id: int, message: str):
         """发送通知消息"""
         await self._send_message(TelegramResponse(
             chat_id=chat_id,
-            text=message,
-            parse_mode="Markdown"
+            text=message
         ))
 
     async def send_trade_notification(self, chat_id: int, trade_info: Dict[str, Any]):
@@ -330,7 +370,7 @@ class TelegramBot:
         quantity = trade_info.get("quantity", 0)
         price = trade_info.get("price", 0)
         
-        text = f"📢 *交易执行*\n\n"
+        text = f"📢 交易执行\n\n"
         text += f"操作: {action.upper()}\n"
         text += f"交易对: {symbol}\n"
         text += f"数量: {quantity}\n"
@@ -338,8 +378,7 @@ class TelegramBot:
         
         await self._send_message(TelegramResponse(
             chat_id=chat_id,
-            text=text,
-            parse_mode="Markdown"
+            text=text
         ))
 
     async def cleanup(self):
@@ -348,7 +387,7 @@ class TelegramBot:
             await self.session.close()
         logger.info("Telegram机器人已清理")
 
-    async def send_message(self, chat_id: int, text: str, parse_mode: str = "Markdown"):
+    async def send_message(self, chat_id: int, text: str, parse_mode: str = None):
         """发送消息的便捷方法"""
         await self._send_message(TelegramResponse(
             chat_id=chat_id,

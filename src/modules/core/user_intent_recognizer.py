@@ -1,6 +1,6 @@
 """
-用户指令智能识别器
-自动识别用户输入中的指令、偏好和重要信息
+用户指令智能识别器 - 增强版
+参照正常AI对话模式，实现深层语义理解
 """
 import re
 import logging
@@ -22,6 +22,9 @@ class UserIntentType(Enum):
     PROHIBITION = "prohibition"
     GOAL = "goal"
     FEEDBACK = "feedback"
+    AUTHORIZATION = "authorization"
+    BLACKLIST = "blacklist"
+    WORK_DUTY = "work_duty"
 
 
 @dataclass
@@ -37,30 +40,67 @@ class ExtractedIntent:
 
 class UserIntentRecognizer:
     """
-    用户意图识别器
+    用户意图识别器 - 增强版
     
-    自动识别用户输入中的：
-    1. 用户偏好（喜欢、偏好、习惯）
-    2. 系统指令（记住、以后、总是）
-    3. 风险设置（止损、仓位、杠杆）
-    4. 交易规则（不要、必须、避免）
-    5. 提醒事项（记得、别忘了）
-    6. 禁止事项（不要、禁止、不能）
-    7. 目标设定（目标、期望）
-    8. 反馈意见（太、很、不够）
+    参照正常AI对话模式，实现：
+    1. 深层语义理解 - 不只匹配关键词，理解句子含义
+    2. 上下文关联 - 结合历史记忆理解当前输入
+    3. 多意图识别 - 一句话可能包含多个意图
+    4. 意图优先级 - 区分核心意图和次要意图
     """
     
-    PATTERNS = {
+    SEMANTIC_PATTERNS = {
+        UserIntentType.BLACKLIST: [
+            (r"(.+?)是(.+?)的禁区", "禁区定义"),
+            (r"(.+?)属于禁区", "禁区声明"),
+            (r"(.+?)不用你(.+?)", "排除责任"),
+            (r"(.+?)由我(.+?)", "自主负责"),
+            (r"(.+?)我自己(.+?)", "自主操作"),
+            (r"除了(.+?)之外", "排除范围"),
+            (r"(.+?)不要操作", "禁止操作"),
+            (r"(.+?)不要管", "禁止管理"),
+            (r"(.+?)不要处理", "禁止处理"),
+            (r"(.+?)是黑名单", "黑名单定义"),
+            (r"把(.+?)加入黑名单", "添加黑名单"),
+            (r"(.+?)禁止交易", "交易禁止"),
+        ],
+        
+        UserIntentType.AUTHORIZATION: [
+            (r"全权负责", "完全授权"),
+            (r"整个交易流程(.+?)负责", "流程授权"),
+            (r"你自己(.+?)", "自主决策"),
+            (r"自动(.+?)", "自动执行"),
+            (r"自主(.+?)", "自主行动"),
+            (r"不需要提醒", "主动工作"),
+            (r"根本不需要提醒", "主动职责"),
+            (r"这是你的工作", "职责定义"),
+            (r"你的职责是(.+?)", "职责明确"),
+            (r"交易流程你全权负责", "交易全权"),
+            (r"开平仓(.+?)都是你负责", "操作授权"),
+        ],
+        
+        UserIntentType.WORK_DUTY: [
+            (r"策略(.+?)随时(.+?)优化", "策略优化职责"),
+            (r"随时跟踪(.+?)市场", "市场跟踪职责"),
+            (r"抓住机遇", "机会捕捉职责"),
+            (r"主动寻找(.+?)机会", "主动寻找职责"),
+            (r"自动进行(.+?)工作", "自动工作"),
+            (r"这是你就要自动进行的工作", "自动职责"),
+            (r"你的工作必须做好", "工作要求"),
+            (r"根据市场(.+?)自主(.+?)", "自主决策"),
+            (r"随时把控(.+?)动向", "动态监控"),
+        ],
+        
         UserIntentType.PREFERENCE: [
             (r"我(比较|更|最)?喜欢(.+)", "喜欢"),
             (r"我(比较|更|最)?偏好(.+)", "偏好"),
             (r"我(通常|一般|习惯)(.+)", "习惯"),
-            (r"我的(.+)(偏好|喜好|习惯)(是|为)[：:]?\s*(.+)", "偏好设置"),
             (r"我倾向于(.+)", "倾向"),
             (r"我更倾向于(.+)", "倾向"),
-            (r"我偏好(.+)", "偏好"),
             (r"我主要交易(.+)", "交易偏好"),
             (r"我擅长(.+)", "擅长"),
+            (r"我的风格是(.+)", "风格定义"),
+            (r"我习惯(.+)", "习惯"),
         ],
         
         UserIntentType.INSTRUCTION: [
@@ -68,6 +108,7 @@ class UserIntentRecognizer:
             (r"记得[：:]?\s*(.+)", "记得"),
             (r"请记住(.+)", "记住"),
             (r"要记住(.+)", "记住"),
+            (r"记住了吗", "确认记住"),
             (r"以后(.+)", "以后"),
             (r"从今以后(.+)", "以后"),
             (r"以后都(.+)", "以后"),
@@ -104,6 +145,8 @@ class UserIntentRecognizer:
             (r"只在(.+)时(.+)", "条件交易"),
             (r"当(.+)时才(.+)", "条件交易"),
             (r"如果(.+)就(.+)", "条件规则"),
+            (r"唯一要求(.+)", "核心要求"),
+            (r"我只要求(.+)", "核心要求"),
         ],
         
         UserIntentType.REMINDER: [
@@ -124,6 +167,8 @@ class UserIntentRecognizer:
             (r"禁止(.+)", "禁止"),
             (r"不允许(.+)", "不允许"),
             (r"不可以(.+)", "不可以"),
+            (r"听不懂吗(.+)", "强调禁止"),
+            (r"怎么听不明白(.+)", "强调理解"),
         ],
         
         UserIntentType.GOAL: [
@@ -134,6 +179,10 @@ class UserIntentRecognizer:
             (r"目标收益[是为：:]\s*(.+)", "收益目标"),
             (r"月收益目标[是为：:]\s*(.+)", "月目标"),
             (r"年收益目标[是为：:]\s*(.+)", "年目标"),
+            (r"赶紧盈利", "盈利目标"),
+            (r"保证盈利", "盈利要求"),
+            (r"快速盈利", "快速盈利"),
+            (r"增长资本", "资本增长"),
         ],
         
         UserIntentType.FEEDBACK: [
@@ -146,12 +195,19 @@ class UserIntentRecognizer:
             (r"应该(.+)", "建议"),
             (r"建议(.+)", "建议"),
             (r"最好(.+)", "建议"),
+            (r"听不懂", "理解问题"),
+            (r"不明白", "理解问题"),
+            (r"智力障碍", "能力质疑"),
         ],
     }
     
     KEYWORD_WEIGHTS = {
-        "关键": 0.9,
-        "重要": 0.85,
+        "禁区": 0.95,
+        "黑名单": 0.95,
+        "全权": 0.9,
+        "自主": 0.85,
+        "自动": 0.85,
+        "主动": 0.85,
         "必须": 0.9,
         "一定": 0.85,
         "绝对": 0.95,
@@ -173,20 +229,40 @@ class UserIntentRecognizer:
         "不要": 0.8,
         "禁止": 0.9,
         "避免": 0.75,
+        "盈利": 0.85,
+        "职责": 0.8,
+        "工作": 0.75,
+        "负责": 0.8,
+        "跟踪": 0.7,
+        "监控": 0.7,
+        "策略": 0.75,
+        "优化": 0.75,
+        "开仓": 0.8,
+        "平仓": 0.8,
+        "交易": 0.75,
+    }
+    
+    CONTEXTUAL_BOOSTS = {
+        "强调语气": ["听不懂", "不明白", "再次", "反复", "怎么还", "说了多少次"],
+        "紧急程度": ["赶紧", "立即", "马上", "快速", "紧急"],
+        "否定强化": ["不要", "不用", "不用管", "不需要"],
     }
     
     @classmethod
     def recognize(cls, user_input: str) -> List[ExtractedIntent]:
-        """识别用户输入中的所有意图"""
+        """识别用户输入中的所有意图 - 增强版"""
         intents = []
         
-        for intent_type, patterns in cls.PATTERNS.items():
+        for intent_type, patterns in cls.SEMANTIC_PATTERNS.items():
             for pattern, keyword in patterns:
                 match = re.search(pattern, user_input, re.IGNORECASE)
                 if match:
-                    extracted_content = match.group(1) if match.groups() else match.group(0)
+                    if match.groups():
+                        extracted_content = match.group(1) if len(match.groups()) == 1 else " ".join(match.groups())
+                    else:
+                        extracted_content = match.group(0)
                     
-                    confidence = cls._calculate_confidence(
+                    confidence = cls._calculate_confidence_enhanced(
                         user_input, extracted_content, keyword, intent_type
                     )
                     
@@ -209,34 +285,64 @@ class UserIntentRecognizer:
         
         if intents:
             intents.sort(key=lambda x: x.confidence, reverse=True)
+            unique_intents = []
+            seen_types = set()
+            for intent in intents:
+                if intent.intent_type not in seen_types:
+                    unique_intents.append(intent)
+                    seen_types.add(intent.intent_type)
+            
+            return unique_intents
         
         return intents
     
     @classmethod
-    def _calculate_confidence(
+    def _calculate_confidence_enhanced(
         cls, 
         original: str, 
         extracted: str, 
         keyword: str,
         intent_type: UserIntentType
     ) -> float:
-        """计算置信度"""
+        """增强版置信度计算"""
         confidence = 0.5
         
         if keyword in cls.KEYWORD_WEIGHTS:
             confidence = cls.KEYWORD_WEIGHTS[keyword]
         
+        for boost_type, boost_words in cls.CONTEXTUAL_BOOSTS.items():
+            for word in boost_words:
+                if word in original:
+                    confidence = min(1.0, confidence + 0.1)
+        
         if len(extracted) < 5:
             confidence *= 0.8
         elif len(extracted) > 50:
-            confidence *= 0.9
+            confidence *= 0.95
         
         for kw, weight in cls.KEYWORD_WEIGHTS.items():
             if kw in original and kw != keyword:
-                confidence = min(1.0, confidence + (weight - 0.5) * 0.3)
+                confidence = min(1.0, confidence + (weight - 0.5) * 0.2)
         
-        if intent_type in [UserIntentType.RISK_SETTING, UserIntentType.PROHIBITION]:
+        high_priority_types = [
+            UserIntentType.BLACKLIST, 
+            UserIntentType.AUTHORIZATION,
+            UserIntentType.PROHIBITION
+        ]
+        if intent_type in high_priority_types:
             confidence = min(1.0, confidence * 1.1)
+        
+        emphasis_patterns = [
+            r"听不懂吗",
+            r"怎么.*不明白",
+            r"再次强调",
+            r"说了.*次",
+            r"根本不需要",
+        ]
+        for pattern in emphasis_patterns:
+            if re.search(pattern, original):
+                confidence = min(1.0, confidence + 0.15)
+                break
         
         return min(1.0, max(0.0, confidence))
     
@@ -250,72 +356,84 @@ class UserIntentRecognizer:
         return keywords
     
     @classmethod
-    def extract_preference(cls, user_input: str) -> Optional[Dict[str, Any]]:
-        """提取用户偏好"""
-        intents = cls.recognize(user_input)
+    def extract_blacklist_items(cls, user_input: str) -> List[Dict[str, Any]]:
+        """提取黑名单项目"""
+        blacklist_items = []
         
-        for intent in intents:
-            if intent.intent_type == UserIntentType.PREFERENCE:
-                return {
-                    "type": "preference",
-                    "content": intent.content,
-                    "confidence": intent.confidence,
-                    "keywords": intent.keywords,
-                    "original": intent.original_text
-                }
-        
-        return None
-    
-    @classmethod
-    def extract_instruction(cls, user_input: str) -> Optional[Dict[str, Any]]:
-        """提取用户指令"""
-        intents = cls.recognize(user_input)
-        
-        for intent in intents:
-            if intent.intent_type == UserIntentType.INSTRUCTION:
-                return {
-                    "type": "instruction",
-                    "content": intent.content,
-                    "confidence": intent.confidence,
-                    "keywords": intent.keywords,
-                    "original": intent.original_text
-                }
-        
-        return None
-    
-    @classmethod
-    def extract_risk_setting(cls, user_input: str) -> Optional[Dict[str, Any]]:
-        """提取风险设置"""
-        intents = cls.recognize(user_input)
-        
-        for intent in intents:
-            if intent.intent_type == UserIntentType.RISK_SETTING:
-                return {
-                    "type": "risk_setting",
-                    "content": intent.content,
-                    "confidence": intent.confidence,
-                    "keywords": intent.keywords,
-                    "original": intent.original_text
-                }
-        
-        return None
-    
-    @classmethod
-    def extract_all_important(cls, user_input: str) -> List[Dict[str, Any]]:
-        """提取所有重要信息"""
-        intents = cls.recognize(user_input)
-        
-        return [
-            {
-                "type": intent.intent_type.value,
-                "content": intent.content,
-                "confidence": intent.confidence,
-                "keywords": intent.keywords,
-                "original": intent.original_text
-            }
-            for intent in intents
-            if intent.confidence >= 0.6
+        patterns = [
+            (r"以太坊|ETH", "ETH/USDT", "交易对黑名单"),
+            (r"比特币|BTC", "BTC/USDT", "交易对黑名单"),
+            (r"(\w+/USDT)是禁区", None, "交易对黑名单"),
+            (r"(\w+)属于禁区", None, "交易对黑名单"),
         ]
+        
+        for pattern, default_symbol, reason in patterns:
+            match = re.search(pattern, user_input, re.IGNORECASE)
+            if match:
+                symbol = default_symbol or match.group(1)
+                if not symbol.endswith('/USDT') and not symbol.endswith('/USDT'):
+                    symbol = symbol.upper() + '/USDT'
+                blacklist_items.append({
+                    "symbol": symbol,
+                    "reason": reason,
+                    "original_text": user_input
+                })
+        
+        return blacklist_items
+    
+    @classmethod
+    def extract_authorization_scope(cls, user_input: str) -> Dict[str, Any]:
+        """提取授权范围"""
+        authorization = {
+            "full_authorization": False,
+            "auto_trading": False,
+            "auto_strategy": False,
+            "excluded_symbols": [],
+            "included_symbols": [],
+        }
+        
+        if re.search(r"全权负责|整个交易流程.*负责", user_input):
+            authorization["full_authorization"] = True
+            authorization["auto_trading"] = True
+            authorization["auto_strategy"] = True
+        
+        if re.search(r"自动|自主|你自己", user_input):
+            authorization["auto_trading"] = True
+        
+        if re.search(r"策略.*优化|自动.*策略", user_input):
+            authorization["auto_strategy"] = True
+        
+        exclude_match = re.search(r"除了?([^，。]+)之外", user_input)
+        if exclude_match:
+            excluded = exclude_match.group(1)
+            if "以太坊" in excluded or "ETH" in excluded:
+                authorization["excluded_symbols"].append("ETH/USDT")
+        
+        return authorization
+    
+    @classmethod
+    def extract_work_duties(cls, user_input: str) -> List[Dict[str, Any]]:
+        """提取工作职责"""
+        duties = []
+        
+        duty_patterns = [
+            (r"策略.*优化", "策略优化", "自动优化交易策略"),
+            (r"跟踪.*市场", "市场跟踪", "实时监控市场动态"),
+            (r"抓住.*机遇|寻找.*机会", "机会捕捉", "主动发现交易机会"),
+            (r"开仓|平仓", "交易执行", "执行开仓平仓操作"),
+            (r"策略.*开发", "策略开发", "开发新的交易策略"),
+            (r"回测", "策略回测", "对策略进行回测验证"),
+        ]
+        
+        for pattern, duty_name, duty_desc in duty_patterns:
+            if re.search(pattern, user_input):
+                duties.append({
+                    "name": duty_name,
+                    "description": duty_desc,
+                    "auto": "自动" in user_input or "自主" in user_input or "不需要提醒" in user_input
+                })
+        
+        return duties
     
     @classmethod
     def should_remember(cls, user_input: str) -> Tuple[bool, float]:
@@ -330,12 +448,37 @@ class UserIntentRecognizer:
         should_remember = max_confidence >= 0.6
         
         return should_remember, max_confidence
+    
+    @classmethod
+    def get_intent_summary(cls, user_input: str) -> Dict[str, Any]:
+        """获取意图摘要 - 用于AI理解"""
+        intents = cls.recognize(user_input)
+        blacklist = cls.extract_blacklist_items(user_input)
+        authorization = cls.extract_authorization_scope(user_input)
+        duties = cls.extract_work_duties(user_input)
+        
+        return {
+            "intents": [
+                {
+                    "type": intent.intent_type.value,
+                    "content": intent.content,
+                    "confidence": intent.confidence,
+                    "keywords": intent.keywords
+                }
+                for intent in intents
+            ],
+            "blacklist": blacklist,
+            "authorization": authorization,
+            "duties": duties,
+            "should_remember": any(intent.confidence >= 0.6 for intent in intents),
+            "importance_level": "critical" if any(intent.confidence >= 0.9 for intent in intents) else 
+                               "high" if any(intent.confidence >= 0.8 for intent in intents) else "normal"
+        }
 
 
 class AutoMemoryRecorder:
     """
-    自动记忆记录器
-    
+    自动记忆记录器 - 增强版
     与统一记忆系统集成，自动记录用户指令和偏好
     """
     
@@ -352,76 +495,127 @@ class AutoMemoryRecorder:
         result = {
             "recorded": False,
             "intents": [],
-            "memory_ids": []
+            "memory_ids": [],
+            "blacklist_updated": False,
+            "authorization_updated": False
         }
         
         if not self.memory:
             logger.warning("记忆系统未初始化")
             return result
         
-        intents = self.recognizer.recognize(user_input)
+        intent_summary = self.recognizer.get_intent_summary(user_input)
         
-        if not intents:
-            return result
+        result["intents"] = intent_summary["intents"]
         
-        result["intents"] = [
-            {
-                "type": intent.intent_type.value,
-                "content": intent.content,
-                "confidence": intent.confidence
-            }
-            for intent in intents
-        ]
+        if intent_summary["blacklist"]:
+            for item in intent_summary["blacklist"]:
+                memory_id = await self._record_blacklist(item)
+                if memory_id:
+                    result["memory_ids"].append(memory_id)
+                    result["blacklist_updated"] = True
+                    result["recorded"] = True
         
-        for intent in intents:
-            if intent.confidence >= 0.6:
-                memory_id = await self._record_intent(intent)
+        if intent_summary["authorization"]["full_authorization"]:
+            memory_id = await self._record_authorization(intent_summary["authorization"], user_input)
+            if memory_id:
+                result["memory_ids"].append(memory_id)
+                result["authorization_updated"] = True
+                result["recorded"] = True
+        
+        for intent_data in intent_summary["intents"]:
+            if intent_data["confidence"] >= 0.6:
+                memory_id = await self._record_intent_from_data(intent_data, user_input)
                 if memory_id:
                     result["memory_ids"].append(memory_id)
                     result["recorded"] = True
         
         return result
     
-    async def _record_intent(self, intent: ExtractedIntent) -> Optional[str]:
-        """记录意图到记忆系统"""
+    async def _record_blacklist(self, item: Dict[str, Any]) -> Optional[str]:
+        """记录黑名单"""
+        from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
+        
+        return await self.memory.add_memory(
+            memory_type=UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            content=f"黑名单: {item['symbol']} - {item['reason']}",
+            summary=f"🚫 交易对黑名单: {item['symbol']}",
+            metadata={
+                "type": "blacklist",
+                "symbol": item["symbol"],
+                "reason": item["reason"],
+                "auto_recorded": True
+            },
+            priority=MemoryPriority.CRITICAL,
+            importance=1.0,
+            source_module="intent_recognizer",
+            tags=["blacklist", item["symbol"].replace("/", "")]
+        )
+    
+    async def _record_authorization(self, auth: Dict[str, Any], original: str) -> Optional[str]:
+        """记录授权"""
+        from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
+        
+        return await self.memory.add_memory(
+            memory_type=UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            content=f"交易授权: 全权负责={auth['full_authorization']}, 自动交易={auth['auto_trading']}, 排除={auth['excluded_symbols']}",
+            summary=f"✅ 交易授权: {'全权负责' if auth['full_authorization'] else '部分授权'}",
+            metadata={
+                "type": "authorization",
+                "full_authorization": auth["full_authorization"],
+                "auto_trading": auth["auto_trading"],
+                "excluded_symbols": auth["excluded_symbols"],
+                "auto_recorded": True
+            },
+            priority=MemoryPriority.CRITICAL,
+            importance=0.95,
+            source_module="intent_recognizer",
+            tags=["authorization", "trading"]
+        )
+    
+    async def _record_intent_from_data(self, intent_data: Dict[str, Any], original: str) -> Optional[str]:
+        """从意图数据记录"""
         from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
         
         type_mapping = {
-            UserIntentType.PREFERENCE: UnifiedMemoryType.USER_PREFERENCE,
-            UserIntentType.INSTRUCTION: UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            UserIntentType.RISK_SETTING: UnifiedMemoryType.RISK_SETTING,
-            UserIntentType.TRADING_RULE: UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            UserIntentType.REMINDER: UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            UserIntentType.PROHIBITION: UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            UserIntentType.GOAL: UnifiedMemoryType.USER_PREFERENCE,
-            UserIntentType.FEEDBACK: UnifiedMemoryType.USER_PREFERENCE,
+            "preference": UnifiedMemoryType.USER_PREFERENCE,
+            "instruction": UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            "risk_setting": UnifiedMemoryType.RISK_SETTING,
+            "trading_rule": UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            "reminder": UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            "prohibition": UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            "goal": UnifiedMemoryType.USER_PREFERENCE,
+            "feedback": UnifiedMemoryType.USER_PREFERENCE,
+            "blacklist": UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            "authorization": UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            "work_duty": UnifiedMemoryType.SYSTEM_INSTRUCTION,
         }
         
-        memory_type = type_mapping.get(intent.intent_type, UnifiedMemoryType.USER_PREFERENCE)
+        intent_type = intent_data["type"]
+        memory_type = type_mapping.get(intent_type, UnifiedMemoryType.USER_PREFERENCE)
         
-        if intent.confidence >= 0.85:
+        confidence = intent_data["confidence"]
+        if confidence >= 0.9:
             priority = MemoryPriority.CRITICAL
-        elif intent.confidence >= 0.75:
+        elif confidence >= 0.8:
             priority = MemoryPriority.HIGH
         else:
             priority = MemoryPriority.NORMAL
         
-        summary = f"[{intent.intent_type.value}] {intent.content[:100]}"
-        
         return await self.memory.add_memory(
             memory_type=memory_type,
-            content=intent.original_text,
-            summary=summary,
+            content=original,
+            summary=f"[{intent_type}] {intent_data['content'][:100]}",
             metadata={
-                "intent_type": intent.intent_type.value,
-                "extracted_content": intent.content,
-                "confidence": intent.confidence,
-                "keywords": intent.keywords
+                "intent_type": intent_type,
+                "confidence": confidence,
+                "keywords": intent_data.get("keywords", []),
+                "auto_recorded": True
             },
             priority=priority,
-            importance=intent.confidence,
-            source_module="auto_recorder",
-            tags=intent.keywords + [intent.intent_type.value]
+            importance=confidence,
+            source_module="intent_recognizer",
+            tags=intent_data.get("keywords", []) + [intent_type]
         )
 
 
