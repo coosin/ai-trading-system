@@ -2,6 +2,19 @@
   "short_term": [],
   "long_term": [
     {
+      "id": "mem_1775217462.714931",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BNB/USDT', 'price': 587.3, 'ticker': {'symbol': 'BNB/USDT', 'last': 587.3, 'bid': 587.3, 'ask': 587.4, 'high': 589.0, 'low': 570.8, 'volume': 15063.123471, 'change': 0.0, 'timestamp': 1775217447512}, 'order_book': {'bid_depth': 609.4180819999999, 'ask_depth': 359.418579, 'spread': 0.017, 'imbalance': 0.26}, 'technical_indicators': {'ma5': 618.8399999999999, 'ma10': 617.74, 'ma20': 614.9999999999999, 'ma50': 613.9939999999999, 'ema12': 616.9777903821496, 'ema26': 614.952774"
+      },
+      "created_at": "2026-04-03T19:57:42.714947",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
       "id": "mem_1775217411.757511",
       "category": "market_insight",
       "priority": 2,
@@ -6487,57 +6500,8 @@
       "last_accessed": null,
       "access_count": 0,
       "expires_at": null
-    },
-    {
-      "id": "mem_1775192058.483361",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: {'analysis': '\\n\\n```json\\n{\\n  \"market_analysis\": {\\n    \"symbol\": \"BTC/USDT\",\\n    \"current_price\": 66585.6,\\n    \"trend\": \"短期下跌趋势，已跌破关键支撑位67000\",\\n    \"sentiment\": \"neutral\",\\n    \"volatility\": 0.0081,\\n    \"volatility_level\": \"较低\"\\n  },\\n  \"key_levels\": {\\n    \"support\": [\\n      {\"price\": 66500, \"strength\": \"较强\", \"note\": \"当前密集成交区\"},\\n      {\"price\": 65000, \"strength\": \"强\", \"note\": \"重要心理关口\"},\\n      {\"price\": 63000, \"strength\": \"强\", \"note\": \"前期支撑位\"}\\n    ],\\n    \"resistance\": [\\n      {\"price\": 67000, \"strength\": \"强\", \"note\": \"已跌破的支撑位\"},\\n      {\"price\": 68000, \"strength\": \"较强\", \"note\": \"短期阻力\"},\\n      {\"price\": 70000, \"strength\": \"强\", \"note\": \"重要心理关口\"}\\n    ]\\n  },\\n  \"technical_indicators\": {\\n    \"trend_indicator\": \"下跌趋势中，MA均线可能呈空头排列\",\\n    \"momentum\": \"偏弱，RSI可能处于40-50区间\",\\n    \"volatility\": \"波动率0.81%处于较低水平，可能酝酿突破\",\\n    \"volume\": \"需结合成交量确认趋势\"\\n  },\\n  \"sentiment_analysis\": {\\n    \"overall\": \"中性偏谨慎\",\\n    \"fear_greed_index\": \"可能处于40-50（中性区间）\",\\n    \"market_factors\": [\\n      \"短期承压，7日跌幅约-2.83%\",\\n      \"跌破67000关键支撑后市场情绪偏谨慎\",\\n      \"波动率较低，等待方向选择\"\\n    ]\\n  },\\n  \"risk_assessment\": {\\n    \"risk_level\": \"中等偏高\",\\n    \"key_risks\": [\\n      \"已跌破67000支撑，可能进一步下探65000\",\\n      \"如果跌破65000，可能引发恐慌性抛售\"\\n    ],\\n    \"opportunities\": [\\n      \"如果能在65000-66500区间企稳，可能出现反弹机会\",\\n      \"波动率处于低位，随时可能爆发行情\"\\n    ]\\n  },\\n  \"trading_recommendations\": {\\n    \"action\": \"观望或轻仓\",\\n    \"entry_conditions\": {\\n      \"long\": {\\n        \"price\": \"<65500\",\\n        \"confirm\": \"在65000-65500区间企稳，出现明显反弹信号\"\\n      },\\n      \"short\": {\\n        \"price\": \">67500\",\\n        \"confirm\": \"反弹至67500上方受阻，伴随放量下跌\"\\n      }\\n    },\\n    \"stop_loss\": {\\n      \"long\": \"65000下方\",\\n      \"short\": \"68000上方\"\\n    },\\n    \"position_size\": \"建议1-2成仓位，严格执行2%单笔亏损限制\",\\n    \"note\": \"当前市场偏跌，建议保持谨慎，优先等待确定性机会\"\\n  },\\n  \"memory_update\": {\\n    \"user_preferences_remembered\": [\\n      \"交易风格：中短线/超短线\",\\n      \"当前建议：以观望为主，等待确定性机会\",\\n      \"单笔亏损限制：2%\",\\n      \"最大持仓数：5笔以内\"\\n    ],\\n    \"market_observation\": \"BTC已跌破67000关键支撑，短期趋势偏跌，需密切关注65000支撑位\"\\n  }\\n}\\n```\\n\\n## 📊 分析总结\\n\\n**核心观点：** BTC/USDT当前处于短期下跌趋势，已跌破67000关键支撑位，可能进一步下探65000。\\n\\n**关键要点：**\\n1. 📉 **趋势**：下跌趋势，7日跌幅约-2.83%，已跌破67000支撑\\n2. 🎯 **关键位**：支撑65000/63000，阻力67000/68000\\n3. 📊 **波动率**：0.81%处于较低水平，随时可能爆发\\n4. 😐 **情绪**：中性偏谨慎\\n\\n**交易建议：** \\n- 建议保持观望或轻仓（1-2成）\\n- 等待价格企稳于65000-65500区间再考虑做多\\n- 严格设置止损（不超过2%单笔亏损）\\n- 优先等待确定性机会\\n\\n**风险提示：** 当前市场偏跌，需密切关注65000",
-      "metadata": {
-        "original": "基于以下市场分析，生成交易策略：\n\n{'analysis': '\\n\\n```json\\n{\\n  \"market_analysis\": {\\n    \"symbol\": \"BTC/USDT\",\\n    \"current_price\": 66585.6,\\n    \"trend\": \"短期下跌趋势，已跌破关键支撑位67000\",\\n    \"sentiment\": \"neutral\",\\n    \"volatility\": 0.0081,\\n    \"volatility_level\": \"较低\"\\n  },\\n  \"key_levels\": {\\n    \"support\": [\\n      {\"price\": 66500, \"strength\": \"较强\", \"note\": \"当前密集成交区\"},\\n      {\"price\": 65000, \"strength\": \"强\", \"note\": \"重要心理关口\"},\\n      {\"price\": 63000, \"strength\": \"强\", \"note\": \"前期支撑位\"}\\n    ],\\n    \"resistance"
-      },
-      "created_at": "2026-04-03T12:54:18.483379",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "risk_1775217425.85828",
-      "category": "risk_event",
-      "priority": 0,
-      "content": "⚠️ 风险事件 [critical_risk] ADA/USDT/SWAP: 持仓风险严重: 浮亏53.2%, 距离强平0.0%, 处理: 预警通知",
-      "metadata": {
-        "event_type": "critical_risk",
-        "symbol": "ADA/USDT/SWAP",
-        "description": "持仓风险严重: 浮亏53.2%, 距离强平0.0%",
-        "action_taken": "预警通知",
-        "impact": "未实现盈亏: 0.13 USDT",
-        "timestamp": "2026-04-03T19:57:05.858260"
-      },
-      "created_at": "2026-04-03T19:57:05.858298",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
-    },
-    {
-      "id": "risk_1775217425.907863",
-      "category": "risk_event",
-      "priority": 0,
-      "content": "⚠️ 风险事件 [critical_risk] ETH/USDT/SWAP: 持仓风险严重: 浮亏-0.2%, 距离强平-1.2%, 处理: 预警通知",
-      "metadata": {
-        "event_type": "critical_risk",
-        "symbol": "ETH/USDT/SWAP",
-        "description": "持仓风险严重: 浮亏-0.2%, 距离强平-1.2%",
-        "action_taken": "预警通知",
-        "impact": "未实现盈亏: -9.52 USDT",
-        "timestamp": "2026-04-03T19:57:05.907843"
-      },
-      "created_at": "2026-04-03T19:57:05.907878",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
     }
   ],
   "session_id": null,
-  "updated_at": "2026-04-03T19:57:05.910723"
+  "updated_at": "2026-04-03T19:58:27.262647"
 }

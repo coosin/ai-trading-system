@@ -28,6 +28,7 @@ class AiCoinConfig:
     base_url: str = "https://open-api.aicoin.com"
     ws_url: str = "wss://open-ws.aicoin.com/ws"
     timeout: int = 30
+    proxy: str = None
 
 
 @dataclass
@@ -108,7 +109,10 @@ class AiCoinDataSource:
         
     async def initialize(self):
         """初始化"""
-        self.session = aiohttp.ClientSession()
+        connector = None
+        if self.config.proxy:
+            connector = aiohttp.TCPConnector()
+        self.session = aiohttp.ClientSession(connector=connector)
         logger.info("✅ AiCoin数据源初始化完成")
         
     async def close(self):
@@ -155,7 +159,8 @@ class AiCoinDataSource:
         url = f"{self.config.base_url}{endpoint}"
         
         try:
-            async with self.session.get(url, params=full_params, timeout=self.config.timeout) as response:
+            proxy = self.config.proxy if self.config.proxy else None
+            async with self.session.get(url, params=full_params, timeout=self.config.timeout, proxy=proxy) as response:
                 if response.status == 200:
                     data = await response.json()
                     if data.get("success"):
@@ -170,7 +175,7 @@ class AiCoinDataSource:
             logger.warning(f"AiCoin API超时: {endpoint}")
             return None
         except Exception as e:
-            logger.error(f"AiCoin API请求异常: {e}")
+            logger.debug(f"AiCoin API请求异常: {e}")
             return None
     
     async def get_long_short_ratio(self) -> Optional[LongShortRatio]:
@@ -374,11 +379,13 @@ async def get_ai_coin_source() -> Optional[AiCoinDataSource]:
         import os
         access_key = os.environ.get("AICOIN_ACCESS_KEY", "")
         secret_key = os.environ.get("AICOIN_SECRET_KEY", "")
+        proxy = os.environ.get("AICOIN_PROXY", "http://127.0.0.1:7890")  # 默认使用本地代理
         
         if access_key and secret_key:
             config = AiCoinConfig(
                 access_key_id=access_key,
-                secret_key=secret_key
+                secret_key=secret_key,
+                proxy=proxy
             )
             ai_coin_data_source = AiCoinDataSource(config)
             await ai_coin_data_source.initialize()
