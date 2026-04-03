@@ -968,7 +968,7 @@ class AICoreDecisionEngine:
             return None
     
     async def _ai_analyze_and_decide(self, symbol: str) -> Optional[TradeDecision]:
-        """AI分析市场并做出决策 - 使用所有模块数据"""
+        """AI分析市场并做出决策 - 使用所有模块数据，全部实时获取"""
         logger.info(f"🧠 AI分析 {symbol}...")
         
         if not self.llm:
@@ -976,38 +976,42 @@ class AICoreDecisionEngine:
             return None
         
         try:
-            # 1. 获取市场数据
+            # 1. 获取市场数据 - 实时
             market_data = await self._get_market_data(symbol)
             logger.info(f"   ✅ 市场数据: 价格={market_data.get('price', 0)}")
             
-            # 2. 获取技术指标
+            # 2. 获取技术指标 - 多周期K线，实时
             technical = await self._get_technical_indicators(symbol)
-            logger.info(f"   ✅ 技术指标: RSI={technical.get('rsi', 0):.1f}, 趋势={technical.get('trend', 'unknown')}")
+            logger.info(f"   ✅ 技术指标: RSI(1H)={technical.get('rsi_1h', 0):.1f}, 趋势(1H)={technical.get('trend_1h', 'unknown')}, 趋势(4H)={technical.get('trend_4h', 'unknown')}, 趋势(1D)={technical.get('trend_1d', 'unknown')}")
             
             # 3. 获取策略建议
             strategy_advice = await self._get_strategy_advice(symbol)
             logger.info(f"   ✅ 策略建议: {strategy_advice.get('count', 0)}个策略可用")
             
-            # 4. 获取风险评估
+            # 4. 获取风险评估 - 实时
             risk_assessment = await self._get_risk_assessment(symbol)
             logger.info(f"   ✅ 风险评估: 等级={risk_assessment.get('level', 'unknown')}")
             
-            # 5. 获取当前持仓
+            # 5. 获取当前持仓 - 实时
             current_positions = await self._get_current_positions()
             logger.info(f"   ✅ 当前持仓: {len(current_positions)}个")
             
-            # 6. 获取第三方数据
+            # 6. 获取账户余额 - 实时
+            account_balance = await self._get_account_balance()
+            logger.info(f"   ✅ 账户余额: 可用={account_balance.get('available', 0):.2f} USDT")
+            
+            # 7. 获取第三方数据 - 实时
             third_party_data = await self._get_third_party_data(symbol)
             logger.info(f"   ✅ 第三方数据: 可用={third_party_data.get('available', False)}, 情绪={third_party_data.get('sentiment', 'neutral')}")
             
-            # 7. 获取历史经验
+            # 8. 获取历史经验
             historical_experience = await self._get_historical_experience(symbol)
             
-            # 8. 获取多源数据融合结果
+            # 9. 获取多源数据融合结果 - 实时
             multi_source_analysis = await self._get_multi_source_analysis(symbol)
             logger.info(f"   ✅ 多源数据融合: {multi_source_analysis.get('status', 'unknown')}")
             
-            # 9. 获取AI交易引擎分析
+            # 10. 获取AI交易引擎分析 - 实时
             ai_engine_analysis = await self._get_ai_engine_analysis(symbol)
             logger.info(f"   ✅ AI引擎分析: {ai_engine_analysis.get('trend', 'unknown')}")
             
@@ -1019,6 +1023,7 @@ class AICoreDecisionEngine:
                 strategy_advice=strategy_advice,
                 risk_assessment=risk_assessment,
                 current_positions=current_positions,
+                account_balance=account_balance,
                 third_party_data=third_party_data,
                 historical_experience=historical_experience,
                 multi_source_analysis=multi_source_analysis,
@@ -1169,41 +1174,71 @@ class AICoreDecisionEngine:
             return {}
     
     async def _get_technical_indicators(self, symbol: str) -> Dict:
-        """获取技术指标"""
+        """获取技术指标 - 多周期K线数据"""
         if not self.exchange:
             return {}
         
         try:
-            klines = await self.exchange.get_klines(symbol.replace('/', '-'), '1H', limit=100)
-            if not klines:
+            # 获取多个周期的K线数据
+            klines_1h = await self.exchange.get_klines(symbol.replace('/', '-'), '1H', limit=100)
+            klines_4h = await self.exchange.get_klines(symbol.replace('/', '-'), '4H', limit=50)
+            klines_1d = await self.exchange.get_klines(symbol.replace('/', '-'), '1D', limit=30)
+            
+            if not klines_1h:
                 return {}
             
-            closes = [k.get('close', 0) for k in klines]
+            closes_1h = [k.get('close', 0) for k in klines_1h]
+            closes_4h = [k.get('close', 0) for k in klines_4h] if klines_4h else closes_1h
+            closes_1d = [k.get('close', 0) for k in klines_1d] if klines_1d else closes_1h
             
-            ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else 0
-            ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else 0
+            def calculate_ma(closes, period):
+                return sum(closes[-period:]) / period if len(closes) >= period else 0
             
-            gains = []
-            losses = []
-            for i in range(1, min(15, len(closes))):
-                change = closes[-i] - closes[-i-1]
-                if change > 0:
-                    gains.append(change)
-                else:
-                    losses.append(abs(change))
+            def calculate_rsi(closes, period=14):
+                gains = []
+                losses = []
+                for i in range(1, min(period + 1, len(closes))):
+                    change = closes[-i] - closes[-i-1]
+                    if change > 0:
+                        gains.append(change)
+                    else:
+                        losses.append(abs(change))
+                
+                if not gains or not losses:
+                    return 50
+                
+                avg_gain = sum(gains) / len(gains)
+                avg_loss = sum(losses) / len(losses)
+                rs = avg_gain / avg_loss
+                return 100 - (100 / (1 + rs))
             
-            avg_gain = sum(gains) / len(gains) if gains else 0
-            avg_loss = sum(losses) / len(losses) if losses else 0.001
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
+            ma5_1h = calculate_ma(closes_1h, 5)
+            ma20_1h = calculate_ma(closes_1h, 20)
+            ma5_4h = calculate_ma(closes_4h, 5)
+            ma20_4h = calculate_ma(closes_4h, 20)
+            ma20_1d = calculate_ma(closes_1d, 20)
             
-            trend = "bullish" if ma5 > ma20 else "bearish"
+            rsi_1h = calculate_rsi(closes_1h)
+            rsi_4h = calculate_rsi(closes_4h)
+            
+            # 趋势判断
+            trend_1h = "bullish" if ma5_1h > ma20_1h else "bearish"
+            trend_4h = "bullish" if ma5_4h > ma20_4h else "bearish"
+            trend_1d = "bullish" if closes_1d[-1] > ma20_1d else "bearish" if closes_1d[-1] < ma20_1d else "sideways"
             
             return {
-                "ma5": ma5,
-                "ma20": ma20,
-                "rsi": rsi,
-                "trend": trend,
+                "ma5_1h": ma5_1h,
+                "ma20_1h": ma20_1h,
+                "ma5_4h": ma5_4h,
+                "ma20_4h": ma20_4h,
+                "ma20_1d": ma20_1d,
+                "rsi_1h": rsi_1h,
+                "rsi_4h": rsi_4h,
+                "trend_1h": trend_1h,
+                "trend_4h": trend_4h,
+                "trend_1d": trend_1d,
+                "price": closes_1h[-1] if closes_1h else 0,
+                "volume_1h": klines_1h[-1].get('volume', 0) if klines_1h else 0,
             }
         except Exception as e:
             logger.error(f"获取技术指标失败: {symbol} - {e}")
@@ -1252,25 +1287,52 @@ class AICoreDecisionEngine:
             return {"level": "unknown", "message": str(e)}
     
     async def _get_current_positions(self) -> List[Dict]:
-        """获取当前持仓"""
+        """获取当前持仓 - 实时从交易所获取"""
         if not self.exchange:
             return []
         
         try:
             positions = await self.exchange.get_positions()
+            # OKX返回格式: {symbol, side, size, entry_price, unrealized_pnl}
+            active_positions = [p for p in positions if float(p.get('size', 0) or 0) != 0]
             return [
                 {
-                    "symbol": p.get('instId', ''),
-                    "side": p.get('posSide', ''),
-                    "size": p.get('pos', ''),
-                    "pnl": p.get('upl', 0),
-                    "pnl_ratio": p.get('uplRatio', 0),
+                    "symbol": p.get('symbol', ''),
+                    "side": p.get('side', ''),
+                    "size": p.get('size', 0),
+                    "entry_price": float(p.get('entry_price', 0) or 0),
+                    "pnl": float(p.get('unrealized_pnl', 0) or 0),
+                    "pnl_ratio": float(p.get('pnl_ratio', 0) or 0),
                 }
-                for p in positions
+                for p in active_positions
             ]
         except Exception as e:
             logger.error(f"获取持仓失败: {e}")
             return []
+    
+    async def _get_account_balance(self) -> Dict:
+        """获取账户余额 - 实时从交易所获取"""
+        if not self.exchange:
+            return {}
+        
+        try:
+            balance = await self.exchange.get_balance()
+            usdt = balance.get('USDT', {})
+            if isinstance(usdt, dict):
+                return {
+                    "available": float(usdt.get('free', 0) or 0),
+                    "total": float(usdt.get('total', 0) or 0),
+                    "locked": float(usdt.get('locked', 0) or 0),
+                }
+            else:
+                return {
+                    "available": float(usdt or 0),
+                    "total": float(usdt or 0),
+                    "locked": 0,
+            }
+        except Exception as e:
+            logger.error(f"获取余额失败: {e}")
+            return {}
     
     async def _get_third_party_data(self, symbol: str) -> Dict:
         """获取第三方数据 - 真正获取并分析"""
@@ -1331,10 +1393,15 @@ class AICoreDecisionEngine:
     def _build_decision_prompt(self, symbol: str, market_data: Dict, 
                                 technical: Dict, strategy_advice: Dict,
                                 risk_assessment: Dict, current_positions: List[Dict],
-                                third_party_data: Dict, historical_experience: str = "",
+                                account_balance: Dict = None,
+                                third_party_data: Dict = None, historical_experience: str = "",
                                 multi_source_analysis: Dict = None, ai_engine_analysis: Dict = None) -> str:
-        """构建AI决策prompt - 融合所有模块数据进行决策"""
+        """构建AI决策prompt - 融合所有模块数据进行决策，全部实时数据"""
         
+        if account_balance is None:
+            account_balance = {}
+        if third_party_data is None:
+            third_party_data = {}
         if multi_source_analysis is None:
             multi_source_analysis = {}
         if ai_engine_analysis is None:
@@ -1382,46 +1449,69 @@ class AICoreDecisionEngine:
 - 信号强度: {ai_engine_analysis.get('signal_strength', 0)}
 """
         
+        # 构建持仓详情
+        positions_detail = "无持仓"
+        if current_positions:
+            positions_detail = ""
+            for pos in current_positions:
+                positions_detail += f"  - {pos.get('symbol', '')}: {pos.get('side', '')} {pos.get('size', 0)} | 入场价: {pos.get('entry_price', 0):.4f} | 盈亏: ${pos.get('pnl', 0):+.2f}\n"
+        
         prompt = f"""你是一个拥有完整控制权的量化交易AI，正在24小时不间断运行。
 
-你必须综合以下所有模块的数据做出交易决策：
-1. 市场数据 - 价格、成交量
-2. 技术指标 - MA、RSI、趋势
+你必须综合以下所有模块的实时数据做出交易决策：
+1. 市场数据 - 实时价格、成交量
+2. 技术指标 - 多周期K线(1H/4H/1D)、MA、RSI、趋势
 3. 策略建议 - 可用策略
-4. 风险评估 - 账户风险
-5. 当前持仓 - 仓位情况
-6. 第三方数据 - 新闻、情绪、链上数据
-7. 多源数据融合 - 综合分析结果
-8. AI引擎分析 - 趋势预测
-9. 历史经验 - 过往交易经验
+4. 风险评估 - 实时账户风险
+5. 当前持仓 - 实时仓位情况
+6. 账户余额 - 实时可用资金
+7. 第三方数据 - 新闻、情绪、链上数据
+8. 多源数据融合 - 综合分析结果
+9. AI引擎分析 - 趋势预测
+10. 历史经验 - 过往交易经验
 
 {aggressive_note}
 
 【交易对】{symbol}
 
-【市场数据】
+【市场数据 - 实时】
 - 当前价格: {market_data.get('price', 0)}
 - 24h最高: {market_data.get('high', 0)}
 - 24h最低: {market_data.get('low', 0)}
 - 成交量: {market_data.get('volume', 0)}
 
-【技术指标】
-- MA5: {technical.get('ma5', 0):.2f}
-- MA20: {technical.get('ma20', 0):.2f}
-- RSI: {technical.get('rsi', 0):.1f}
-- 趋势: {technical.get('trend', 'unknown')}
+【技术指标 - 多周期K线实时分析】
+1小时周期:
+- MA5: {technical.get('ma5_1h', 0):.4f}
+- MA20: {technical.get('ma20_1h', 0):.4f}
+- RSI: {technical.get('rsi_1h', 0):.1f}
+- 趋势: {technical.get('trend_1h', 'unknown')}
+
+4小时周期:
+- MA5: {technical.get('ma5_4h', 0):.4f}
+- MA20: {technical.get('ma20_4h', 0):.4f}
+- RSI: {technical.get('rsi_4h', 0):.1f}
+- 趋势: {technical.get('trend_4h', 'unknown')}
+
+日线周期:
+- MA20: {technical.get('ma20_1d', 0):.4f}
+- 趋势: {technical.get('trend_1d', 'unknown')}
 
 【可用策略】
 - 策略数量: {strategy_advice.get('count', 0)}
 - 策略详情: {json.dumps(strategy_advice.get('strategies', []), indent=2, ensure_ascii=False)}
 {historical_experience}
-【风险评估】
+【风险评估 - 实时】
 - 风险等级: {risk_assessment.get('level', 'unknown')}
 - 保证金比例: {risk_assessment.get('margin_ratio', 0):.2%}
 
-【当前持仓】
-{json.dumps(current_positions, indent=2, ensure_ascii=False)}
+【账户余额 - 实时】
+- 可用余额: {account_balance.get('available', 0):.2f} USDT
+- 总余额: {account_balance.get('total', 0):.2f} USDT
+- 冻结金额: {account_balance.get('locked', 0):.2f} USDT
 
+【当前持仓 - 实时】
+{positions_detail}
 {third_party_detail}
 {multi_source_detail}
 {ai_engine_detail}
