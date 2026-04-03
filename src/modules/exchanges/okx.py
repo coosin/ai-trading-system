@@ -52,12 +52,16 @@ class OKXExchange(ExchangeBase):
         }
         return headers
     
-    async def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None, body: Dict[str, Any] = None) -> Dict[str, Any]:
+    async def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None, body: Dict[str, Any] = None) -> Any:
         """发送请求到OKX API"""
         url = self.api_url + endpoint
-        body_str = json.dumps(body) if body else ""
+        body_str = json.dumps(body, separators=(',', ':')) if body else ""
         
         headers = self._get_headers(method, endpoint, body_str)
+        
+        logger.debug(f"📤 OKX请求: {method} {endpoint}")
+        logger.debug(f"📤 Body: {body_str}")
+        logger.debug(f"📤 Headers: OK-ACCESS-KEY={headers.get('OK-ACCESS-KEY')[:8]}..., TIMESTAMP={headers.get('OK-ACCESS-TIMESTAMP')}")
         
         try:
             timeout = aiohttp.ClientTimeout(total=60, connect=30)
@@ -68,16 +72,17 @@ class OKXExchange(ExchangeBase):
                 async with self._session.get(url, headers=headers, params=params, timeout=timeout, proxy=proxy) as response:
                     data = await response.json()
                     if data.get("code") == "0":
-                        return data.get("data", {})
+                        return data.get("data", [])
                     else:
                         error_msg = data.get('msg', '') or data.get('code', 'unknown')
                         logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
                         raise Exception(f"OKX API错误: {error_msg}")
             elif method == "POST":
-                async with self._session.post(url, headers=headers, json=body, timeout=timeout, proxy=proxy) as response:
+                async with self._session.post(url, headers=headers, data=body_str, timeout=timeout, proxy=proxy) as response:
                     data = await response.json()
+                    logger.debug(f"📥 OKX响应: {data}")
                     if data.get("code") == "0":
-                        return data.get("data", {})
+                        return data.get("data", [])
                     else:
                         error_msg = data.get('msg', '') or data.get('code', 'unknown')
                         logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
@@ -86,7 +91,7 @@ class OKXExchange(ExchangeBase):
                 async with self._session.delete(url, headers=headers, json=body, timeout=timeout, proxy=proxy) as response:
                     data = await response.json()
                     if data.get("code") == "0":
-                        return data.get("data", {})
+                        return data.get("data", [])
                     else:
                         error_msg = data.get('msg', '') or data.get('code', 'unknown')
                         logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
@@ -637,19 +642,23 @@ class OKXExchange(ExchangeBase):
             size: 仓位大小（张数或币数）
             leverage: 杠杆倍数
             price: 限价单价格，None为市价单
-            margin_mode: 保证金模式
+            margin_mode: 保证金模式 cross/isolated
         """
         okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        if "--" in okx_symbol:
+            okx_symbol = okx_symbol.replace("--", "-")
         
         await self.set_leverage(symbol, leverage, margin_mode)
         
         order_type = "market" if price is None else "limit"
         
+        pos_side = await self._get_position_side(side)
+        
         body = {
             "instId": okx_symbol,
             "tdMode": margin_mode,
             "side": "buy" if side == "long" else "sell",
-            "posSide": side,
+            "posSide": pos_side,
             "ordType": order_type,
             "sz": str(size)
         }
@@ -659,12 +668,15 @@ class OKXExchange(ExchangeBase):
         
         endpoint = "/api/v5/trade/order"
         
+        logger.info(f"📤 发送订单请求: {body}")
+        
         try:
             data = await self._make_request("POST", endpoint, body=body)
+            order_data = data[0] if isinstance(data, list) and len(data) > 0 else data
             logger.info(f"✅ 开仓成功: {symbol} {side} {size} @ {leverage}x")
             return {
                 "success": True,
-                "order_id": data.get("ordId"),
+                "orderId": order_data.get("ordId"),
                 "symbol": symbol,
                 "side": side,
                 "size": size,
@@ -674,6 +686,32 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.error(f"开仓失败: {e}")
             return {"success": False, "error": str(e)}
+    
+    async def _get_position_side(self, side: str) -> str:
+        """获取持仓方向 - 适配单向/双向持仓模式"""
+        try:
+            account_config = await self._get_account_config()
+            pos_mode = account_config.get("posMode", "long_short_mode")
+            
+            if pos_mode == "net_mode":
+                return "net"
+            else:
+                return side
+        except Exception as e:
+            logger.warning(f"获取持仓模式失败，使用默认: {e}")
+            return side
+    
+    async def _get_account_config(self) -> Dict[str, Any]:
+        """获取账户配置"""
+        endpoint = "/api/v5/account/config"
+        try:
+            data = await self._make_request("GET", endpoint)
+            if isinstance(data, list) and len(data) > 0:
+                return data[0]
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.error(f"获取账户配置失败: {e}")
+            return {}
     
     async def close_swap_position(self, symbol: str, side: str, size: float = None) -> Dict[str, Any]:
         """平永续合约仓位
@@ -695,11 +733,13 @@ class OKXExchange(ExchangeBase):
         if size is None or size <= 0:
             return {"success": False, "error": "未找到持仓或数量为0"}
         
+        pos_side = await self._get_position_side(side)
+        
         body = {
             "instId": okx_symbol,
             "tdMode": "cross",
             "side": "sell" if side == "long" else "buy",
-            "posSide": side,
+            "posSide": pos_side,
             "ordType": "market",
             "sz": str(size)
         }
@@ -711,7 +751,7 @@ class OKXExchange(ExchangeBase):
             logger.info(f"✅ 平仓成功: {symbol} {side} {size}")
             return {
                 "success": True,
-                "order_id": data.get("ordId"),
+                "orderId": data.get("ordId") if isinstance(data, dict) else data[0].get("ordId") if isinstance(data, list) else None,
                 "symbol": symbol,
                 "side": side,
                 "size": size,

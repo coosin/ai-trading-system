@@ -84,8 +84,15 @@ Desktop.ini
 
 # Project Specific
 workspace/memory/*.json
+workspace/USER.md
 data/historical/*.csv
 data/historical/*.json
+data/memory/*.json
+data/strategy_optimization.json
+agents/*/sessions/*.json
+agents/*/agent/models.json
+backups/*.tar.gz
+backups/*.zip
 
 # Secrets (never commit these!)
 secrets/
