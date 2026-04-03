@@ -210,11 +210,110 @@ class AICoreDecisionEngine:
         logger.info("🚀 启动AI核心决策引擎...")
         self._running = True
         
+        # 等待交易所连接完成
+        logger.info("⏳ 等待交易所连接...")
+        for i in range(10):
+            if self.exchange:
+                try:
+                    # 测试交易所连接
+                    await self.exchange.get_balance()
+                    logger.info("✅ 交易所连接就绪")
+                    break
+                except Exception as e:
+                    logger.debug(f"交易所未就绪，等待... ({i+1}/10): {e}")
+                    await asyncio.sleep(1)
+            else:
+                logger.debug(f"交易所未连接，等待... ({i+1}/10)")
+                await asyncio.sleep(1)
+        
+        # 启动时同步持仓和交易上下文
+        await self._sync_positions_on_startup()
+        
         asyncio.create_task(self._main_decision_loop())
         asyncio.create_task(self._strategy_management_loop())
         asyncio.create_task(self._risk_monitoring_loop())
         
         logger.info("✅ AI核心决策引擎已启动 - AI拥有完整控制权")
+    
+    async def _sync_positions_on_startup(self) -> None:
+        """启动时同步持仓 - 从交易所获取当前持仓状态"""
+        logger.info("🔄 同步持仓状态...")
+        
+        if not self.exchange:
+            logger.warning("交易所未连接，无法同步持仓")
+            return
+        
+        try:
+            # 获取当前持仓
+            positions = await self.exchange.get_positions()
+            logger.debug(f"获取到 {len(positions) if positions else 0} 个持仓记录")
+            
+            if not positions:
+                logger.info("📊 交易所返回无持仓数据")
+                return
+            
+            # 打印原始数据用于调试
+            for p in positions[:3]:
+                logger.debug(f"持仓原始数据: instId={p.get('instId')}, pos={p.get('pos')}, posSide={p.get('posSide')}")
+            
+            active_positions = [p for p in positions if float(p.get('pos', 0) or 0) != 0]
+            
+            if active_positions:
+                logger.info(f"📊 同步到 {len(active_positions)} 个活跃持仓:")
+                for pos in active_positions:
+                    symbol = pos.get('instId', '')
+                    side = pos.get('posSide', '')
+                    size = pos.get('pos', '')
+                    pnl = float(pos.get('upl', 0) or 0)
+                    entry_price = float(pos.get('avgPx', 0) or 0)
+                    logger.info(f"   - {symbol}: {side} {size} | 入场价: {entry_price:.4f} | 盈亏: ${pnl:+.2f}")
+                
+                # 保存到记忆系统
+                if self.memory:
+                    position_summary = {
+                        "timestamp": datetime.now().isoformat(),
+                        "total_positions": len(active_positions),
+                        "positions": [
+                            {
+                                "symbol": p.get('instId', ''),
+                                "side": p.get('posSide', ''),
+                                "size": p.get('pos', ''),
+                                "entry_price": float(p.get('avgPx', 0)),
+                                "pnl": float(p.get('upl', 0))
+                            }
+                            for p in active_positions
+                        ]
+                    }
+                    
+                    # 保存持仓快照到记忆
+                    try:
+                        await self.memory.save_memory(
+                            content=f"系统启动时持仓同步: {json.dumps(position_summary, ensure_ascii=False)}",
+                            memory_type="position_sync",
+                            importance=0.9
+                        )
+                        logger.info("✅ 持仓状态已保存到记忆系统")
+                    except Exception as e:
+                        logger.warning(f"保存持仓到记忆失败: {e}")
+            else:
+                logger.info("📊 当前无活跃持仓")
+            
+            # 获取账户余额
+            try:
+                balance = await self.exchange.get_balance()
+                usdt = balance.get('USDT', {})
+                if isinstance(usdt, dict):
+                    available = usdt.get('free', 0)
+                    total = usdt.get('total', 0)
+                else:
+                    available = usdt
+                    total = usdt
+                logger.info(f"💰 账户余额: 可用 {available:.2f} USDT, 总计 {total:.2f} USDT")
+            except Exception as e:
+                logger.warning(f"获取余额失败: {e}")
+            
+        except Exception as e:
+            logger.error(f"同步持仓失败: {e}")
     
     async def stop(self) -> None:
         """停止"""
