@@ -265,6 +265,9 @@ class MainController:
         
         # AI记忆管理器
         self.ai_memory_manager = None
+        
+        # 内存优化器
+        self.memory_optimizer = None
 
         # 默认配置
         self.auto_restart_modules = True
@@ -326,6 +329,16 @@ class MainController:
         workspace_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "workspace")
         self.ai_memory_manager = AIMemoryManager(workspace_path=workspace_path)
         logger.info("✅ AI记忆管理器初始化完成")
+        
+        # 初始化内存优化器
+        from src.modules.core.memory_optimizer import MemoryOptimizer
+        self.memory_optimizer = MemoryOptimizer({
+            "max_memory_percent": 80,
+            "cleanup_interval": 300,
+            "cache_size_limit": 500
+        })
+        await self.memory_optimizer.start()
+        logger.info("✅ 内存优化器初始化完成")
         
         # 初始化增强记忆管理器
         try:

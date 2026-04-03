@@ -106,23 +106,45 @@ class BaseDataProvider(ABC):
         
         await self._init_proxy()
         
-        try:
-            async with self.session.get(url, headers=headers, params=params, proxy=self._proxy_url, timeout=30) as response:
-                if response.status == 200:
-                    return await response.json()
-                elif response.status == 429:
-                    logger.warning(f"Rate limit hit for {self.__class__.__name__}")
-                    await asyncio.sleep(60)
-                    return None
-                else:
-                    logger.error(f"API error: {response.status}")
-                    return None
-        except asyncio.TimeoutError:
-            logger.error(f"Request timeout for {url}")
-            return None
-        except Exception as e:
-            logger.error(f"Request error: {e}")
-            return None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self.session.get(url, headers=headers, params=params, proxy=self._proxy_url, timeout=30) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 429:
+                        wait_time = 60 * (attempt + 1)
+                        logger.warning(f"Rate limit hit for {self.__class__.__name__}, waiting {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    elif response.status == 403:
+                        logger.warning(f"API access denied (403) for {self.__class__.__name__} - skipping this provider")
+                        return None
+                    elif response.status == 401:
+                        logger.warning(f"API unauthorized (401) for {self.__class__.__name__} - check API key")
+                        return None
+                    elif response.status >= 500:
+                        wait_time = 5 * (attempt + 1)
+                        logger.warning(f"Server error {response.status}, retrying in {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.debug(f"API returned status {response.status} for {self.__class__.__name__}")
+                        return None
+            except asyncio.TimeoutError:
+                logger.debug(f"Request timeout for {url} (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                return None
+            except Exception as e:
+                logger.debug(f"Request error: {e} (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return None
+        
+        return None
     
     async def close(self):
         if self.session:

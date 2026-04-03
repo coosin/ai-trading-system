@@ -30,14 +30,12 @@ class CacheEntry:
 class IntelligentCacheSystem:
     """智能缓存系统"""
     
-    def __init__(self, max_size: int = 1000, default_ttl: int = 300):
+    def __init__(self, max_size: int = 500, default_ttl: int = 300):
         self.max_size = max_size
         self.default_ttl = default_ttl
         
-        # 缓存存储
         self._cache: Dict[str, CacheEntry] = {}
         
-        # 缓存统计
         self.stats = {
             "hits": 0,
             "misses": 0,
@@ -45,14 +43,16 @@ class IntelligentCacheSystem:
             "total_size": 0,
         }
         
-        # TTL配置
         self.ttl_config = {
-            "market_data": 5,      # 市场数据缓存5秒
-            "indicators": 60,      # 技术指标缓存60秒
-            "ai_analysis": 300,    # AI分析缓存5分钟
-            "account_info": 10,    # 账户信息缓存10秒
-            "positions": 5,        # 持仓信息缓存5秒
+            "market_data": 10,
+            "indicators": 120,
+            "ai_analysis": 600,
+            "account_info": 15,
+            "positions": 10,
         }
+        
+        self._last_cleanup = datetime.now()
+        self._cleanup_interval = 60
     
     async def get_or_compute(
         self,
