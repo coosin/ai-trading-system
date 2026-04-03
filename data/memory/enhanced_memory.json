@@ -2,6 +2,19 @@
   "short_term": [],
   "long_term": [
     {
+      "id": "mem_1775181962.377192",
+      "category": "market_insight",
+      "priority": 2,
+      "content": "市场洞察: 2. 关键",
+      "metadata": {
+        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66529.3, 'ticker': {'symbol': 'BTC/USDT', 'last': 66529.3, 'bid': 66529.3, 'ask': 66529.4, 'high': 67428.5, 'low': 65701.7, 'volume': 6128.79120047, 'change': 0.0, 'timestamp': 1775181936807}, 'order_book': {'bid_depth': 0.48520114000000003, 'ask_depth': 1.29786978, 'spread': 0.0002, 'imbalance': -0.46}, 'technical_indicators': {'ma5': None, 'ma10': None, 'ma20': None, 'ma50': None, 'ema12': None, 'ema26': None, 'ema50': None, 'ema200': None, 'rsi': Non"
+      },
+      "created_at": "2026-04-03T10:06:02.377218",
+      "last_accessed": null,
+      "access_count": 0,
+      "expires_at": null
+    },
+    {
       "id": "mem_1775181020.905083",
       "category": "market_insight",
       "priority": 2,
@@ -6487,21 +6500,8 @@
       "last_accessed": null,
       "access_count": 0,
       "expires_at": null
-    },
-    {
-      "id": "mem_1775160880.440908",
-      "category": "market_insight",
-      "priority": 2,
-      "content": "市场洞察: 2. 关键",
-      "metadata": {
-        "original": "分析以下市场数据：\n\n{'symbol': 'BTC/USDT', 'price': 66893.6, 'trend': 'bearish', 'sentiment': 'neutral', 'volatility': 0.010155198822185862}\n\n请提供：\n1. 市场趋势分析\n2. 关键支撑位和阻力位\n3. 技术指标解读\n4. 市场情绪分析\n5. 交易建议\n\n请以JSON格式返回分析结果。"
-      },
-      "created_at": "2026-04-03T04:14:40.440923",
-      "last_accessed": null,
-      "access_count": 0,
-      "expires_at": null
     }
   ],
   "session_id": null,
-  "updated_at": "2026-04-03T09:58:53.239356"
+  "updated_at": "2026-04-03T10:06:02.379588"
 }

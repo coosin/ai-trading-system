@@ -837,7 +837,7 @@ class OKXExchange(ExchangeBase):
             "orders": orders
         }
     
-    async def get_open_interest(self, symbol: str) -> Optional[float]:
+    async def get_open_interest(self, symbol: str) -> Optional[Dict[str, float]]:
         """获取持仓量"""
         endpoint = "/api/v5/public/open-interest"
         okx_symbol = symbol.replace("/", "-") + "-SWAP"
@@ -848,8 +848,10 @@ class OKXExchange(ExchangeBase):
             if data:
                 oi = float(data.get("oi", 0))
                 vol24h = float(data.get("vol24h", 0))
-                return oi
- vol24h
+                return {
+                    "open_interest": oi,
+                    "volume_24h": vol24h
+                }
             return None
         except Exception as e:
             logger.error(f"获取持仓量失败: {e}")

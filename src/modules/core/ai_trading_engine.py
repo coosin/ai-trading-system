@@ -714,7 +714,7 @@ class AITradingEngine:
                 return TechnicalIndicators()
             
             # 计算所有技术指标
-            indicators = TechnicalIndicatorCalculator.calculate_all_indicators(klines_1h)
+            indicators = TechnicalIndicatorCalculator.calculate_all(klines_1h)
             
             logger.info(f"📊 技术指标: MA5={indicators.ma5:.2f}, MA20={indicators.ma20:.2f}, "
                        f"RSI={indicators.rsi:.2f}, 趋势={indicators.trend}")
