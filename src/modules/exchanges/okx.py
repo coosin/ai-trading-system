@@ -836,3 +836,55 @@ class OKXExchange(ExchangeBase):
             "grid_spacing": grid_spacing,
             "orders": orders
         }
+    
+    async def get_open_interest(self, symbol: str) -> Optional[float]:
+        """获取持仓量"""
+        endpoint = "/api/v5/public/open-interest"
+        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        params = {"instId": okx_symbol}
+        
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            if data:
+                oi = float(data.get("oi", 0))
+                vol24h = float(data.get("vol24h", 0))
+                return oi
+ vol24h
+            return None
+        except Exception as e:
+            logger.error(f"获取持仓量失败: {e}")
+        return None
+    
+    async def get_funding_rate(self, symbol: str) -> Optional[float]:
+        """获取资金费率"""
+        endpoint = "/api/v5/public/funding-rate"
+        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        params = {"instId": okx_symbol}
+        
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            if data:
+                return float(data.get("fundingRate", 0))
+            return None
+        except Exception as e:
+            logger.error(f"获取资金费率失败: {e}")
+        return None
+    
+    async def get_long_short_ratio(self, symbol: str) -> Optional[Dict[str, float]]:
+        """获取多空比"""
+        endpoint = "/api/v5/rubik/stat/positions-long-short-account-ratio"
+        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        params = {"instId": okx_symbol}
+        
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            if data:
+                return {
+                    "long": float(data.get("long", 0)),
+                    "short": float(data.get("short", 0)),
+                    "timestamp": int(data.get("ts", 0))
+                }
+            return None
+        except Exception as e:
+            logger.error(f"获取多空比失败: {e}")
+        return None
