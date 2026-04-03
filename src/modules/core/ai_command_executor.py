@@ -165,12 +165,12 @@ class AICommandExecutor:
 
 只返回JSON，不要其他内容。"""
 
-                response = await self.llm_integration.generate_response(prompt)
+                response = await self.llm_integration.generate(prompt)
                 
                 if response:
                     import json
                     try:
-                        result = json.loads(response)
+                        result = json.loads(response.content)
                         return Intent(
                             action=result.get("action", "chat"),
                             params=result.get("params", {}),
@@ -921,11 +921,11 @@ class AICommandExecutor:
     "reasoning": "组合理由"
 }}"""
                     
-                    response = await self.llm_integration.generate_response(prompt)
+                    response = await self.llm_integration.generate(prompt)
                     if response:
                         import json
                         try:
-                            result = json.loads(response)
+                            result = json.loads(response.content)
                             
                             return {
                                 "success": True,
