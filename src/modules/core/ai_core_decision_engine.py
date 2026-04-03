@@ -1335,7 +1335,7 @@ class AICoreDecisionEngine:
             return {}
     
     async def _get_third_party_data(self, symbol: str) -> Dict:
-        """获取第三方数据 - 真正获取并分析"""
+        """获取第三方数据 - 真正获取并分析，包含AiCoin特色数据"""
         result = {
             "available": False,
             "sentiment": "neutral",
@@ -1343,9 +1343,23 @@ class AICoreDecisionEngine:
             "social_sentiment": {},
             "fear_greed_index": None,
             "on_chain_data": {},
+            "aicoin_data": {},
         }
         
-        # 1. 尝试从插件管理器获取数据
+        # 1. 尝试从AiCoin获取特色数据
+        try:
+            from src.modules.data.aicoin_data_source import get_ai_coin_source
+            aicoin = await get_ai_coin_source()
+            if aicoin:
+                market_summary = await aicoin.get_market_summary()
+                if market_summary:
+                    result["aicoin_data"] = market_summary
+                    result["available"] = True
+                    logger.info(f"📊 AiCoin特色数据获取完成: 多空比={market_summary.get('long_short_ratio', {}).get('current', 0):.2f}")
+        except Exception as e:
+            logger.debug(f"AiCoin数据获取失败: {e}")
+        
+        # 2. 尝试从插件管理器获取数据
         if self.plugin_manager:
             try:
                 plugins_info = self.plugin_manager.get_all_plugin_info()
@@ -1368,7 +1382,7 @@ class AICoreDecisionEngine:
             except Exception as e:
                 logger.error(f"从插件管理器获取数据失败: {e}")
         
-        # 2. 尝试从主控制器获取第三方数据集成器
+        # 3. 尝试从主控制器获取第三方数据集成器
         if self.main_controller and hasattr(self.main_controller, 'third_party_integrator'):
             try:
                 integrator = self.main_controller.third_party_integrator
@@ -1384,7 +1398,7 @@ class AICoreDecisionEngine:
             except Exception as e:
                 logger.error(f"从第三方集成器获取数据失败: {e}")
         
-        # 3. 如果没有可用数据，返回默认值
+        # 4. 如果没有可用数据，返回默认值
         if not result["available"]:
             logger.warning(f"⚠️ 第三方数据暂不可用: {symbol}")
         
