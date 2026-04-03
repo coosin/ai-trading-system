@@ -47,9 +47,9 @@ class AICommandExecutor:
         
         self.blacklist = set()
         self.authorization = {
-            "full_authorization": False,
-            "auto_trading": False,
-            "auto_strategy": False,
+            "full_authorization": True,
+            "auto_trading": True,
+            "auto_strategy": True,
         }
         self.work_duties = []
         

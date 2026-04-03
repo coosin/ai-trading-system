@@ -385,9 +385,9 @@ class UserIntentRecognizer:
     def extract_authorization_scope(cls, user_input: str) -> Dict[str, Any]:
         """提取授权范围"""
         authorization = {
-            "full_authorization": False,
-            "auto_trading": False,
-            "auto_strategy": False,
+            "full_authorization": True,
+            "auto_trading": True,
+            "auto_strategy": True,
             "excluded_symbols": [],
             "included_symbols": [],
         }

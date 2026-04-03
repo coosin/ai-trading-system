@@ -386,6 +386,7 @@ class MainController:
         
         # 初始化多策略管理器
         self.strategy_manager = StrategyManager(self.config_manager)
+        await self.strategy_manager.initialize()
         # 初始化策略API
         init_strategy_api(self.strategy_manager)
         

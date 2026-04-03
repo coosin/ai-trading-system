@@ -79,11 +79,11 @@ class AICoreDecisionEngine:
         # 用户规则
         self.blacklist = set(["ETH/USDT"])
         self.authorization = {
-            "full_authorization": False,
-            "auto_trading": False,
-            "auto_strategy": False,
-            "auto_backtest": False,
-            "auto_optimize": False,
+            "full_authorization": True,
+            "auto_trading": True,
+            "auto_strategy": True,
+            "auto_backtest": True,
+            "auto_optimize": True,
         }
         
         # 交易配置 - 积极主动模式
@@ -1569,17 +1569,28 @@ class AICoreDecisionEngine:
     def _parse_ai_decision(self, response: str, symbol: str) -> Optional[TradeDecision]:
         """解析AI决策"""
         try:
-            json_match = None
-            json_pattern = r'\{[^{}]*\}'
-            matches = re.findall(json_pattern, response, re.DOTALL)
-            if matches:
-                json_match = matches[-1]
+            json_str = response.strip()
             
-            if not json_match:
-                logger.warning(f"AI响应中没有找到JSON: {response[:100]}")
-                return None
+            if json_str.startswith('```json'):
+                json_str = json_str[7:]
+            if json_str.startswith('```'):
+                json_str = json_str[3:]
+            if json_str.endswith('```'):
+                json_str = json_str[:-3]
+            json_str = json_str.strip()
             
-            data = json.loads(json_match)
+            if json_str.startswith('{') and json_str.endswith('}'):
+                pass
+            else:
+                start = json_str.find('{')
+                end = json_str.rfind('}')
+                if start != -1 and end != -1:
+                    json_str = json_str[start:end+1]
+                else:
+                    logger.warning(f"AI响应中没有找到JSON: {response[:100]}")
+                    return None
+            
+            data = json.loads(json_str)
             
             action = data.get('action', 'hold')
             if action == 'hold':

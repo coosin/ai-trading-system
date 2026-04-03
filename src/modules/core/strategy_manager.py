@@ -1461,19 +1461,30 @@ class StrategyManager:
 
     async def _load_strategy_configs(self) -> None:
         """加载策略配置"""
+        loaded_from_config = False
         if self.config_manager:
-            strategies_config = await self.config_manager.get_config("strategies", {})
+            try:
+                strategies_config = await self.config_manager.get_config("strategies", {})
+                strategies_list = strategies_config.get("strategies", [])
+                
+                if strategies_list:
+                    for strategy_data in strategies_list:
+                        try:
+                            await self.load_strategy_config(strategy_data)
+                            loaded_from_config = True
+                        except Exception as e:
+                            logger.error(f"加载策略配置失败: {e}")
+            except Exception as e:
+                logger.warning(f"获取策略配置失败: {e}")
 
-            for strategy_data in strategies_config.get("strategies", []):
-                await self.load_strategy_config(strategy_data)
-
-        # 如果没有配置，加载默认示例策略
+        # 如果没有从配置加载任何策略，加载默认示例策略
         if not self.strategy_configs:
+            logger.info("未加载任何策略配置，加载默认策略...")
             await self._load_default_strategies()
 
     async def _load_default_strategies(self) -> None:
         """加载默认策略"""
-        # 示例趋势跟踪策略
+        # 示例趋势跟踪策略 - 适用于所有交易对
         trend_strategy = StrategyConfig(
             strategy_id="trend_following_ma",
             name="移动平均趋势跟踪",
@@ -1485,14 +1496,14 @@ class StrategyManager:
                 "stop_loss_pct": 0.05,
                 "take_profit_pct": 0.1,
             },
-            symbols=["BTC/USDT", "ETH/USDT"],
+            symbols=[],  # 空列表表示适用于所有交易对
             timeframe="1h",
             initial_capital=10000.0,
         )
 
         await self.load_strategy_config(trend_strategy.to_dict())
 
-        # 示例均值回归策略
+        # 示例均值回归策略 - 适用于所有交易对
         mean_reversion_strategy = StrategyConfig(
             strategy_id="mean_reversion_bollinger",
             name="布林带均值回归",
@@ -1505,14 +1516,14 @@ class StrategyManager:
                 "rsi_overbought": 70,
                 "rsi_oversold": 30,
             },
-            symbols=["BTC/USDT", "ETH/USDT", "BNB/USDT"],
+            symbols=[],  # 空列表表示适用于所有交易对
             timeframe="30m",
             initial_capital=5000.0,
         )
 
         await self.load_strategy_config(mean_reversion_strategy.to_dict())
 
-        # 示例机器学习策略
+        # 示例机器学习策略 - 适用于所有交易对
         ml_strategy = StrategyConfig(
             strategy_id="ml_based_strategy",
             name="机器学习策略",
@@ -1523,7 +1534,7 @@ class StrategyManager:
                 "prediction_horizon": 1,
                 "confidence_threshold": 0.6,
             },
-            symbols=["BTC/USDT", "ETH/USDT"],
+            symbols=[],  # 空列表表示适用于所有交易对
             timeframe="1h",
             initial_capital=10000.0,
         )
