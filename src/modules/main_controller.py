@@ -436,8 +436,7 @@ class MainController:
                 main_controller=self
             )
             await self.telegram_bot.initialize()
-            # 启动Telegram机器人轮询
-            await self.telegram_bot.start_polling()
+            await self.telegram_bot.start()
         
         # 初始化模拟交易市场
         self.simulated_market = SimulatedMarket()
