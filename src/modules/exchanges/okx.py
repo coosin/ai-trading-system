@@ -9,6 +9,7 @@ import base64
 import hmac
 import json
 import logging
+import ssl
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -134,21 +135,21 @@ class OKXExchange(ExchangeBase):
                     if proxy.proxy_type.value in ["socks5", "socks4"]:
                         # 使用 SOCKS 代理
                         from aiohttp_socks import ProxyConnector
-                        connector = ProxyConnector.from_url(proxy.url)
+                        connector = ProxyConnector.from_url(proxy.url, ssl=False)
                     else:
-                        # HTTP/HTTPS 代理
-                        connector = aiohttp.TCPConnector()
+                        # HTTP/HTTPS 代理 - 禁用SSL验证以避免代理证书问题
+                        connector = aiohttp.TCPConnector(ssl=False)
                         self._proxy_url = proxy.url
                 else:
                     logger.warning("⚠️ 未找到可用代理，使用直连")
-                    connector = aiohttp.TCPConnector()
+                    connector = aiohttp.TCPConnector(ssl=False)
             except Exception as proxy_error:
                 logger.warning(f"⚠️ 加载代理配置失败: {proxy_error}，使用直连")
                 import traceback
                 traceback.print_exc()
-                connector = aiohttp.TCPConnector()
+                connector = aiohttp.TCPConnector(ssl=False)
             
-            self._session = aiohttp.ClientSession(connector=connector)
+            self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
             # 测试连接
             await self.get_exchange_info()
             self._running = True
