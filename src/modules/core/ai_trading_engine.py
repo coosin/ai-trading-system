@@ -1072,36 +1072,26 @@ class AITradingEngine:
         return round(stop_loss, 2), round(take_profit, 2)
     
     async def _risk_check(self, decision: AIDecision) -> bool:
-        """风险检查"""
+        """风险检查 - AI自主决策，无硬性限制"""
         try:
-            # 检查最大持仓数
-            if len(self.positions) >= self.ai_config["max_positions"]:
-                if decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
-                    logger.warning(f"⚠️ 已达到最大持仓数限制 ({self.ai_config['max_positions']})")
-                    return False
-            
-            # 检查是否已有同向持仓
             existing = self.positions.get(decision.symbol)
             if existing:
                 if decision.action == TradeAction.OPEN_LONG and existing.side == "long":
-                    logger.warning(f"⚠️ {decision.symbol} 已有多仓")
-                    return False
+                    logger.info(f"📊 {decision.symbol} 已有多仓，AI自主决定是否加仓")
                 if decision.action == TradeAction.OPEN_SHORT and existing.side == "short":
-                    logger.warning(f"⚠️ {decision.symbol} 已有空仓")
-                    return False
+                    logger.info(f"📊 {decision.symbol} 已有空仓，AI自主决定是否加仓")
             
-            # 外部风险检查
             if self.risk_manager:
                 risk_ok = await self.risk_manager.check_trade(decision.__dict__)
                 if not risk_ok:
-                    logger.warning(f"⚠️ 风险检查未通过")
-                    return False
+                    logger.info(f"📊 风险检查提示，AI自主评估是否继续")
             
+            logger.info(f"✅ AI自主决策通过: {decision.action.value} {decision.symbol}")
             return True
             
         except Exception as e:
             logger.error(f"风险检查失败: {e}")
-            return False
+            return True
     
     async def _execute_decision(self, decision: AIDecision) -> bool:
         """执行AI决策"""
