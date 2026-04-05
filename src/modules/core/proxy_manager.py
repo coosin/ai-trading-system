@@ -11,6 +11,7 @@
 
 import asyncio
 import logging
+import os
 import socket
 import time
 from dataclasses import dataclass, field
@@ -136,10 +137,39 @@ class ProxyManager:
         """初始化代理管理器"""
         logger.info("初始化代理管理器...")
         
+        # 如果没有配置，检查环境变量
+        if not config:
+            http_proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+            if http_proxy:
+                logger.info(f"从环境变量加载代理: {http_proxy}")
+                parsed = urlparse(http_proxy)
+                config = {
+                    "use_global_proxy": True,
+                    "global_proxy": {
+                        "name": "env_proxy",
+                        "proxy_type": "http",
+                        "host": parsed.hostname,
+                        "port": parsed.port or 7890,
+                        "enabled": True
+                    }
+                }
+        
         if config:
             # 加载全局代理设置
             global_config = config.get("global_proxy")
             if global_config:
+                # 处理环境变量引用
+                if "username_env" in global_config:
+                    env_key = global_config.pop("username_env")
+                    global_config["username"] = os.environ.get(env_key, "")
+                if "password_env" in global_config:
+                    env_key = global_config.pop("password_env")
+                    global_config["password"] = os.environ.get(env_key, "")
+                
+                # 确保必要字段存在
+                if "name" not in global_config:
+                    global_config["name"] = "global_proxy"
+                
                 self.global_proxy = ProxyConfig(**global_config)
                 self.use_global_proxy = config.get("use_global_proxy", False)
                 logger.info(f"配置全局代理: {self.global_proxy.url}")
@@ -147,6 +177,13 @@ class ProxyManager:
             # 加载代理列表
             proxies_config = config.get("proxies", [])
             for proxy_conf in proxies_config:
+                # 处理环境变量引用
+                if "username_env" in proxy_conf:
+                    env_key = proxy_conf.pop("username_env")
+                    proxy_conf["username"] = os.environ.get(env_key, "")
+                if "password_env" in proxy_conf:
+                    env_key = proxy_conf.pop("password_env")
+                    proxy_conf["password"] = os.environ.get(env_key, "")
                 await self.add_proxy(ProxyConfig(**proxy_conf))
             
             # 加载黑白名单

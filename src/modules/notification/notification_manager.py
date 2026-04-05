@@ -286,3 +286,8 @@ class NotificationManager:
             bool: 健康状态
         """
         return self.enabled
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

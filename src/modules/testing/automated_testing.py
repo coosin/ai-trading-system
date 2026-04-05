@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 
 class TestType(str, Enum):
+
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        return True
+
     """测试类型"""
     UNIT = "unit"
     INTEGRATION = "integration"
@@ -416,3 +421,8 @@ class AutomatedTestingSystem:
             "pass_rate": (passed / total * 100) if total > 0 else 0,
             "last_test_time": self.test_results[-1].timestamp.isoformat() if self.test_results else None
         }
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

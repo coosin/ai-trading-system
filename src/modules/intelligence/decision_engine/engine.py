@@ -573,3 +573,8 @@ class DecisionEngine:
         except Exception as e:
             logger.error(f"Error getting learning stats: {e}")
             return {}
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

@@ -513,3 +513,7 @@ class TradingMonitor:
             "symbols": list(self.market_data_status.keys()),
             "risk_metrics": self.risk_metrics.__dict__ if self.risk_metrics else None
         }
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

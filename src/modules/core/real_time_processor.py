@@ -395,3 +395,8 @@ class LowLatencyDecisionEngine:
             bool: 健康状态
         """
         return self.enabled and self.real_time_processor.is_healthy()
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

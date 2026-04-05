@@ -621,3 +621,8 @@ class ModelManager:
             bool: 健康状态
         """
         return True  # 备用模型总是健康的
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

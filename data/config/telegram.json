@@ -1,17 +1,19 @@
 {
-    "enabled": true,
-    "bot_token": "8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60",
-    "chat_ids": [6716232147],
-    "allowed_users": [],
-    "notifications": {
-        "trade_signals": true,
-        "position_changes": true,
-        "risk_alerts": true,
-        "system_status": true,
-        "daily_summary": true
-    },
-    "commands_enabled": true,
-    "polling_timeout": 30,
-    "retry_attempts": 3,
-    "retry_delay": 5
+    "telegram": {
+        "enabled": true,
+        "bot_token": "8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60",
+        "chat_ids": [6716232147],
+        "allowed_users": [],
+        "notifications": {
+            "trade_signals": true,
+            "position_changes": true,
+            "risk_alerts": true,
+            "system_status": true,
+            "daily_summary": true
+        },
+        "commands_enabled": true,
+        "polling_timeout": 30,
+        "retry_attempts": 3,
+        "retry_delay": 5
+    }
 }

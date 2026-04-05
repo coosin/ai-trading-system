@@ -162,9 +162,30 @@ class RealTimeDataCollector:
         self.data_sources[config.name] = config
         self.connection_status[config.name] = ConnectionStatus.DISCONNECTED
         self.data_buffers[config.name] = DataBuffer(symbol=config.symbol)
-
+        
         logger.info(f"注册数据源: {config.name}")
         return True
+    
+    def add_data_source(self, name: str, source: Any = None, 
+                        source_type: str = "custom", symbol: str = "",
+                        websocket_url: str = "", rest_api_url: str = "") -> bool:
+        """添加数据源（兼容接口）"""
+        type_map = {
+            "exchange": DataSourceType.EXCHANGE,
+            "websocket": DataSourceType.WEBSOCKET,
+            "rest_api": DataSourceType.REST_API,
+            "custom": DataSourceType.CUSTOM,
+        }
+        stype = type_map.get(source_type, DataSourceType.CUSTOM)
+        
+        config = DataSourceConfig(
+            name=name,
+            source_type=stype,
+            symbol=symbol,
+            websocket_url=websocket_url,
+            rest_api_url=rest_api_url
+        )
+        return self.register_data_source(config)
 
     def unregister_data_source(self, source_name: str) -> bool:
         """

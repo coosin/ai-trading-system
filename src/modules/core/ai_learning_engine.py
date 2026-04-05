@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 class LessonType(Enum):
+
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        return True
+
     """经验类型"""
     SUCCESS_PATTERN = "success_pattern"      # 成功模式
     FAILURE_PATTERN = "failure_pattern"      # 失败模式
@@ -573,3 +578,8 @@ class AILearningEngine:
             ],
             "config": self.config
         }
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

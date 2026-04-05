@@ -86,6 +86,26 @@ class EnhancedRiskController:
             "circuit_breaker_triggers": 0,
         }
     
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        logger.info("初始化增强风险控制器...")
+        return True
+    
+    async def cleanup(self):
+        """清理资源"""
+        logger.info("清理增强风险控制器...")
+        pass
+    
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        logger.info("初始化增强风险控制器...")
+        return True
+    
+    async def cleanup(self):
+        """清理资源"""
+        logger.info("清理增强风险控制器...")
+        pass
+    
     async def check_pre_trade_risk(
         self,
         symbol: str,

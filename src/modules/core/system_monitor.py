@@ -1,787 +1,276 @@
-from __future__ import annotations
+"""
+系统监控模块
+
+提供系统资源监控、性能分析和健康检查功能
+"""
 
 import asyncio
 import logging
+import os
+import platform
 import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Callable
+
 import psutil
-from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List, Optional, Any, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
 
-class SystemStatus(Enum):
-    """系统状态"""
-    HEALTHY = "healthy"
-    WARNING = "warning"
-    CRITICAL = "critical"
-    DOWN = "down"
-
-
-class ComponentType(Enum):
-    """组件类型"""
-    DATABASE = "database"
-    REDIS = "redis"
-    EXCHANGE_API = "exchange_api"
-    ML_MODEL = "ml_model"
-    LARGE_MODEL = "large_model"
-    STRATEGY = "strategy"
-    EXECUTION = "execution"
-    MONITORING = "monitoring"
-    API_SERVER = "api_server"
+@dataclass
+class SystemMetrics:
+    """系统指标"""
+    timestamp: datetime = field(default_factory=datetime.now)
+    cpu_percent: float = 0.0
+    memory_percent: float = 0.0
+    memory_used: float = 0.0
+    memory_total: float = 0.0
+    disk_percent: float = 0.0
+    disk_used: float = 0.0
+    disk_total: float = 0.0
+    network_bytes_sent: int = 0
+    network_bytes_recv: int = 0
+    process_count: int = 0
+    load_average: tuple = (0.0, 0.0, 0.0)
 
 
 @dataclass
-class ComponentStatus:
-    """组件状态"""
-    component: ComponentType
-    status: SystemStatus
-    timestamp: float
+class HealthStatus:
+    """健康状态"""
+    component: str
+    status: str  # healthy, warning, critical
     message: str
-    details: Dict[str, Any]
-
-
-@dataclass
-class SystemHealth:
-    """系统健康状态"""
-    timestamp: float
-    overall_status: SystemStatus
-    component_statuses: List[ComponentStatus]
-    cpu_usage: float
-    cpu_details: Dict[str, Any]
-    memory_usage: float
-    memory_details: Dict[str, Any]
-    disk_usage: float
-    disk_details: Dict[str, Any]
-    network_status: Dict[str, Any]
-    network_details: Dict[str, Any]
-    business_metrics: Dict[str, Any]
-
-
-class PerformanceAnalyzer:
-    """性能分析器"""
-
-    def __init__(self):
-        """初始化性能分析器"""
-        self.performance_data = []
-        self.max_data_points = 1000
-        self.start_times = {}
-
-    def start_measurement(self, name: str):
-        """开始性能测量
-
-        Args:
-            name: 测量名称
-        """
-        self.start_times[name] = time.time()
-
-    def end_measurement(self, name: str) -> float:
-        """结束性能测量
-
-        Args:
-            name: 测量名称
-
-        Returns:
-            float: 执行时间（秒）
-        """
-        if name in self.start_times:
-            duration = time.time() - self.start_times[name]
-            del self.start_times[name]
-            
-            # 记录性能数据
-            self.performance_data.append({
-                "timestamp": time.time(),
-                "name": name,
-                "duration": duration
-            })
-            
-            # 限制数据点数量
-            if len(self.performance_data) > self.max_data_points:
-                self.performance_data = self.performance_data[-self.max_data_points:]
-            
-            return duration
-        return 0.0
-
-    def get_performance_stats(self, name: str = None) -> Dict[str, Any]:
-        """获取性能统计信息
-
-        Args:
-            name: 测量名称，None表示所有测量
-
-        Returns:
-            Dict[str, Any]: 性能统计信息
-        """
-        if name:
-            data = [d for d in self.performance_data if d["name"] == name]
-        else:
-            data = self.performance_data
-        
-        if not data:
-            return {}
-        
-        durations = [d["duration"] for d in data]
-        stats = {
-            "count": len(durations),
-            "average": sum(durations) / len(durations),
-            "min": min(durations),
-            "max": max(durations),
-            "total": sum(durations)
-        }
-        
-        return stats
-
-    def get_performance_history(self, name: str = None, limit: int = 100) -> List[Dict[str, Any]]:
-        """获取性能历史数据
-
-        Args:
-            name: 测量名称，None表示所有测量
-            limit: 返回的历史记录数量
-
-        Returns:
-            List[Dict[str, Any]]: 性能历史数据
-        """
-        if name:
-            data = [d for d in self.performance_data if d["name"] == name]
-        else:
-            data = self.performance_data
-        
-        return data[-limit:]
-
-    def clear_performance_data(self):
-        """清除性能数据"""
-        self.performance_data.clear()
+    timestamp: datetime = field(default_factory=datetime.now)
+    details: Dict[str, Any] = field(default_factory=dict)
 
 
 class SystemMonitor:
-    """系统监控和故障恢复模块"""
-
-    def __init__(self, config: Dict[str, Any]):
-        """初始化系统监控
-
-        Args:
-            config: 配置信息
-        """
-        self.config = config
-        self.enabled = False
-        self.health_history = []
-        self.failure_count = {}
-        self.recovery_attempts = {}
-        self.monitoring_interval = config.get("monitoring_interval", 10)  # 秒
-        self.max_health_history = config.get("max_health_history", 100)
-        self.failure_threshold = config.get("failure_threshold", 3)
-        self.recovery_timeout = config.get("recovery_timeout", 60)  # 秒
-        self.component_checks = {}
-        self.recovery_handlers = {}
-        self.alerts = []
-        self.alert_thresholds = config.get("alert_thresholds", {
-            "cpu": 80,
-            "memory": 85,
-            "disk": 90,
-            "network_latency": 500
-        })
-        self.alert_history = []
-        self.max_alert_history = config.get("max_alert_history", 100)
-        self.performance_analyzer = PerformanceAnalyzer()
-
+    """系统监控器"""
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        
+        self._metrics_history: List[SystemMetrics] = []
+        self._max_history = self.config.get("max_history", 1000)
+        
+        self._health_checks: Dict[str, Callable] = {}
+        self._health_status: Dict[str, HealthStatus] = {}
+        
+        self._alerts: List[Dict[str, Any]] = []
+        self._alert_callbacks: List[Callable] = []
+        
+        self._running = False
+        self._monitor_task: Optional[asyncio.Task] = None
+        
+        self._thresholds = {
+            "cpu_warning": self.config.get("cpu_warning", 80),
+            "cpu_critical": self.config.get("cpu_critical", 95),
+            "memory_warning": self.config.get("memory_warning", 80),
+            "memory_critical": self.config.get("memory_critical", 95),
+            "disk_warning": self.config.get("disk_warning", 80),
+            "disk_critical": self.config.get("disk_critical", 95),
+        }
+    
     async def initialize(self) -> bool:
-        """初始化系统监控
-
-        Returns:
-            bool: 初始化是否成功
-        """
-        try:
-            # 注册组件检查函数
-            self._register_component_checks()
-            
-            # 注册恢复处理函数
-            self._register_recovery_handlers()
-            
-            # 启动监控循环
-            asyncio.create_task(self._monitoring_loop())
-            
-            self.enabled = True
-            logger.info("SystemMonitor initialized successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to initialize SystemMonitor: {e}")
-            return False
-
-    async def shutdown(self) -> bool:
-        """关闭系统监控
-
-        Returns:
-            bool: 关闭是否成功
-        """
-        try:
-            self.enabled = False
-            self.health_history.clear()
-            self.failure_count.clear()
-            self.recovery_attempts.clear()
-            logger.info("SystemMonitor shutdown successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to shutdown SystemMonitor: {e}")
-            return False
-
-    def _register_component_checks(self):
-        """注册组件检查函数"""
-        # 数据库检查
-        async def check_database():
-            try:
-                # 这里应该实现数据库连接检查
-                return SystemStatus.HEALTHY, "Database connection healthy"
-            except Exception as e:
-                return SystemStatus.CRITICAL, f"Database connection failed: {e}"
+        """初始化系统监控器"""
+        logger.info("系统监控器初始化完成")
+        return True
+    
+    async def start(self) -> None:
+        """启动监控"""
+        if self._running:
+            return
         
-        # Redis检查
-        async def check_redis():
+        self._running = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        logger.info("系统监控器已启动")
+    
+    async def stop(self) -> None:
+        """停止监控"""
+        self._running = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
             try:
-                # 这里应该实现Redis连接检查
-                return SystemStatus.HEALTHY, "Redis connection healthy"
-            except Exception as e:
-                return SystemStatus.CRITICAL, f"Redis connection failed: {e}"
-        
-        # 交易所API检查
-        async def check_exchange_api():
-            try:
-                # 这里应该实现交易所API检查
-                return SystemStatus.HEALTHY, "Exchange API healthy"
-            except Exception as e:
-                return SystemStatus.WARNING, f"Exchange API issue: {e}"
-        
-        # 机器学习模型检查
-        async def check_ml_model():
-            try:
-                # 这里应该实现机器学习模型检查
-                return SystemStatus.HEALTHY, "ML models healthy"
-            except Exception as e:
-                return SystemStatus.WARNING, f"ML model issue: {e}"
-        
-        # 大模型检查
-        async def check_large_model():
-            try:
-                # 这里应该实现大模型检查
-                return SystemStatus.HEALTHY, "Large models healthy"
-            except Exception as e:
-                return SystemStatus.WARNING, f"Large model issue: {e}"
-        
-        self.component_checks = {
-            ComponentType.DATABASE: check_database,
-            ComponentType.REDIS: check_redis,
-            ComponentType.EXCHANGE_API: check_exchange_api,
-            ComponentType.ML_MODEL: check_ml_model,
-            ComponentType.LARGE_MODEL: check_large_model
-        }
-
-    def _register_recovery_handlers(self):
-        """注册恢复处理函数"""
-        # 数据库恢复
-        async def recover_database():
-            try:
-                # 这里应该实现数据库恢复逻辑
-                logger.info("Attempting to recover database connection")
-                # 模拟恢复
-                await asyncio.sleep(2)
-                logger.info("Database connection recovered")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to recover database: {e}")
-                return False
-        
-        # Redis恢复
-        async def recover_redis():
-            try:
-                # 这里应该实现Redis恢复逻辑
-                logger.info("Attempting to recover Redis connection")
-                # 模拟恢复
-                await asyncio.sleep(2)
-                logger.info("Redis connection recovered")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to recover Redis: {e}")
-                return False
-        
-        # 交易所API恢复
-        async def recover_exchange_api():
-            try:
-                # 这里应该实现交易所API恢复逻辑
-                logger.info("Attempting to recover exchange API connection")
-                # 模拟恢复
-                await asyncio.sleep(5)
-                logger.info("Exchange API connection recovered")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to recover exchange API: {e}")
-                return False
-        
-        self.recovery_handlers = {
-            ComponentType.DATABASE: recover_database,
-            ComponentType.REDIS: recover_redis,
-            ComponentType.EXCHANGE_API: recover_exchange_api
-        }
-
-    async def _monitoring_loop(self):
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("系统监控器已停止")
+    
+    async def _monitor_loop(self) -> None:
         """监控循环"""
-        while self.enabled:
+        interval = self.config.get("monitor_interval", 60)
+        
+        while self._running:
             try:
-                # 检查系统健康状态
-                health = await self.check_system_health()
-                self.health_history.append(health)
+                metrics = await self.collect_metrics()
+                self._metrics_history.append(metrics)
                 
-                # 限制历史记录大小
-                if len(self.health_history) > self.max_health_history:
-                    self.health_history = self.health_history[-self.max_health_history:]
+                if len(self._metrics_history) > self._max_history:
+                    self._metrics_history = self._metrics_history[-self._max_history:]
                 
-                # 检查是否需要生成告警
-                await self._check_alerts(health)
+                await self._check_thresholds(metrics)
+                await self._run_health_checks()
                 
-                # 检查故障并尝试恢复
-                await self._check_failures_and_recover(health)
             except Exception as e:
-                logger.error(f"Error in monitoring loop: {e}")
+                logger.error(f"监控循环错误: {e}")
             
-            await asyncio.sleep(self.monitoring_interval)
-
-    async def check_system_health(self) -> SystemHealth:
-        """检查系统健康状态
-
-        Returns:
-            SystemHealth: 系统健康状态
-        """
+            await asyncio.sleep(interval)
+    
+    async def collect_metrics(self) -> SystemMetrics:
+        """收集系统指标"""
+        metrics = SystemMetrics()
+        
         try:
-            # 检查系统资源
-            cpu_usage = psutil.cpu_percent(interval=0.1)
-            cpu_details = {
-                "per_cpu_usage": psutil.cpu_percent(interval=0.1, percpu=True),
-                "cpu_count": psutil.cpu_count(),
-                "cpu_count_logical": psutil.cpu_count(logical=True),
-                "cpu_freq": psutil.cpu_freq()._asdict() if psutil.cpu_freq() else {}
-            }
+            metrics.cpu_percent = psutil.cpu_percent(interval=1)
             
             memory = psutil.virtual_memory()
-            memory_usage = memory.percent
-            memory_details = {
-                "total": memory.total,
-                "available": memory.available,
-                "used": memory.used,
-                "free": memory.free,
-                "active": getattr(memory, 'active', 0),
-                "inactive": getattr(memory, 'inactive', 0)
-            }
+            metrics.memory_percent = memory.percent
+            metrics.memory_used = memory.used / (1024 ** 3)
+            metrics.memory_total = memory.total / (1024 ** 3)
             
             disk = psutil.disk_usage('/')
-            disk_usage = disk.percent
-            disk_details = {
-                "total": disk.total,
-                "used": disk.used,
-                "free": disk.free,
-                "partitions": [{
-                    "device": p.device,
-                    "mountpoint": p.mountpoint,
-                    "fstype": p.fstype,
-                    "opts": p.opts
-                } for p in psutil.disk_partitions()]
-            }
+            metrics.disk_percent = disk.percent
+            metrics.disk_used = disk.used / (1024 ** 3)
+            metrics.disk_total = disk.total / (1024 ** 3)
             
-            # 检查网络状态
-            network_status = await self._check_network_status()
-            network_details = {
-                "interfaces": dict(psutil.net_if_stats()),
-                "connections": len(psutil.net_connections()),
-                "io_counters": psutil.net_io_counters()._asdict()
-            }
+            net = psutil.net_io_counters()
+            metrics.network_bytes_sent = net.bytes_sent
+            metrics.network_bytes_recv = net.bytes_recv
             
-            # 检查组件状态
-            component_statuses = await self._check_components()
+            metrics.process_count = len(psutil.pids())
             
-            # 业务级别的性能指标
-            business_metrics = await self._get_business_metrics()
+            if hasattr(os, 'getloadavg'):
+                metrics.load_average = os.getloadavg()
             
-            # 确定整体状态
-            overall_status = self._determine_overall_status(component_statuses)
-            
-            return SystemHealth(
-                timestamp=time.time(),
-                overall_status=overall_status,
-                component_statuses=component_statuses,
-                cpu_usage=cpu_usage,
-                cpu_details=cpu_details,
-                memory_usage=memory_usage,
-                memory_details=memory_details,
-                disk_usage=disk_usage,
-                disk_details=disk_details,
-                network_status=network_status,
-                network_details=network_details,
-                business_metrics=business_metrics
-            )
         except Exception as e:
-            logger.error(f"Error checking system health: {e}")
-            return SystemHealth(
-                timestamp=time.time(),
-                overall_status=SystemStatus.CRITICAL,
-                component_statuses=[],
-                cpu_usage=0,
-                cpu_details={},
-                memory_usage=0,
-                memory_details={},
-                disk_usage=0,
-                disk_details={},
-                network_status={},
-                network_details={},
-                business_metrics={}
-            )
-
-    async def _check_network_status(self) -> Dict[str, Any]:
-        """检查网络状态
-
-        Returns:
-            Dict[str, Any]: 网络状态
-        """
-        try:
-            # 这里应该实现网络状态检查
-            return {
-                "status": "healthy",
-                "latency": 100,
-                "bandwidth": "100Mbps"
-            }
-        except Exception as e:
-            logger.error(f"Error checking network status: {e}")
-            return {
-                "status": "unhealthy",
-                "error": str(e)
-            }
-
-    async def _get_business_metrics(self) -> Dict[str, Any]:
-        """获取业务级别的性能指标
-
-        Returns:
-            Dict[str, Any]: 业务指标
-        """
-        try:
-            # 业务级别的性能指标
-            business_metrics = {
-                "strategy_execution_time": 0.0,
-                "order_response_time": 0.0,
-                "market_data_update_time": 0.0,
-                "risk_analysis_time": 0.0,
-                "active_strategies": 0,
-                "active_orders": 0,
-                "completed_trades": 0,
-                "error_rate": 0.0
-            }
-            
-            # 这里可以从各个模块收集实际的业务指标
-            # 例如从策略管理器获取活跃策略数量
-            # 从交易执行器获取订单状态
-            # 从市场分析模块获取数据更新时间
-            
-            return business_metrics
-        except Exception as e:
-            logger.error(f"Error getting business metrics: {e}")
-            return {}
-
-    async def _generate_alert(self, alert_type: str, severity: str, message: str, details: Dict[str, Any]):
-        """生成告警
-
-        Args:
-            alert_type: 告警类型
-            severity: 严重程度
-            message: 告警消息
-            details: 详细信息
-        """
-        alert = {
-            "timestamp": time.time(),
-            "type": alert_type,
-            "severity": severity,
-            "message": message,
-            "details": details
-        }
-        self.alerts.append(alert)
-        self.alert_history.append(alert)
+            logger.warning(f"收集系统指标失败: {e}")
         
-        # 限制告警历史大小
-        if len(self.alert_history) > self.max_alert_history:
-            self.alert_history = self.alert_history[-self.max_alert_history:]
+        return metrics
+    
+    async def _check_thresholds(self, metrics: SystemMetrics) -> None:
+        """检查阈值"""
+        alerts = []
         
-        logger.warning(f"Alert: {severity} - {message}")
-
-    async def _check_alerts(self, health: SystemHealth):
-        """检查是否需要生成告警
-
-        Args:
-            health: 系统健康状态
-        """
-        # 检查CPU使用率
-        if health.cpu_usage > self.alert_thresholds["cpu"]:
-            await self._generate_alert(
-                "cpu_usage",
-                "warning",
-                f"CPU usage is high: {health.cpu_usage:.2f}%",
-                {"cpu_usage": health.cpu_usage}
-            )
+        if metrics.cpu_percent >= self._thresholds["cpu_critical"]:
+            alerts.append({
+                "type": "cpu",
+                "level": "critical",
+                "message": f"CPU使用率过高: {metrics.cpu_percent:.1f}%"
+            })
+        elif metrics.cpu_percent >= self._thresholds["cpu_warning"]:
+            alerts.append({
+                "type": "cpu",
+                "level": "warning",
+                "message": f"CPU使用率警告: {metrics.cpu_percent:.1f}%"
+            })
         
-        # 检查内存使用率
-        if health.memory_usage > self.alert_thresholds["memory"]:
-            await self._generate_alert(
-                "memory_usage",
-                "warning",
-                f"Memory usage is high: {health.memory_usage:.2f}%",
-                {"memory_usage": health.memory_usage}
-            )
+        if metrics.memory_percent >= self._thresholds["memory_critical"]:
+            alerts.append({
+                "type": "memory",
+                "level": "critical",
+                "message": f"内存使用率过高: {metrics.memory_percent:.1f}%"
+            })
+        elif metrics.memory_percent >= self._thresholds["memory_warning"]:
+            alerts.append({
+                "type": "memory",
+                "level": "warning",
+                "message": f"内存使用率警告: {metrics.memory_percent:.1f}%"
+            })
         
-        # 检查磁盘使用率
-        if health.disk_usage > self.alert_thresholds["disk"]:
-            await self._generate_alert(
-                "disk_usage",
-                "warning",
-                f"Disk usage is high: {health.disk_usage:.2f}%",
-                {"disk_usage": health.disk_usage}
-            )
+        if metrics.disk_percent >= self._thresholds["disk_critical"]:
+            alerts.append({
+                "type": "disk",
+                "level": "critical",
+                "message": f"磁盘使用率过高: {metrics.disk_percent:.1f}%"
+            })
+        elif metrics.disk_percent >= self._thresholds["disk_warning"]:
+            alerts.append({
+                "type": "disk",
+                "level": "warning",
+                "message": f"磁盘使用率警告: {metrics.disk_percent:.1f}%"
+            })
         
-        # 检查网络延迟
-        network_latency = health.network_status.get("latency", 0)
-        if network_latency > self.alert_thresholds["network_latency"]:
-            await self._generate_alert(
-                "network_latency",
-                "warning",
-                f"Network latency is high: {network_latency}ms",
-                {"network_latency": network_latency}
-            )
+        for alert in alerts:
+            await self._trigger_alert(alert)
+    
+    async def _trigger_alert(self, alert: Dict[str, Any]) -> None:
+        """触发告警"""
+        alert["timestamp"] = datetime.now().isoformat()
+        self._alerts.append(alert)
         
-        # 检查组件状态
-        for component_status in health.component_statuses:
-            if component_status.status == SystemStatus.CRITICAL:
-                await self._generate_alert(
-                    "component_failure",
-                    "critical",
-                    f"Component {component_status.component.value} is critical: {component_status.message}",
-                    {
-                        "component": component_status.component.value,
-                        "message": component_status.message
-                    }
-                )
-            elif component_status.status == SystemStatus.WARNING:
-                await self._generate_alert(
-                    "component_warning",
-                    "warning",
-                    f"Component {component_status.component.value} has warning: {component_status.message}",
-                    {
-                        "component": component_status.component.value,
-                        "message": component_status.message
-                    }
-                )
-
-    async def _check_components(self) -> List[ComponentStatus]:
-        """检查组件状态
-
-        Returns:
-            List[ComponentStatus]: 组件状态列表
-        """
-        component_statuses = []
+        logger.warning(f"系统告警: {alert['message']}")
         
-        for component, check_func in self.component_checks.items():
+        for callback in self._alert_callbacks:
             try:
-                status, message = await check_func()
-                component_statuses.append(ComponentStatus(
-                    component=component,
-                    status=status,
-                    timestamp=time.time(),
-                    message=message,
-                    details={}
-                ))
+                await callback(alert) if asyncio.iscoroutinefunction(callback) else callback(alert)
             except Exception as e:
-                logger.error(f"Error checking component {component.value}: {e}")
-                component_statuses.append(ComponentStatus(
-                    component=component,
-                    status=SystemStatus.CRITICAL,
-                    timestamp=time.time(),
-                    message=f"Error checking component: {e}",
-                    details={}
-                ))
-        
-        return component_statuses
-
-    def _determine_overall_status(self, component_statuses: List[ComponentStatus]) -> SystemStatus:
-        """确定整体状态
-
-        Args:
-            component_statuses: 组件状态列表
-
-        Returns:
-            SystemStatus: 整体状态
-        """
-        if not component_statuses:
-            return SystemStatus.WARNING
-        
-        # 检查是否有关键组件故障
-        for status in component_statuses:
-            if status.status == SystemStatus.CRITICAL:
-                return SystemStatus.CRITICAL
-            elif status.status == SystemStatus.WARNING:
-                return SystemStatus.WARNING
-        
-        return SystemStatus.HEALTHY
-
-    async def _check_failures_and_recover(self, health: SystemHealth):
-        """检查故障并尝试恢复
-
-        Args:
-            health: 系统健康状态
-        """
-        for component_status in health.component_statuses:
-            component = component_status.component
-            status = component_status.status
-            
-            # 检查是否需要恢复
-            if status in [SystemStatus.CRITICAL, SystemStatus.DOWN]:
-                # 增加故障计数
-                self.failure_count[component] = self.failure_count.get(component, 0) + 1
+                logger.error(f"告警回调执行失败: {e}")
+    
+    def register_health_check(self, name: str, check_func: Callable) -> None:
+        """注册健康检查"""
+        self._health_checks[name] = check_func
+        logger.info(f"注册健康检查: {name}")
+    
+    async def _run_health_checks(self) -> None:
+        """运行健康检查"""
+        for name, check_func in self._health_checks.items():
+            try:
+                if asyncio.iscoroutinefunction(check_func):
+                    result = await check_func()
+                else:
+                    result = check_func()
                 
-                # 检查是否达到故障阈值
-                if self.failure_count[component] >= self.failure_threshold:
-                    # 检查是否可以恢复
-                    if component in self.recovery_handlers:
-                        # 检查是否在恢复超时内
-                        last_attempt = self.recovery_attempts.get(component, 0)
-                        if time.time() - last_attempt > self.recovery_timeout:
-                            # 尝试恢复
-                            logger.warning(f"Attempting to recover component: {component.value}")
-                            self.recovery_attempts[component] = time.time()
-                            
-                            # 执行恢复
-                            recovered = await self.recovery_handlers[component]()
-                            if recovered:
-                                # 恢复成功，重置故障计数
-                                self.failure_count[component] = 0
-                                logger.info(f"Component {component.value} recovered successfully")
-                            else:
-                                logger.error(f"Failed to recover component: {component.value}")
-
-    def get_system_health(self) -> Optional[SystemHealth]:
-        """获取当前系统健康状态
-
-        Returns:
-            Optional[SystemHealth]: 系统健康状态
-        """
-        if self.health_history:
-            return self.health_history[-1]
+                if isinstance(result, dict):
+                    self._health_status[name] = HealthStatus(
+                        component=name,
+                        status=result.get("status", "healthy"),
+                        message=result.get("message", ""),
+                        details=result.get("details", {})
+                    )
+                elif isinstance(result, bool):
+                    self._health_status[name] = HealthStatus(
+                        component=name,
+                        status="healthy" if result else "critical",
+                        message="OK" if result else "Check failed"
+                    )
+            except Exception as e:
+                self._health_status[name] = HealthStatus(
+                    component=name,
+                    status="critical",
+                    message=str(e)
+                )
+    
+    def add_alert_callback(self, callback: Callable) -> None:
+        """添加告警回调"""
+        self._alert_callbacks.append(callback)
+    
+    def get_current_metrics(self) -> Optional[SystemMetrics]:
+        """获取当前指标"""
+        if self._metrics_history:
+            return self._metrics_history[-1]
         return None
-
-    def get_health_history(self, limit: int = 10) -> List[SystemHealth]:
-        """获取健康历史
-
-        Args:
-            limit: 返回的历史记录数量
-
-        Returns:
-            List[SystemHealth]: 健康历史
-        """
-        return self.health_history[-limit:]
-
-    def is_healthy(self) -> bool:
-        """检查系统是否健康
-
-        Returns:
-            bool: 健康状态
-        """
-        health = self.get_system_health()
-        return health and health.overall_status in [SystemStatus.HEALTHY, SystemStatus.WARNING]
-
-    async def add_custom_check(self, component: ComponentType, check_func: Callable[[], Awaitable[Tuple[SystemStatus, str]]]):
-        """添加自定义检查函数
-
-        Args:
-            component: 组件类型
-            check_func: 检查函数
-        """
-        self.component_checks[component] = check_func
-
-    async def add_custom_recovery(self, component: ComponentType, recovery_func: Callable[[], Awaitable[bool]]):
-        """添加自定义恢复函数
-
-        Args:
-            component: 组件类型
-            recovery_func: 恢复函数
-        """
-        self.recovery_handlers[component] = recovery_func
-
-    def get_active_alerts(self) -> List[Dict[str, Any]]:
-        """获取当前活跃的告警
-
-        Returns:
-            List[Dict[str, Any]]: 活跃告警列表
-        """
-        return self.alerts
-
-    def get_alert_history(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """获取告警历史
-
-        Args:
-            limit: 返回的历史记录数量
-
-        Returns:
-            List[Dict[str, Any]]: 告警历史
-        """
-        return self.alert_history[-limit:]
-
-    def clear_alerts(self):
-        """清除所有活跃告警"""
-        self.alerts.clear()
-
-    def set_alert_threshold(self, alert_type: str, threshold: float):
-        """设置告警阈值
-
-        Args:
-            alert_type: 告警类型
-            threshold: 阈值
-        """
-        if alert_type in self.alert_thresholds:
-            self.alert_thresholds[alert_type] = threshold
-            logger.info(f"Set alert threshold for {alert_type} to {threshold}")
-
-    def start_performance_measurement(self, name: str):
-        """开始性能测量
-
-        Args:
-            name: 测量名称
-        """
-        self.performance_analyzer.start_measurement(name)
-
-    def end_performance_measurement(self, name: str) -> float:
-        """结束性能测量
-
-        Args:
-            name: 测量名称
-
-        Returns:
-            float: 执行时间（秒）
-        """
-        return self.performance_analyzer.end_measurement(name)
-
-    def get_performance_stats(self, name: str = None) -> Dict[str, Any]:
-        """获取性能统计信息
-
-        Args:
-            name: 测量名称，None表示所有测量
-
-        Returns:
-            Dict[str, Any]: 性能统计信息
-        """
-        return self.performance_analyzer.get_performance_stats(name)
-
-    def get_performance_history(self, name: str = None, limit: int = 100) -> List[Dict[str, Any]]:
-        """获取性能历史数据
-
-        Args:
-            name: 测量名称，None表示所有测量
-            limit: 返回的历史记录数量
-
-        Returns:
-            List[Dict[str, Any]]: 性能历史数据
-        """
-        return self.performance_analyzer.get_performance_history(name, limit)
-
-    def clear_performance_data(self):
-        """清除性能数据"""
-        self.performance_analyzer.clear_performance_data()
+    
+    def get_metrics_history(self, limit: int = 100) -> List[SystemMetrics]:
+        """获取历史指标"""
+        return self._metrics_history[-limit:]
+    
+    def get_health_status(self) -> Dict[str, HealthStatus]:
+        """获取健康状态"""
+        return self._health_status
+    
+    def get_alerts(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取告警列表"""
+        return self._alerts[-limit:]
+    
+    def get_system_info(self) -> Dict[str, Any]:
+        """获取系统信息"""
+        return {
+            "platform": platform.platform(),
+            "python_version": platform.python_version(),
+            "cpu_count": psutil.cpu_count(),
+            "cpu_freq": psutil.cpu_freq().current if psutil.cpu_freq() else 0,
+            "memory_total": psutil.virtual_memory().total / (1024 ** 3),
+            "disk_total": psutil.disk_usage('/').total / (1024 ** 3),
+            "hostname": platform.node(),
+        }

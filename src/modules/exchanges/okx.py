@@ -13,12 +13,48 @@ import ssl
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
+from functools import wraps
 
 import aiohttp
 
 from .exchange_base import ExchangeBase, MarketData, OrderBook, Order, Balance, ExchangeInfo
 
 logger = logging.getLogger(__name__)
+
+
+def retry_on_error(max_retries=3, delay=1.0, backoff=2.0, allowed_exceptions=(Exception,)):
+    """
+    重试装饰器
+    
+    Args:
+        max_retries: 最大重试次数
+        delay: 初始延迟时间（秒）
+        backoff: 延迟时间的增长因子
+        allowed_exceptions: 允许重试的异常类型
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            current_delay = delay
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except allowed_exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        logger.warning(f"⚠️ {func.__name__} 失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
+                        logger.info(f"⏳ 等待 {current_delay:.1f} 秒后重试...")
+                        await asyncio.sleep(current_delay)
+                        current_delay *= backoff
+                    else:
+                        logger.error(f"❌ {func.__name__} 失败，已达到最大重试次数")
+                        raise
+            
+            raise last_exception
+        return wrapper
+    return decorator
 
 
 class OKXExchange(ExchangeBase):
@@ -30,6 +66,9 @@ class OKXExchange(ExchangeBase):
         self.ws_url = "wss://ws.okx.com:8443" if not self.testnet else "wss://wspap.okx.com:8443"
         self._session = None
         self._ws_connections = {}
+        self._request_semaphore = asyncio.Semaphore(10)  # 限制并发请求数
+        self._last_request_time = 0
+        self._min_request_interval = 0.1  # 最小请求间隔（秒）
     
     def _generate_signature(self, timestamp: str, method: str, endpoint: str, body: str = "") -> str:
         """生成OKX API签名"""
@@ -54,68 +93,129 @@ class OKXExchange(ExchangeBase):
         return headers
     
     async def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None, body: Dict[str, Any] = None) -> Any:
-        """发送请求到OKX API"""
-        url = self.api_url + endpoint
-        body_str = json.dumps(body, separators=(',', ':')) if body else ""
-        
-        headers = self._get_headers(method, endpoint, body_str)
-        
-        logger.debug(f"📤 OKX请求: {method} {endpoint}")
-        logger.debug(f"📤 Body: {body_str}")
-        logger.debug(f"📤 Headers: OK-ACCESS-KEY={headers.get('OK-ACCESS-KEY')[:8]}..., TIMESTAMP={headers.get('OK-ACCESS-TIMESTAMP')}")
-        
-        try:
-            timeout = aiohttp.ClientTimeout(total=60, connect=30)
+        """发送请求到OKX API - 带重试和限流机制"""
+        async with self._request_semaphore:
+            current_time = time.time()
+            time_since_last = current_time - self._last_request_time
+            if time_since_last < self._min_request_interval:
+                await asyncio.sleep(self._min_request_interval - time_since_last)
+            
+            self._last_request_time = time.time()
+            
+            url = self.api_url + endpoint
+            body_str = json.dumps(body, separators=(',', ':')) if body else ""
+            
+            headers = self._get_headers(method, endpoint, body_str)
+            
+            logger.debug(f"📤 OKX请求: {method} {endpoint}")
+            logger.debug(f"📤 Body: {body_str}")
+            logger.debug(f"📤 Headers: OK-ACCESS-KEY={headers.get('OK-ACCESS-KEY')[:8]}..., TIMESTAMP={headers.get('OK-ACCESS-TIMESTAMP')}")
+            
+            max_retries = 3
+            retry_delay = 1.0
             
             proxy = getattr(self, '_proxy_url', None)
+            if proxy:
+                logger.debug(f"📤 使用代理: {proxy}")
             
-            if method == "GET":
-                async with self._session.get(url, headers=headers, params=params, timeout=timeout, proxy=proxy) as response:
-                    data = await response.json()
-                    if data.get("code") == "0":
-                        return data.get("data", [])
+            for attempt in range(max_retries + 1):
+                try:
+                    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+                    
+                    if method == "GET":
+                        async with self._session.get(url, headers=headers, params=params, timeout=timeout, proxy=proxy, ssl=False) as response:
+                            if response.status == 429:  # Rate limit
+                                logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                                continue
+                            
+                            data = await response.json()
+                            if data.get("code") == "0":
+                                return data.get("data", [])
+                            else:
+                                error_msg = data.get('msg', '') or data.get('code', 'unknown')
+                                logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                                raise Exception(f"OKX API错误: {error_msg}")
+                                
+                    elif method == "POST":
+                        async with self._session.post(url, headers=headers, data=body_str, timeout=timeout, proxy=proxy, ssl=False) as response:
+                            if response.status == 429:  # Rate limit
+                                logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                                continue
+                            
+                            data = await response.json()
+                            logger.debug(f"📥 OKX响应: {data}")
+                            if data.get("code") == "0":
+                                return data.get("data", [])
+                            else:
+                                error_msg = data.get('msg', '') or data.get('code', 'unknown')
+                                logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                                raise Exception(f"OKX API错误: {error_msg}")
+                                
+                    elif method == "DELETE":
+                        async with self._session.delete(url, headers=headers, json=body, timeout=timeout, proxy=proxy, ssl=False) as response:
+                            if response.status == 429:  # Rate limit
+                                logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                                continue
+                            
+                            data = await response.json()
+                            if data.get("code") == "0":
+                                return data.get("data", [])
+                            else:
+                                error_msg = data.get('msg', '') or data.get('code', 'unknown')
+                                logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                                raise Exception(f"OKX API错误: {error_msg}")
+                                
+                except asyncio.TimeoutError as e:
+                    if attempt < max_retries:
+                        logger.warning(f"⚠️ OKX API 超时 (尝试 {attempt + 1}/{max_retries + 1}): {method} {endpoint}")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 1.5
+                        continue
                     else:
-                        error_msg = data.get('msg', '') or data.get('code', 'unknown')
-                        logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
-                        raise Exception(f"OKX API错误: {error_msg}")
-            elif method == "POST":
-                async with self._session.post(url, headers=headers, data=body_str, timeout=timeout, proxy=proxy) as response:
-                    data = await response.json()
-                    logger.debug(f"📥 OKX响应: {data}")
-                    if data.get("code") == "0":
-                        return data.get("data", [])
+                        logger.error(f"❌ OKX API 超时，已达到最大重试次数: {method} {endpoint}")
+                        raise
+                        
+                except aiohttp.ClientConnectorError as e:
+                    if attempt < max_retries:
+                        logger.warning(f"⚠️ OKX API 连接失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
                     else:
-                        error_msg = data.get('msg', '') or data.get('code', 'unknown')
-                        logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
-                        raise Exception(f"OKX API错误: {error_msg}")
-            elif method == "DELETE":
-                async with self._session.delete(url, headers=headers, json=body, timeout=timeout, proxy=proxy) as response:
-                    data = await response.json()
-                    if data.get("code") == "0":
-                        return data.get("data", [])
+                        logger.error(f"❌ OKX API 连接失败，已达到最大重试次数: {e}")
+                        raise
+                        
+                except aiohttp.ClientError as e:
+                    if attempt < max_retries and "SSL" in str(e):
+                        logger.warning(f"⚠️ OKX API SSL错误 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
                     else:
-                        error_msg = data.get('msg', '') or data.get('code', 'unknown')
-                        logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
-                        raise Exception(f"OKX API错误: {error_msg}")
-        except aiohttp.ClientError as e:
-            logger.error(f"OKX API网络错误: {method} {endpoint} - {type(e).__name__}: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"OKX API请求失败: {method} {endpoint} - {type(e).__name__}: {e}")
-            raise
+                        logger.error(f"OKX API网络错误: {method} {endpoint} - {type(e).__name__}: {e}")
+                        raise
+                        
+                except Exception as e:
+                    logger.error(f"OKX API请求失败: {method} {endpoint} - {type(e).__name__}: {e}")
+                    raise
     
     async def initialize(self) -> bool:
         """初始化交易所连接"""
         try:
-            # 尝试加载代理配置
             connector = None
+            ssl_context = None
+            
             try:
                 from src.modules.core.proxy_manager import get_proxy_manager
                 proxy_manager = await get_proxy_manager()
                 
-                # 确保proxy_manager已初始化
                 if not proxy_manager._running:
-                    # 使用传递过来的config_manager，或者创建新的
                     if hasattr(self, '_config_manager') and self._config_manager:
                         config_manager = self._config_manager
                     else:
@@ -133,24 +233,27 @@ class OKXExchange(ExchangeBase):
                 if proxy:
                     logger.info(f"✅ 使用代理: {proxy.url}")
                     if proxy.proxy_type.value in ["socks5", "socks4"]:
-                        # 使用 SOCKS 代理
                         from aiohttp_socks import ProxyConnector
                         connector = ProxyConnector.from_url(proxy.url, ssl=False)
                     else:
-                        # HTTP/HTTPS 代理 - 禁用SSL验证以避免代理证书问题
-                        connector = aiohttp.TCPConnector(ssl=False)
+                        ssl_context = ssl.create_default_context()
+                        ssl_context.check_hostname = False
+                        ssl_context.verify_mode = ssl.CERT_NONE
+                        connector = aiohttp.TCPConnector(ssl=ssl_context)
                         self._proxy_url = proxy.url
+                        logger.info(f"✅ 已配置HTTPS代理SSL上下文 (忽略证书验证)")
                 else:
                     logger.warning("⚠️ 未找到可用代理，使用直连")
-                    connector = aiohttp.TCPConnector(ssl=False)
+                    ssl_context = ssl.create_default_context()
+                    connector = aiohttp.TCPConnector(ssl=ssl_context)
             except Exception as proxy_error:
                 logger.warning(f"⚠️ 加载代理配置失败: {proxy_error}，使用直连")
                 import traceback
                 traceback.print_exc()
-                connector = aiohttp.TCPConnector(ssl=False)
+                ssl_context = ssl.create_default_context()
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
             
             self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
-            # 测试连接
             await self.get_exchange_info()
             self._running = True
             logger.info(f"OKX交易所初始化成功")
@@ -316,11 +419,33 @@ class OKXExchange(ExchangeBase):
         return None
     
     async def place_order(self, order: Order) -> Dict[str, Any]:
-        """下单"""
+        """下单
+        
+        支持永续合约交易：
+        - symbol格式: BTC/USDT/SWAP 或 BTC/USDT
+        - 自动转换为OKX格式: BTC-USDT-SWAP
+        """
         endpoint = "/api/v5/trade/order"
-        okx_symbol = order.symbol.replace("/", "-")
+        
+        # 交易对格式转换
+        symbol = order.symbol
+        if "/SWAP" in symbol or symbol.endswith("SWAP"):
+            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
+            if not okx_symbol.endswith("-SWAP"):
+                okx_symbol = okx_symbol + "-SWAP"
+        else:
+            # 默认使用永续合约
+            okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
+        # 判断是开仓还是平仓
+        is_close = hasattr(order, 'metadata') and order.metadata and order.metadata.get('is_close', False)
         
         # OKX的订单方向转换
+        # 对于永续合约：
+        # - 开多: side=buy, posSide=long
+        # - 开空: side=sell, posSide=short
+        # - 平多: side=sell, posSide=long
+        # - 平空: side=buy, posSide=short
         side_map = {"buy": "buy", "sell": "sell"}
         ord_type_map = {"market": "market", "limit": "limit"}
         
@@ -328,15 +453,30 @@ class OKXExchange(ExchangeBase):
             "instId": okx_symbol,
             "tdMode": "cross",  # 全仓模式
             "side": side_map.get(order.side, "buy"),
-            "ordType": ord_type_map.get(order.order_type, "limit"),
+            "ordType": ord_type_map.get(order.order_type, "market"),
             "sz": str(order.quantity)
         }
+        
+        # 永续合约需要指定posSide
+        if "-SWAP" in okx_symbol:
+            if hasattr(order, 'metadata') and order.metadata:
+                pos_side = order.metadata.get('posSide', 'net')
+                if pos_side in ['long', 'short']:
+                    body["posSide"] = pos_side
+            elif is_close:
+                # 平仓时根据side推断posSide
+                if order.side == "buy":
+                    body["posSide"] = "short"  # 平空
+                else:
+                    body["posSide"] = "long"   # 平多
         
         if order.order_type == "limit" and order.price:
             body["px"] = str(order.price)
         
         if order.client_order_id:
             body["clOrdId"] = order.client_order_id
+        
+        logger.info(f"📤 OKX下单请求: {body}")
         
         try:
             data = await self._make_request("POST", endpoint, body=body)
@@ -577,9 +717,21 @@ class OKXExchange(ExchangeBase):
         return {b.asset: b.free for b in balances if b.free > 0}
     
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """获取行情数据（便捷方法）"""
+        """获取行情数据（便捷方法）
+        
+        自动识别现货和永续合约：
+        - 现货: BTC/USDT -> BTC-USDT (需要指定 instType=SP)
+        - 永续合约: BTC/USDT/SWAP 或 BTC/USDT -> BTC-USDT-SWAP (默认)
+        """
         endpoint = "/api/v5/market/ticker"
-        okx_symbol = symbol.replace("/", "-")
+        
+        if "/SWAP" in symbol or symbol.endswith("SWAP"):
+            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
+            if not okx_symbol.endswith("-SWAP"):
+                okx_symbol = okx_symbol + "-SWAP"
+        else:
+            okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
         params = {"instId": okx_symbol}
         
         try:

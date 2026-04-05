@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CacheEntry:
+
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        return True
+
     """缓存条目"""
     key: str
     value: Any

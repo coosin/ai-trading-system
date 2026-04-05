@@ -50,6 +50,7 @@ class Order:
     avg_price: float = 0.0
     timestamp: datetime = None
     client_order_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None  # 额外元数据（如posSide）
 
 
 @dataclass

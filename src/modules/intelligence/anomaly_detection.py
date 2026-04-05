@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class AnomalyDetectionConfig:
     """异常检测配置"""
     # 模型配置
-    contamination: float = 0.05  # 异常比例
+    contamination: float = 0.03  # 异常比例（降低以减少误报）
     n_estimators: int = 100  # 树的数量
     max_samples: float = 0.8  # 采样比例
     
@@ -38,12 +38,17 @@ class AnomalyDetectionConfig:
     min_history: int = 100  # 最小历史数据量
     
     # 告警配置
-    alert_threshold: float = 0.8  # 告警阈值
-    alert_cooldown: int = 60  # 告警冷却时间（秒）
+    alert_threshold: float = 0.9  # 告警阈值（提高以减少误报）
+    alert_cooldown: int = 300  # 告警冷却时间（秒）- 增加到5分钟
     
     # 学习配置
     retrain_interval: int = 3600  # 重训练间隔（秒）
     max_history_size: int = 10000  # 最大历史数据量
+    
+    # 异常分数阈值
+    critical_threshold: float = 0.95  # 严重异常阈值
+    high_threshold: float = 0.85  # 高风险阈值
+    medium_threshold: float = 0.75  # 中等风险阈值
 
 
 @dataclass
@@ -256,17 +261,28 @@ class AnomalyDetector:
         
         if alert_key in self.last_alert_time:
             if current_time - self.last_alert_time[alert_key] < self.config.alert_cooldown:
+                logger.debug(f"告警 {alert_key} 在冷却期内，跳过")
                 return
         
-        # 确定严重程度
-        if score.score > 0.95:
+        # 更严格的告警过滤 - 只有在确实异常时才发送
+        if score.score < self.config.alert_threshold:
+            logger.debug(f"异常分数 {score.score:.2f} 低于阈值 {self.config.alert_threshold}，跳过告警")
+            return
+        
+        # 根据异常分数确定严重程度
+        if score.score >= self.config.critical_threshold:
             severity = "critical"
-        elif score.score > 0.9:
+        elif score.score >= self.config.high_threshold:
             severity = "high"
-        elif score.score > 0.85:
+        elif score.score >= self.config.medium_threshold:
             severity = "medium"
         else:
             severity = "low"
+        
+        # 只有高严重级别的才发送告警
+        if severity in ["low", "medium"]:
+            logger.debug(f"异常严重程度 {severity}，仅记录不告警")
+            return
         
         # 生成事件ID
         event_id = f"anomaly_{int(current_time)}_{score.anomaly_details.get('main_cause', 'general')}"

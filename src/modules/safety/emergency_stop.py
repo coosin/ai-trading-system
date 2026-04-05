@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 
 class EmergencyLevel(str, Enum):
+
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        return True
+
     """紧急级别"""
     LOW = "low"              # 低级紧急
     MEDIUM = "medium"        # 中级紧急
@@ -301,3 +306,8 @@ class EmergencyStopSystem:
                 if (datetime.now() - e.timestamp).total_seconds() < 3600
             ])
         }
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

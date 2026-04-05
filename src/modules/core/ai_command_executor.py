@@ -67,11 +67,6 @@ class AICommandExecutor:
             
             if hasattr(self.main_controller, 'ai_memory_manager'):
                 self.memory_manager = self.main_controller.ai_memory_manager
-            
-            # 获取AI核心决策引擎引用
-            if hasattr(self.main_controller, 'ai_core'):
-                self.ai_core = self.main_controller.ai_core
-                logger.info("✅ 已连接到AI核心决策引擎")
         
         try:
             from .unified_intelligent_memory import get_unified_memory
@@ -87,6 +82,18 @@ class AICommandExecutor:
             logger.warning(f"加载统一记忆系统失败: {e}")
         
         logger.info("✅ AI指令执行器（智能增强版）初始化完成")
+    
+    def _get_ai_core(self):
+        """动态获取AI核心决策引擎（运行时获取，避免初始化顺序问题）"""
+        if self.main_controller and hasattr(self.main_controller, 'ai_core'):
+            return self.main_controller.ai_core
+        return None
+    
+    def _get_ai_trading_engine(self):
+        """动态获取AI交易引擎"""
+        if self.main_controller and hasattr(self.main_controller, 'ai_trading_engine'):
+            return self.main_controller.ai_trading_engine
+        return None
     
     async def _load_user_rules_from_memory(self) -> None:
         """从记忆中加载用户规则"""
@@ -302,7 +309,7 @@ class AICommandExecutor:
 
 只返回JSON。"""
 
-                response = await self.llm_integration.generate(prompt)
+                response = await self.llm_integration.generate(prompt, is_user_input=False)
                 
                 if response:
                     try:
@@ -515,7 +522,7 @@ class AICommandExecutor:
 
 只返回JSON，不要其他内容。"""
                     
-                    response = await self.llm_integration.generate(prompt)
+                    response = await self.llm_integration.generate(prompt, is_user_input=False)
                     if response:
                         try:
                             strategy_config = json.loads(response.content)
@@ -616,7 +623,7 @@ class AICommandExecutor:
 2. 关键价位
 3. 操作建议"""
 
-                        response = await self.llm_integration.generate(prompt)
+                        response = await self.llm_integration.generate(prompt, is_user_input=False)
                         if response:
                             return {
                                 "success": True,
@@ -689,24 +696,37 @@ class AICommandExecutor:
     async def _get_positions(self) -> Dict[str, Any]:
         """获取持仓"""
         try:
+            okx = None
+            
+            # 优先从 main_controller.okx_exchange 获取
             if self.main_controller and hasattr(self.main_controller, 'okx_exchange'):
                 okx = self.main_controller.okx_exchange
-                positions = await okx.get_positions()
-                
-                if positions:
-                    response = "当前持仓\n\n"
-                    total_pnl = 0
-                    for pos in positions:
-                        side_emoji = "🟢多" if pos.get('side') == 'long' else "🔴空"
-                        pnl = pos.get('unrealized_pnl', 0)
-                        total_pnl += pnl
-                        
-                        response += f"{side_emoji} {pos.get('symbol')} | 数量:{pos.get('size', 0):.4f} | 盈亏:${pnl:+,.2f}\n"
-                    response += f"\n总盈亏: ${total_pnl:+,.2f}"
+            
+            # 如果 okx_exchange 还没有设置， 尝试从 ai_trading_engine.exchange 获取
+            if okx is None and hasattr(self.main_controller, 'ai_trading_engine'):
+                engine = self.main_controller.ai_trading_engine
+                if hasattr(engine, 'exchange') and engine.exchange:
+                    okx = engine.exchange
+            
+            if okx is None:
+                return {"success": True, "response": "当前没有任何持仓"}
+            
+            positions = await okx.get_positions()
+            
+            if positions:
+                response = "当前持仓\n\n"
+                total_pnl = 0
+                for pos in positions:
+                    side_emoji = "🟢多" if pos.get('side') == 'long' else "🔴空"
+                    pnl = pos.get('unrealized_pnl', 0)
+                    total_pnl += pnl
                     
-                    return {"success": True, "response": response, "data": positions}
-                else:
-                    return {"success": True, "response": "当前没有任何持仓"}
+                    response += f"{side_emoji} {pos.get('symbol')} | 数量:{pos.get('size', 0):.4f} | 盈亏:${pnl:+,.2f}\n"
+                response += f"\n总盈亏: ${total_pnl:+,.2f}"
+                
+                return {"success": True, "response": response, "data": positions}
+            else:
+                return {"success": True, "response": "当前没有任何持仓"}
             
             return {"success": False, "response": "获取持仓失败：交易所未连接"}
             
@@ -806,7 +826,7 @@ class AICommandExecutor:
 
 只返回JSON。"""
                     
-                    response = await self.llm_integration.generate(prompt)
+                    response = await self.llm_integration.generate(prompt, is_user_input=False)
                     if response:
                         try:
                             trade_params = json.loads(response.content)
@@ -990,7 +1010,7 @@ class AICommandExecutor:
 
 请用自然、友好的方式回复，就像和一个朋友聊天一样。不要使用JSON格式或命令格式。"""
 
-                response = await self.llm_integration.generate(prompt)
+                response = await self.llm_integration.generate(prompt, is_user_input=False)
                 
                 if response:
                     return {
@@ -1169,7 +1189,7 @@ class AICommandExecutor:
 
 请理解用户意图，用自然语言回复。你有完全的自主权。"""
 
-                response = await self.llm_integration.generate(prompt)
+                response = await self.llm_integration.generate(prompt, is_user_input=False)
                 
                 if response:
                     return {

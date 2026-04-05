@@ -23,6 +23,7 @@ from .technical_indicators import TechnicalIndicatorCalculator, TechnicalIndicat
 from .historical_data_storage import HistoricalDataStorage, TradeRecord, IndicatorRecord, get_historical_storage
 from .account_risk_monitor import AccountRiskMonitor, AccountRisk, PositionRisk, RiskLevel
 from .strategy_optimizer import StrategyOptimizer, StrategyType, StrategyPerformance
+from ..exchanges.exchange_base import Order
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,8 @@ class AITradingEngine:
             "max_positions": 5,       # 最大持仓数 (合约)
             "risk_per_trade": 0.02,   # 单笔交易风险（2%）
             "trade_mode": "real",     # 实盘交易模式
+            "auto_risk_management": True,  # 自动风险管理
+            "critical_risk_auto_close": True,  # 严重风险自动平仓
         }
         
         # 运行状态
@@ -160,6 +163,10 @@ class AITradingEngine:
         # 风险事件去重 - 记录最近一次风险事件时间
         self._last_risk_events: Dict[str, float] = {}
         self._risk_event_cooldown = 300  # 相同风险事件冷却时间（秒）
+        
+        # 自动平仓去重 - 避免重复平仓
+        self._auto_close_attempts: Dict[str, float] = {}
+        self._auto_close_cooldown = 60  # 自动平仓冷却时间（秒）
         
         logger.info("全智能AI交易引擎初始化完成")
     
@@ -174,24 +181,46 @@ class AITradingEngine:
         
         # 连接交易所 - 直接创建OKX交易所实例
         try:
-            if self.main_controller and self.main_controller.config_manager:
-                # 获取exchanges配置
-                exchanges_config = await self.main_controller.config_manager.get_config("exchanges", {})
-                okx_config = exchanges_config.get("okx", {})
-                logger.info(f"📋 OKX配置: {okx_config}")
-                if okx_config and okx_config.get('api_key'):
-                    from src.modules.exchanges.okx import OKXExchange
-                    self.exchange = OKXExchange(okx_config)
-                    # 传递config_manager给OKXExchange
-                    self.exchange._config_manager = self.main_controller.config_manager
-                    await self.exchange.initialize()
-                    logger.info("✅ OKX交易所已连接")
-                else:
-                    logger.warning("⚠️ OKX配置不完整，使用模拟数据")
+            okx_config = {}
+            
+            # 优先从环境变量读取配置
+            import os
+            api_key = os.getenv('OKX_API_KEY')
+            secret = os.getenv('OKX_SECRET')
+            passphrase = os.getenv('OKX_PASSPHRASE')
+            
+            if api_key and secret and passphrase:
+                okx_config = {
+                    'api_key': api_key,
+                    'api_secret': secret,  # 注意：ExchangeBase期望的键名是api_secret
+                    'api_passphrase': passphrase,  # 注意：ExchangeBase期望的键名是api_passphrase
+                    'testnet': False
+                }
+                logger.info("✅ 从环境变量加载OKX配置")
             else:
-                logger.warning("⚠️ 配置管理器未找到，使用模拟数据")
+                # 从配置管理器读取
+                if self.main_controller and self.main_controller.config_manager:
+                    exchanges_config = await self.main_controller.config_manager.get_config("exchanges", {})
+                    okx_config = exchanges_config.get("okx", {})
+                    logger.info(f"📋 从配置文件加载OKX配置")
+            
+            if okx_config and okx_config.get('api_key'):
+                from src.modules.exchanges.okx import OKXExchange
+                self.exchange = OKXExchange(okx_config)
+                # 传递config_manager给OKXExchange
+                if self.main_controller and self.main_controller.config_manager:
+                    self.exchange._config_manager = self.main_controller.config_manager
+                await self.exchange.initialize()
+                logger.info("✅ OKX交易所已连接")
+            else:
+                logger.warning("⚠️ OKX配置不完整，使用模拟数据")
+                logger.warning(f"   API Key: {'已设置' if api_key else '未设置'}")
+                logger.warning(f"   Secret: {'已设置' if secret else '未设置'}")
+                logger.warning(f"   Passphrase: {'已设置' if passphrase else '未设置'}")
         except Exception as e:
             logger.warning(f"⚠️ 交易所连接失败: {e}，将使用模拟数据")
+            import traceback
+            logger.debug(traceback.format_exc())
         
         # 连接风险管理器
         if self.main_controller and hasattr(self.main_controller, 'risk_manager'):
@@ -219,8 +248,7 @@ class AITradingEngine:
         # 初始化策略优化器
         try:
             self.strategy_optimizer = StrategyOptimizer(
-                memory_manager=self.llm_integration,
-                data_storage=self.data_storage
+                config={"memory_manager": self.llm_integration, "data_storage": self.data_storage}
             )
             logger.info("✅ 策略优化器已初始化")
         except Exception as e:
@@ -236,8 +264,10 @@ class AITradingEngine:
                 llm_integration=self.llm_integration
             )
             
-            binance_source = BinanceDataSource(proxy_url="http://127.0.0.1:7890")
-            coingecko_source = CoinGeckoDataSource(proxy_url="http://127.0.0.1:7890")
+            proxy_url = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "http://host.docker.internal:7890"
+            
+            binance_source = BinanceDataSource(proxy_url=proxy_url)
+            coingecko_source = CoinGeckoDataSource(proxy_url=proxy_url)
             
             await self.data_fusion.register_data_source("binance", binance_source)
             await self.data_fusion.register_data_source("coingecko", coingecko_source)
@@ -541,7 +571,11 @@ class AITradingEngine:
             if hasattr(self, 'data_fusion') and self.data_fusion:
                 try:
                     fused_intelligence = await self.data_fusion.analyze_market(symbol)
-                    logger.info(f"📊 多源数据融合分析完成: {symbol}, 情绪={fused_intelligence.overall_sentiment.value}")
+                    if isinstance(fused_intelligence, dict):
+                        sentiment_val = fused_intelligence.get("sentiment", 0.5)
+                        logger.info(f"📊 多源数据融合分析完成: {symbol}, 情绪={sentiment_val}")
+                    else:
+                        logger.info(f"📊 多源数据融合分析完成: {symbol}, 情绪={getattr(fused_intelligence, 'overall_sentiment', 0.5)}")
                 except Exception as e:
                     logger.warning(f"多源数据分析失败，使用基础分析: {e}")
             
@@ -578,7 +612,12 @@ class AITradingEngine:
             
             # 如果有多源数据，添加到分析中
             if fused_intelligence:
-                analysis_data["fused_intelligence"] = fused_intelligence.to_dict()
+                if isinstance(fused_intelligence, dict):
+                    analysis_data["fused_intelligence"] = fused_intelligence
+                elif hasattr(fused_intelligence, 'to_dict'):
+                    analysis_data["fused_intelligence"] = fused_intelligence.to_dict()
+                else:
+                    analysis_data["fused_intelligence"] = dict(fused_intelligence.__dict__) if hasattr(fused_intelligence, '__dict__') else {}
             
             # 添加第三方数据（社交媒体情绪、新闻等）
             if third_party_sentiment:
@@ -669,19 +708,37 @@ class AITradingEngine:
             
             # 如果有多源数据，优先使用融合分析的结论
             if fused_intelligence:
-                context = MarketContext(
-                    symbol=symbol,
-                    price=market_data["ticker"].get("last", 0),
-                    trend=fused_intelligence.recommendation if fused_intelligence.recommendation in ["bullish", "bearish", "sideways"] else ai_analysis.get("trend", technical_indicators.trend),
-                    volatility=self._calculate_volatility(technical_indicators),
-                    volume_24h=market_data["ticker"].get("volume", 0),
-                    sentiment=fused_intelligence.overall_sentiment.value,
-                    support_levels=ai_analysis.get("support_levels", []),
-                    resistance_levels=ai_analysis.get("resistance_levels", [])
-                )
-                
-                logger.info(f"✅ AI增强分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}, "
-                           f"信号强度={fused_intelligence.signal_strength.value}")
+                if isinstance(fused_intelligence, dict):
+                    fi_trend = fused_intelligence.get("trend", "neutral")
+                    fi_sentiment = fused_intelligence.get("sentiment", 0.5) or 0.5
+                    context = MarketContext(
+                        symbol=symbol,
+                        price=market_data["ticker"].get("last", 0),
+                        trend=fi_trend if fi_trend in ["bullish", "bearish", "sideways"] else ai_analysis.get("trend", technical_indicators.trend),
+                        volatility=self._calculate_volatility(technical_indicators),
+                        volume_24h=market_data["ticker"].get("volume", 0),
+                        sentiment="greed" if fi_sentiment > 0.6 else "fear" if fi_sentiment < 0.4 else "neutral",
+                        support_levels=ai_analysis.get("support_levels", []),
+                        resistance_levels=ai_analysis.get("resistance_levels", [])
+                    )
+                    logger.info(f"✅ AI增强分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}")
+                else:
+                    fi_recommendation = getattr(fused_intelligence, 'recommendation', None)
+                    fi_sentiment = getattr(fused_intelligence, 'overall_sentiment', None)
+                    fi_signal = getattr(fused_intelligence, 'signal_strength', None)
+                    
+                    context = MarketContext(
+                        symbol=symbol,
+                        price=market_data["ticker"].get("last", 0),
+                        trend=fi_recommendation if fi_recommendation in ["bullish", "bearish", "sideways"] else ai_analysis.get("trend", technical_indicators.trend),
+                        volatility=self._calculate_volatility(technical_indicators),
+                        volume_24h=market_data["ticker"].get("volume", 0),
+                        sentiment=getattr(fi_sentiment, 'value', str(fi_sentiment)) if fi_sentiment else "neutral",
+                        support_levels=ai_analysis.get("support_levels", []),
+                        resistance_levels=ai_analysis.get("resistance_levels", [])
+                    )
+                    logger.info(f"✅ AI增强分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}, "
+                               f"信号强度={getattr(fi_signal, 'value', 'N/A') if fi_signal else 'N/A'}")
             else:
                 # 解析AI分析结果
                 context = MarketContext(
@@ -826,9 +883,17 @@ class AITradingEngine:
         base_context = self._basic_analysis(symbol, market_data, indicators)
         
         if fused_intelligence:
-            base_context.sentiment = fused_intelligence.overall_sentiment.value
-            if fused_intelligence.recommendation in ["bullish", "bearish"]:
-                base_context.trend = fused_intelligence.recommendation
+            if isinstance(fused_intelligence, dict):
+                sentiment = fused_intelligence.get("sentiment", 0.5)
+                trend = fused_intelligence.get("trend", "neutral")
+                base_context.sentiment = "greed" if sentiment > 0.6 else "fear" if sentiment < 0.4 else "neutral"
+                if trend in ["bullish", "bearish"]:
+                    base_context.trend = trend
+            else:
+                if hasattr(fused_intelligence, 'overall_sentiment'):
+                    base_context.sentiment = getattr(fused_intelligence.overall_sentiment, 'value', str(fused_intelligence.overall_sentiment))
+                if hasattr(fused_intelligence, 'recommendation') and fused_intelligence.recommendation in ["bullish", "bearish"]:
+                    base_context.trend = fused_intelligence.recommendation
             
             logger.info(f"📈 增强基础分析 {symbol}: 趋势={base_context.trend}, 情绪={base_context.sentiment}")
         
@@ -1100,14 +1165,39 @@ class AITradingEngine:
                 logger.warning("❌ 交易所未连接，无法执行")
                 return False
             
+            if isinstance(decision, dict):
+                logger.error(f"❌ 决策对象格式错误（字典），期望AIDecision对象: {decision}")
+                return False
+            
+            if not hasattr(decision, 'symbol') or not hasattr(decision, 'action'):
+                logger.error(f"❌ 决策对象缺少必要属性: {type(decision)}")
+                return False
+            
             logger.info(f"🚀 执行交易: {decision.action.value} {decision.symbol} "
                        f"@ {decision.price}, 数量={decision.quantity}")
             
-            order = {
-                "symbol": decision.symbol,
-                "side": "buy" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "sell",
-                "type": "market",
-                "quantity": decision.quantity
+            # 确定仓位方向
+            is_close = decision.action in [TradeAction.CLOSE_LONG, TradeAction.CLOSE_SHORT]
+            if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG]:
+                pos_side = "long"
+            elif decision.action in [TradeAction.OPEN_SHORT, TradeAction.CLOSE_SHORT]:
+                pos_side = "short"
+            else:
+                pos_side = "net"
+            
+            order = Order(
+                order_id="",
+                symbol=decision.symbol,
+                side="buy" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "sell",
+                order_type="market",
+                quantity=decision.quantity,
+                price=decision.price
+            )
+            
+            # 添加元数据用于OKX下单
+            order.metadata = {
+                "posSide": pos_side,
+                "is_close": is_close
             }
             
             result = await self.exchange.place_order(order)
@@ -1144,7 +1234,7 @@ class AITradingEngine:
                 return False
                 
         except Exception as e:
-            logger.error(f"执行决策失败: {e}")
+            logger.error(f"执行决策失败: {e}", exc_info=True)
             return False
     
     async def _save_trade_to_memory(self, decision: AIDecision, result: Dict) -> None:
@@ -1173,11 +1263,17 @@ class AITradingEngine:
                 )
             else:
                 existing = self.positions.get(decision.symbol)
-                open_price = existing.entry_price if existing else decision.price
+                
+                if isinstance(existing, dict):
+                    logger.warning(f"⚠️ {decision.symbol} 持仓数据格式错误（字典），使用默认价格")
+                    open_price = decision.price
+                else:
+                    open_price = existing.entry_price if existing else decision.price
+                
                 pnl = 0
                 pnl_percent = 0
                 
-                if existing:
+                if existing and not isinstance(existing, dict):
                     if side == "long":
                         pnl = (decision.price - open_price) * decision.quantity
                         pnl_percent = (decision.price - open_price) / open_price * 100
@@ -1202,74 +1298,158 @@ class AITradingEngine:
             logger.error(f"保存交易到记忆失败: {e}")
     
     async def _update_positions(self) -> None:
-        """更新持仓信息"""
+        """更新持仓信息 - 从交易所实时获取"""
         try:
             if not self.exchange:
                 return
             
-            # 获取当前持仓
             positions = await self.exchange.get_positions()
             
-            self.positions.clear()
+            existing_symbols = set(self.positions.keys())
+            new_symbols = set()
+            
             for pos in positions:
                 symbol = pos.get("symbol")
-                if symbol:
-                    self.positions[symbol] = Position(
-                        symbol=symbol,
-                        side=pos.get("side", "long"),
-                        entry_price=pos.get("entry_price", 0),
-                        quantity=pos.get("quantity", 0),
-                        current_price=pos.get("mark_price", 0),
-                        unrealized_pnl=pos.get("unrealized_pnl", 0),
-                        unrealized_pnl_percent=pos.get("unrealized_pnl_percent", 0),
-                        stop_loss=pos.get("stop_loss"),
-                        take_profit=pos.get("take_profit")
-                    )
+                if not symbol:
+                    continue
+                
+                size = float(pos.get("size", 0) or 0)
+                
+                if size == 0:
+                    continue
+                
+                new_symbols.add(symbol)
+                
+                existing_pos = self.positions.get(symbol)
+                
+                if isinstance(existing_pos, dict):
+                    logger.warning(f"⚠️ {symbol} 持仓数据格式错误，重新创建")
+                    existing_pos = None
+                
+                old_stop_loss = existing_pos.stop_loss if existing_pos else None
+                old_take_profit = existing_pos.take_profit if existing_pos else None
+                
+                entry_price = float(pos.get("entry_price", 0) or 0)
+                side = pos.get("side", "long")
+                
+                if old_stop_loss is None and entry_price > 0:
+                    if side == "long":
+                        old_stop_loss = entry_price * 0.97
+                    else:
+                        old_stop_loss = entry_price * 1.03
+                    logger.info(f"📊 {symbol} 自动设置止损: {old_stop_loss:.4f}")
+                
+                if old_take_profit is None and entry_price > 0:
+                    if side == "long":
+                        old_take_profit = entry_price * 1.06
+                    else:
+                        old_take_profit = entry_price * 0.94
+                    logger.info(f"📊 {symbol} 自动设置止盈: {old_take_profit:.4f}")
+                
+                self.positions[symbol] = Position(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry_price,
+                    quantity=abs(size),
+                    current_price=float(pos.get("mark_price", 0) or pos.get("current_price", 0) or 0),
+                    unrealized_pnl=float(pos.get("unrealized_pnl", 0) or 0),
+                    unrealized_pnl_percent=float(pos.get("pnl_ratio", 0) or pos.get("unrealized_pnl_percent", 0) or 0),
+                    stop_loss=old_stop_loss,
+                    take_profit=old_take_profit
+                )
+            
+            closed_symbols = existing_symbols - new_symbols
+            for symbol in closed_symbols:
+                logger.info(f"📊 {symbol} 已平仓，从监控列表移除")
+                del self.positions[symbol]
+            
+            if self.positions:
+                logger.info(f"📊 当前监控 {len(self.positions)} 个持仓")
+                for sym, pos in self.positions.items():
+                    logger.info(f"   - {sym}: {pos.side} {pos.quantity} | 止损={pos.stop_loss:.4f} | 止盈={pos.take_profit:.4f}")
             
         except Exception as e:
             logger.error(f"更新持仓失败: {e}")
     
     async def _monitoring_loop(self) -> None:
-        """监控循环"""
+        """监控循环 - 持仓跟踪和止损止盈检查"""
         while self._running:
             try:
                 self.state = TradingState.MONITORING
                 
-                # 监控持仓
-                for symbol, position in self.positions.items():
-                    # 检查止损止盈
-                    if position.stop_loss and position.current_price <= position.stop_loss:
-                        logger.warning(f"🚨 {symbol} 触发止损!")
-                        # 自动平仓
+                # 1. 先更新持仓信息（从交易所实时获取）
+                await self._update_positions()
+                
+                # 2. 监控每个持仓
+                for symbol, position in list(self.positions.items()):
+                    try:
+                        if isinstance(position, dict):
+                            logger.warning(f"⚠️ {symbol} 持仓数据格式错误（字典），跳过监控")
+                            continue
+                        
+                        ticker = await self.exchange.get_ticker(symbol.replace("/SWAP", ""))
+                        if ticker:
+                            position.current_price = ticker.get('last', position.current_price)
+                    except:
+                        pass
+                    
+                    stop_loss = position.stop_loss
+                    take_profit = position.take_profit
+                    current_price = position.current_price
+                    side = position.side
+                    
+                    stop_loss_triggered = False
+                    take_profit_triggered = False
+                    
+                    if side == "long":
+                        if stop_loss and current_price <= stop_loss:
+                            stop_loss_triggered = True
+                        if take_profit and current_price >= take_profit:
+                            take_profit_triggered = True
+                    else:
+                        if stop_loss and current_price >= stop_loss:
+                            stop_loss_triggered = True
+                        if take_profit and current_price <= take_profit:
+                            take_profit_triggered = True
+                    
+                    if stop_loss_triggered:
+                        logger.warning(f"🚨 {symbol} 触发止损! {side}单 当前价={current_price:.4f} 止损价={stop_loss:.4f}")
                         await self._execute_decision(AIDecision(
-                            action=TradeAction.CLOSE_LONG if position.side == "long" else TradeAction.CLOSE_SHORT,
+                            action=TradeAction.CLOSE_LONG if side == "long" else TradeAction.CLOSE_SHORT,
                             symbol=symbol,
-                            price=position.current_price,
+                            price=current_price,
                             quantity=position.quantity,
                             confidence=1.0,
                             reasoning="止损触发",
                             risk_level="high"
                         ))
                     
-                    elif position.take_profit and position.current_price >= position.take_profit:
-                        logger.info(f"🎯 {symbol} 触发止盈!")
-                        # 自动平仓
+                    elif take_profit_triggered:
+                        logger.info(f"🎯 {symbol} 触发止盈! {side}单 当前价={current_price:.4f} 止盈价={take_profit:.4f}")
                         await self._execute_decision(AIDecision(
-                            action=TradeAction.CLOSE_LONG if position.side == "long" else TradeAction.CLOSE_SHORT,
+                            action=TradeAction.CLOSE_LONG if side == "long" else TradeAction.CLOSE_SHORT,
                             symbol=symbol,
-                            price=position.current_price,
+                            price=current_price,
                             quantity=position.quantity,
                             confidence=1.0,
                             reasoning="止盈触发",
                             risk_level="low"
                         ))
+                    
+                    # 检查持仓风险（无止损止盈时）
+                    else:
+                        pnl_percent = position.unrealized_pnl_percent
+                        if pnl_percent < -5:  # 亏损超过5%
+                            logger.warning(f"⚠️ {symbol} 浮亏 {pnl_percent:.2f}%，建议关注")
+                        elif pnl_percent > 10:  # 盈利超过10%
+                            logger.info(f"📈 {symbol} 浮盈 {pnl_percent:.2f}%，可考虑止盈")
                 
-                # 每10秒检查一次
-                await asyncio.sleep(10)
+                # 每30秒检查一次
+                await asyncio.sleep(30)
                 
             except Exception as e:
                 logger.error(f"监控循环错误: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
     
     async def _optimization_loop(self) -> None:
         """优化循环 - 策略自我优化"""
@@ -1458,6 +1638,10 @@ class AITradingEngine:
                         action_taken="预警通知",
                         impact=f"未实现盈亏: {pos_risk.unrealized_pnl:.2f} USDT"
                     )
+                    
+                    if self.ai_config.get("critical_risk_auto_close", False):
+                        logger.critical(f"🤖 自动风险处理: 平仓 {pos_risk.symbol}")
+                        await self._auto_close_position(pos_risk.symbol)
         
         elif account_risk.risk_level == RiskLevel.HIGH:
             for warning in account_risk.warnings:
@@ -1470,6 +1654,60 @@ class AITradingEngine:
                 action_taken="监控中",
                 impact=f"总权益: {account_risk.total_equity:.2f} USDT"
             )
+    
+    async def _auto_close_position(self, symbol: str) -> bool:
+        """自动平仓（风险控制）- 带冷却机制避免重复平仓"""
+        try:
+            import time
+            
+            # 检查冷却时间
+            current_time = time.time()
+            if symbol in self._auto_close_attempts:
+                last_attempt_time = self._auto_close_attempts[symbol]
+                if current_time - last_attempt_time < self._auto_close_cooldown:
+                    logger.warning(f"⏸️ {symbol} 自动平仓在冷却期内，跳过（距上次 {current_time - last_attempt_time:.1f}秒）")
+                    return False
+            
+            position = self.positions.get(symbol)
+            if not position:
+                logger.warning(f"⚠️ 未找到持仓 {symbol}")
+                return False
+            
+            if isinstance(position, dict):
+                logger.error(f"❌ 持仓数据格式错误: {symbol}")
+                return False
+            
+            # 记录平仓尝试时间
+            self._auto_close_attempts[symbol] = current_time
+            
+            logger.critical(f"🚨 执行自动平仓: {symbol} {position.side} {position.quantity}")
+            
+            decision = AIDecision(
+                action=TradeAction.CLOSE_LONG if position.side == "long" else TradeAction.CLOSE_SHORT,
+                symbol=symbol,
+                price=position.current_price,
+                quantity=position.quantity,
+                confidence=1.0,
+                reasoning="风险控制自动平仓",
+                risk_level="high",
+                metadata={"auto_close": True, "reason": "critical_risk"}
+            )
+            
+            result = await self._execute_decision(decision)
+            
+            if result:
+                logger.critical(f"✅ 自动平仓成功: {symbol}")
+                # 平仓成功后，从持仓列表中移除
+                if symbol in self.positions:
+                    del self.positions[symbol]
+            else:
+                logger.error(f"❌ 自动平仓失败: {symbol}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"自动平仓失败: {e}")
+            return False
     
     async def _save_risk_event_to_memory(self, event_type: str, symbol: str,
                                          description: str, action_taken: str,
@@ -1508,3 +1746,8 @@ class AITradingEngine:
             
         except Exception as e:
             logger.error(f"保存风险事件失败: {e}")
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

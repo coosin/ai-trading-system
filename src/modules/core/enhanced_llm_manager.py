@@ -450,6 +450,39 @@ class EnhancedLLMManager:
         predefined = [
             ModelConfig(
                 provider=ModelProvider.OPENAI,
+                model_id="spark-lite",
+                display_name="讯飞星火 Spark Lite",
+                base_url="https://spark-api-open.xf-yun.com/v1/chat/completions",
+                api_key=xunfei_api_key,  # 从环境变量读取
+                cost_per_input_token=0.0,
+                cost_per_output_token=0.0,
+                context_window=32768,
+                priority=12
+            ),
+            ModelConfig(
+                provider=ModelProvider.OPENAI,
+                model_id="deepseek-v3.2",
+                display_name="百度千帆 DeepSeek V3.2",
+                base_url="https://qianfan.baidubce.com/v2/coding/chat/completions",
+                api_key=qianfan_api_key,  # 从环境变量读取
+                cost_per_input_token=0.0,
+                cost_per_output_token=0.0,
+                context_window=98304,
+                priority=13
+            ),
+            ModelConfig(
+                provider=ModelProvider.OPENAI,
+                model_id="qianfan-code-latest",
+                display_name="百度千帆 qianfan-code-latest",
+                base_url="https://qianfan.baidubce.com/v2/coding/chat/completions",
+                api_key=qianfan_api_key,  # 从环境变量读取
+                cost_per_input_token=0.0,
+                cost_per_output_token=0.0,
+                context_window=98304,
+                priority=11
+            ),
+            ModelConfig(
+                provider=ModelProvider.OPENAI,
                 model_id="astron-code-latest",
                 display_name="讯飞 astron-code-latest",
                 base_url="https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
@@ -458,17 +491,6 @@ class EnhancedLLMManager:
                 cost_per_output_token=0.0,
                 context_window=32768,
                 priority=10
-            ),
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="qianfan-code-latest",
-                display_name="百度千帆 qianfan-code-latest",
-                base_url="https://qianfan.baidubce.com/v2/coding",
-                api_key=qianfan_api_key,  # 从环境变量读取
-                cost_per_input_token=0.0,
-                cost_per_output_token=0.0,
-                context_window=32768,
-                priority=9
             ),
             ModelConfig(
                 provider=ModelProvider.LOCAL,
@@ -659,6 +681,11 @@ class EnhancedLLMManager:
                 success=False,
                 error_message=f"模型提供者未初始化: {model_id}"
             )
+        
+        MAX_PROMPT_CHARS = 150000
+        if len(prompt) > MAX_PROMPT_CHARS:
+            logger.warning(f"Prompt过长 ({len(prompt)} chars), 截断至 {MAX_PROMPT_CHARS}")
+            prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n[...内容已截断...]"
         
         provider = self.providers[model_id]
         response = await provider.generate(prompt, **kwargs)

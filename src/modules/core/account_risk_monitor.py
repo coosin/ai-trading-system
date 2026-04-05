@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 
 class RiskLevel(Enum):
+
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        return True
+
     """风险等级"""
     LOW = "low"
     MEDIUM = "medium"
@@ -255,10 +260,10 @@ class AccountRiskMonitor:
     
     def _evaluate_position_risk_level(self, pos: PositionRisk) -> RiskLevel:
         """评估持仓风险等级"""
-        if pos.distance_to_liquidation <= self.risk_config["liquidation_distance_critical"]:
+        if pos.liquidation_price > 0 and pos.distance_to_liquidation <= self.risk_config["liquidation_distance_critical"]:
             return RiskLevel.CRITICAL
         
-        if pos.distance_to_liquidation <= self.risk_config["liquidation_distance_warning"]:
+        if pos.liquidation_price > 0 and pos.distance_to_liquidation <= self.risk_config["liquidation_distance_warning"]:
             return RiskLevel.HIGH
         
         if pos.unrealized_pnl_percent <= self.risk_config["unrealized_loss_critical"] * 100:
@@ -293,9 +298,9 @@ class AccountRiskMonitor:
         """生成持仓预警信息"""
         warnings = []
         
-        if pos.distance_to_liquidation <= self.risk_config["liquidation_distance_critical"]:
+        if pos.liquidation_price > 0 and pos.distance_to_liquidation <= self.risk_config["liquidation_distance_critical"]:
             warnings.append(f"🚨 {pos.symbol} 接近强平价格! 距离: {pos.distance_to_liquidation:.1%}")
-        elif pos.distance_to_liquidation <= self.risk_config["liquidation_distance_warning"]:
+        elif pos.liquidation_price > 0 and pos.distance_to_liquidation <= self.risk_config["liquidation_distance_warning"]:
             warnings.append(f"⚠️ {pos.symbol} 距离强平价格较近: {pos.distance_to_liquidation:.1%}")
         
         if pos.unrealized_pnl_percent <= self.risk_config["unrealized_loss_critical"] * 100:
@@ -410,3 +415,8 @@ class AccountRiskMonitor:
             "reward": reward,
             "risk_reward_ratio": ratio
         }
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

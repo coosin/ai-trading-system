@@ -36,6 +36,8 @@ class PredictionResult:
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
     direction: str = "neutral"
+    predicted_change: float = 0.0
+    model_id: str = ""
     
     def __post_init__(self):
         if not hasattr(self, 'direction') or not self.direction:
@@ -45,6 +47,9 @@ class PredictionResult:
                 self.direction = "short"
             else:
                 self.direction = "neutral"
+        
+        if not hasattr(self, 'predicted_change'):
+            self.predicted_change = (self.prediction - 0.5) * 2.0
 
 
 @dataclass
@@ -128,18 +133,24 @@ class LSTMModel(DeepLearningModel):
                     confidence=0.3,
                     model_type=self.model_type,
                     features_used=["fallback"],
-                    metadata={"note": "model_not_trained_using_fallback"}
+                    metadata={"note": "model_not_trained_using_fallback"},
+                    direction="neutral",
+                    predicted_change=0.0,
+                    model_id="lstm_fallback"
                 )
             
             prediction = np.random.random()
             confidence = np.random.random() * 0.3 + 0.6
+            predicted_change = (prediction - 0.5) * 0.1
             
             return PredictionResult(
                 symbol="BTC/USDT",
                 prediction=prediction,
                 confidence=confidence,
                 model_type=self.model_type,
-                features_used=["price", "volume", "rsi", "macd"]
+                features_used=["price", "volume", "rsi", "macd"],
+                predicted_change=predicted_change,
+                model_id="lstm"
             )
             
         except Exception as e:
@@ -185,18 +196,24 @@ class TransformerModel(DeepLearningModel):
                     confidence=0.3,
                     model_type=self.model_type,
                     features_used=["fallback"],
-                    metadata={"note": "model_not_trained_using_fallback"}
+                    metadata={"note": "model_not_trained_using_fallback"},
+                    direction="neutral",
+                    predicted_change=0.0,
+                    model_id="transformer_fallback"
                 )
             
             prediction = np.random.random()
             confidence = np.random.random() * 0.3 + 0.65
+            predicted_change = (prediction - 0.5) * 0.12
             
             return PredictionResult(
                 symbol="BTC/USDT",
                 prediction=prediction,
                 confidence=confidence,
                 model_type=self.model_type,
-                features_used=["price", "volume", "onchain", "sentiment"]
+                features_used=["price", "volume", "onchain", "sentiment"],
+                predicted_change=predicted_change,
+                model_id="transformer"
             )
             
         except Exception as e:
@@ -247,7 +264,10 @@ class EnsembleModel(DeepLearningModel):
                     confidence=0.3,
                     model_type=self.model_type,
                     features_used=["fallback"],
-                    metadata={"note": "model_not_trained_using_fallback"}
+                    metadata={"note": "model_not_trained_using_fallback"},
+                    direction="neutral",
+                    predicted_change=0.0,
+                    model_id="ensemble_fallback"
                 )
             
             predictions = []
@@ -266,7 +286,10 @@ class EnsembleModel(DeepLearningModel):
                     confidence=0.3,
                     model_type=self.model_type,
                     features_used=["fallback"],
-                    metadata={"note": "no_predictions_available"}
+                    metadata={"note": "no_predictions_available"},
+                    direction="neutral",
+                    predicted_change=0.0,
+                    model_id="ensemble_no_predictions"
                 )
             
             weights = np.array(self.weights[:len(predictions)])
@@ -274,13 +297,16 @@ class EnsembleModel(DeepLearningModel):
             
             final_prediction = np.average(predictions, weights=weights)
             final_confidence = np.average(confidences, weights=weights)
+            predicted_change = (final_prediction - 0.5) * 0.15
             
             return PredictionResult(
                 symbol="BTC/USDT",
                 prediction=final_prediction,
                 confidence=final_confidence,
                 model_type=self.model_type,
-                features_used=["all_features"]
+                features_used=["all_features"],
+                predicted_change=predicted_change,
+                model_id="ensemble"
             )
             
         except Exception as e:

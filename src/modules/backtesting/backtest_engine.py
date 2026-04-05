@@ -804,3 +804,7 @@ class BacktestEngine:
         
         df = pd.DataFrame(data, index=timestamps)
         return df
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

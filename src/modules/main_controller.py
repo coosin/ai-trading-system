@@ -45,6 +45,35 @@ from src.modules.simulation.simulated_market import SimulatedMarket
 from src.modules.simulation.contract_simulator import ContractSimulator
 from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 
+# 导入智能系统组件
+from src.modules.core.hierarchical_memory import HierarchicalMemoryManager
+from src.modules.skills import (
+    SkillManager,
+    SystemDiagnosisSkill,
+    PerformanceAnalysisSkill,
+    RiskAssessmentSkill,
+    OptimizationSkill,
+    AutoRepairSkill,
+    SystemMaintenanceSkill,
+    CodeEditorSkill,
+    CodeDeveloperSkill,
+    CodeReviewerSkill,
+    ExternalResourceSkill,
+    WebSearchSkill,
+    SelfLearningSkill
+)
+from src.modules.core.system_stability_analyzer import (
+    SystemStabilityAnalyzer,
+    StabilityLevel,
+    DecisionType
+)
+from src.modules.core.autonomous_developer import AutonomousDeveloper
+from src.modules.core.heartbeat_monitor import HeartbeatMonitor
+from src.modules.core.smart_notification import SmartNotificationSystem
+
+# 导入统一信息收集分析管理器
+from src.modules.data.unified_info_collector import UnifiedInfoCollector, InfoCollectorConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -268,6 +297,22 @@ class MainController:
         
         # 内存优化器
         self.memory_optimizer = None
+        
+        # 智能系统组件
+        self.hierarchical_memory = None          # 层次化记忆管理器
+        self.skill_manager = None                # 技能管理器
+        self.heartbeat_monitor = None            # 心跳监控器
+        self.smart_notification = None           # 智能通知系统
+        self.stability_analyzer = None           # 系统稳定性分析器
+        self.autonomous_developer = None         # 自主开发框架
+        
+        # 统一系统
+        self.unified_memory = None               # 统一记忆系统
+        self.unified_data_manager = None         # 统一数据管理器
+        self.unified_strategy_system = None      # 统一策略系统
+        self.unified_trade_system = None         # 统一交易系统
+        self.unified_risk_system = None          # 统一风险系统
+        self.unified_info_collector = None       # 统一信息收集器
 
         # 默认配置
         self.auto_restart_modules = True
@@ -322,43 +367,76 @@ class MainController:
         self.enhanced_llm_manager = EnhancedLLMManager()
         await self.enhanced_llm_manager.initialize(llm_config)
         
-        # 初始化AI记忆管理器
-        from src.modules.core.ai_memory import AIMemoryManager
-        from src.modules.core.enhanced_memory_manager import get_enhanced_memory_manager
+        # 初始化统一记忆系统（整合所有记忆功能）
+        from src.modules.core.unified_memory_system import UnifiedMemorySystem
         import os
-        workspace_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "workspace")
-        self.ai_memory_manager = AIMemoryManager(workspace_path=workspace_path)
-        logger.info("✅ AI记忆管理器初始化完成")
         
-        # 初始化内存优化器
-        from src.modules.core.memory_optimizer import MemoryOptimizer
-        self.memory_optimizer = MemoryOptimizer({
-            "max_memory_percent": 80,
-            "cleanup_interval": 300,
-            "cache_size_limit": 500
-        })
-        await self.memory_optimizer.start()
-        logger.info("✅ 内存优化器初始化完成")
+        workspace_path = os.environ.get("WORKSPACE_PATH", "/app/workspace")
         
-        # 初始化增强记忆管理器
+        self.unified_memory = UnifiedMemorySystem(workspace_path=workspace_path)
+        await self.unified_memory.initialize()
+        logger.info("✅ 统一记忆系统初始化完成")
+        
+        # 保留现有接口的引用（向后兼容）
+        self.ai_memory_manager = self.unified_memory.get_ai_memory()
+        self.hierarchical_memory = self.unified_memory.get_hierarchical_memory()
+        self.memory_optimizer = self.unified_memory.get_memory_optimizer()
+        logger.info("✅ 记忆系统接口已设置（向后兼容）")
+        
+        # 初始化智能系统组件
         try:
-            enhanced_memory = get_enhanced_memory_manager(workspace_path=workspace_path)
-            logger.info("✅ 增强记忆管理器初始化完成")
+            # 层次化记忆管理器已在统一记忆系统中初始化
+            logger.info("✅ 层次化记忆管理器已由统一记忆系统管理")
+            
+            # 初始化技能管理器
+            self.skill_manager = SkillManager()
+            self.skill_manager.register_skill(SystemDiagnosisSkill())
+            self.skill_manager.register_skill(PerformanceAnalysisSkill())
+            self.skill_manager.register_skill(RiskAssessmentSkill())
+            self.skill_manager.register_skill(OptimizationSkill())
+            self.skill_manager.register_skill(AutoRepairSkill())
+            self.skill_manager.register_skill(SystemMaintenanceSkill())
+            self.skill_manager.register_skill(CodeEditorSkill())
+            self.skill_manager.register_skill(CodeDeveloperSkill())
+            self.skill_manager.register_skill(CodeReviewerSkill())
+            self.skill_manager.register_skill(ExternalResourceSkill())
+            self.skill_manager.register_skill(WebSearchSkill())
+            self.skill_manager.register_skill(SelfLearningSkill())
+            logger.info(f"✅ 技能管理器初始化完成 - 已注册 {len(self.skill_manager.skills)} 个技能")
+            
+            # 初始化系统稳定性分析器
+            self.stability_analyzer = SystemStabilityAnalyzer()
+            logger.info("✅ 系统稳定性分析器已初始化")
+            
+            # 初始化自主开发框架
+            self.autonomous_developer = AutonomousDeveloper()
+            self.autonomous_developer.set_skills(
+                code_editor=self.skill_manager.get_skill("code_editor"),
+                code_developer=self.skill_manager.get_skill("code_developer"),
+                code_reviewer=self.skill_manager.get_skill("code_reviewer")
+            )
+            logger.info("✅ 自主开发框架已初始化")
+            
+            # 初始化智能通知系统
+            self.smart_notification = SmartNotificationSystem(
+                send_func=self._send_notification_handler
+            )
+            logger.info("✅ 智能通知系统初始化完成")
+            
         except Exception as e:
-            logger.warning(f"增强记忆管理器初始化失败: {e}")
-            enhanced_memory = None
+            logger.error(f"智能系统组件初始化失败: {e}", exc_info=True)
         
-        # 初始化大模型集成系统，使用已初始化的enhanced_llm_manager和ai_memory_manager
+        # 初始化大模型集成系统，使用统一记忆系统
         self.llm_integration = EnhancedLLMIntegration(
             llm_manager=self.enhanced_llm_manager,
             memory_manager=self.ai_memory_manager
         )
         
-        # 设置增强记忆管理器
-        if enhanced_memory:
-            self.llm_integration.enhanced_memory = enhanced_memory
+        # 设置统一记忆系统（增强功能）
+        if self.unified_memory:
+            self.llm_integration.unified_memory = self.unified_memory
         
-        logger.info("大模型集成系统已连接到增强大模型管理器和AI记忆管理器")
+        logger.info("大模型集成系统已连接到统一记忆系统")
         
         # 初始化AI指令执行器
         from src.modules.core.ai_command_executor import AICommandExecutor
@@ -433,6 +511,7 @@ class MainController:
         # 初始化Telegram机器人（仅当有config_manager时）
         if self.config_manager:
             telegram_config = await self.config_manager.get_config("telegram", {})
+            logger.info(f"📱 Telegram配置: {telegram_config}")
             
             # 获取代理配置
             proxy_config = await self.config_manager.get_config("proxy", {})
@@ -469,6 +548,9 @@ class MainController:
         # 初始化数据库管理器
         self.database_manager = DatabaseManager(self.config_manager)
         await self.database_manager.initialize()
+        
+        # 初始化统一系统
+        await self._init_unified_systems()
         
         # 初始化业务流程管理器
         self.business_process_manager = BusinessProcessManager(self)
@@ -522,6 +604,39 @@ class MainController:
             logger.warning(f"⚠️ 智能资金管理器初始化失败: {e}")
             self.fund_manager = None
         
+        # 初始化实时数据采集器
+        try:
+            from src.modules.data.realtime_data_collector import RealTimeDataCollector
+            self.realtime_data_collector = RealTimeDataCollector(
+                business_process_manager=self.business_process_manager
+            )
+            await self.realtime_data_collector.initialize()
+            logger.info("✅ 实时数据采集器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 实时数据采集器初始化失败: {e}")
+            self.realtime_data_collector = None
+        
+        # 初始化情感分析器
+        try:
+            from src.modules.intelligence.sentiment_analyzer import SentimentAnalyzer
+            sentiment_config = {
+                "sources": ["twitter", "reddit", "news", "telegram"],
+                "model_config": {
+                    "threshold": 0.3,
+                    "window_size": 60,
+                    "min_confidence": 0.5
+                }
+            }
+            self.sentiment_analyzer = SentimentAnalyzer(
+                db_manager=self.database_manager,
+                config=sentiment_config
+            )
+            await self.sentiment_analyzer.initialize()
+            logger.info("✅ 情感分析器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 情感分析器初始化失败: {e}")
+            self.sentiment_analyzer = None
+        
         # 初始化全智能AI交易引擎
         from src.modules.core.ai_trading_engine import AITradingEngine
         self.ai_trading_engine = AITradingEngine(self)
@@ -536,6 +651,26 @@ class MainController:
         if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'risk_monitor'):
             self.risk_monitor = self.ai_trading_engine.risk_monitor
             logger.info("✅ 风险监控引用已设置")
+        
+        # 添加历史数据存储引用
+        if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'data_storage'):
+            self.historical_data_storage = self.ai_trading_engine.data_storage
+            logger.info("✅ 历史数据存储引用已设置")
+        
+        # 添加市场分析器引用
+        if self.unified_info_collector and hasattr(self.unified_info_collector, 'market_analyzer'):
+            self.market_analyzer = self.unified_info_collector.market_analyzer
+            logger.info("✅ 市场分析器引用已设置")
+        
+        # 添加链上数据集成器引用
+        if self.unified_info_collector and hasattr(self.unified_info_collector, 'onchain_integrator'):
+            self.onchain_integrator = self.unified_info_collector.onchain_integrator
+            logger.info("✅ 链上数据集成器引用已设置")
+        
+        # 添加回测引擎引用
+        if hasattr(self, 'enhanced_backtester') and self.enhanced_backtester:
+            self.backtest_engine = self.enhanced_backtester
+            logger.info("✅ 回测引擎引用已设置")
 
         # 初始化AI核心决策引擎 - AI是交易决策的核心
         try:
@@ -550,6 +685,76 @@ class MainController:
             logger.error(f"❌ AI核心决策引擎初始化失败: {e}")
             self.ai_core = None
             self.active_trader = None
+        
+        # 初始化统一信息收集分析管理器
+        try:
+            info_collector_config = InfoCollectorConfig(
+                enable_realtime_collection=True,
+                enable_market_analysis=True,
+                enable_sentiment_analysis=True,
+                enable_onchain_analysis=True,
+                symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", 
+                        "XRP/USDT", "ADA/USDT", "DOGE/USDT", "DOT/USDT"]
+            )
+            self.unified_info_collector = UnifiedInfoCollector(
+                main_controller=self,
+                config=info_collector_config
+            )
+            await self.unified_info_collector.initialize()
+            logger.info("✅ 统一信息收集分析管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 统一信息收集分析管理器初始化失败: {e}")
+            self.unified_info_collector = None
+        
+        # 初始化缓存管理器
+        try:
+            from src.modules.core.cache_manager import CacheManager
+            self.cache_manager = CacheManager()
+            await self.cache_manager.initialize()
+            logger.info("✅ 缓存管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 缓存管理器初始化失败: {e}")
+            self.cache_manager = None
+        
+        # 初始化日志管理器
+        try:
+            from src.modules.core.log_manager import LogManager
+            self.log_manager = LogManager()
+            await self.log_manager.initialize()
+            logger.info("✅ 日志管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 日志管理器初始化失败: {e}")
+            self.log_manager = None
+        
+        # 初始化系统监控器
+        try:
+            from src.modules.core.system_monitor import SystemMonitor
+            self.system_monitor = SystemMonitor()
+            await self.system_monitor.initialize()
+            logger.info("✅ 系统监控器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 系统监控器初始化失败: {e}")
+            self.system_monitor = None
+        
+        # 初始化风险管理器
+        try:
+            from src.modules.core.risk_manager import RiskManager
+            self.risk_manager = RiskManager()
+            await self.risk_manager.initialize()
+            logger.info("✅ 风险管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 风险管理器初始化失败: {e}")
+            self.risk_manager = None
+        
+        # 初始化API服务器
+        try:
+            from src.modules.api.server import APIServer
+            self.api_server = APIServer(main_controller=self)
+            await self.api_server.initialize()
+            logger.info("✅ API服务器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ API服务器初始化失败: {e}")
+            self.api_server = None
 
         # 注册默认事件处理器
         self._register_default_handlers()
@@ -560,6 +765,82 @@ class MainController:
 
         self._initialized = True
         logger.info("主控制器初始化完成")
+
+    async def _init_unified_systems(self):
+        """初始化统一系统"""
+        try:
+            logger.info("🔧 初始化统一系统...")
+            
+            # 初始化统一数据管理器（复用已存在的组件）
+            try:
+                from src.modules.data.unified_data_manager import UnifiedDataManager
+                self.unified_data_manager = UnifiedDataManager()
+                # 复用已初始化的组件
+                if self.data_storage:
+                    self.unified_data_manager.storage = self.data_storage
+                if self.backup_manager:
+                    self.unified_data_manager.backup = self.backup_manager
+                await self.unified_data_manager.initialize()
+                logger.info("✅ 统一数据管理器已初始化（复用现有组件）")
+            except Exception as e:
+                logger.warning(f"⚠️ 统一数据管理器初始化失败: {e}")
+                self.unified_data_manager = None
+            
+            # 初始化统一策略系统（复用已存在的组件）
+            try:
+                from src.modules.strategies.unified_strategy_system import UnifiedStrategySystem
+                self.unified_strategy_system = UnifiedStrategySystem()
+                # 复用已初始化的组件
+                if self.strategy_manager:
+                    self.unified_strategy_system.manager = self.strategy_manager
+                if self.strategy_evaluator:
+                    self.unified_strategy_system.evaluator = self.strategy_evaluator
+                if self.portfolio_optimizer:
+                    if self.unified_strategy_system.optimizer:
+                        self.unified_strategy_system.optimizer["portfolio"] = self.portfolio_optimizer
+                if self.parameter_optimizer:
+                    if self.unified_strategy_system.optimizer:
+                        self.unified_strategy_system.optimizer["parameter"] = self.parameter_optimizer
+                if self.enhanced_backtester:
+                    self.unified_strategy_system.backtester = self.enhanced_backtester
+                await self.unified_strategy_system.initialize()
+                logger.info("✅ 统一策略系统已初始化（复用现有组件）")
+            except Exception as e:
+                logger.warning(f"⚠️ 统一策略系统初始化失败: {e}")
+                self.unified_strategy_system = None
+            
+            # 初始化统一交易系统
+            try:
+                from src.modules.trading.unified_trade_system import UnifiedTradeSystem
+                self.unified_trade_system = UnifiedTradeSystem()
+                # 复用已初始化的组件
+                if self.trading_monitor:
+                    self.unified_trade_system.monitor = self.trading_monitor
+                await self.unified_trade_system.initialize()
+                logger.info("✅ 统一交易系统已初始化（复用现有组件）")
+            except Exception as e:
+                logger.warning(f"⚠️ 统一交易系统初始化失败: {e}")
+                self.unified_trade_system = None
+            
+            # 初始化统一风险系统
+            try:
+                from src.modules.risk.unified_risk_system import UnifiedRiskSystem
+                self.unified_risk_system = UnifiedRiskSystem()
+                # 复用已初始化的组件
+                if hasattr(self, 'intelligent_monitoring') and self.intelligent_monitoring:
+                    self.unified_risk_system.monitor = self.intelligent_monitoring
+                if hasattr(self, 'portfolio_optimizer') and self.portfolio_optimizer:
+                    self.unified_risk_system.optimizer = self.portfolio_optimizer
+                await self.unified_risk_system.initialize()
+                logger.info("✅ 统一风险系统已初始化（复用现有组件）")
+            except Exception as e:
+                logger.warning(f"⚠️ 统一风险系统初始化失败: {e}")
+                self.unified_risk_system = None
+            
+            logger.info("✅ 统一系统初始化完成")
+            
+        except Exception as e:
+            logger.error(f"❌ 统一系统初始化失败: {e}")
 
     async def cleanup(self) -> None:
         """
@@ -666,6 +947,23 @@ class MainController:
             await self.fund_manager.shutdown()
             self.fund_manager = None
             
+        # 清理统一系统
+        if hasattr(self, 'unified_data_manager') and self.unified_data_manager:
+            await self.unified_data_manager.cleanup()
+            self.unified_data_manager = None
+        
+        if hasattr(self, 'unified_strategy_system') and self.unified_strategy_system:
+            await self.unified_strategy_system.cleanup()
+            self.unified_strategy_system = None
+        
+        if hasattr(self, 'unified_trade_system') and self.unified_trade_system:
+            await self.unified_trade_system.cleanup()
+            self.unified_trade_system = None
+        
+        if hasattr(self, 'unified_risk_system') and self.unified_risk_system:
+            await self.unified_risk_system.cleanup()
+            self.unified_risk_system = None
+            
         self._initialized = False
 
         logger.info("主控制器清理完成")
@@ -704,6 +1002,9 @@ class MainController:
                     self._running = True
                     logger.info("系统启动成功")
                     
+                    # 验证关键模块连接状态
+                    await self._verify_module_connections()
+                    
                     # 启动全智能AI交易引擎
                     if self.ai_trading_engine:
                         await self.ai_trading_engine.start()
@@ -713,6 +1014,29 @@ class MainController:
                     if hasattr(self, 'ai_core') and self.ai_core:
                         await self.ai_core.start()
                         logger.info("🧠 AI核心决策引擎已启动 - AI全权决策模式")
+                    
+                    # 启动心跳监控器
+                    if not self.heartbeat_monitor and self.ai_trading_engine and self.skill_manager:
+                        try:
+                            self.heartbeat_monitor = HeartbeatMonitor(
+                                trading_engine=self.ai_trading_engine,
+                                skill_manager=self.skill_manager,
+                                memory_manager=self.hierarchical_memory,
+                                notification_handler=self._send_notification_handler,
+                                interval=1800  # 30分钟
+                            )
+                            logger.info("✅ 心跳监控器已初始化")
+                        except Exception as e:
+                            logger.error(f"心跳监控器初始化失败: {e}")
+                    
+                    # 启动心跳监控任务
+                    if self.heartbeat_monitor:
+                        try:
+                            heartbeat_task = asyncio.create_task(self.heartbeat_monitor.start())
+                            self._tasks.append(heartbeat_task)
+                            logger.info("💓 心跳监控器已启动 - 主动式系统监控")
+                        except Exception as e:
+                            logger.error(f"心跳监控器启动失败: {e}")
 
                     # 发送心跳事件
                     await self.emit_event(
@@ -754,6 +1078,40 @@ class MainController:
                 await self.emit_event(
                     EventType.SYSTEM_STOP, "controller", {"timestamp": datetime.now().isoformat()}
                 )
+                
+                # 停止心跳监控器
+                if self.heartbeat_monitor:
+                    try:
+                        self.heartbeat_monitor.stop()
+                        logger.info("💔 心跳监控器已停止")
+                    except Exception as e:
+                        logger.error(f"停止心跳监控器失败: {e}")
+                
+                # 清空通知队列
+                if self.smart_notification:
+                    try:
+                        await self.smart_notification.flush()
+                        logger.info("📢 通知队列已清空")
+                    except Exception as e:
+                        logger.error(f"清空通知队列失败: {e}")
+                
+                # 保存最终记忆
+                if self.hierarchical_memory:
+                    try:
+                        summary = f"""# 系统关闭总结 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## 运行统计
+- 运行时间: {datetime.now() - self.start_time if self.start_time else 'N/A'}
+- 处理事件: {self.metrics.get('total_events', 0)}
+- 错误次数: {self.metrics.get('total_errors', 0)}
+
+## 系统状态
+- 最终状态: {self.system_status.value}
+"""
+                        await self.hierarchical_memory.save_daily_memory(summary)
+                        logger.info("💾 最终记忆已保存")
+                    except Exception as e:
+                        logger.error(f"保存最终记忆失败: {e}")
 
                 # 停止所有模块（逆序）
                 await self.stop_all_modules(reverse=True)
@@ -1058,6 +1416,53 @@ class MainController:
         
         logger.debug(f"注册事件处理器: {event_type.value} -> {handler.__name__}")
 
+    async def _verify_module_connections(self):
+        """验证关键模块连接状态"""
+        logger.info("🔍 验证模块连接状态...")
+        
+        # 定义关键模块检查列表
+        critical_modules = {
+            "核心系统": ["event_system", "data_quality_system", "fault_tolerance", "enhanced_llm_manager"],
+            "AI决策": ["llm_integration", "ai_trading_engine", "ai_core"],
+            "智能系统": ["hierarchical_memory", "skill_manager", "smart_notification"],
+            "交易系统": ["trading_monitor", "strategy_manager", "risk_monitor"],
+            "数据存储": ["data_storage", "backup_manager", "database_manager"],
+            "通知系统": ["telegram_bot", "natural_language_interface"],
+            "安全风控": ["emergency_stop", "intelligent_monitoring", "security_manager", "fund_manager"],
+            "信息收集分析": ["unified_info_collector"],
+        }
+        
+        total_checked = 0
+        connected_count = 0
+        missing_modules = []
+        
+        for category, modules in critical_modules.items():
+            for module_name in modules:
+                total_checked += 1
+                module = getattr(self, module_name, None)
+                
+                if module is not None:
+                    connected_count += 1
+                else:
+                    missing_modules.append((category, module_name))
+        
+        # 计算连接率
+        connection_rate = (connected_count / total_checked * 100) if total_checked > 0 else 0
+        
+        logger.info(f"📊 模块连接状态: {connected_count}/{total_checked} ({connection_rate:.1f}%)")
+        
+        # 如果有缺失的关键模块，记录警告
+        if missing_modules:
+            logger.warning(f"⚠️ 缺失模块 ({len(missing_modules)}):")
+            for category, module_name in missing_modules[:5]:  # 只显示前5个
+                logger.warning(f"   - [{category}] {module_name}")
+        
+        # 如果连接率低于80%，发出警告
+        if connection_rate < 80:
+            logger.warning(f"⚠️ 模块连接率较低 ({connection_rate:.1f}%)，请检查系统配置")
+        else:
+            logger.info(f"✅ 模块连接状态良好 ({connection_rate:.1f}%)")
+
     async def emit_event(
         self, event_type: EventType, source: str, data: Dict[str, Any], priority: int = 0
     ) -> None:
@@ -1205,6 +1610,296 @@ class MainController:
 
         events.sort(key=lambda e: e.timestamp, reverse=True)
         return [e.to_dict() for e in events[:limit]]
+    
+    async def check_system_stability(self) -> Dict[str, Any]:
+        """
+        检查系统稳定性
+        
+        Returns:
+            稳定性分析结果
+        """
+        if not self.stability_analyzer:
+            return {"error": "稳定性分析器未初始化"}
+        
+        context = {
+            "main_controller": self,
+            "trading_engine": self.ai_trading_engine if hasattr(self, 'ai_trading_engine') else None
+        }
+        
+        metrics = await self.stability_analyzer.analyze(context)
+        decision = await self.stability_analyzer.make_decision(metrics, context)
+        
+        return {
+            "stability_metrics": metrics.to_dict(),
+            "decision": decision.to_dict(),
+            "trend": self.stability_analyzer.get_stability_trend()
+        }
+    
+    async def execute_stability_decision(self) -> bool:
+        """
+        执行稳定性决策
+        
+        Returns:
+            是否执行成功
+        """
+        if not self.stability_analyzer:
+            logger.warning("稳定性分析器未初始化")
+            return False
+        
+        last_decision = self.stability_analyzer.get_last_decision()
+        if not last_decision:
+            return False
+        
+        context = {
+            "main_controller": self,
+            "trading_engine": self.ai_trading_engine if hasattr(self, 'ai_trading_engine') else None
+        }
+        
+        return await self.stability_analyzer.execute_decision(last_decision, context)
+    
+    async def perform_system_maintenance(self) -> Dict[str, Any]:
+        """
+        执行系统维护
+        
+        Returns:
+            维护结果
+        """
+        if not self.skill_manager:
+            return {"error": "技能管理器未初始化"}
+        
+        system_maintenance_skill = self.skill_manager.get_skill("system_maintenance")
+        if not system_maintenance_skill:
+            return {"error": "系统维护技能未注册"}
+        
+        context = {
+            "main_controller": self,
+            "trading_engine": self.ai_trading_engine if hasattr(self, 'ai_trading_engine') else None
+        }
+        
+        result = await system_maintenance_skill.execute(context)
+        
+        return result.to_dict()
+    
+    def get_ai_capabilities(self) -> Dict[str, Any]:
+        """
+        获取AI能力列表
+        
+        Returns:
+            AI能力信息
+        """
+        capabilities = {
+            "skills": [],
+            "stability_analysis": False,
+            "auto_maintenance": False,
+            "decision_making": False,
+            "code_editing": False,
+            "code_development": False,
+            "code_review": False,
+            "autonomous_development": False
+        }
+        
+        if self.skill_manager:
+            capabilities["skills"] = [
+                {
+                    "name": skill.name,
+                    "description": skill.description,
+                    "priority": skill.priority.value if hasattr(skill.priority, 'value') else str(skill.priority)
+                }
+                for skill in self.skill_manager.skills.values()
+            ]
+            capabilities["auto_maintenance"] = any(
+                s.name == "system_maintenance" for s in self.skill_manager.skills.values()
+            )
+            capabilities["code_editing"] = any(
+                s.name == "code_editor" for s in self.skill_manager.skills.values()
+            )
+            capabilities["code_development"] = any(
+                s.name == "code_developer" for s in self.skill_manager.skills.values()
+            )
+            capabilities["code_review"] = any(
+                s.name == "code_reviewer" for s in self.skill_manager.skills.values()
+            )
+        
+        if self.stability_analyzer:
+            capabilities["stability_analysis"] = True
+            capabilities["decision_making"] = True
+            
+            last_analysis = self.stability_analyzer.get_last_analysis()
+            if last_analysis:
+                capabilities["current_stability"] = last_analysis.to_dict()
+            
+            last_decision = self.stability_analyzer.get_last_decision()
+            if last_decision:
+                capabilities["last_decision"] = last_decision.to_dict()
+        
+        if self.autonomous_developer:
+            capabilities["autonomous_development"] = True
+            capabilities["developer_tasks"] = self.autonomous_developer.get_all_tasks()
+        
+        return capabilities
+    
+    async def create_development_task(
+        self,
+        name: str,
+        description: str,
+        requirements: List[str]
+    ) -> Dict[str, Any]:
+        """
+        创建开发任务
+        
+        Args:
+            name: 任务名称
+            description: 任务描述
+            requirements: 需求列表
+            
+        Returns:
+            任务信息
+        """
+        if not self.autonomous_developer:
+            return {"error": "自主开发框架未初始化"}
+        
+        task = await self.autonomous_developer.create_task(
+            name=name,
+            description=description,
+            requirements=requirements
+        )
+        
+        return task.to_dict()
+    
+    async def execute_development_task(self, task_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        执行开发任务
+        
+        Args:
+            task_id: 任务ID，如果为None则执行当前任务
+            
+        Returns:
+            执行结果
+        """
+        if not self.autonomous_developer:
+            return {"error": "自主开发框架未初始化"}
+        
+        task = None
+        if task_id:
+            for t in self.autonomous_developer.tasks:
+                if t.task_id == task_id:
+                    task = t
+                    break
+        
+        result = await self.autonomous_developer.execute_task(task)
+        
+        return result.to_dict()
+    
+    async def edit_code(
+        self,
+        file_path: str,
+        edit_type: str,
+        content: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        description: str = ""
+    ) -> Dict[str, Any]:
+        """
+        编辑代码
+        
+        Args:
+            file_path: 文件路径
+            edit_type: 编辑类型 (insert/delete/replace)
+            content: 新内容
+            start_line: 起始行
+            end_line: 结束行
+            description: 描述
+            
+        Returns:
+            编辑结果
+        """
+        if not self.skill_manager:
+            return {"error": "技能管理器未初始化"}
+        
+        code_editor = self.skill_manager.get_skill("code_editor")
+        if not code_editor:
+            return {"error": "代码编辑技能未注册"}
+        
+        from src.modules.skills.code_editor_skill import EditOperation
+        
+        context = {
+            "edit_request": {
+                "operation": "edit",
+                "file_path": file_path,
+                "edit_type": edit_type,
+                "content": content,
+                "start_line": start_line,
+                "end_line": end_line,
+                "description": description
+            }
+        }
+        
+        result = await code_editor.execute(context)
+        
+        return result.to_dict()
+    
+    async def review_code(self, file_path: str) -> Dict[str, Any]:
+        """
+        审查代码
+        
+        Args:
+            file_path: 文件路径
+            
+        Returns:
+            审查结果
+        """
+        if not self.skill_manager:
+            return {"error": "技能管理器未初始化"}
+        
+        code_reviewer = self.skill_manager.get_skill("code_reviewer")
+        if not code_reviewer:
+            return {"error": "代码审查技能未注册"}
+        
+        context = {
+            "review_request": {
+                "operation": "review_file",
+                "file_path": file_path
+            }
+        }
+        
+        result = await code_reviewer.execute(context)
+        
+        return result.to_dict()
+    
+    async def generate_code(
+        self,
+        dev_type: str,
+        spec: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        生成代码
+        
+        Args:
+            dev_type: 开发类型
+            spec: 规格说明
+            
+        Returns:
+            生成结果
+        """
+        if not self.skill_manager:
+            return {"error": "技能管理器未初始化"}
+        
+        code_developer = self.skill_manager.get_skill("code_developer")
+        if not code_developer:
+            return {"error": "代码开发技能未注册"}
+        
+        context = {
+            "dev_request": {
+                "operation": "create",
+                "dev_type": dev_type,
+                "spec": spec
+            }
+        }
+        
+        result = await code_developer.execute(context)
+        
+        return result.to_dict()
+    
     
     async def check_data_quality(self, data_source: str, data: Any) -> Dict[str, Any]:
         """
@@ -2375,6 +3070,39 @@ class MainController:
                 await asyncio.sleep(self.health_check_interval)
 
         logger.info("健康检查工作线程停止")
+
+    async def _send_notification_handler(self, title: str, message: str, priority: str = "medium"):
+        """
+        通知处理方法 - 统一的通知发送接口
+        
+        Args:
+            title: 通知标题
+            message: 通知内容
+            priority: 优先级
+        """
+        try:
+            # 发送到Telegram
+            if self.telegram_bot:
+                try:
+                    await self.telegram_bot.send_message(
+                        f"{title}\n\n{message}"
+                    )
+                    logger.debug(f"Telegram通知已发送: {title}")
+                except Exception as e:
+                    logger.error(f"Telegram通知发送失败: {e}")
+            
+            # 记录到日志
+            log_level = {
+                "critical": logging.CRITICAL,
+                "high": logging.WARNING,
+                "medium": logging.INFO,
+                "low": logging.DEBUG
+            }.get(priority.lower(), logging.INFO)
+            
+            logger.log(log_level, f"📢 [{priority.upper()}] {title}: {message[:100]}")
+            
+        except Exception as e:
+            logger.error(f"通知处理失败: {e}")
 
     def _register_default_handlers(self) -> None:
         """注册默认事件处理器"""

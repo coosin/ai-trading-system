@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 class UpdateTrigger(Enum):
+
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        return True
+
     PERFORMANCE_DEGRADATION = "performance_degradation"
     SCHEDULED = "scheduled"
     DATA_DRIFT = "data_drift"

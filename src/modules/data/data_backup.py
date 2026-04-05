@@ -12,6 +12,11 @@ from concurrent.futures import ThreadPoolExecutor
 logger = logging.getLogger(__name__)
 
 class DataBackupManager:
+
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        return True
+
     """数据备份管理器"""
     
     def __init__(self, base_path: str = "./data", backup_path: str = "./backups"):
@@ -512,3 +517,8 @@ if __name__ == "__main__":
         backup_manager.close()
     
     asyncio.run(main())
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

@@ -134,7 +134,7 @@ class OpenAIProvider(LLMProvider):
 
 请以JSON格式返回分析结果。"""
         
-        response = await self.generate(prompt, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         return safe_json_parse(response)
     
@@ -155,7 +155,7 @@ class OpenAIProvider(LLMProvider):
 
 请以JSON格式返回策略结果。"""
         
-        response = await self.generate(prompt, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         return safe_json_parse(response)
 
@@ -210,7 +210,7 @@ class AnthropicProvider(LLMProvider):
 
 请以JSON格式返回分析结果。"""
         
-        response = await self.generate(prompt, max_tokens=2000)
+        response = await self.generate(prompt, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         return safe_json_parse(response)
     
@@ -231,7 +231,7 @@ class AnthropicProvider(LLMProvider):
 
 请以JSON格式返回策略结果。"""
         
-        response = await self.generate(prompt, max_tokens=2000)
+        response = await self.generate(prompt, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         try:
             import json
@@ -282,7 +282,7 @@ class LocalLLMProvider(LLMProvider):
 
 请以JSON格式返回分析结果。"""
         
-        response = await self.generate(prompt, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         try:
             import json
@@ -308,7 +308,7 @@ class LocalLLMProvider(LLMProvider):
 
 请以JSON格式返回策略结果。"""
         
-        response = await self.generate(prompt, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         try:
             import json
@@ -362,8 +362,15 @@ class EnhancedLLMIntegration:
         self._initialized = True
         logger.info("增强大模型集成已设置外部LLM管理器")
     
-    async def generate(self, prompt: str, provider: Optional[str] = None, **kwargs):
-        """生成文本（带记忆注入）"""
+    async def generate(self, prompt: str, provider: Optional[str] = None, 
+                       is_user_input: bool = True, **kwargs):
+        """生成文本（带记忆注入）
+        
+        Args:
+            prompt: 输入提示词
+            provider: 模型提供商
+            is_user_input: 是否是真正的用户输入（False表示系统生成的提示词，不保存到记忆）
+        """
         from src.modules.core.enhanced_llm_manager import LLMResponse
         
         if not self.llm_manager:
@@ -377,32 +384,33 @@ class EnhancedLLMIntegration:
         
         memory_context = ""
         
-        if self.enhanced_memory:
-            try:
-                memory_context = self.enhanced_memory.build_memory_context(prompt)
-                self.enhanced_memory.add_message("user", prompt)
-            except Exception as e:
-                logger.warning(f"增强记忆注入失败: {e}")
-        elif self.memory_manager:
-            try:
-                memory_context = await self.memory_manager.build_memory_context(prompt)
-                await self.memory_manager.add_short_term_memory(
-                    f"用户: {prompt}",
-                    importance=0.7
-                )
-            except Exception as e:
-                logger.warning(f"记忆注入失败: {e}")
+        if is_user_input:
+            if self.enhanced_memory:
+                try:
+                    memory_context = self.enhanced_memory.build_memory_context(prompt)
+                    self.enhanced_memory.add_message("user", prompt)
+                except Exception as e:
+                    logger.warning(f"增强记忆注入失败: {e}")
+            elif self.memory_manager:
+                try:
+                    memory_context = await self.memory_manager.build_memory_context(prompt)
+                    await self.memory_manager.add_short_term_memory(
+                        f"用户: {prompt}",
+                        importance=0.7
+                    )
+                except Exception as e:
+                    logger.warning(f"记忆注入失败: {e}")
         
         if memory_context:
-            full_prompt = f"""请根据以下记忆和当前问题进行回答。
-
-【记忆信息】
+            full_prompt = f"""[系统记忆上下文]
 {memory_context}
 
-【当前问题】
+---
+
+[当前对话]
 {prompt}
 
-请参考记忆信息来回答当前问题，保持回答的连贯性和一致性。记住用户的重要偏好和设置。如果用户表达了新的偏好或设置，请记住它们。"""
+请根据你的核心信念和身份定义，以专业、主动的方式回应用户。记住用户的偏好和指令，并在回答中体现你的专业性和主动性。"""
         else:
             full_prompt = prompt
         
@@ -416,19 +424,20 @@ class EnhancedLLMIntegration:
         )
         
         if response.success:
-            if self.enhanced_memory:
-                try:
-                    self.enhanced_memory.add_message("assistant", response.content)
-                except Exception as e:
-                    logger.warning(f"增强记忆记录AI回复失败: {e}")
-            elif self.memory_manager:
-                try:
-                    await self.memory_manager.add_short_term_memory(
-                        f"AI: {response.content[:500]}...",
-                        importance=0.8
-                    )
-                except Exception as e:
-                    logger.warning(f"保存AI回复记忆失败: {e}")
+            if is_user_input:
+                if self.enhanced_memory:
+                    try:
+                        self.enhanced_memory.add_message("assistant", response.content)
+                    except Exception as e:
+                        logger.warning(f"增强记忆记录AI回复失败: {e}")
+                elif self.memory_manager:
+                    try:
+                        await self.memory_manager.add_short_term_memory(
+                            f"AI: {response.content[:500]}...",
+                            importance=0.8
+                        )
+                    except Exception as e:
+                        logger.warning(f"保存AI回复记忆失败: {e}")
         
         return response
     
@@ -450,7 +459,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回分析结果。"""
 
-        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         if response.success:
             try:
@@ -485,7 +494,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回策略。"""
 
-        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         if response.success:
             try:
@@ -520,7 +529,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回分析结果。"""
 
-        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         if response.success:
             try:
@@ -554,7 +563,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回风险评估。"""
 
-        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000)
+        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000, is_user_input=False)
         
         if response.success:
             try:
@@ -605,7 +614,7 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回交易信号。"""
         
-        response = await self.generate(prompt, provider, temperature=0.5, max_tokens=1000)
+        response = await self.generate(prompt, provider, temperature=0.5, max_tokens=1000, is_user_input=False)
         
         try:
             signal = safe_json_parse(response.content)

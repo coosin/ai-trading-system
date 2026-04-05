@@ -172,7 +172,7 @@ notifications:
 telegram:
   enabled: true
   bot_token: "8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60"  # Telegram Bot Token
-  chat_ids: []  # 接收通知的聊天ID列表
+  chat_ids: [6716232147]  # 接收通知的聊天ID列表
   allowed_users: []  # 允许使用机器人的用户名列表（为空则允许所有）
   
   # 通知设置
@@ -215,14 +215,30 @@ proxy:
   enabled: true
   use_global_proxy: true
   global_proxy:
-    name: "clash"
+    name: "clash-http"
     proxy_type: "http"  # http, https, socks5, socks4
-    host: "127.0.0.1"
+    host: "host.docker.internal"
     port: 7890
     username: null
     password: null
     enabled: true
-  proxies: []
+  proxies:
+    - name: "clash-http"
+      proxy_type: "http"
+      host: "host.docker.internal"
+      port: 7890
+      enabled: true
+      priority: 0
+      timeout: 30
+      retry_count: 3
+    - name: "clash-socks5"
+      proxy_type: "socks5"
+      host: "host.docker.internal"
+      port: 7891
+      enabled: true
+      priority: 1
+      timeout: 30
+      retry_count: 3
   whitelist_domains: []  # 仅对这些域名使用代理
   blacklist_domains: []  # 不对这些域名使用代理
 

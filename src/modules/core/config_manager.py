@@ -366,7 +366,7 @@ class ConfigManager:
             # 合并配置
             for section, values in config_data.items():
                 if not isinstance(values, dict):
-                    logger.warning(f"配置段必须为字典: {section}")
+                    self._config[section] = values
                     continue
 
                 if section not in self._config:

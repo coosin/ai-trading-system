@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 
 class FailureType(str, Enum):
+
+    async def initialize(self) -> bool:
+        """初始化模块"""
+        return True
+
     """故障类型"""
     NETWORK_ERROR = "network_error"
     API_TIMEOUT = "api_timeout"
@@ -546,3 +551,8 @@ class AutoRecoverySystem:
             return False
         
         return True
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

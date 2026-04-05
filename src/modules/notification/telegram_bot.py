@@ -11,6 +11,7 @@ Telegram机器人模块 - 纯自然语言交互
 import asyncio
 import logging
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable, Awaitable
@@ -46,8 +47,19 @@ class TelegramBot:
     def __init__(self, config: Dict[str, Any], nli=None, llm_integration=None, main_controller=None):
         self.config = config
         self.enabled = config.get("enabled", False)
-        self.bot_token = config.get("bot_token", "")
-        self.chat_ids = config.get("chat_ids", [])
+        
+        # 支持从环境变量读取
+        if config.get("bot_token_env"):
+            self.bot_token = os.environ.get(config["bot_token_env"], "")
+        else:
+            self.bot_token = config.get("bot_token", "")
+        
+        if config.get("chat_ids_env"):
+            chat_id_str = os.environ.get(config["chat_ids_env"], "")
+            logger.info(f"📱 从环境变量 {config['chat_ids_env']} 读取 chat_ids: {chat_id_str}")
+            self.chat_ids = [int(x.strip()) for x in chat_id_str.split(",") if x.strip()]
+        else:
+            self.chat_ids = config.get("chat_ids", [])
         
         self.nli = nli
         self.llm_integration = llm_integration
@@ -61,7 +73,7 @@ class TelegramBot:
         
         self.message_handlers: List[Callable] = []
         
-        logger.info("Telegram机器人初始化完成 - 纯自然语言模式")
+        logger.info(f"Telegram机器人初始化完成 - enabled={self.enabled}, chat_ids={self.chat_ids}")
 
     async def initialize(self):
         """初始化"""
@@ -69,7 +81,8 @@ class TelegramBot:
             logger.info("Telegram机器人未启用")
             return
         
-        proxy = self.config.get("proxy") or "http://127.0.0.1:7890"
+        self.proxy = self.config.get("proxy") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "http://host.docker.internal:7890"
+        logger.info(f"📱 Telegram使用代理: {self.proxy}")
         
         self.session = aiohttp.ClientSession()
         
@@ -98,13 +111,18 @@ class TelegramBot:
             except asyncio.CancelledError:
                 pass
         logger.info("Telegram机器人已停止")
+    
+    async def shutdown(self):
+        """关闭Telegram机器人"""
+        await self.stop()
+        await self.cleanup()
+        logger.info("Telegram机器人已关闭")
 
     async def _get_me(self) -> Optional[Dict]:
         """获取机器人信息"""
         try:
             url = f"{self.base_url}/getMe"
-            proxy = "http://127.0.0.1:7890"
-            async with self.session.get(url, proxy=proxy) as resp:
+            async with self.session.get(url, proxy=self.proxy) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("ok"):
@@ -134,8 +152,7 @@ class TelegramBot:
                 "timeout": 30
             }
             
-            proxy = "http://127.0.0.1:7890"
-            async with self.session.get(url, params=params, proxy=proxy) as resp:
+            async with self.session.get(url, params=params, proxy=self.proxy) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("ok"):
@@ -182,14 +199,20 @@ class TelegramBot:
     async def _process_natural_language(self, message: TelegramMessage):
         """处理自然语言消息 - 直接调用AI核心决策引擎"""
         try:
-            # 优先使用AI核心决策引擎 - 这是唯一的AI系统
+            logger.info(f"📩 收到消息 [{message.from_user}]: {message.text[:100] if len(message.text) > 100 else message.text}")
+            
             ai_core = getattr(self.main_controller, 'ai_core', None) if self.main_controller else None
             
+            logger.info(f"Telegram处理消息: main_controller={'存在' if self.main_controller else '不存在'}, ai_core={'存在' if ai_core else '不存在'}")
+            
             if ai_core:
-                # 直接调用AI核心处理用户指令
+                logger.info(f"🤖 调用ai_core.process_user_command: {message.text[:50]}")
                 result = await ai_core.process_user_command(message.text)
                 
                 response_text = result.get("response", "处理完成")
+                success = result.get("success", False)
+                
+                logger.info(f"📤 AI响应: success={success}, response长度={len(response_text)}")
                 
                 await self._send_message(TelegramResponse(
                     chat_id=message.chat_id,
@@ -197,6 +220,7 @@ class TelegramBot:
                     reply_to_message_id=message.message_id
                 ))
             elif self.llm_integration:
+                logger.info(f"Telegram使用llm_integration处理消息")
                 system_context = await self._get_system_context()
                 
                 prompt = f"""你是一个全自主的量化交易AI助手。用户通过Telegram与你交流。
@@ -245,7 +269,7 @@ class TelegramBot:
             ))
 
     async def _get_system_context(self) -> str:
-        """获取系统上下文"""
+        """获取系统上下文 - 包含实时持仓信息"""
         context_parts = [
             "系统状态:",
             "- 模式: 实盘交易",
@@ -257,58 +281,166 @@ class TelegramBot:
         if self.main_controller:
             mc = self.main_controller
             
-            if hasattr(mc, 'ai_trading_engine') and mc.ai_trading_engine:
-                engine = mc.ai_trading_engine
-                positions = getattr(engine, 'positions', {})
-                context_parts.append(f"- 当前持仓: {len(positions)}个")
-            
+            # 获取实时持仓
             if hasattr(mc, 'okx_exchange') and mc.okx_exchange:
                 context_parts.append("- 交易所: OKX (已连接)")
+                try:
+                    positions = await mc.okx_exchange.get_positions()
+                    active_pos = [p for p in positions if float(p.get('size', 0) or 0) != 0]
+                    if active_pos:
+                        pos_info = []
+                        for p in active_pos[:5]:
+                            symbol = p.get('symbol', '')
+                            side = p.get('side', '')
+                            size = p.get('size', 0)
+                            pnl = float(p.get('unrealized_pnl', 0) or 0)
+                            pos_info.append(f"  {symbol}: {side} {size} | 盈亏: ${pnl:+.2f}")
+                        context_parts.append(f"- 当前持仓 ({len(active_pos)}个):\n" + "\n".join(pos_info))
+                    else:
+                        context_parts.append("- 当前持仓: 无")
+                except Exception as e:
+                    context_parts.append(f"- 当前持仓: 获取失败 ({e})")
+            
+            # 获取账户余额
+            if hasattr(mc, 'okx_exchange') and mc.okx_exchange:
+                try:
+                    balance = await mc.okx_exchange.get_balance()
+                    usdt = balance.get('USDT', {})
+                    if isinstance(usdt, dict):
+                        available = usdt.get('free', 0)
+                    else:
+                        available = usdt
+                    context_parts.append(f"- 可用余额: {available:.2f} USDT")
+                except:
+                    pass
         
         return "\n".join(context_parts)
 
     async def _send_message(self, response: TelegramResponse):
-        """发送消息 - 支持长消息分割"""
+        """发送消息 - 智能消息分割和去重"""
         try:
             text = response.text
             
             # Telegram消息长度限制为4096字符
             max_length = 4000
             
-            # 如果消息太长，分割发送
-            if len(text) > max_length:
-                messages = []
-                current_msg = ""
-                
-                # 按行分割
-                lines = text.split('\n')
-                for line in lines:
-                    if len(current_msg) + len(line) + 1 > max_length:
-                        messages.append(current_msg)
-                        current_msg = line + '\n'
-                    else:
-                        current_msg += line + '\n'
-                
-                if current_msg:
-                    messages.append(current_msg)
-                
-                # 发送分割后的消息
-                for i, msg in enumerate(messages):
-                    await self._send_single_message(TelegramResponse(
-                        chat_id=response.chat_id,
-                        text=msg,
-                        parse_mode=response.parse_mode,
-                        disable_web_page_preview=response.disable_web_page_preview,
-                        reply_to_message_id=response.reply_to_message_id if i == 0 else None
-                    ))
-                    # 消息之间稍微延迟
-                    if i < len(messages) - 1:
-                        await asyncio.sleep(0.5)
-            else:
+            # 如果消息很短，直接发送
+            if len(text) <= max_length:
                 await self._send_single_message(response)
+                return
+            
+            # 智能分割长消息
+            messages = self._smart_split_message(text, max_length)
+            
+            # 发送分割后的消息
+            for i, msg in enumerate(messages):
+                await self._send_single_message(TelegramResponse(
+                    chat_id=response.chat_id,
+                    text=msg,
+                    parse_mode=response.parse_mode,
+                    disable_web_page_preview=response.disable_web_page_preview,
+                    reply_to_message_id=response.reply_to_message_id if i == 0 else None
+                ))
+                
+                # 消息之间稍微延迟，避免频率限制
+                if i < len(messages) - 1:
+                    await asyncio.sleep(0.5)
                 
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
+    
+    def _smart_split_message(self, text: str, max_length: int) -> List[str]:
+        """
+        智能分割消息 - 保持内容完整性
+        
+        优先级：
+        1. 按段落分割（双换行）
+        2. 按单行分割
+        3. 强制分割（最后手段）
+        """
+        messages = []
+        
+        # 如果消息不太长，直接返回
+        if len(text) <= max_length:
+            return [text]
+        
+        # 1. 尝试按段落分割
+        paragraphs = text.split('\n\n')
+        if len(paragraphs) > 1:
+            current_msg = ""
+            for para in paragraphs:
+                # 如果单个段落就超长，需要进一步分割
+                if len(para) > max_length:
+                    # 先保存当前消息
+                    if current_msg:
+                        messages.append(current_msg.strip())
+                        current_msg = ""
+                    
+                    # 分割超长段落
+                    para_messages = self._split_long_paragraph(para, max_length)
+                    messages.extend(para_messages)
+                # 如果加上这个段落不超长
+                elif len(current_msg) + len(para) + 2 <= max_length:
+                    current_msg += para + "\n\n"
+                # 否则保存当前消息，开始新消息
+                else:
+                    if current_msg:
+                        messages.append(current_msg.strip())
+                    current_msg = para + "\n\n"
+            
+            if current_msg:
+                messages.append(current_msg.strip())
+        
+        # 2. 如果段落分割失败，按行分割
+        else:
+            messages = self._split_by_lines(text, max_length)
+        
+        # 过滤空消息
+        messages = [msg for msg in messages if msg.strip()]
+        
+        # 如果还是失败，强制分割
+        if not messages:
+            messages = [text[i:i+max_length] for i in range(0, len(text), max_length)]
+        
+        return messages
+    
+    def _split_long_paragraph(self, para: str, max_length: int) -> List[str]:
+        """分割超长段落"""
+        messages = []
+        lines = para.split('\n')
+        current_msg = ""
+        
+        for line in lines:
+            if len(current_msg) + len(line) + 1 <= max_length:
+                current_msg += line + "\n"
+            else:
+                if current_msg:
+                    messages.append(current_msg.strip())
+                current_msg = line + "\n"
+        
+        if current_msg:
+            messages.append(current_msg.strip())
+        
+        return messages
+    
+    def _split_by_lines(self, text: str, max_length: int) -> List[str]:
+        """按行分割消息"""
+        messages = []
+        lines = text.split('\n')
+        current_msg = ""
+        
+        for line in lines:
+            if len(current_msg) + len(line) + 1 <= max_length:
+                current_msg += line + "\n"
+            else:
+                if current_msg:
+                    messages.append(current_msg.strip())
+                current_msg = line + "\n"
+        
+        if current_msg:
+            messages.append(current_msg.strip())
+        
+        return messages
     
     async def _send_single_message(self, response: TelegramResponse):
         """发送单条消息"""
@@ -326,8 +458,7 @@ class TelegramBot:
             if response.reply_to_message_id:
                 payload["reply_to_message_id"] = response.reply_to_message_id
             
-            proxy = "http://127.0.0.1:7890"
-            async with self.session.post(url, json=payload, proxy=proxy) as resp:
+            async with self.session.post(url, json=payload, proxy=self.proxy) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("ok"):

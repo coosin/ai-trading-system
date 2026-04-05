@@ -1,93 +1,52 @@
 """
-智能监控和告警系统
+智能监控系统
 
-为无人化AI交易系统提供全面的监控和告警功能
+提供系统健康监控、性能分析和异常检测功能
 """
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
-from enum import Enum
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
 
-class AlertLevel(str, Enum):
-    """告警级别"""
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
-    CRITICAL = "critical"
-    EMERGENCY = "emergency"
+@dataclass
+class MonitoringMetric:
+    """监控指标"""
+    name: str
+    value: float
+    unit: str = ""
+    timestamp: datetime = field(default_factory=datetime.now)
+    tags: Dict[str, str] = field(default_factory=dict)
 
 
-class AlertType(str, Enum):
-    """告警类型"""
-    SYSTEM_HEALTH = "system_health"
-    API_PERFORMANCE = "api_performance"
-    DATA_QUALITY = "data_quality"
-    AI_MODEL = "ai_model"
-    FUND_SAFETY = "fund_safety"
-    TRADING_ANOMALY = "trading_anomaly"
-    RISK_BREACH = "risk_breach"
-    NETWORK_ISSUE = "network_issue"
+@dataclass
+class AlertRule:
+    """告警规则"""
+    name: str
+    metric_name: str
+    condition: str  # "gt", "lt", "eq", "ne"
+    threshold: float
+    severity: str = "warning"  # info, warning, critical
+    enabled: bool = True
+    cooldown: int = 300  # 冷却时间（秒）
+    last_triggered: Optional[datetime] = None
 
 
 @dataclass
 class Alert:
-    """告警信息"""
-    id: str
-    level: AlertLevel
-    type: AlertType
-    title: str
+    """告警"""
+    rule_name: str
+    metric_name: str
+    metric_value: float
+    threshold: float
+    severity: str
     message: str
-    data: Dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=datetime.now)
     acknowledged: bool = False
-    resolved: bool = False
-    escalation_count: int = 0
-
-
-@dataclass
-class SystemHealthMetrics:
-    """系统健康指标"""
-    
-    # API性能
-    api_latency: float = 0.0
-    api_success_rate: float = 100.0
-    api_timeout_count: int = 0
-    
-    # 数据质量
-    data_freshness: float = 0.0  # 秒
-    data_completeness: float = 100.0
-    data_accuracy: float = 100.0
-    
-    # AI模型状态
-    ai_model_status: str = "healthy"
-    ai_response_time: float = 0.0
-    ai_confidence_avg: float = 0.0
-    
-    # 资金安全
-    account_balance: float = 0.0
-    available_margin: float = 0.0
-    position_risk: float = 0.0
-    daily_pnl: float = 0.0
-    
-    # 系统资源
-    cpu_usage: float = 0.0
-    memory_usage: float = 0.0
-    disk_usage: float = 0.0
-    
-    # 交易状态
-    active_positions: int = 0
-    pending_orders: int = 0
-    trade_count_today: int = 0
-    
-    # 健康评分
-    overall_health_score: float = 100.0
-    timestamp: datetime = field(default_factory=datetime.now)
 
 
 class IntelligentMonitoringSystem:
@@ -96,344 +55,226 @@ class IntelligentMonitoringSystem:
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         
-        # 告警配置
-        self.alert_thresholds = {
-            "api_latency_warning": 5.0,      # 秒
-            "api_latency_critical": 10.0,
-            "api_success_rate_warning": 95.0,  # 百分比
-            "api_success_rate_critical": 90.0,
-            "data_freshness_warning": 60.0,    # 秒
-            "data_freshness_critical": 120.0,
-            "ai_response_time_warning": 30.0,  # 秒
-            "ai_response_time_critical": 60.0,
-            "ai_confidence_warning": 0.6,      # 百分比
-            "ai_confidence_critical": 0.5,
-            "position_risk_warning": 0.7,      # 百分比
-            "position_risk_critical": 0.85,
-            "daily_loss_warning": 0.03,        # 百分比
-            "daily_loss_critical": 0.05,
-            "cpu_usage_warning": 70.0,         # 百分比
-            "cpu_usage_critical": 90.0,
-            "memory_usage_warning": 80.0,      # 百分比
-            "memory_usage_critical": 95.0,
-        }
+        self._metrics: Dict[str, List[MonitoringMetric]] = {}
+        self._max_metrics = self.config.get("max_metrics", 1000)
         
-        # 告警历史
-        self.alerts: Dict[str, Alert] = {}
-        self.alert_history: List[Alert] = []
+        self._alert_rules: Dict[str, AlertRule] = {}
+        self._alerts: List[Alert] = []
+        self._alert_callbacks: List[Callable] = []
         
-        # 健康指标历史
-        self.health_history: List[SystemHealthMetrics] = []
+        self._health_status: Dict[str, Dict[str, Any]] = {}
+        self._component_checks: Dict[str, Callable] = {}
         
-        # 监控状态
         self._running = False
-        self._monitoring_task: Optional[asyncio.Task] = None
-        
-        # 告警处理器
-        self.alert_handlers: List[callable] = []
-        
-        # 升级配置
-        self.escalation_config = {
-            "info_escalation_minutes": 60,
-            "warning_escalation_minutes": 30,
-            "error_escalation_minutes": 15,
-            "critical_escalation_minutes": 5,
-            "emergency_escalation_minutes": 1,
-        }
+        self._monitor_task: Optional[asyncio.Task] = None
     
-    async def start_monitoring(self):
+    async def initialize(self) -> bool:
+        """初始化监控系统"""
+        self._setup_default_alert_rules()
+        logger.info("✅ 智能监控系统初始化完成")
+        return True
+    
+    def _setup_default_alert_rules(self) -> None:
+        """设置默认告警规则"""
+        default_rules = [
+            AlertRule("cpu_high", "cpu_percent", "gt", 80, "warning"),
+            AlertRule("cpu_critical", "cpu_percent", "gt", 95, "critical"),
+            AlertRule("memory_high", "memory_percent", "gt", 80, "warning"),
+            AlertRule("memory_critical", "memory_percent", "gt", 95, "critical"),
+            AlertRule("disk_high", "disk_percent", "gt", 80, "warning"),
+            AlertRule("disk_critical", "disk_percent", "gt", 95, "critical"),
+            AlertRule("error_rate_high", "error_rate", "gt", 0.1, "warning"),
+            AlertRule("latency_high", "latency_ms", "gt", 1000, "warning"),
+        ]
+        
+        for rule in default_rules:
+            self._alert_rules[rule.name] = rule
+    
+    async def start(self) -> None:
         """启动监控"""
         if self._running:
             return
         
         self._running = True
-        self._monitoring_task = asyncio.create_task(self._monitoring_loop())
-        logger.info("✅ 智能监控系统已启动")
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        logger.info("智能监控系统已启动")
     
-    async def stop_monitoring(self):
+    async def stop(self) -> None:
         """停止监控"""
         self._running = False
-        
-        if self._monitoring_task:
-            self._monitoring_task.cancel()
+        if self._monitor_task:
+            self._monitor_task.cancel()
             try:
-                await self._monitoring_task
+                await self._monitor_task
             except asyncio.CancelledError:
                 pass
-        
-        logger.info("🛑 智能监控系统已停止")
+        logger.info("智能监控系统已停止")
     
-    async def _monitoring_loop(self):
+    async def _monitor_loop(self) -> None:
         """监控循环"""
+        interval = self.config.get("monitor_interval", 30)
+        
         while self._running:
             try:
-                # 1. 收集健康指标
-                metrics = await self._collect_health_metrics()
-                
-                # 2. 保存历史
-                self.health_history.append(metrics)
-                
-                # 保持最近100条记录
-                if len(self.health_history) > 100:
-                    self.health_history.pop(0)
-                
-                # 3. 检查告警条件
-                await self._check_alert_conditions(metrics)
-                
-                # 4. 处理告警升级
-                await self._process_alert_escalation()
-                
-                # 5. 计算健康评分
-                health_score = self._calculate_health_score(metrics)
-                
-                # 6. 记录状态
-                logger.debug(
-                    f"系统健康度: {health_score:.1f}% | "
-                    f"API延迟: {metrics.api_latency:.2f}s | "
-                    f"AI响应: {metrics.ai_response_time:.2f}s"
-                )
-                
-                # 每10秒监控一次
-                await asyncio.sleep(10)
-                
+                await self._collect_metrics()
+                await self._check_alerts()
+                await self._check_components()
             except Exception as e:
                 logger.error(f"监控循环错误: {e}")
-                await asyncio.sleep(5)
+            
+            await asyncio.sleep(interval)
     
-    async def _collect_health_metrics(self) -> SystemHealthMetrics:
-        """收集健康指标"""
-        metrics = SystemHealthMetrics()
-        
+    async def _collect_metrics(self) -> None:
+        """收集指标"""
         try:
-            # 这里应该从实际系统收集数据
-            # 暂时返回模拟数据
-            metrics.api_latency = 0.5
-            metrics.api_success_rate = 99.5
-            metrics.data_freshness = 10.0
-            metrics.ai_response_time = 2.0
-            metrics.ai_confidence_avg = 0.75
-            metrics.cpu_usage = 45.0
-            metrics.memory_usage = 60.0
-            metrics.overall_health_score = 95.0
+            import psutil
+            
+            self.record_metric("cpu_percent", psutil.cpu_percent(interval=1))
+            
+            memory = psutil.virtual_memory()
+            self.record_metric("memory_percent", memory.percent)
+            self.record_metric("memory_used_gb", memory.used / (1024**3))
+            
+            disk = psutil.disk_usage('/')
+            self.record_metric("disk_percent", disk.percent)
+            self.record_metric("disk_used_gb", disk.used / (1024**3))
             
         except Exception as e:
-            logger.error(f"收集健康指标失败: {e}")
-        
-        return metrics
+            logger.warning(f"收集指标失败: {e}")
     
-    async def _check_alert_conditions(self, metrics: SystemHealthMetrics):
-        """检查告警条件"""
-        
-        # API延迟检查
-        if metrics.api_latency > self.alert_thresholds["api_latency_critical"]:
-            await self._create_alert(
-                level=AlertLevel.CRITICAL,
-                type=AlertType.API_PERFORMANCE,
-                title="API延迟严重",
-                message=f"API延迟{metrics.api_latency:.2f}秒，超过临界值{self.alert_thresholds['api_latency_critical']}秒",
-                data={"latency": metrics.api_latency}
-            )
-        elif metrics.api_latency > self.alert_thresholds["api_latency_warning"]:
-            await self._create_alert(
-                level=AlertLevel.WARNING,
-                type=AlertType.API_PERFORMANCE,
-                title="API延迟警告",
-                message=f"API延迟{metrics.api_latency:.2f}秒，超过警告值{self.alert_thresholds['api_latency_warning']}秒",
-                data={"latency": metrics.api_latency}
-            )
-        
-        # AI响应时间检查
-        if metrics.ai_response_time > self.alert_thresholds["ai_response_time_critical"]:
-            await self._create_alert(
-                level=AlertLevel.CRITICAL,
-                type=AlertType.AI_MODEL,
-                title="AI响应超时",
-                message=f"AI响应时间{metrics.ai_response_time:.2f}秒，可能影响交易决策",
-                data={"response_time": metrics.ai_response_time}
-            )
-        
-        # 系统资源检查
-        if metrics.cpu_usage > self.alert_thresholds["cpu_usage_critical"]:
-            await self._create_alert(
-                level=AlertLevel.CRITICAL,
-                type=AlertType.SYSTEM_HEALTH,
-                title="CPU使用率过高",
-                message=f"CPU使用率{metrics.cpu_usage:.1f}%，可能影响系统性能",
-                data={"cpu_usage": metrics.cpu_usage}
-            )
-        
-        if metrics.memory_usage > self.alert_thresholds["memory_usage_critical"]:
-            await self._create_alert(
-                level=AlertLevel.CRITICAL,
-                type=AlertType.SYSTEM_HEALTH,
-                title="内存使用率过高",
-                message=f"内存使用率{metrics.memory_usage:.1f}%，可能导致系统崩溃",
-                data={"memory_usage": metrics.memory_usage}
-            )
-    
-    async def _create_alert(
-        self,
-        level: AlertLevel,
-        type: AlertType,
-        title: str,
-        message: str,
-        data: Dict[str, Any]
-    ):
-        """创建告警"""
-        import uuid
-        
-        alert_id = str(uuid.uuid4())
-        
-        alert = Alert(
-            id=alert_id,
-            level=level,
-            type=type,
-            title=title,
-            message=message,
-            data=data
-        )
-        
-        # 检查是否已存在相同告警
-        existing_alert = self._find_similar_alert(alert)
-        if existing_alert:
-            # 更新现有告警
-            existing_alert.escalation_count += 1
-            existing_alert.timestamp = datetime.now()
-            logger.debug(f"更新告警: {title} (升级次数: {existing_alert.escalation_count})")
-        else:
-            # 创建新告警
-            self.alerts[alert_id] = alert
-            self.alert_history.append(alert)
-            
-            logger.warning(f"🚨 新告警 [{level.value.upper()}]: {title} - {message}")
-            
-            # 触发告警处理器
-            for handler in self.alert_handlers:
-                try:
-                    await handler(alert)
-                except Exception as e:
-                    logger.error(f"告警处理器执行失败: {e}")
-    
-    def _find_similar_alert(self, new_alert: Alert) -> Optional[Alert]:
-        """查找相似告警"""
-        for alert in self.alerts.values():
-            if (alert.type == new_alert.type and 
-                alert.title == new_alert.title and
-                not alert.resolved):
-                return alert
-        return None
-    
-    async def _process_alert_escalation(self):
-        """处理告警升级"""
-        now = datetime.now()
-        
-        for alert in list(self.alerts.values()):
-            if alert.resolved:
+    async def _check_alerts(self) -> None:
+        """检查告警"""
+        for rule in self._alert_rules.values():
+            if not rule.enabled:
                 continue
             
-            # 计算告警持续时间
-            duration_minutes = (now - alert.timestamp).total_seconds() / 60
+            if rule.metric_name not in self._metrics:
+                continue
             
-            # 根据告警级别获取升级时间
-            escalation_key = f"{alert.level.value}_escalation_minutes"
-            escalation_minutes = self.escalation_config.get(escalation_key, 30)
+            latest_metric = self._metrics[rule.metric_name][-1]
             
-            # 检查是否需要升级
-            if duration_minutes >= escalation_minutes * (alert.escalation_count + 1):
-                alert.escalation_count += 1
-                logger.warning(
-                    f"⚠️ 告警升级: {alert.title} "
-                    f"(持续{duration_minutes:.1f}分钟, 升级{alert.escalation_count}次)"
+            triggered = False
+            if rule.condition == "gt" and latest_metric.value > rule.threshold:
+                triggered = True
+            elif rule.condition == "lt" and latest_metric.value < rule.threshold:
+                triggered = True
+            elif rule.condition == "eq" and latest_metric.value == rule.threshold:
+                triggered = True
+            elif rule.condition == "ne" and latest_metric.value != rule.threshold:
+                triggered = True
+            
+            if triggered:
+                if rule.last_triggered:
+                    elapsed = (datetime.now() - rule.last_triggered).total_seconds()
+                    if elapsed < rule.cooldown:
+                        continue
+                
+                alert = Alert(
+                    rule_name=rule.name,
+                    metric_name=rule.metric_name,
+                    metric_value=latest_metric.value,
+                    threshold=rule.threshold,
+                    severity=rule.severity,
+                    message=f"{rule.metric_name} {rule.condition} {rule.threshold}: current={latest_metric.value}"
                 )
                 
-                # 发送升级通知
-                await self._send_escalation_notification(alert)
+                self._alerts.append(alert)
+                rule.last_triggered = datetime.now()
+                
+                await self._trigger_alert_callback(alert)
     
-    async def _send_escalation_notification(self, alert: Alert):
-        """发送升级通知"""
-        # 这里应该集成通知系统
-        logger.critical(
-            f"🔔 告警升级通知: [{alert.level.value.upper()}] {alert.title}\n"
-            f"消息: {alert.message}\n"
-            f"持续时间: {(datetime.now() - alert.timestamp).total_seconds() / 60:.1f}分钟\n"
-            f"升级次数: {alert.escalation_count}"
+    async def _trigger_alert_callback(self, alert: Alert) -> None:
+        """触发告警回调"""
+        logger.warning(f"告警: {alert.message}")
+        
+        for callback in self._alert_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(alert)
+                else:
+                    callback(alert)
+            except Exception as e:
+                logger.error(f"告警回调执行失败: {e}")
+    
+    async def _check_components(self) -> None:
+        """检查组件健康状态"""
+        for name, check_func in self._component_checks.items():
+            try:
+                if asyncio.iscoroutinefunction(check_func):
+                    result = await check_func()
+                else:
+                    result = check_func()
+                
+                self._health_status[name] = {
+                    "status": "healthy" if result else "unhealthy",
+                    "last_check": datetime.now().isoformat()
+                }
+            except Exception as e:
+                self._health_status[name] = {
+                    "status": "error",
+                    "error": str(e),
+                    "last_check": datetime.now().isoformat()
+                }
+    
+    def record_metric(self, name: str, value: float, unit: str = "", 
+                      tags: Optional[Dict[str, str]] = None) -> None:
+        """记录指标"""
+        metric = MonitoringMetric(
+            name=name,
+            value=value,
+            unit=unit,
+            tags=tags or {}
         )
-    
-    def _calculate_health_score(self, metrics: SystemHealthMetrics) -> float:
-        """计算健康评分"""
-        score = 100.0
         
-        # API性能 (权重25%)
-        if metrics.api_latency > self.alert_thresholds["api_latency_critical"]:
-            score -= 25
-        elif metrics.api_latency > self.alert_thresholds["api_latency_warning"]:
-            score -= 10
+        if name not in self._metrics:
+            self._metrics[name] = []
         
-        # AI模型状态 (权重25%)
-        if metrics.ai_response_time > self.alert_thresholds["ai_response_time_critical"]:
-            score -= 25
-        elif metrics.ai_response_time > self.alert_thresholds["ai_response_time_warning"]:
-            score -= 10
+        self._metrics[name].append(metric)
         
-        # 系统资源 (权重25%)
-        if metrics.cpu_usage > self.alert_thresholds["cpu_usage_critical"]:
-            score -= 15
-        elif metrics.cpu_usage > self.alert_thresholds["cpu_usage_warning"]:
-            score -= 5
-        
-        if metrics.memory_usage > self.alert_thresholds["memory_usage_critical"]:
-            score -= 10
-        elif metrics.memory_usage > self.alert_thresholds["memory_usage_warning"]:
-            score -= 5
-        
-        # 数据质量 (权重25%)
-        if metrics.data_freshness > self.alert_thresholds["data_freshness_critical"]:
-            score -= 25
-        elif metrics.data_freshness > self.alert_thresholds["data_freshness_warning"]:
-            score -= 10
-        
-        return max(0, score)
+        if len(self._metrics[name]) > self._max_metrics:
+            self._metrics[name] = self._metrics[name][-self._max_metrics:]
     
-    def add_alert_handler(self, handler: callable):
-        """添加告警处理器"""
-        self.alert_handlers.append(handler)
+    def add_alert_rule(self, rule: AlertRule) -> None:
+        """添加告警规则"""
+        self._alert_rules[rule.name] = rule
     
-    async def acknowledge_alert(self, alert_id: str) -> bool:
-        """确认告警"""
-        if alert_id in self.alerts:
-            self.alerts[alert_id].acknowledged = True
-            logger.info(f"告警已确认: {alert_id}")
-            return True
-        return False
+    def add_alert_callback(self, callback: Callable) -> None:
+        """添加告警回调"""
+        self._alert_callbacks.append(callback)
     
-    async def resolve_alert(self, alert_id: str) -> bool:
-        """解决告警"""
-        if alert_id in self.alerts:
-            self.alerts[alert_id].resolved = True
-            logger.info(f"告警已解决: {alert_id}")
-            return True
-        return False
+    def register_component_check(self, name: str, check_func: Callable) -> None:
+        """注册组件检查"""
+        self._component_checks[name] = check_func
     
-    def get_active_alerts(self) -> List[Alert]:
-        """获取活动告警"""
-        return [alert for alert in self.alerts.values() if not alert.resolved]
+    def get_metrics(self, name: str, limit: int = 100) -> List[MonitoringMetric]:
+        """获取指标历史"""
+        if name not in self._metrics:
+            return []
+        return self._metrics[name][-limit:]
     
-    def get_health_status(self) -> Dict[str, Any]:
+    def get_latest_metric(self, name: str) -> Optional[MonitoringMetric]:
+        """获取最新指标"""
+        if name not in self._metrics or not self._metrics[name]:
+            return None
+        return self._metrics[name][-1]
+    
+    def get_alerts(self, limit: int = 100, severity: Optional[str] = None) -> List[Alert]:
+        """获取告警列表"""
+        alerts = self._alerts
+        if severity:
+            alerts = [a for a in alerts if a.severity == severity]
+        return alerts[-limit:]
+    
+    def get_health_status(self) -> Dict[str, Dict[str, Any]]:
         """获取健康状态"""
-        if not self.health_history:
-            return {"status": "unknown", "score": 0}
-        
-        latest_metrics = self.health_history[-1]
-        
+        return self._health_status
+    
+    def get_summary(self) -> Dict[str, Any]:
+        """获取监控摘要"""
         return {
-            "status": "healthy" if latest_metrics.overall_health_score >= 80 else "degraded",
-            "score": latest_metrics.overall_health_score,
-            "metrics": {
-                "api_latency": latest_metrics.api_latency,
-                "ai_response_time": latest_metrics.ai_response_time,
-                "cpu_usage": latest_metrics.cpu_usage,
-                "memory_usage": latest_metrics.memory_usage,
-            },
-            "active_alerts": len(self.get_active_alerts()),
-            "timestamp": latest_metrics.timestamp.isoformat()
+            "metrics_count": sum(len(m) for m in self._metrics.values()),
+            "alerts_count": len(self._alerts),
+            "components": len(self._health_status),
+            "alert_rules": len(self._alert_rules),
+            "running": self._running
         }

@@ -105,6 +105,10 @@ class AIMemoryManager:
         
         logger.info("✅ AI记忆管理器初始化完成")
     
+    async def initialize(self) -> bool:
+        """异步初始化（兼容接口）"""
+        return True
+    
     async def add_short_term_memory(self, content: str, 
                                     metadata: Dict[str, Any] = None,
                                     importance: float = 0.5) -> str:
@@ -648,79 +652,44 @@ class AIMemoryManager:
         """
         context_parts = []
         
-        # 1. 添加工作区文件化记忆（最重要的长期记忆）
         if self.workspace_memory:
-            context_parts.append("═══════════════════════════════════════════")
-            context_parts.append("📚 【我的长期记忆 - 核心文件】")
-            context_parts.append("═══════════════════════════════════════════")
-            
-            # SOUL.md - 核心灵魂
             if "SOUL.md" in self.workspace_memory:
-                context_parts.append("\n【SOUL.md - 我的核心信念】")
-                context_parts.append(self.workspace_memory["SOUL.md"])
+                soul_content = self.workspace_memory["SOUL.md"][:800]
+                context_parts.append(f"[核心信念]\n{soul_content}")
             
-            # IDENTITY.md - 身份定义
             if "IDENTITY.md" in self.workspace_memory:
-                context_parts.append("\n【IDENTITY.md - 我是谁】")
-                context_parts.append(self.workspace_memory["IDENTITY.md"])
+                identity_content = self.workspace_memory["IDENTITY.md"][:600]
+                context_parts.append(f"[身份定义]\n{identity_content}")
             
-            # USER.md - 用户信息
             if "USER.md" in self.workspace_memory:
-                context_parts.append("\n【USER.md - 关于我的用户】")
-                context_parts.append(self.workspace_memory["USER.md"])
+                user_content = self.workspace_memory["USER.md"][:400]
+                context_parts.append(f"[用户信息]\n{user_content}")
             
-            # TRADING.md - 交易知识
-            if "TRADING.md" in self.workspace_memory:
-                context_parts.append("\n【TRADING.md - 我的交易知识库】")
-                context_parts.append(self.workspace_memory["TRADING.md"])
-            
-            # INSTRUCTIONS.md - 工作指令
             if "INSTRUCTIONS.md" in self.workspace_memory:
-                context_parts.append("\n【INSTRUCTIONS.md - 我的工作指令】")
-                context_parts.append(self.workspace_memory["INSTRUCTIONS.md"])
-            
-            context_parts.append("\n═══════════════════════════════════════════")
+                inst_content = self.workspace_memory["INSTRUCTIONS.md"][:300]
+                context_parts.append(f"[工作指令]\n{inst_content}")
         
-        # 2. 添加系统指令
-        system_instructions = [m for m in self.long_term_memory 
-                              if m.memory_type == MemoryType.SYSTEM_INSTRUCTION]
-        if system_instructions:
-            context_parts.append("\n📋 【近期系统指令】:")
-            for inst in system_instructions[-5:]:
-                context_parts.append(f"  - {inst.content}")
-        
-        # 3. 添加用户偏好
         user_prefs = [m for m in self.long_term_memory 
                      if m.memory_type == MemoryType.USER_PREF]
         if user_prefs:
-            context_parts.append("\n👤 【用户偏好记录】:")
-            for pref in user_prefs[-10:]:
-                context_parts.append(f"  - {pref.content}")
+            for pref in user_prefs[-3:]:
+                context_parts.append(pref.content[:100])
         
-        # 4. 添加交易历史总结
-        trade_memories = [m for m in self.long_term_memory 
-                         if m.memory_type == MemoryType.TRADE_HISTORY]
-        if trade_memories:
-            context_parts.append("\n💹 【交易历史】:")
-            trade_summary = self._summarize_trades(trade_memories[-20:])
-            context_parts.append(f"  {trade_summary}")
-            
-            for trade in trade_memories[-5:]:
-                context_parts.append(f"  - {trade.content}")
-        
-        # 5. 添加短期对话记忆
         if self.short_term_memory:
-            context_parts.append("\n💬 【最近对话】:")
-            for item in self.short_term_memory[-10:]:
-                context_parts.append(f"  - {item.content}")
+            for item in self.short_term_memory[-3:]:
+                context_parts.append(item.content[:100])
         
-        # 6. 根据查询检索相关记忆
         if query:
-            relevant = await self.retrieve_memory(query, top_k=3)
+            relevant = await self.retrieve_memory(query, top_k=2)
             if relevant:
-                context_parts.append("\n🔍 【相关记忆】:")
                 for item in relevant:
-                    context_parts.append(f"  - {item.content}")
+                    context_parts.append(item.content[:100])
         
-        context_parts.append("\n═══════════════════════════════════════════")
-        return "\n".join(context_parts)
+        if context_parts:
+            return "\n\n".join(context_parts)
+        return ""
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass

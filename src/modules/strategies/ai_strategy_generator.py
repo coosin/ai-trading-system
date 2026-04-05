@@ -230,7 +230,7 @@ def breakout_strategy(data):
             
             # 调用AI生成
             if self.llm_integration:
-                response = await self.llm_integration.generate(prompt)
+                response = await self.llm_integration.generate(prompt, is_user_input=False)
                 
                 # 解析AI响应
                 strategy_data = self._parse_strategy_response(response, strategy_type)

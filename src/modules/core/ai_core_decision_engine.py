@@ -164,7 +164,7 @@ class AICoreDecisionEngine:
         # 获取记忆系统
         try:
             from .unified_intelligent_memory import get_unified_memory
-            self.memory = get_unified_memory()
+            self.memory = await get_unified_memory()
             logger.info("✅ 记忆系统已连接")
         except Exception as e:
             logger.warning(f"记忆系统连接失败: {e}")
@@ -292,9 +292,8 @@ class AICoreDecisionEngine:
                     # 保存持仓快照到记忆
                     try:
                         await self.memory.add_memory(
-                            UnifiedMemoryType.TRADE_RECORD,
                             content=f"系统启动时持仓同步: {json.dumps(position_summary, ensure_ascii=False)}",
-                            summary="持仓同步",
+                            memory_type="episodic",
                             importance=0.9
                         )
                         logger.info("✅ 持仓状态已保存到记忆系统")
@@ -536,7 +535,7 @@ class AICoreDecisionEngine:
 
 用简洁的中文回答，不超过100字。"""
 
-            response = await self.llm.generate(prompt)
+            response = await self.llm.generate(prompt, is_user_input=False)
             
             if response and self.memory:
                 from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
@@ -868,7 +867,7 @@ class AICoreDecisionEngine:
 
 只返回JSON。"""
 
-            response = await self.llm.generate(prompt)
+            response = await self.llm.generate(prompt, is_user_input=False)
             
             if not response:
                 return None
@@ -1085,6 +1084,7 @@ class AICoreDecisionEngine:
             
             # 5. 获取当前持仓 - 实时
             current_positions = await self._get_current_positions()
+            self._current_positions = {p.get('symbol'): p for p in current_positions if p.get('symbol')}
             logger.info(f"   ✅ 当前持仓: {len(current_positions)}个")
             
             # 6. 获取账户余额 - 实时
@@ -1121,7 +1121,7 @@ class AICoreDecisionEngine:
                 ai_engine_analysis=ai_engine_analysis
             )
             
-            response = await self.llm.generate(prompt)
+            response = await self.llm.generate(prompt, is_user_input=False)
             
             if not response:
                 logger.warning(f"AI未返回决策: {symbol}")
@@ -1530,8 +1530,8 @@ class AICoreDecisionEngine:
 - 数据可用: {third_party_data.get('available', False)}
 - 市场情绪: {third_party_data.get('sentiment', 'neutral')}
 - 恐惧贪婪指数: {third_party_data.get('fear_greed_index', 'N/A')}
-- 链上数据: {json.dumps(third_party_data.get('on_chain_data', {}), ensure_ascii=False) if third_party_data.get('on_chain_data') else '暂无'}
-- 社交媒体情绪: {json.dumps(third_party_data.get('social_sentiment', {}), ensure_ascii=False) if third_party_data.get('social_sentiment') else '暂无'}
+- 链上数据: {json.dumps(third_party_data.get('on_chain_data', {}), ensure_ascii=False)[:500] if third_party_data.get('on_chain_data') else '暂无'}
+- 社交媒体情绪: {json.dumps(third_party_data.get('social_sentiment', {}), ensure_ascii=False)[:500] if third_party_data.get('social_sentiment') else '暂无'}
 """
         
         # 构建多源数据融合分析
@@ -1605,7 +1605,7 @@ class AICoreDecisionEngine:
 
 【可用策略】
 - 策略数量: {strategy_advice.get('count', 0)}
-- 策略详情: {json.dumps(strategy_advice.get('strategies', []), indent=2, ensure_ascii=False)}
+- 策略详情: {json.dumps(strategy_advice.get('strategies', [])[:3], indent=2, ensure_ascii=False)[:2000]}
 {historical_experience}
 【风险评估 - 实时】
 - 风险等级: {risk_assessment.get('level', 'unknown')}
@@ -1920,6 +1920,9 @@ class AICoreDecisionEngine:
                 for symbol, time in self._last_decision_time.items()
             },
             "last_strategy_check": self._last_strategy_check.isoformat() if self._last_strategy_check else None,
+            "active_positions": len(self._current_positions) if hasattr(self, '_current_positions') else 0,
+            "positions": self._current_positions if hasattr(self, '_current_positions') else {},
+            "total_trades": len(self._trade_history) if hasattr(self, '_trade_history') else 0,
         }
     
     async def process_user_command(self, command: str) -> Dict[str, Any]:
@@ -1961,13 +1964,14 @@ class AICoreDecisionEngine:
         if self.exchange:
             try:
                 positions = await self.exchange.get_positions()
-                if positions:
+                active_pos = [p for p in positions if float(p.get('size', 0) or 0) != 0]
+                if active_pos:
                     report += f"\n【当前持仓】\n"
-                    for pos in positions[:5]:
-                        symbol = pos.get('instId', '')
-                        side = pos.get('posSide', '')
-                        size = pos.get('pos', '')
-                        pnl = float(pos.get('upl', 0))
+                    for pos in active_pos[:5]:
+                        symbol = pos.get('symbol', '')
+                        side = pos.get('side', '')
+                        size = pos.get('size', 0)
+                        pnl = float(pos.get('unrealized_pnl', 0) or 0)
                         report += f"  {symbol}: {side} {size} | 盈亏: ${pnl:+.2f}\n"
             except:
                 pass
@@ -2330,10 +2334,16 @@ class AICoreDecisionEngine:
 
 请直接回复用户，不要使用Markdown格式。"""
 
-            response = await self.llm.generate(prompt)
+            response = await self.llm.generate(prompt, is_user_input=False)
             
-            if response:
+            if response and response.success and response.content:
                 return {"success": True, "response": response.content}
+            elif response and not response.success:
+                error_msg = response.error_message or "LLM调用失败"
+                logger.error(f"LLM响应失败: {error_msg}")
+                return {"success": False, "response": f"AI处理失败: {error_msg}"}
+            elif response and not response.content:
+                return {"success": False, "response": "AI返回了空响应"}
             
             return {"success": False, "response": "无法处理"}
             
@@ -2378,16 +2388,17 @@ class AICoreDecisionEngine:
         if self.exchange:
             try:
                 positions = await self.exchange.get_positions()
-                active_pos = [p for p in positions if float(p.get('pos', 0)) != 0]
+                # get_positions 返回的字段: symbol, side, size, entry_price, unrealized_pnl
+                active_pos = [p for p in positions if float(p.get('size', 0) or 0) != 0]
                 logger.debug(f"对话上下文获取到 {len(active_pos)} 个活跃持仓")
                 if active_pos:
                     pos_info = []
                     for p in active_pos[:10]:
-                        symbol = p.get('instId', '')
-                        side = p.get('posSide', '')
-                        size = p.get('pos', '')
-                        pnl = float(p.get('upl', 0))
-                        entry_price = float(p.get('avgPx', 0))
+                        symbol = p.get('symbol', '')
+                        side = p.get('side', '')
+                        size = p.get('size', 0)
+                        pnl = float(p.get('unrealized_pnl', 0) or 0)
+                        entry_price = float(p.get('entry_price', 0) or 0)
                         pos_info.append(f"  {symbol}: {side} {size} | 入场价: {entry_price:.4f} | 盈亏: ${pnl:+.2f}")
                     context_parts.append(f"""【当前持仓】(共{len(active_pos)}个)
 {chr(10).join(pos_info)}""")
@@ -2453,3 +2464,8 @@ class AICoreDecisionEngine:
         report += f"  黑名单: {status['blacklist']}\n"
         
         return report
+
+
+    async def cleanup(self):
+        """清理资源"""
+        pass
