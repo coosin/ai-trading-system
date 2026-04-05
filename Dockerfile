@@ -42,8 +42,9 @@ COPY --chown=trader:trader .env.example ./.env.example
 COPY --chown=trader:trader start_production.sh health_check.sh ./
 
 # 创建必要目录并设置权限
-RUN mkdir -p logs data/memory data/models data/historical && \
-    chown -R trader:trader logs data && \
+RUN mkdir -p logs data/memory data/models data/historical backups/code backups/config backups/data && \
+    chown -R trader:trader logs data backups && \
+    chmod -R 755 logs data backups && \
     chmod +x start_production.sh health_check.sh && \
     cp .env.example .env && \
     chown trader:trader .env

@@ -282,6 +282,15 @@ monitoring:
         to_addrs: []
 
 # ======================
+# Telegram配置
+# ======================
+telegram:
+  enabled: true
+  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  chat_ids_env: "TELEGRAM_CHAT_ID"
+  proxy: null  # 可选：http://127.0.0.1:7890
+
+# ======================
 # API配置
 # ======================
 api:

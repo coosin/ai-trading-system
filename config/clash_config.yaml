@@ -1,0 +1,63 @@
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+
+proxies:
+  - name: "AWS-EC2-SG"
+    type: vless
+    server: 13.250.1.194
+    port: 443
+    uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
+    network: tcp
+    tls: true
+    flow: xtls-rprx-vision
+    servername: www.microsoft.com
+    reality-opts:
+      public-key: zZAB95_buovBE49ljV3TkwM8JS5kUF-gC5iOHNFZl18
+      short-id: ""
+    client-fingerprint: chrome
+
+proxy-groups:
+  - name: "🚀 节点选择"
+    type: select
+    proxies:
+      - "♻️ 自动选择"
+      - "AWS-EC2-SG"
+      - "🎯 全球直连"
+
+  - name: "♻️ 自动选择"
+    type: url-test
+    proxies:
+      - "AWS-EC2-SG"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+
+  - name: "🎯 全球直连"
+    type: select
+    proxies:
+      - DIRECT
+
+  - name: "🛑 全球拦截"
+    type: select
+    proxies:
+      - REJECT
+
+rules:
+  - DOMAIN-SUFFIX,local,🎯 全球直连
+  - IP-CIDR,127.0.0.0/8,🎯 全球直连
+  - IP-CIDR,172.16.0.0/12,🎯 全球直连
+  - IP-CIDR,192.168.0.0/16,🎯 全球直连
+  - IP-CIDR,10.0.0.0/8,🎯 全球直连
+  - IP-CIDR,100.64.0.0/10,🎯 全球直连
+  - DOMAIN,ad.com,🛑 全球拦截
+  - DOMAIN,ad.doubler.com,🛑 全球拦截
+  - DOMAIN-SUFFIX,ad.doubler.com,🛑 全球拦截
+  - DOMAIN,ad.doubleclick.net,🛑 全球拦截
+  - DOMAIN-SUFFIX,ad.doubleclick.net,🛑 全球拦截
+  - DOMAIN-SUFFIX,googlesyndication.com,🛑 全球拦截
+  - DOMAIN-SUFFIX,googleadservices.com,🛑 全球拦截
+  - DOMAIN-SUFFIX,doubleclick.net,🛑 全球拦截
+  - GEOIP,LAN,🎯 全球直连
+  - GEOIP,CN,🎯 全球直连
+  - MATCH,🚀 节点选择

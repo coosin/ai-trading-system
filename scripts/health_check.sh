@@ -1,11 +1,15 @@
 #!/bin/bash
 # OpenClaw Trading System - Health Check Script
 # Run frequency: hourly
+# 
+# 重要：此脚本只监控系统状态，不直接启动进程
+# 所有进程管理通过 systemd 进行
 
 APP_NAME="openclaw-trading"
 APP_DIR="/home/cool/.openclaw-trading"
 LOG_FILE="$APP_DIR/logs/health_check.log"
 ALERT_FILE="$APP_DIR/logs/alerts.log"
+SERVICE_NAME="openclaw-trading.service"
 
 # Telegram configuration
 TELEGRAM_BOT_TOKEN="8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60"
@@ -28,26 +32,44 @@ echo "=== $(date) Health Check ===" >> "$LOG_FILE"
 ALERTS=""
 CRITICAL=false
 
-# Check process
-if ! pgrep -f "python3 -m src.main" > /dev/null; then
-    ALERTS="${ALERTS}WARNING: Process not running!\n"
-    echo "[CRITICAL] Process not running!" | tee -a "$ALERT_FILE"
+# Check systemd service status (preferred method)
+SERVICE_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+
+if [ "$SERVICE_STATUS" != "active" ]; then
+    ALERTS="${ALERTS}WARNING: Service not active (status: $SERVICE_STATUS)\n"
+    echo "[CRITICAL] Service not active!" | tee -a "$ALERT_FILE"
     
-    # Clean lock files
-    rm -f /tmp/${APP_NAME}.lock /tmp/${APP_NAME}.pid 2>/dev/null
-    
-    # Try to restart
-    cd "$APP_DIR" && nohup python3 -m src.main >> "$APP_DIR/logs/app.log" 2>&1 &
+    # Try to restart via systemctl (not direct process start)
+    sudo systemctl restart "$SERVICE_NAME" 2>/dev/null
     sleep 5
     
-    if pgrep -f "python3 -m src.main" > /dev/null; then
-        ALERTS="${ALERTS}SUCCESS: Service auto-restarted\n"
-        echo "[INFO] Service auto-restarted" >> "$LOG_FILE"
+    NEW_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+    if [ "$NEW_STATUS" = "active" ]; then
+        ALERTS="${ALERTS}SUCCESS: Service restarted via systemctl\n"
+        echo "[INFO] Service restarted via systemctl" >> "$LOG_FILE"
     else
         ALERTS="${ALERTS}ERROR: Service restart failed!\n"
         echo "[EMERGENCY] Service restart failed!" | tee -a "$ALERT_FILE"
         CRITICAL=true
     fi
+fi
+
+# Check for multiple instances (should never happen)
+PROCESS_COUNT=$(pgrep -f "python.*src.main" 2>/dev/null | wc -l)
+if [ "$PROCESS_COUNT" -gt 1 ]; then
+    ALERTS="${ALERTS}WARNING: Multiple instances detected ($PROCESS_COUNT)\n"
+    echo "[WARNING] Multiple instances detected!" | tee -a "$ALERT_FILE"
+    
+    # Kill all but the systemd service
+    SYSTEMD_PID=$(systemctl show --property MainPID "$SERVICE_NAME" 2>/dev/null | cut -d= -f2)
+    
+    for PID in $(pgrep -f "python.*src.main" 2>/dev/null); do
+        if [ "$PID" != "$SYSTEMD_PID" ] && [ "$PID" -gt 1 ]; then
+            kill -9 "$PID" 2>/dev/null
+            ALERTS="${ALERTS}Killed extra process: $PID\n"
+            echo "[INFO] Killed extra process: $PID" >> "$LOG_FILE"
+        fi
+    done
 fi
 
 # Check API

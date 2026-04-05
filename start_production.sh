@@ -58,22 +58,26 @@ if nc -z 127.0.0.1 7890 2>/dev/null; then
     export HTTPS_PROXY="http://127.0.0.1:7890"
 fi
 
-# 检查依赖
+# 检查依赖 (Docker镜像中已安装，跳过检查)
 echo ""
 echo -e "${GREEN}检查依赖...${NC}"
-MISSING_DEPS=""
-for dep in numpy pandas aiohttp yaml redis sqlalchemy psutil dotenv sklearn; do
-    if ! python3 -c "import $dep" 2>/dev/null; then
-        MISSING_DEPS="$MISSING_DEPS $dep"
-    fi
-done
+if [ -f "/.dockerenv" ]; then
+    echo -e "${GREEN}✓${NC} Docker环境，跳过依赖检查"
+else
+    MISSING_DEPS=""
+    for dep in numpy pandas aiohttp yaml redis sqlalchemy psutil dotenv sklearn; do
+        if ! python3 -c "import $dep" 2>/dev/null; then
+            MISSING_DEPS="$MISSING_DEPS $dep"
+        fi
+    done
 
-if [ -n "$MISSING_DEPS" ]; then
-    echo -e "${RED}✗${NC} 缺少依赖:$MISSING_DEPS"
-    echo -e "${YELLOW}!${NC} 请运行: pip install -r requirements.txt"
-    exit 1
+    if [ -n "$MISSING_DEPS" ]; then
+        echo -e "${RED}✗${NC} 缺少依赖:$MISSING_DEPS"
+        echo -e "${YELLOW}!${NC} 请运行: pip install -r requirements.txt"
+        exit 1
+    fi
+    echo -e "${GREEN}✓${NC} 所有核心依赖已安装"
 fi
-echo -e "${GREEN}✓${NC} 所有核心依赖已安装"
 
 # 显示配置
 echo ""
