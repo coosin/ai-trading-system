@@ -1,6 +1,6 @@
 # OpenClaw Trading System - 系统架构文档
 
-**版本**: 2.0.0  
+**版本**: 2.1.0  
 **最后更新**: 2026-04-05  
 **状态**: 生产运行中
 
@@ -12,12 +12,13 @@
 2. [技术栈](#2-技术栈)
 3. [系统架构](#3-系统架构)
 4. [核心模块](#4-核心模块)
-5. [数据流](#5-数据流)
-6. [部署架构](#6-部署架构)
-7. [配置说明](#7-配置说明)
-8. [API接口](#8-api接口)
-9. [安全机制](#9-安全机制)
-10. [监控告警](#10-监控告警)
+5. [新增模块 (V2.1)](#5-新增模块-v21)
+6. [数据流](#6-数据流)
+7. [部署架构](#7-部署架构)
+8. [配置说明](#8-配置说明)
+9. [API接口](#9-api接口)
+10. [安全机制](#10-安全机制)
+11. [监控告警](#11-监控告警)
 
 ---
 
@@ -28,8 +29,9 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
 - **AI智能决策**: 基于百度千帆 DeepSeek-V3.2 模型的智能分析和决策
 - **自动化交易**: 7x24小时自主监控和交易执行
 - **风险控制**: 多层次风险管理和自动干预机制
-- **记忆系统**: 长期记忆和上下文理解能力
+- **记忆系统**: 智能记忆管理，按需动态加载
 - **自我进化**: 从交易经验中持续学习和优化
+- **执行验证**: 命令执行结果可验证、可追溯
 
 ### 运行模式
 
@@ -72,8 +74,12 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
 │  │MainController│ │DecisionEngine│ │TradingEngine│         │
 │  └─────────────┘  └─────────────┘  └─────────────┘         │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │ 记忆系统    │  │ 风险控制    │  │ 策略管理    │         │
-│  │MemorySystem │ │RiskController│ │StrategyMgr  │         │
+│  │ 智能记忆    │  │ 风险控制    │  │ 策略管理    │         │
+│  │SmartMemory  │ │RiskController│ │StrategyMgr  │         │
+│  └─────────────┘  └─────────────┘  └─────────────┘         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │ 执行验证器  │  │ 止盈止损    │  │ 审计日志    │         │
+│  │ExecVerifier │ │StopLossMgr  │ │AuditLogger  │         │
 │  └─────────────┘  └─────────────┘  └─────────────┘         │
 └─────────────────────────────────────────────────────────────┘
                                │
@@ -104,14 +110,19 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
 │   ├── main.py                    # 主入口
 │   └── modules/
 │       ├── core/                  # 核心模块
+│       │   ├── main_controller.py         # 主控制器
 │       │   ├── ai_trading_engine.py       # AI交易引擎
 │       │   ├── ai_core_decision_engine.py # AI决策引擎
-│       │   ├── ai_memory.py               # AI记忆系统
+│       │   ├── ai_memory.py               # 智能记忆系统 V2.0
 │       │   ├── enhanced_llm_manager.py    # LLM管理器
 │       │   ├── llm_integration.py         # LLM集成
 │       │   ├── account_risk_monitor.py    # 账户风险监控
-│       │   ├── unified_memory_system.py   # 统一记忆系统
-│       │   ├── strategy_optimizer.py      # 策略优化器
+│       │   ├── dynamic_position_manager.py # 动态仓位管理器
+│       │   ├── correlation_monitor.py     # 品种相关性监控器
+│       │   ├── strategy_hot_loader.py     # 策略热加载器
+│       │   ├── audit_logger.py            # 审计日志记录器
+│       │   ├── stop_loss_take_profit.py   # 止盈止损管理器
+│       │   ├── execution_verifier.py      # 执行验证器
 │       │   └── ...
 │       ├── exchanges/             # 交易所接口
 │       │   ├── okx.py             # OKX交易所
@@ -120,14 +131,12 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
 │       ├── notification/          # 通知模块
 │       │   └── telegram_bot.py    # Telegram机器人
 │       ├── data/                  # 数据模块
-│       │   ├── unified_data_manager.py    # 统一数据管理
-│       │   ├── realtime_data_collector.py # 实时数据采集
-│       │   └── ...
 │       ├── strategies/            # 策略模块
 │       ├── skills/                # 技能模块
 │       ├── risk/                  # 风险管理
 │       ├── api/                   # API服务
 │       └── monitoring/            # 监控模块
+│           └── enhanced_monitoring.py     # 增强监控系统
 ├── workspace/                     # AI记忆文件
 │   ├── SOUL.md                    # 核心信念
 │   ├── IDENTITY.md                # 身份定义
@@ -139,10 +148,19 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
 │   │   ├── default.yml            # 默认配置
 │   │   └── proxy.json             # 代理配置
 │   └── memory/                    # 记忆数据
+│       ├── daily/                 # 每日记忆（保留30天）
+│       ├── summary/               # 每日总结（保留30天）
+│       ├── weekly/                # 周度汇总（保留12周）
+│       ├── monthly/               # 月度汇总（永久）
+│       ├── experience/            # 经验教训（永久）
+│       ├── trades/                # 交易记录
+│       └── sessions/              # 会话记录
 ├── logs/                          # 日志文件
+│   └── audit/                     # 审计日志
 ├── docker-compose.yml             # Docker编排
 ├── Dockerfile                     # Docker镜像
 ├── requirements.txt               # Python依赖
+├── ARCHITECTURE.md                # 本文档
 └── .env                          # 环境变量
 ```
 
@@ -180,73 +198,174 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
 - 持仓监控
 - 自动平仓和风险控制
 
-### 4.4 记忆系统 (Memory System)
+### 4.4 智能记忆系统 V2.0 (SmartMemoryManager)
 
-**文件**: 
-- `src/modules/core/ai_memory.py`
-- `src/modules/core/unified_memory_system.py`
+**文件**: `src/modules/core/ai_memory.py`
 
 **职责**:
-- 长期记忆存储（workspace/*.md文件）
-- 短期记忆管理
-- 记忆检索和注入
-- 上下文构建
+- 固定最小加载 + 按需动态加载
+- 意图识别关键词匹配
+- 30天每日记忆 + 自动总结
+- 经验教训永久保留
 
-**记忆文件说明**:
-| 文件 | 用途 | 大小限制 |
-|------|------|----------|
-| SOUL.md | AI核心信念和价值观 | 800字符 |
-| IDENTITY.md | AI身份定义和能力 | 600字符 |
-| USER.md | 用户偏好和设置 | 400字符 |
-| TRADING.md | 交易知识和经验 | 动态 |
-| INSTRUCTIONS.md | 工作指令和任务 | 300字符 |
+**记忆加载策略**:
+| 层级 | 内容 | 加载时机 | 字符限制 |
+|------|------|----------|----------|
+| 核心身份 | SOUL.md + IDENTITY.md | 每次对话 | 300字 |
+| 用户期望 | USER.md | 每次对话 | 100字 |
+| 对话上下文 | 最近3-5条对话 | 每次对话 | 动态 |
+| 交易相关 | TRADING.md + 今日交易 | 交易关键词触发 | 800字 |
+| 市场分析 | 今日市场观察 | 市场关键词触发 | 500字 |
+| 风险相关 | 近期风险事件 | 风险关键词触发 | 500字 |
+| 经验教训 | lessons_learned.md | 学习关键词触发 | 400字 |
 
-### 4.5 LLM管理器 (EnhancedLLMManager)
-
-**文件**: `src/modules/core/enhanced_llm_manager.py`
-
-**职责**:
-- 多模型管理（百度千帆、讯飞星火等）
-- API调用和错误处理
-- 模型切换和负载均衡
-- Prompt构建和优化
-
-**当前配置**:
-- 主模型: 百度千帆 DeepSeek-V3.2
-- API端点: `https://qianfan.baidubce.com/v2/coding/chat/completions`
-
-### 4.6 风险监控 (AccountRiskMonitor)
-
-**文件**: `src/modules/core/account_risk_monitor.py`
-
-**职责**:
-- 实时监控账户风险
-- 持仓风险评估
-- 风险预警生成
-- 自动风险处理
-
-**风险等级**:
-| 等级 | 触发条件 | 处理方式 |
-|------|----------|----------|
-| LOW | 正常状态 | 继续监控 |
-| HIGH | 接近预警线 | 发送警告 |
-| CRITICAL | 触及危险线 | 自动平仓 |
-
-### 4.7 交易所接口 (Exchange Connector)
-
-**文件**: `src/modules/exchanges/okx.py`
-
-**职责**:
-- OKX API对接
-- 订单执行
-- 持仓查询
-- 账户管理
+**意图关键词**:
+| 意图 | 关键词示例 |
+|------|-----------|
+| 交易 | 开仓、平仓、止损、止盈、仓位、做多、做空 |
+| 市场 | 行情、走势、趋势、分析、支撑、阻力 |
+| 风险 | 风险、亏损、预警、强平、爆仓 |
+| 学习 | 为什么、原因、教训、改进、总结 |
+| 指令 | 你要、我要求、我希望、记住 |
 
 ---
 
-## 5. 数据流
+## 5. 新增模块 (V2.1)
 
-### 5.1 交易决策流程
+### 5.1 动态仓位管理器 (DynamicPositionManager)
+
+**文件**: `src/modules/core/dynamic_position_manager.py`
+
+**功能**:
+- 基于市场波动率动态调整仓位
+- 基于账户风险状态调整仓位
+- 基于策略表现动态调整仓位
+- 支持多品种仓位分散
+
+**配置**:
+```python
+DynamicPositionConfig:
+    base_position_ratio: 0.1      # 基础仓位比例
+    max_position_ratio: 0.3       # 单品种最大仓位
+    max_total_position_ratio: 0.8 # 总仓位上限
+```
+
+### 5.2 品种相关性监控器 (CorrelationMonitor)
+
+**文件**: `src/modules/core/correlation_monitor.py`
+
+**功能**:
+- 实时计算品种间相关性
+- 检测相关性变化
+- 预警过度集中风险
+- 提供分散化建议和得分
+
+**配置**:
+```python
+CorrelationMonitorConfig:
+    correlation_threshold_high: 0.7  # 高相关性阈值
+    lookback_periods: 30             # 回看周期
+```
+
+### 5.3 策略热加载器 (StrategyHotLoader)
+
+**文件**: `src/modules/core/strategy_hot_loader.py`
+
+**功能**:
+- 无需重启即可更新策略逻辑
+- 策略版本管理
+- 策略回滚支持
+- 自动备份和恢复
+
+### 5.4 审计日志记录器 (AuditLogger)
+
+**文件**: `src/modules/core/audit_logger.py`
+
+**功能**:
+- 完整的操作日志记录
+- 敏感操作审计
+- 日志查询和分析
+- 合规性报告生成
+
+**日志类型**:
+| 事件类型 | 描述 |
+|----------|------|
+| TRADE_OPEN | 开仓 |
+| TRADE_CLOSE | 平仓 |
+| POSITION_UPDATE | 持仓更新 |
+| RISK_ALERT | 风险预警 |
+| STRATEGY_LOAD | 策略加载 |
+| SYSTEM_ACTION | 系统操作 |
+
+### 5.5 止盈止损管理器 (StopLossTakeProfitManager)
+
+**文件**: `src/modules/core/stop_loss_take_profit.py`
+
+**功能**:
+- 固定止盈止损
+- 移动止盈止损（追踪止损）
+- 分批止盈
+- 保本止损
+- 时间止损
+- ATR动态止损
+
+**配置**:
+```python
+StopLossTakeProfitConfig:
+    default_stop_loss_percent: 0.03   # 默认止损3%
+    default_take_profit_percent: 0.06  # 默认止盈6%
+    enable_trailing_stop: True         # 启用移动止损
+    trailing_stop_offset: 0.02         # 移动止损偏移2%
+    enable_breakeven: True             # 启用保本止损
+    breakeven_trigger: 0.02            # 2%盈利触发保本
+```
+
+### 5.6 执行验证器 (ExecutionVerifier)
+
+**文件**: `src/modules/core/execution_verifier.py`
+
+**功能**:
+- 命令解析和分类
+- 执行状态追踪
+- 结果验证和反馈
+- 审计日志记录
+- 执行状态查询
+
+**命令类型**:
+| 类型 | 描述 |
+|------|------|
+| OPEN_POSITION | 开仓 |
+| CLOSE_POSITION | 平仓 |
+| SET_STOP_LOSS | 设置止损 |
+| SET_TAKE_PROFIT | 设置止盈 |
+| QUERY_POSITION | 查询持仓 |
+| QUERY_BALANCE | 查询余额 |
+| ANALYZE_MARKET | 分析市场 |
+
+**执行状态**:
+| 状态 | 描述 |
+|------|------|
+| PENDING | 待执行 |
+| EXECUTING | 执行中 |
+| SUCCESS | 成功 |
+| FAILED | 失败 |
+| TIMEOUT | 超时 |
+
+### 5.7 增强监控系统 (EnhancedMonitoringSystem)
+
+**文件**: `src/modules/monitoring/enhanced_monitoring.py`
+
+**功能**:
+- 实时监控关键指标
+- 多渠道报警（Telegram、邮件、Webhook）
+- 报警分级和聚合
+- 自动关联审计日志
+
+---
+
+## 6. 数据流
+
+### 6.1 交易决策流程
 
 ```
 用户指令/市场数据
@@ -259,14 +378,9 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
          │
          ▼
 ┌─────────────────┐
-│  数据采集层     │
-│ DataCollector   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  记忆注入       │
-│ MemoryInjection │
+│  智能记忆加载   │
+│ SmartMemory     │
+│ (按需动态加载)  │
 └────────┬────────┘
          │
          ▼
@@ -277,8 +391,26 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
          │
          ▼
 ┌─────────────────┐
+│  动态仓位计算   │
+│ PositionManager │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  相关性检查     │
+│ CorrelationMon  │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
 │  风险评估       │
 │ RiskAssessment  │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  执行验证器     │
+│ ExecVerifier    │
 └────────┬────────┘
          │
          ▼
@@ -289,22 +421,37 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
          │
          ▼
 ┌─────────────────┐
-│  结果反馈       │
-│ Feedback        │
+│  止盈止损设置   │
+│ StopLossManager │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  审计日志记录   │
+│ AuditLogger     │
 └─────────────────┘
 ```
 
-### 5.2 记忆注入流程
+### 6.2 记忆加载流程
 
 ```
 用户输入
     │
     ▼
 ┌─────────────────┐
-│ 加载工作区文件  │
-│ SOUL/IDENTITY   │
-│ USER/TRADING    │
+│ 意图识别        │
+│ IntentAnalysis  │
 └────────┬────────┘
+         │
+    ┌────┴────┐
+    │         │
+    ▼         ▼
+┌───────┐ ┌───────┐
+│固定加载│ │动态加载│
+│核心身份│ │按意图 │
+└───┬───┘ └───┬───┘
+    │         │
+    └────┬────┘
          │
          ▼
 ┌─────────────────┐
@@ -326,9 +473,9 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
 
 ---
 
-## 6. 部署架构
+## 7. 部署架构
 
-### 6.1 Docker容器化部署
+### 7.1 Docker容器化部署
 
 ```yaml
 # docker-compose.yml
@@ -363,7 +510,7 @@ volumes:
   redis-data:
 ```
 
-### 6.2 网络配置
+### 7.2 网络配置
 
 - **代理**: Docker容器通过 `host.docker.internal:7890` 访问宿主机代理
 - **Redis**: 容器内部通信
@@ -371,9 +518,9 @@ volumes:
 
 ---
 
-## 7. 配置说明
+## 8. 配置说明
 
-### 7.1 环境变量 (.env)
+### 8.1 环境变量 (.env)
 
 ```bash
 # 百度千帆API
@@ -393,7 +540,7 @@ HTTP_PROXY=http://host.docker.internal:7890
 HTTPS_PROXY=http://host.docker.internal:7890
 ```
 
-### 7.2 系统配置 (data/config/default.yml)
+### 8.2 系统配置 (data/config/default.yml)
 
 ```yaml
 # API服务器配置
@@ -427,13 +574,27 @@ llm:
   model: "deepseek-v3.2"
   temperature: 0.7
   max_tokens: 4096
+
+# 止盈止损配置
+stop_loss:
+  default_stop_loss_percent: 0.03
+  default_take_profit_percent: 0.06
+  enable_trailing_stop: true
+  trailing_stop_offset: 0.02
+
+# 记忆系统配置
+memory:
+  daily_retention_days: 30
+  weekly_retention_weeks: 12
+  enable_auto_summary: true
+  summary_time: "23:55"
 ```
 
 ---
 
-## 8. API接口
+## 9. API接口
 
-### 8.1 REST API
+### 9.1 REST API
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
@@ -442,8 +603,10 @@ llm:
 | `/api/v1/positions` | GET | 当前持仓 |
 | `/api/v1/orders` | GET | 订单历史 |
 | `/api/v1/account` | GET | 账户信息 |
+| `/api/v1/executions` | GET | 执行记录 |
+| `/api/v1/memory/stats` | GET | 记忆统计 |
 
-### 8.2 Telegram Bot命令
+### 9.2 Telegram Bot命令
 
 | 命令 | 描述 |
 |------|------|
@@ -452,48 +615,58 @@ llm:
 | `/status` | 查看状态 |
 | `/positions` | 查看持仓 |
 | `/balance` | 查看余额 |
+| `/executions` | 查看执行记录 |
 
 ---
 
-## 9. 安全机制
+## 10. 安全机制
 
-### 9.1 API密钥管理
+### 10.1 API密钥管理
 
 - 所有API密钥存储在 `.env` 文件中
 - 不提交到版本控制
 - 容器运行时通过环境变量注入
 
-### 9.2 风险控制
+### 10.2 风险控制
 
 - 单笔交易最大亏损: 2%
 - 日内最大亏损: 5%
 - 最大回撤: 15%
-- 黑名单机制: 禁止交易指定币种
+- 黑名单机制: 禁止交易指定币种（当前已清空）
 
-### 9.3 自动保护
+### 10.3 自动保护
 
 - CRITICAL风险自动平仓
 - 异常检测自动告警
 - 系统故障自动恢复
+- 止盈止损自动执行
+
+### 10.4 审计追踪
+
+- 所有交易操作记录审计日志
+- 执行结果可验证、可追溯
+- 日志保留90天
 
 ---
 
-## 10. 监控告警
+## 11. 监控告警
 
-### 10.1 日志系统
+### 11.1 日志系统
 
 - **应用日志**: `logs/app.log`
 - **交易日志**: `logs/trading.log`
 - **错误日志**: `logs/error.log`
+- **审计日志**: `logs/audit/`
 
-### 10.2 Telegram通知
+### 11.2 Telegram通知
 
 - 交易执行通知
 - 风险预警通知
 - 系统状态通知
 - 错误告警通知
+- 止盈止损触发通知
 
-### 10.3 健康检查
+### 11.3 健康检查
 
 ```bash
 # 检查容器状态
@@ -504,13 +677,33 @@ curl http://localhost:8000/health
 
 # 查看实时日志
 docker logs -f openclaw-trading
+
+# 查看执行记录
+curl http://localhost:8000/api/v1/executions
 ```
 
 ---
 
 ## 附录
 
-### A. 常见问题
+### A. 版本更新日志
+
+**V2.1.0 (2026-04-05)**
+- 新增动态仓位管理器
+- 新增品种相关性监控器
+- 新增策略热加载器
+- 新增审计日志记录器
+- 新增止盈止损管理器
+- 新增执行验证器
+- 新增增强监控系统
+- 重构智能记忆系统V2.0（按需动态加载）
+- 优化记忆加载策略（固定最小+按需动态）
+- 移除ETH/USDT黑名单
+
+**V2.0.0**
+- 初始版本
+
+### B. 常见问题
 
 **Q: 如何更新API密钥？**
 A: 编辑 `.env` 文件，然后重启容器: `docker-compose restart`
@@ -521,13 +714,20 @@ A: `docker logs openclaw-trading | grep -i trade`
 **Q: 如何手动平仓？**
 A: 通过Telegram发送平仓指令，或调用API接口
 
-### B. 维护指南
+**Q: 如何查询执行状态？**
+A: 发送"最近执行了什么"或调用 `/api/v1/executions`
+
+**Q: 如何验证止损是否设置？**
+A: 发送"BTC的止损设置了吗"或调用 `verify_stop_loss_set()`
+
+### C. 维护指南
 
 1. **日常检查**: 查看Telegram通知和日志
 2. **周度检查**: 检查账户余额和持仓
 3. **月度检查**: 备份数据和配置
+4. **定期清理**: 30天前的每日记忆自动清理
 
-### C. 相关文档
+### D. 相关文档
 
 - [快速开始指南](./快速开始指南.md)
 - [AI记忆文件](./workspace/)

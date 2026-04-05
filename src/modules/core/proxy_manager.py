@@ -397,7 +397,6 @@ class ProxyManager:
         proxy = self.proxies[name]
         
         try:
-            # 简单的 TCP 连接测试
             start_time = time.time()
             
             reader, writer = await asyncio.wait_for(
@@ -409,11 +408,20 @@ class ProxyManager:
             
             response_time = time.time() - start_time
             
-            # 更新统计
             await self.report_proxy_success(name, response_time)
             
             return True
             
+        except asyncio.TimeoutError:
+            await self.report_proxy_error(name, "连接超时")
+            return False
+        except ConnectionRefusedError:
+            await self.report_proxy_error(name, "连接被拒绝")
+            return False
+        except OSError as e:
+            if "No route to host" in str(e) or "Network is unreachable" in str(e):
+                await self.report_proxy_error(name, f"网络不可达: {e}")
+            return False
         except Exception as e:
             await self.report_proxy_error(name, str(e))
             return False
@@ -421,11 +429,12 @@ class ProxyManager:
     async def _health_check_worker(self):
         """健康检查工作线程"""
         logger.info("启动代理健康检查任务")
+        check_interval = 300
+        error_count = {}
         
         while self._running:
             try:
-                # 每 60 秒检查一次
-                await asyncio.sleep(60)
+                await asyncio.sleep(check_interval)
                 
                 for name, proxy in self.proxies.items():
                     if not proxy.enabled:
@@ -435,9 +444,15 @@ class ProxyManager:
                     is_healthy = await self.check_proxy_health(name)
                     
                     if is_healthy:
+                        if name in error_count:
+                            del error_count[name]
                         logger.debug(f"代理 {name} 健康检查通过")
                     else:
-                        logger.warning(f"代理 {name} 健康检查失败")
+                        error_count[name] = error_count.get(name, 0) + 1
+                        if error_count[name] <= 3:
+                            logger.warning(f"代理 {name} 健康检查失败 (第{error_count[name]}次)")
+                        elif error_count[name] == 4:
+                            logger.warning(f"代理 {name} 健康检查持续失败，将减少日志输出")
                         
             except asyncio.CancelledError:
                 break

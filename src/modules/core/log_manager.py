@@ -388,9 +388,13 @@ class FileHandler(LogHandler):
                     {
                         "type": "log_file_header",
                         "created_at": datetime.now().isoformat(),
-                        "config": asdict(self.config),
+                        "config": {
+                            k: v.value if isinstance(v, Enum) else v
+                            for k, v in asdict(self.config).items()
+                        },
                     },
                     ensure_ascii=False,
+                    default=str,
                 )
                 + "\n"
             )

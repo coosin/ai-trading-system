@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
@@ -122,10 +123,10 @@ class DatabaseStats:
 class DatabaseConfig:
     """数据库配置"""
 
-    type: DatabaseType = DatabaseType.POSTGRESQL
+    type: DatabaseType = DatabaseType.SQLITE
     host: str = "localhost"
     port: int = 5432
-    database: str = "trading_system"
+    database: str = "/app/data/trading_system.db"
     username: str = "postgres"
     password: str = ""
     pool_size: int = 20
@@ -863,10 +864,19 @@ class DatabaseManager:
         if not self.config:
             raise RuntimeError("数据库配置未加载")
 
-        # 构建连接字符串
         connection_string = self.config.get_connection_string()
 
-        # 创建异步引擎
+        if self.config.type == DatabaseType.SQLITE and self.config.database != ":memory:":
+            db_path = Path(self.config.database)
+            try:
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                fallback_path = Path("/tmp/openclaw_data")
+                fallback_path.mkdir(parents=True, exist_ok=True)
+                self.config.database = str(fallback_path / "trading_system.db")
+                connection_string = self.config.get_connection_string()
+                logger.warning(f"数据库路径权限不足，使用备用路径: {self.config.database}")
+
         engine_kwargs = {
             "pool_size": self.config.pool_size,
             "max_overflow": self.config.max_overflow,
@@ -876,13 +886,11 @@ class DatabaseManager:
             "future": True,
         }
         
-        # SQLite不支持READ COMMITTED隔离级别，使用默认隔离级别
         if self.config.type != DatabaseType.SQLITE:
             engine_kwargs["isolation_level"] = self.config.isolation_level.value.upper()
         
         self.engine = create_async_engine(connection_string, **engine_kwargs)
 
-        # 创建会话工厂
         self.session_factory = async_sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
         )

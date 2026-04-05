@@ -134,8 +134,12 @@ class OKXExchange(ExchangeBase):
                             if data.get("code") == "0":
                                 return data.get("data", [])
                             else:
-                                error_msg = data.get('msg', '') or data.get('code', 'unknown')
-                                logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                                error_code = data.get('code', '')
+                                error_msg = data.get('msg', '') or error_code or 'unknown'
+                                if error_code == "51001":
+                                    logger.debug(f"OKX API交易对不存在: {method} {endpoint} - {error_msg}")
+                                else:
+                                    logger.error(f"OKX API返回错误: {method} {endpoint} - code={error_code}, msg={error_msg}")
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
                     elif method == "POST":
@@ -167,8 +171,12 @@ class OKXExchange(ExchangeBase):
                             if data.get("code") == "0":
                                 return data.get("data", [])
                             else:
-                                error_msg = data.get('msg', '') or data.get('code', 'unknown')
-                                logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                                error_code = data.get('code', '')
+                                error_msg = data.get('msg', '') or error_code or 'unknown'
+                                if error_code == "51001":
+                                    logger.debug(f"OKX API交易对不存在: {method} {endpoint}")
+                                else:
+                                    logger.error(f"OKX API返回错误: {method} {endpoint} - code={error_code}, msg={error_msg}")
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
                 except asyncio.TimeoutError as e:
@@ -202,7 +210,11 @@ class OKXExchange(ExchangeBase):
                         raise
                         
                 except Exception as e:
-                    logger.error(f"OKX API请求失败: {method} {endpoint} - {type(e).__name__}: {e}")
+                    error_str = str(e)
+                    if "51001" in error_str or "doesn't exist" in error_str:
+                        logger.debug(f"OKX API交易对不存在: {method} {endpoint}")
+                    else:
+                        logger.error(f"OKX API请求失败: {method} {endpoint} - {type(e).__name__}: {e}")
                     raise
     
     async def initialize(self) -> bool:
@@ -278,7 +290,6 @@ class OKXExchange(ExchangeBase):
     
     async def get_market_data(self, symbol: str, interval: str = "1m") -> MarketData:
         """获取市场数据"""
-        # OKX的时间间隔格式转换
         interval_map = {
             "1m": "1m",
             "5m": "5m",
@@ -290,7 +301,14 @@ class OKXExchange(ExchangeBase):
         okx_interval = interval_map.get(interval, "1m")
         
         endpoint = "/api/v5/market/candles"
-        okx_symbol = symbol.replace("/", "-")
+        
+        if "/SWAP" in symbol or symbol.endswith("SWAP"):
+            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
+            if not okx_symbol.endswith("-SWAP"):
+                okx_symbol = okx_symbol + "-SWAP"
+        else:
+            okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
         params = {
             "instId": okx_symbol,
             "bar": okx_interval,
@@ -312,7 +330,7 @@ class OKXExchange(ExchangeBase):
                     quote_volume=float(candle[7])
                 )
         except Exception as e:
-            logger.error(f"获取OKX市场数据失败: {e}")
+            logger.debug(f"获取OKX市场数据失败: {symbol} -> {okx_symbol}: {e}")
         return None
     
     async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict[str, any]]:
@@ -339,7 +357,14 @@ class OKXExchange(ExchangeBase):
         okx_interval = interval_map.get(interval, "1H")
         
         endpoint = "/api/v5/market/candles"
-        okx_symbol = symbol.replace("/", "-")
+        
+        if "/SWAP" in symbol or symbol.endswith("SWAP"):
+            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
+            if not okx_symbol.endswith("-SWAP"):
+                okx_symbol = okx_symbol + "-SWAP"
+        else:
+            okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
         params = {
             "instId": okx_symbol,
             "bar": okx_interval,
@@ -362,7 +387,7 @@ class OKXExchange(ExchangeBase):
                     })
                 return klines
         except Exception as e:
-            logger.error(f"获取OKX K线数据失败: {e}")
+            logger.debug(f"获取OKX K线数据失败: {symbol} -> {okx_symbol}: {e}")
         return []
     
     async def get_multi_timeframe_klines(self, symbol: str, timeframes: List[str] = None) -> Dict[str, List[Dict]]:
@@ -396,7 +421,14 @@ class OKXExchange(ExchangeBase):
     async def get_order_book(self, symbol: str, depth: int = 10) -> OrderBook:
         """获取订单簿"""
         endpoint = "/api/v5/market/books"
-        okx_symbol = symbol.replace("/", "-")
+        
+        if "/SWAP" in symbol or symbol.endswith("SWAP"):
+            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
+            if not okx_symbol.endswith("-SWAP"):
+                okx_symbol = okx_symbol + "-SWAP"
+        else:
+            okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        
         params = {
             "instId": okx_symbol,
             "sz": depth
@@ -415,7 +447,7 @@ class OKXExchange(ExchangeBase):
                     bids=bids
                 )
         except Exception as e:
-            logger.error(f"获取OKX订单簿失败: {e}")
+            logger.debug(f"获取OKX订单簿失败: {symbol} -> {okx_symbol}: {e}")
         return None
     
     async def place_order(self, order: Order) -> Dict[str, Any]:
@@ -750,7 +782,30 @@ class OKXExchange(ExchangeBase):
                     "timestamp": int(ticker.get("ts", 0))
                 }
         except Exception as e:
-            logger.error(f"获取OKX行情失败: {e}")
+            error_str = str(e)
+            if "51001" in error_str or "doesn't exist" in error_str:
+                logger.debug(f"交易对 {okx_symbol} 不存在，尝试现货...")
+                try:
+                    spot_symbol = symbol.replace("/SWAP", "").replace("/", "-")
+                    params["instId"] = spot_symbol
+                    data = await self._make_request("GET", endpoint, params)
+                    if data and len(data) > 0:
+                        ticker = data[0]
+                        return {
+                            "symbol": symbol,
+                            "last": float(ticker.get("last", 0)),
+                            "bid": float(ticker.get("bidPx", 0)),
+                            "ask": float(ticker.get("askPx", 0)),
+                            "high": float(ticker.get("high24h", 0)),
+                            "low": float(ticker.get("low24h", 0)),
+                            "volume": float(ticker.get("vol24h", 0)),
+                            "change": float(ticker.get("change24h", 0)),
+                            "timestamp": int(ticker.get("ts", 0))
+                        }
+                except Exception as e2:
+                    logger.debug(f"交易对 {symbol} 行情获取失败: {e2}")
+            else:
+                logger.debug(f"获取OKX行情失败: {e}")
         return {}
     
     async def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "cross") -> Dict[str, Any]:

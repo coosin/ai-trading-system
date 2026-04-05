@@ -104,6 +104,7 @@ class LLMResponse:
     cost: float = 0.0
     success: bool = True
     error_message: Optional[str] = None
+    error_code: Optional[str] = None
 
 
 class BaseLLMProvider(ABC):
@@ -140,11 +141,24 @@ class BaseLLMProvider(ABC):
 class OpenAIProvider(BaseLLMProvider):
     """OpenAI兼容API提供者（支持OpenAI、DeepSeek等）"""
 
+    def _is_auth_error(self, status_code: int, error_text: str) -> bool:
+        """检查是否是认证错误"""
+        if status_code == 401:
+            return True
+        if status_code == 403 and 'auth' in error_text.lower():
+            return True
+        auth_error_codes = ['invalid_api_key', 'invalid_iam_token', 'authentication_failed', 'unauthorized']
+        for code in auth_error_codes:
+            if code in error_text.lower():
+                return True
+        return False
+
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
-        """生成文本（带重试机制）"""
+        """生成文本（带重试机制和认证错误检测）"""
         start_time = time.time()
         max_retries = kwargs.get('max_retries', self.config.max_retries)
         last_error = None
+        is_auth_failure = False
         
         for retry in range(max_retries):
             try:
@@ -174,6 +188,21 @@ class OpenAIProvider(BaseLLMProvider):
                 
                 if response.status_code != 200:
                     error_text = response.text
+                    is_auth_failure = self._is_auth_error(response.status_code, error_text)
+                    
+                    if is_auth_failure:
+                        logger.warning(f"LLM API认证失败 ({self.config.model_id}): {error_text[:200]}")
+                        last_error = f"API认证失败: {response.status_code}"
+                        return LLMResponse(
+                            content="",
+                            model_id=self.config.model_id,
+                            provider=self.config.provider,
+                            latency_ms=(time.time() - start_time) * 1000,
+                            success=False,
+                            error_message=last_error,
+                            error_code="AUTH_FAILED"
+                        )
+                    
                     logger.error(f"OpenAI API返回错误: status={response.status_code}, url={url}, response={error_text[:500]}")
                     last_error = f"API返回错误: {response.status_code}"
                     if retry < max_retries - 1:
@@ -453,44 +482,48 @@ class EnhancedLLMManager:
                 model_id="spark-lite",
                 display_name="讯飞星火 Spark Lite",
                 base_url="https://spark-api-open.xf-yun.com/v1/chat/completions",
-                api_key=xunfei_api_key,  # 从环境变量读取
+                api_key=xunfei_api_key,
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=32768,
-                priority=12
+                priority=12,
+                fallback_models=[]
             ),
             ModelConfig(
                 provider=ModelProvider.OPENAI,
                 model_id="deepseek-v3.2",
                 display_name="百度千帆 DeepSeek V3.2",
                 base_url="https://qianfan.baidubce.com/v2/coding/chat/completions",
-                api_key=qianfan_api_key,  # 从环境变量读取
+                api_key=qianfan_api_key,
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=98304,
-                priority=13
+                priority=13,
+                fallback_models=["spark-lite", "astron-code-latest"]
             ),
             ModelConfig(
                 provider=ModelProvider.OPENAI,
                 model_id="qianfan-code-latest",
                 display_name="百度千帆 qianfan-code-latest",
                 base_url="https://qianfan.baidubce.com/v2/coding/chat/completions",
-                api_key=qianfan_api_key,  # 从环境变量读取
+                api_key=qianfan_api_key,
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=98304,
-                priority=11
+                priority=11,
+                fallback_models=["spark-lite", "deepseek-v3.2"]
             ),
             ModelConfig(
                 provider=ModelProvider.OPENAI,
                 model_id="astron-code-latest",
                 display_name="讯飞 astron-code-latest",
                 base_url="https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
-                api_key=xunfei_api_key,  # 从环境变量读取
+                api_key=xunfei_api_key,
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=32768,
-                priority=10
+                priority=10,
+                fallback_models=["spark-lite"]
             ),
             ModelConfig(
                 provider=ModelProvider.LOCAL,
@@ -500,7 +533,8 @@ class EnhancedLLMManager:
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=8192,
-                priority=5
+                priority=5,
+                fallback_models=[]
             )
         ]
         
@@ -657,6 +691,8 @@ class EnhancedLLMManager:
         response = await self._generate_with_model(prompt, model_id, task_type, **kwargs)
         
         if not response.success and use_fallback:
+            is_auth_error = getattr(response, 'error_code', None) == 'AUTH_FAILED'
+            
             model_config = self.models.get(model_id)
             if model_config and model_config.fallback_models:
                 for fallback_model_id in model_config.fallback_models:
@@ -667,6 +703,20 @@ class EnhancedLLMManager:
                         )
                         if fallback_response.success:
                             return fallback_response
+            
+            if is_auth_error or (model_config and not model_config.fallback_models):
+                available_models = sorted(
+                    [m for m in self.models.values() 
+                     if m.enabled and m.model_id in self.providers and m.model_id != model_id],
+                    key=lambda x: -x.priority
+                )
+                for alt_model in available_models:
+                    logger.info(f"认证失败，尝试备用模型: {alt_model.model_id}")
+                    alt_response = await self._generate_with_model(
+                        prompt, alt_model.model_id, task_type, **kwargs
+                    )
+                    if alt_response.success:
+                        return alt_response
         
         return response
 

@@ -124,8 +124,8 @@ class AITradingEngine:
         # 监控的交易对
         self.symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
         
-        # 交易对黑名单 (ETH已被用户禁用)
-        self.symbol_blacklist = ["ETH/USDT"]
+        # 交易对黑名单
+        self.symbol_blacklist = []
         
         # 永续合约交易配置
         self.contract_config = {
@@ -1734,12 +1734,9 @@ class AITradingEngine:
             if not memory:
                 return
             
-            memory.save_risk_event(
-                event_type=event_type,
-                symbol=symbol,
-                description=description,
-                action_taken=action_taken,
-                impact=impact
+            await memory.record_risk_event(
+                event=f"{event_type}: {description}",
+                level="warning" if "warning" in event_type.lower() else "critical"
             )
             
             logger.info(f"⚠️ 风险事件已保存到记忆库: {event_key}")

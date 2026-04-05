@@ -4,6 +4,7 @@
 
 import logging
 import asyncio
+import os
 from typing import Dict, Any, List
 from datetime import datetime
 from pathlib import Path
@@ -79,7 +80,7 @@ class AutoRepairSkill(SkillBase):
     def _check_log_files(self) -> List[Dict[str, Any]]:
         """检查日志文件"""
         issues = []
-        log_path = Path("/home/cool/.openclaw-trading/logs")
+        log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
         
         if log_path.exists():
             log_files = list(log_path.glob("*.log"))
@@ -153,7 +154,7 @@ class AutoRepairSkill(SkillBase):
     async def _rotate_logs(self) -> bool:
         """轮转日志"""
         try:
-            log_path = Path("/home/cool/.openclaw-trading/logs")
+            log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
             if not log_path.exists():
                 return False
             

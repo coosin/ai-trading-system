@@ -15,11 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 class RiskLevel(Enum):
-
-    async def initialize(self) -> bool:
-        """初始化模块"""
-        return True
-
     """风险等级"""
     LOW = "low"
     MEDIUM = "medium"
@@ -93,6 +88,9 @@ class AccountRiskMonitor:
         
         self._callbacks: List[callable] = []
         self._last_account_risk: Optional[AccountRisk] = None
+        self._warning_counts: Dict[str, int] = {}
+        self._last_warning_time: Dict[str, datetime] = {}
+        self._warning_cooldown = 300
         
         logger.info("账户风险监控器初始化完成")
     
@@ -311,9 +309,24 @@ class AccountRiskMonitor:
         return warnings
     
     async def _notify_warnings(self, account_risk: AccountRisk) -> None:
-        """通知预警"""
+        """通知预警（带日志抑制）"""
+        now = datetime.now()
+        
         for warning in account_risk.warnings:
+            warning_key = warning.split()[0] if warning else ""
+            
+            if warning_key in self._last_warning_time:
+                time_since_last = (now - self._last_warning_time[warning_key]).total_seconds()
+                if time_since_last < self._warning_cooldown:
+                    self._warning_counts[warning_key] = self._warning_counts.get(warning_key, 0) + 1
+                    count = self._warning_counts[warning_key]
+                    if count in [1, 5, 10, 20, 50, 100] or count % 100 == 0:
+                        logger.warning(f"{warning} (累计{count}次)")
+                    continue
+            
             logger.warning(warning)
+            self._last_warning_time[warning_key] = now
+            self._warning_counts[warning_key] = 1
         
         for callback in self._callbacks:
             try:

@@ -439,6 +439,7 @@ class ThirdPartyDataIntegrator:
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         self.providers: Dict[DataSource, BaseDataProvider] = {}
+        self._disabled_providers: set = set()
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ttl = timedelta(minutes=15)
         self._initialize_providers()
@@ -450,6 +451,16 @@ class ThirdPartyDataIntegrator:
         self.providers[DataSource.FEAR_GREED_INDEX] = FearGreedIndexProvider()
         self.providers[DataSource.LUNARCRUSH] = LunarCrushProvider()
     
+    def disable_provider(self, source: DataSource):
+        """禁用指定的数据源"""
+        self._disabled_providers.add(source)
+        logger.info(f"已禁用数据源: {source.value}")
+    
+    def enable_provider(self, source: DataSource):
+        """启用指定的数据源"""
+        self._disabled_providers.discard(source)
+        logger.info(f"已启用数据源: {source.value}")
+    
     async def get_social_sentiment(self, symbol: str, sources: Optional[List[DataSource]] = None) -> Dict[str, Any]:
         sources = sources or [DataSource.TWITTER, DataSource.REDDIT]
         cache_key = f"social_{symbol}_{'-'.join(s.value for s in sources)}"
@@ -459,16 +470,20 @@ class ThirdPartyDataIntegrator:
         
         results = {}
         tasks = []
+        active_sources = [s for s in sources if s not in self._disabled_providers]
         
-        for source in sources:
+        for source in active_sources:
             if source in self.providers:
                 tasks.append(self._fetch_with_source(source, symbol))
         
         fetch_results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        for source, result in zip(sources, fetch_results):
+        for source, result in zip(active_sources, fetch_results):
             if isinstance(result, Exception):
-                logger.error(f"Error fetching {source.value}: {result}")
+                error_str = str(result)
+                if "403" in error_str or "access denied" in error_str.lower():
+                    self.disable_provider(source)
+                logger.debug(f"获取 {source.value} 数据失败: {result}")
             else:
                 results[source.value] = result
         

@@ -620,6 +620,8 @@ class AICoreDecisionEngine:
                                 symbol = pos.get('instId', '')
                                 pnl_ratio = float(pos.get('uplRatio', 0))
                                 
+                                logger.info(f"📊 检查持仓风险: {symbol}, 盈亏比例: {pnl_ratio:.2%}")
+                                
                                 # 检查是否在黑名单中
                                 in_blacklist = False
                                 for bl in self.blacklist:
@@ -627,10 +629,14 @@ class AICoreDecisionEngine:
                                         in_blacklist = True
                                         break
                                 
+                                logger.debug(f"📋 {symbol} 黑名单状态: {in_blacklist}, 黑名单: {list(self.blacklist)}")
+                                
                                 # 如果是非黑名单币种且亏损严重，才处理
                                 if not in_blacklist and pnl_ratio < -0.1:
                                     non_blacklist_risk = True
-                                    logger.warning(f"� 非黑名单币种风险: {symbol} 亏损 {pnl_ratio:.2%}")
+                                    logger.warning(f"🚨 非黑名单币种风险: {symbol} 亏损 {pnl_ratio:.2%}")
+                            
+                            logger.info(f"📊 风险检查结果: non_blacklist_risk={non_blacklist_risk}, 持仓数={len(positions)}")
                             
                             # 只有非黑名单币种有风险才处理
                             if non_blacklist_risk:

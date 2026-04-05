@@ -11,6 +11,7 @@ AI自主开发框架 - 赋予AI完整的自主开发能力
 
 import asyncio
 import logging
+import os
 from typing import Dict, Any, List, Optional, Callable
 from datetime import datetime
 from pathlib import Path
@@ -113,7 +114,7 @@ class AutonomousDeveloper:
             DevelopmentStage.INTEGRATING: self._integrate_code,
         }
         
-        self._workspace = Path("/home/cool/.openclaw-trading")
+        self._workspace = Path(os.environ.get("OPENCLAW_WORKSPACE", "/app"))
         self._auto_test = True
         self._auto_review = True
         self._min_review_score = 70.0

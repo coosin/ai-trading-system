@@ -75,8 +75,12 @@ class HistoricalDataStorage:
     
     def __init__(self, db_path: str = None):
         if db_path is None:
-            data_dir = Path.home() / ".openclaw-trading" / "data"
-            data_dir.mkdir(parents=True, exist_ok=True)
+            data_dir = Path(os.environ.get("OPENCLAW_DATA_PATH", "/app/data"))
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                data_dir = Path("/tmp/openclaw_data")
+                data_dir.mkdir(parents=True, exist_ok=True)
             db_path = str(data_dir / "historical_data.db")
         
         self.db_path = db_path

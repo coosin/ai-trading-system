@@ -38,9 +38,16 @@ class MemoryLevel:
 class HierarchicalMemoryManager:
     """层次化记忆管理器"""
     
-    def __init__(self, base_path: str = "/home/cool/.openclaw-trading/memory"):
+    def __init__(self, base_path: str = None):
+        if base_path is None:
+            base_path = os.environ.get("OPENCLAW_MEMORY_PATH", "/app/workspace/memory")
         self.base_path = Path(base_path)
-        self.base_path.mkdir(parents=True, exist_ok=True)
+        try:
+            self.base_path.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            self.base_path = Path("/tmp/openclaw_memory")
+            self.base_path.mkdir(parents=True, exist_ok=True)
+            logger.warning(f"使用备用记忆路径: {self.base_path}")
         
         self.daily_path = self.base_path / "daily"
         self.weekly_path = self.base_path / "weekly"
@@ -48,12 +55,15 @@ class HierarchicalMemoryManager:
         self.insights_path = self.base_path / "insights"
         
         for path in [self.daily_path, self.weekly_path, self.lessons_path, self.insights_path]:
-            path.mkdir(exist_ok=True)
+            try:
+                path.mkdir(exist_ok=True)
+            except PermissionError:
+                logger.warning(f"无法创建目录 {path}")
         
         self.session_context: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
         
-        logger.info("层次化记忆管理器初始化完成")
+        logger.info(f"层次化记忆管理器初始化完成，路径: {self.base_path}")
     
     async def save_daily_memory(self, content: str, date: Optional[datetime] = None):
         """保存每日交易记忆"""

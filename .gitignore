@@ -90,6 +90,7 @@ data/historical/*.json
 data/memory/*.json
 data/strategy_optimization.json
 agents/*/sessions/*.json
+agents/*/sessions/*.jsonl
 agents/*/agent/models.json
 backups/*.tar.gz
 backups/*.zip

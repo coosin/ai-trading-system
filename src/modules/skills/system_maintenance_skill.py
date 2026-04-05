@@ -11,6 +11,7 @@
 
 import asyncio
 import logging
+import os
 import psutil
 import shutil
 from typing import Dict, Any, List, Optional
@@ -293,7 +294,7 @@ class SystemMaintenanceSkill(SkillBase):
     
     def _check_logs(self) -> Dict[str, Any]:
         """检查日志状态"""
-        log_path = Path("/home/cool/.openclaw-trading/logs")
+        log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
         
         total_size = 0
         file_count = 0
@@ -438,7 +439,7 @@ class SystemMaintenanceSkill(SkillBase):
     async def _rotate_logs(self) -> bool:
         """轮转日志"""
         try:
-            log_path = Path("/home/cool/.openclaw-trading/logs")
+            log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
             if not log_path.exists():
                 return False
             
@@ -459,9 +460,10 @@ class SystemMaintenanceSkill(SkillBase):
     async def _clean_temp_files(self) -> bool:
         """清理临时文件"""
         try:
+            base_path = Path(os.environ.get("OPENCLAW_BASE_PATH", "/app"))
             temp_paths = [
-                Path("/home/cool/.openclaw-trading/temp"),
-                Path("/home/cool/.openclaw-trading/cache"),
+                base_path / "temp",
+                base_path / "cache",
                 Path("/tmp")
             ]
             

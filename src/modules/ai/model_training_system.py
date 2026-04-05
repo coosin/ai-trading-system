@@ -319,7 +319,9 @@ class ClassificationTrainer(BaseModelTrainer):
 
 
 class ModelTrainingPipeline:
-    def __init__(self, base_dir: str = "models"):
+    def __init__(self, base_dir: str = None):
+        if base_dir is None:
+            base_dir = os.environ.get("OPENCLAW_MODELS_PATH", "/app/data/models")
         self.base_dir = Path(base_dir)
         self.models_dir = self.base_dir / "trained"
         self.checkpoints_dir = self.base_dir / "checkpoints"
@@ -333,9 +335,20 @@ class ModelTrainingPipeline:
         self._is_running = False
     
     def _ensure_directories(self):
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
-        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+            self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+            self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            fallback = Path("/tmp/openclaw_models")
+            self.base_dir = fallback
+            self.models_dir = fallback / "trained"
+            self.checkpoints_dir = fallback / "checkpoints"
+            self.metadata_dir = fallback / "metadata"
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+            self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+            self.metadata_dir.mkdir(parents=True, exist_ok=True)
+            logger.warning(f"使用备用模型目录: {fallback}")
     
     async def start_pipeline(self):
         if self._is_running:

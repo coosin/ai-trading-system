@@ -2,7 +2,7 @@
 
 **全智能量化交易系统** - 基于AI的自主交易解决方案
 
-[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](https://github.com/openclaw-trading)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](https://github.com/openclaw-trading)
 [![Python](https://img.shields.io/badge/python-3.11+-green.svg)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
@@ -176,4 +176,4 @@ docker exec -it openclaw-trading bash
 
 ---
 
-**版本**: 2.0.0 | **更新日期**: 2026-04-05
+**版本**: 2.1.0 | **更新日期**: 2026-04-05

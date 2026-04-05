@@ -101,9 +101,9 @@ class UnifiedMemorySystem:
     async def _init_ai_memory(self):
         """初始化AI记忆管理器（保留现有功能）"""
         try:
-            from src.modules.core.ai_memory import AIMemoryManager
+            from src.modules.core.ai_memory import SmartMemoryManager
             
-            self.ai_memory = AIMemoryManager(workspace_path=self.workspace_path)
+            self.ai_memory = SmartMemoryManager(workspace_path=self.workspace_path)
             await self.ai_memory.initialize()
             
             logger.info("✅ AI记忆管理器已初始化（保留现有功能）")
@@ -344,6 +344,19 @@ class UnifiedMemorySystem:
             except:
                 pass
         return []
+    
+    async def retrieve_memories(self, query: str, limit: int = 10) -> List[Dict]:
+        """
+        检索记忆（兼容接口）
+        
+        Args:
+            query: 查询字符串
+            limit: 返回数量限制
+        
+        Returns:
+            List[Dict]: 记忆列表
+        """
+        return await self.recall(query, level="all", limit=limit)
     
     # ==================== 保留现有接口 ====================
     

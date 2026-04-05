@@ -404,23 +404,32 @@ class APIServer:
 
         try:
             if HAS_FASTAPI and self.app:
-                # 导入uvicorn
                 import uvicorn
-                from fastapi.staticfiles import StaticFiles
+                import threading
+                import socket
                 
-                # 创建uvicorn配置
+                def is_port_in_use(port: int) -> bool:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        return s.connect_ex(('localhost', port)) == 0
+                
+                if is_port_in_use(self.port):
+                    logger.warning(f"端口 {self.port} 已被占用，尝试使用备用端口")
+                    for alt_port in range(self.port + 1, self.port + 10):
+                        if not is_port_in_use(alt_port):
+                            self.port = alt_port
+                            logger.info(f"使用备用端口: {self.port}")
+                            break
+                
                 config = uvicorn.Config(
                     self.app,
                     host=self.host,
                     port=self.port,
-                    log_level="info",
-                    access_log=True
+                    log_level="warning",
+                    access_log=False
                 )
                 
-                # 创建服务器
                 server = uvicorn.Server(config)
                 
-                # 在异步任务中启动服务器
                 async def run_server():
                     try:
                         await server.serve()
@@ -428,16 +437,22 @@ class APIServer:
                         logger.info("API服务器任务被取消")
                     except Exception as e:
                         logger.error(f"API服务器运行错误: {e}")
+                        import traceback
+                        traceback.print_exc()
                 
-                # 启动服务器任务
                 server_task = asyncio.create_task(run_server())
                 self._tasks.append(server_task)
                 
-                self._running = True
-                logger.info(f"API服务器已启动，访问 http://{self.host}:{self.port}/docs 查看文档")
-                return True
+                await asyncio.sleep(1)
+                
+                if is_port_in_use(self.port):
+                    self._running = True
+                    logger.info(f"✅ API服务器已启动，访问 http://{self.host}:{self.port}/docs 查看文档")
+                    return True
+                else:
+                    logger.error(f"API服务器启动失败，端口 {self.port} 未监听")
+                    return False
             else:
-                # 模拟模式
                 self._running = True
                 logger.info(f"API服务器已启动（模拟模式），访问 http://{self.host}:{self.port}/docs 查看文档")
                 return True

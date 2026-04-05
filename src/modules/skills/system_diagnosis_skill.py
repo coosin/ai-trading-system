@@ -4,6 +4,7 @@
 
 import psutil
 import logging
+import os
 from typing import Dict, Any, List
 from pathlib import Path
 from datetime import datetime
@@ -136,7 +137,7 @@ class SystemDiagnosisSkill(SkillBase):
     
     def _check_logs(self) -> Dict[str, Any]:
         """检查日志状态"""
-        log_path = Path("/home/cool/.openclaw-trading/logs")
+        log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
         if not log_path.exists():
             return {"exists": False, "size_mb": 0}
         

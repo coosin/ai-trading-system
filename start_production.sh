@@ -29,8 +29,10 @@ echo ""
 PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
 echo -e "${GREEN}✓${NC} Python版本: $PYTHON_VERSION"
 
-# 检查.env文件
-if [ ! -f ".env" ]; then
+# 检查.env文件（Docker环境跳过）
+if [ -f "/.dockerenv" ]; then
+    echo -e "${GREEN}✓${NC} Docker环境，使用docker-compose传递的环境变量"
+elif [ ! -f ".env" ]; then
     echo -e "${YELLOW}!${NC} .env文件不存在，从模板创建..."
     cp .env.example .env
     echo -e "${YELLOW}!${NC} 请编辑 .env 文件配置您的API密钥"

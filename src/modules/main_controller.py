@@ -45,6 +45,41 @@ from src.modules.simulation.simulated_market import SimulatedMarket
 from src.modules.simulation.contract_simulator import ContractSimulator
 from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 
+# 导入新增的升级模块
+from src.modules.core.dynamic_position_manager import DynamicPositionManager, DynamicPositionConfig
+from src.modules.core.correlation_monitor import CorrelationMonitor, CorrelationMonitorConfig
+from src.modules.core.strategy_hot_loader import StrategyHotLoader
+from src.modules.core.audit_logger import AuditLogger, AuditConfig, AuditEventType, AuditSeverity
+from src.modules.monitoring.enhanced_monitoring import EnhancedMonitoringSystem, AlertLevel, AlertChannel
+
+# 导入止盈止损管理模块
+from src.modules.core.stop_loss_take_profit import (
+    StopLossTakeProfitManager, 
+    StopLossTakeProfitConfig,
+    StopLossConfig,
+    TakeProfitConfig,
+    StopLossTakeProfitOrder,
+    StopType,
+    TakeProfitType
+)
+
+# 导入执行验证模块
+from src.modules.core.execution_verifier import (
+    ExecutionVerifier,
+    ExecutionConfig,
+    ExecutionResult,
+    CommandType,
+    ExecutionStatus
+)
+
+# 导入动态币种筛选器
+from src.modules.core.dynamic_symbol_selector import (
+    DynamicSymbolSelector,
+    DynamicSymbolSelectorConfig,
+    SymbolScore,
+    SelectionCriteria
+)
+
 # 导入智能系统组件
 from src.modules.core.hierarchical_memory import HierarchicalMemoryManager
 from src.modules.skills import (
@@ -313,6 +348,16 @@ class MainController:
         self.unified_trade_system = None         # 统一交易系统
         self.unified_risk_system = None          # 统一风险系统
         self.unified_info_collector = None       # 统一信息收集器
+        
+        # 新增升级模块
+        self.dynamic_position_manager = None     # 动态仓位管理器
+        self.correlation_monitor = None          # 品种相关性监控器
+        self.strategy_hot_loader = None          # 策略热加载器
+        self.audit_logger = None                 # 审计日志记录器
+        self.enhanced_monitoring = None          # 增强监控系统
+        self.stop_loss_manager = None            # 止盈止损管理器
+        self.execution_verifier = None           # 执行验证器
+        self.dynamic_symbol_selector = None      # 动态币种筛选器
 
         # 默认配置
         self.auto_restart_modules = True
@@ -431,6 +476,11 @@ class MainController:
             llm_manager=self.enhanced_llm_manager,
             memory_manager=self.ai_memory_manager
         )
+        
+        # 设置增强记忆系统（用于对话记录）
+        if self.ai_memory_manager:
+            self.llm_integration.enhanced_memory = self.ai_memory_manager
+            logger.info("✅ 增强记忆系统已连接到LLM集成")
         
         # 设置统一记忆系统（增强功能）
         if self.unified_memory:
@@ -746,6 +796,206 @@ class MainController:
             logger.warning(f"⚠️ 风险管理器初始化失败: {e}")
             self.risk_manager = None
         
+        # ========== 新增升级模块初始化 ==========
+        
+        # 初始化动态仓位管理器
+        try:
+            position_config = DynamicPositionConfig(
+                base_position_ratio=0.1,
+                max_position_ratio=0.3,
+                max_total_position_ratio=0.8
+            )
+            self.dynamic_position_manager = DynamicPositionManager(position_config)
+            await self.dynamic_position_manager.initialize()
+            logger.info("✅ 动态仓位管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 动态仓位管理器初始化失败: {e}")
+            self.dynamic_position_manager = None
+        
+        # 初始化品种相关性监控器
+        try:
+            correlation_config = CorrelationMonitorConfig(
+                correlation_threshold_high=0.7,
+                lookback_periods=30
+            )
+            self.correlation_monitor = CorrelationMonitor(correlation_config)
+            await self.correlation_monitor.initialize()
+            
+            # 注册相关性预警回调
+            async def on_correlation_alert(alert):
+                if self.telegram_bot:
+                    await self.telegram_bot.send_message(
+                        f"📊 相关性预警\n\n{alert.message}"
+                    )
+            self.correlation_monitor.register_callback(on_correlation_alert)
+            logger.info("✅ 品种相关性监控器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 品种相关性监控器初始化失败: {e}")
+            self.correlation_monitor = None
+        
+        # 初始化审计日志记录器（必须在其他模块之前初始化）
+        try:
+            audit_config = AuditConfig(
+                log_dir="logs/audit",
+                retention_days=90
+            )
+            self.audit_logger = AuditLogger(audit_config)
+            await self.audit_logger.initialize()
+            logger.info("✅ 审计日志记录器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 审计日志记录器初始化失败: {e}")
+            self.audit_logger = None
+        
+        # 初始化策略热加载器
+        try:
+            self.strategy_hot_loader = StrategyHotLoader()
+            await self.strategy_hot_loader.initialize()
+            
+            # 注册策略加载回调
+            async def on_strategy_load(strategy_name, instance):
+                if self.audit_logger:
+                    await self.audit_logger.log_event(
+                        AuditEventType.STRATEGY_LOAD,
+                        AuditSeverity.INFO,
+                        f"策略加载: {strategy_name}",
+                        {"version": instance.version.version_id}
+                    )
+            self.strategy_hot_loader.register_callback("on_load", on_strategy_load)
+            logger.info("✅ 策略热加载器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 策略热加载器初始化失败: {e}")
+            self.strategy_hot_loader = None
+        
+        # 初始化增强监控系统
+        try:
+            self.enhanced_monitoring = EnhancedMonitoringSystem()
+            await self.enhanced_monitoring.initialize()
+            
+            # 设置Telegram机器人
+            if self.telegram_bot:
+                self.enhanced_monitoring.set_telegram_bot(self.telegram_bot)
+            
+            # 注册报警回调
+            async def on_alert(alert):
+                if self.audit_logger:
+                    await self.audit_logger.log_risk_alert(
+                        alert.rule.name,
+                        alert.message,
+                        {"metric": alert.rule.metric, "value": alert.metric_value},
+                        AuditSeverity.WARNING if alert.level == AlertLevel.WARNING else AuditSeverity.ERROR
+                    )
+            self.enhanced_monitoring.register_callback("on_alert", on_alert)
+            logger.info("✅ 增强监控系统已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 增强监控系统初始化失败: {e}")
+            self.enhanced_monitoring = None
+        
+        # 初始化止盈止损管理器
+        try:
+            sltp_config = StopLossTakeProfitConfig(
+                default_stop_loss_percent=0.03,
+                default_take_profit_percent=0.06,
+                enable_trailing_stop=True,
+                trailing_stop_offset=0.02,
+                trailing_stop_trigger=0.02,
+                enable_breakeven=True,
+                breakeven_trigger=0.02,
+                enable_partial_tp=True,
+                check_interval=5
+            )
+            self.stop_loss_manager = StopLossTakeProfitManager(sltp_config)
+            await self.stop_loss_manager.initialize()
+            
+            # 设置关联组件
+            if self.audit_logger:
+                self.stop_loss_manager.set_audit_logger(self.audit_logger)
+            if self.enhanced_monitoring:
+                self.stop_loss_manager.set_enhanced_monitoring(self.enhanced_monitoring)
+            
+            # 注册止盈止损回调
+            async def on_stop_loss_trigger(order, current_price):
+                logger.warning(f"🚨 止损触发: {order.symbol} @ {current_price}")
+                if self.telegram_bot:
+                    pnl_percent = (current_price - order.entry_price) / order.entry_price if order.side == "long" \
+                                  else (order.entry_price - current_price) / order.entry_price
+                    await self.telegram_bot.send_message(
+                        f"🚨 止损触发\n\n"
+                        f"交易对: {order.symbol}\n"
+                        f"方向: {order.side}\n"
+                        f"入场价: {order.entry_price:.4f}\n"
+                        f"止损价: {order.stop_loss_price:.4f}\n"
+                        f"当前价: {current_price:.4f}\n"
+                        f"亏损: {pnl_percent*100:.2f}%"
+                    )
+            
+            async def on_take_profit_trigger(order, current_price):
+                logger.info(f"🎯 止盈触发: {order.symbol} @ {current_price}")
+                if self.telegram_bot:
+                    pnl_percent = (current_price - order.entry_price) / order.entry_price if order.side == "long" \
+                                  else (order.entry_price - current_price) / order.entry_price
+                    await self.telegram_bot.send_message(
+                        f"🎯 止盈触发\n\n"
+                        f"交易对: {order.symbol}\n"
+                        f"方向: {order.side}\n"
+                        f"入场价: {order.entry_price:.4f}\n"
+                        f"止盈价: {order.take_profit_price:.4f}\n"
+                        f"当前价: {current_price:.4f}\n"
+                        f"盈利: {pnl_percent*100:.2f}%"
+                    )
+            
+            self.stop_loss_manager.register_callback("on_stop_loss", on_stop_loss_trigger)
+            self.stop_loss_manager.register_callback("on_take_profit", on_take_profit_trigger)
+            
+            logger.info("✅ 止盈止损管理器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 止盈止损管理器初始化失败: {e}")
+            self.stop_loss_manager = None
+        
+        # 初始化执行验证器
+        try:
+            exec_config = ExecutionConfig(
+                timeout_seconds=30,
+                max_retries=3,
+                enable_verification=True
+            )
+            self.execution_verifier = ExecutionVerifier(exec_config)
+            
+            # 设置关联组件
+            if hasattr(self, 'okx_exchange') and self.okx_exchange:
+                self.execution_verifier.set_exchange(self.okx_exchange)
+            if self.audit_logger:
+                self.execution_verifier.set_audit_logger(self.audit_logger)
+            if self.stop_loss_manager:
+                self.execution_verifier.set_stop_loss_manager(self.stop_loss_manager)
+            
+            logger.info("✅ 执行验证器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 执行验证器初始化失败: {e}")
+            self.execution_verifier = None
+        
+        # 初始化动态币种筛选器
+        try:
+            selector_config = DynamicSymbolSelectorConfig(
+                max_symbols=10,
+                min_symbols=3,
+                selection_interval=300,
+                min_24h_volume=10000000,
+                enable_auto_discovery=True,
+                always_include=["BTC/USDT", "ETH/USDT"],
+                always_exclude=[]
+            )
+            self.dynamic_symbol_selector = DynamicSymbolSelector(selector_config)
+            await self.dynamic_symbol_selector.initialize()
+            
+            # 设置交易所
+            if hasattr(self, 'okx_exchange') and self.okx_exchange:
+                self.dynamic_symbol_selector.set_exchange(self.okx_exchange)
+            
+            logger.info("✅ 动态币种筛选器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 动态币种筛选器初始化失败: {e}")
+            self.dynamic_symbol_selector = None
+        
         # 初始化API服务器
         try:
             from src.modules.api.server import APIServer
@@ -963,6 +1213,32 @@ class MainController:
         if hasattr(self, 'unified_risk_system') and self.unified_risk_system:
             await self.unified_risk_system.cleanup()
             self.unified_risk_system = None
+        
+        # 清理新增升级模块
+        if hasattr(self, 'dynamic_position_manager') and self.dynamic_position_manager:
+            await self.dynamic_position_manager.cleanup()
+            self.dynamic_position_manager = None
+        
+        if hasattr(self, 'correlation_monitor') and self.correlation_monitor:
+            await self.correlation_monitor.cleanup()
+            self.correlation_monitor = None
+        
+        if hasattr(self, 'strategy_hot_loader') and self.strategy_hot_loader:
+            await self.strategy_hot_loader.cleanup()
+            self.strategy_hot_loader = None
+        
+        if hasattr(self, 'audit_logger') and self.audit_logger:
+            await self.audit_logger.cleanup()
+            self.audit_logger = None
+        
+        if hasattr(self, 'enhanced_monitoring') and self.enhanced_monitoring:
+            await self.enhanced_monitoring.cleanup()
+            self.enhanced_monitoring = None
+        
+        # 清理止盈止损管理器
+        if hasattr(self, 'stop_loss_manager') and self.stop_loss_manager:
+            await self.stop_loss_manager.cleanup()
+            self.stop_loss_manager = None
             
         self._initialized = False
 
@@ -1430,6 +1706,7 @@ class MainController:
             "通知系统": ["telegram_bot", "natural_language_interface"],
             "安全风控": ["emergency_stop", "intelligent_monitoring", "security_manager", "fund_manager"],
             "信息收集分析": ["unified_info_collector"],
+            "升级模块": ["dynamic_position_manager", "correlation_monitor", "strategy_hot_loader", "audit_logger", "enhanced_monitoring", "stop_loss_manager"],
         }
         
         total_checked = 0
@@ -3177,6 +3454,501 @@ class MainController:
             self.event_system.subscribe(CoreEventType.MODULE_ERROR, error_event_handler)
             self.event_system.subscribe(CoreEventType.CONFIG_CHANGED, config_change_handler)
             self.event_system.subscribe(CoreEventType.RISK_ALERT, log_event_handler)
+
+    # ========== 新增升级模块便捷方法 ==========
+
+    def get_dynamic_position_manager(self) -> Optional[DynamicPositionManager]:
+        """获取动态仓位管理器实例"""
+        return self.dynamic_position_manager
+    
+    async def calculate_dynamic_position(
+        self,
+        symbol: str,
+        base_size: float,
+        account_balance: float,
+        current_positions: Dict[str, Any],
+        market_data: Optional[Dict] = None
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        计算动态仓位大小
+        
+        Args:
+            symbol: 交易对
+            base_size: 基础仓位大小
+            account_balance: 账户余额
+            current_positions: 当前持仓
+            market_data: 市场数据
+        
+        Returns:
+            (调整后仓位大小, 调整详情)
+        """
+        if not self.dynamic_position_manager:
+            return base_size, {"error": "动态仓位管理器未初始化"}
+        
+        return await self.dynamic_position_manager.calculate_dynamic_position_size(
+            symbol, base_size, account_balance, current_positions, market_data
+        )
+    
+    async def get_position_recommendations(
+        self,
+        account_balance: float,
+        current_positions: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """获取仓位调整建议"""
+        if not self.dynamic_position_manager:
+            return {"error": "动态仓位管理器未初始化"}
+        
+        return await self.dynamic_position_manager.get_position_recommendations(
+            account_balance, current_positions
+        )
+    
+    def get_correlation_monitor(self) -> Optional[CorrelationMonitor]:
+        """获取品种相关性监控器实例"""
+        return self.correlation_monitor
+    
+    async def check_correlation_risks(
+        self,
+        current_positions: Dict[str, Any]
+    ) -> List[Any]:
+        """检查相关性风险"""
+        if not self.correlation_monitor:
+            return []
+        
+        return await self.correlation_monitor.check_correlation_risks(current_positions)
+    
+    async def get_diversification_score(
+        self,
+        current_positions: Dict[str, Any]
+    ) -> float:
+        """获取分散化得分"""
+        if not self.correlation_monitor:
+            return 1.0
+        
+        return await self.correlation_monitor.get_diversification_score(current_positions)
+    
+    async def get_correlation_summary(self) -> Dict[str, Any]:
+        """获取相关性摘要"""
+        if not self.correlation_monitor:
+            return {"error": "相关性监控器未初始化"}
+        
+        return await self.correlation_monitor.get_correlation_summary()
+    
+    def get_strategy_hot_loader(self) -> Optional[StrategyHotLoader]:
+        """获取策略热加载器实例"""
+        return self.strategy_hot_loader
+    
+    async def hot_reload_strategy(self, strategy_name: str) -> bool:
+        """热加载策略"""
+        if not self.strategy_hot_loader:
+            logger.warning("策略热加载器未初始化")
+            return False
+        
+        return await self.strategy_hot_loader.reload_strategy(strategy_name)
+    
+    async def hot_load_strategy(
+        self,
+        strategy_name: str,
+        strategy_path: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """热加载新策略"""
+        if not self.strategy_hot_loader:
+            logger.warning("策略热加载器未初始化")
+            return False
+        
+        return await self.strategy_hot_loader.load_strategy(strategy_name, strategy_path, config)
+    
+    async def rollback_strategy(self, strategy_name: str, version_id: Optional[str] = None) -> bool:
+        """回滚策略版本"""
+        if not self.strategy_hot_loader:
+            logger.warning("策略热加载器未初始化")
+            return False
+        
+        return await self.strategy_hot_loader.rollback_strategy(strategy_name, version_id)
+    
+    async def list_hot_strategies(self) -> List[Dict[str, Any]]:
+        """列出热加载的策略"""
+        if not self.strategy_hot_loader:
+            return []
+        
+        return await self.strategy_hot_loader.list_strategies()
+    
+    def get_audit_logger(self) -> Optional[AuditLogger]:
+        """获取审计日志记录器实例"""
+        return self.audit_logger
+    
+    async def log_audit_event(
+        self,
+        event_type: AuditEventType,
+        severity: AuditSeverity,
+        action: str,
+        details: Optional[Dict[str, Any]] = None,
+        source: str = "system"
+    ) -> Optional[str]:
+        """记录审计事件"""
+        if not self.audit_logger:
+            return None
+        
+        return await self.audit_logger.log_event(
+            event_type, severity, action, details, source
+        )
+    
+    async def log_trade_audit(
+        self,
+        action: str,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        order_id: Optional[str] = None
+    ) -> Optional[str]:
+        """记录交易审计日志"""
+        if not self.audit_logger:
+            return None
+        
+        return await self.audit_logger.log_trade(
+            action, symbol, side, quantity, price, order_id
+        )
+    
+    async def generate_audit_report(
+        self,
+        start_time: datetime,
+        end_time: datetime
+    ) -> Dict[str, Any]:
+        """生成审计报告"""
+        if not self.audit_logger:
+            return {"error": "审计日志记录器未初始化"}
+        
+        return await self.audit_logger.generate_report(start_time, end_time)
+    
+    def get_enhanced_monitoring_system(self) -> Optional[EnhancedMonitoringSystem]:
+        """获取增强监控系统实例"""
+        return self.enhanced_monitoring
+    
+    async def update_monitoring_metric(
+        self,
+        metric_name: str,
+        value: float,
+        tags: Optional[Dict[str, str]] = None
+    ):
+        """更新监控指标"""
+        if self.enhanced_monitoring:
+            await self.enhanced_monitoring.update_metric(metric_name, value, tags)
+    
+    async def get_active_alerts(self) -> List[Any]:
+        """获取活动报警"""
+        if not self.enhanced_monitoring:
+            return []
+        
+        return await self.enhanced_monitoring.get_active_alerts()
+    
+    async def get_monitoring_status(self) -> Dict[str, Any]:
+        """获取监控状态"""
+        if not self.enhanced_monitoring:
+            return {"status": "unavailable"}
+        
+        return await self.enhanced_monitoring.get_system_status()
+    
+    async def add_alert_rule(
+        self,
+        rule_id: str,
+        name: str,
+        metric: str,
+        condition: str,
+        threshold: float,
+        level: str = "warning"
+    ) -> bool:
+        """添加报警规则"""
+        if not self.enhanced_monitoring:
+            return False
+        
+        from src.modules.monitoring.enhanced_monitoring import AlertRule
+        
+        level_map = {
+            "info": AlertLevel.INFO,
+            "warning": AlertLevel.WARNING,
+            "error": AlertLevel.ERROR,
+            "critical": AlertLevel.CRITICAL
+        }
+        
+        rule = AlertRule(
+            rule_id=rule_id,
+            name=name,
+            metric=metric,
+            condition=condition,
+            threshold=threshold,
+            level=level_map.get(level, AlertLevel.WARNING),
+            channels=[AlertChannel.TELEGRAM, AlertChannel.LOG]
+        )
+        
+        await self.enhanced_monitoring.add_rule(rule)
+        return True
+    
+    async def get_upgrade_modules_status(self) -> Dict[str, Any]:
+        """获取升级模块状态"""
+        return {
+            "dynamic_position_manager": {
+                "available": self.dynamic_position_manager is not None,
+                "status": "active" if self.dynamic_position_manager else "unavailable"
+            },
+            "correlation_monitor": {
+                "available": self.correlation_monitor is not None,
+                "status": "active" if self.correlation_monitor else "unavailable"
+            },
+            "strategy_hot_loader": {
+                "available": self.strategy_hot_loader is not None,
+                "status": "active" if self.strategy_hot_loader else "unavailable"
+            },
+            "audit_logger": {
+                "available": self.audit_logger is not None,
+                "status": "active" if self.audit_logger else "unavailable"
+            },
+            "enhanced_monitoring": {
+                "available": self.enhanced_monitoring is not None,
+                "status": "active" if self.enhanced_monitoring else "unavailable"
+            },
+            "stop_loss_manager": {
+                "available": self.stop_loss_manager is not None,
+                "status": "active" if self.stop_loss_manager else "unavailable"
+            }
+        }
+    
+    # ========== 止盈止损管理便捷方法 ==========
+    
+    def get_stop_loss_manager(self) -> Optional[StopLossTakeProfitManager]:
+        """获取止盈止损管理器实例"""
+        return self.stop_loss_manager
+    
+    async def create_stop_loss_order(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        quantity: float,
+        stop_loss_percent: float = 0.03,
+        take_profit_percent: float = 0.06,
+        enable_trailing: bool = True,
+        trailing_offset: float = 0.02
+    ) -> Optional[StopLossTakeProfitOrder]:
+        """
+        创建止盈止损订单
+        
+        Args:
+            symbol: 交易对
+            side: 方向 (long/short)
+            entry_price: 入场价格
+            quantity: 数量
+            stop_loss_percent: 止损百分比 (默认3%)
+            take_profit_percent: 止盈百分比 (默认6%)
+            enable_trailing: 启用移动止损
+            trailing_offset: 移动止损偏移量
+        
+        Returns:
+            止盈止损订单
+        """
+        if not self.stop_loss_manager:
+            logger.warning("止盈止损管理器未初始化")
+            return None
+        
+        sl_config = StopLossConfig(
+            stop_type=StopType.PERCENTAGE,
+            stop_value=stop_loss_percent,
+            trailing_offset=trailing_offset if enable_trailing else 0
+        )
+        
+        tp_config = TakeProfitConfig(
+            tp_type=TakeProfitType.PERCENTAGE,
+            tp_value=take_profit_percent
+        )
+        
+        order = await self.stop_loss_manager.create_order(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            quantity=quantity,
+            stop_loss_config=sl_config,
+            take_profit_config=tp_config
+        )
+        
+        logger.info(f"✅ 创建止盈止损订单: {symbol} {side} 止损={stop_loss_percent*100:.1f}% 止盈={take_profit_percent*100:.1f}%")
+        
+        return order
+    
+    async def update_stop_loss_price(self, symbol: str, current_price: float) -> Optional[StopLossTakeProfitOrder]:
+        """
+        更新止盈止损价格
+        
+        Args:
+            symbol: 交易对
+            current_price: 当前价格
+        
+        Returns:
+            如果触发止盈止损，返回订单
+        """
+        if not self.stop_loss_manager:
+            return None
+        
+        return await self.stop_loss_manager.update_price(symbol, current_price)
+    
+    async def modify_stop_loss(
+        self,
+        symbol: str,
+        new_stop_loss: Optional[float] = None,
+        new_take_profit: Optional[float] = None
+    ) -> Optional[StopLossTakeProfitOrder]:
+        """
+        修改止盈止损价格
+        
+        Args:
+            symbol: 交易对
+            new_stop_loss: 新止损价格
+            new_take_profit: 新止盈价格
+        
+        Returns:
+            修改后的订单
+        """
+        if not self.stop_loss_manager:
+            return None
+        
+        return await self.stop_loss_manager.modify_order(symbol, new_stop_loss, new_take_profit)
+    
+    async def cancel_stop_loss_order(self, symbol: str) -> bool:
+        """取消止盈止损订单"""
+        if not self.stop_loss_manager:
+            return False
+        
+        return await self.stop_loss_manager.cancel_order(symbol)
+    
+    async def get_active_stop_loss_orders(self) -> List[StopLossTakeProfitOrder]:
+        """获取所有活动的止盈止损订单"""
+        if not self.stop_loss_manager:
+            return []
+        
+        return await self.stop_loss_manager.get_all_active_orders()
+    
+    async def get_stop_loss_stats(self) -> Dict[str, Any]:
+        """获取止盈止损统计信息"""
+        if not self.stop_loss_manager:
+            return {"error": "止盈止损管理器未初始化"}
+        
+        return self.stop_loss_manager.get_stats()
+    
+    async def start_stop_loss_monitoring(self):
+        """启动止盈止损监控"""
+        if self.stop_loss_manager:
+            # 设置交易所
+            if hasattr(self, 'okx_exchange') and self.okx_exchange:
+                self.stop_loss_manager.set_exchange(self.okx_exchange)
+            await self.stop_loss_manager.start()
+            logger.info("✅ 止盈止损监控已启动")
+    
+    async def stop_stop_loss_monitoring(self):
+        """停止止盈止损监控"""
+        if self.stop_loss_manager:
+            await self.stop_loss_manager.stop()
+            logger.info("止盈止损监控已停止")
+    
+    # ========== 执行验证便捷方法 ==========
+    
+    def get_execution_verifier(self) -> Optional[ExecutionVerifier]:
+        """获取执行验证器实例"""
+        return self.execution_verifier
+    
+    async def execute_command(
+        self,
+        command_type: CommandType,
+        action: str,
+        symbol: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None
+    ) -> Optional[ExecutionResult]:
+        """
+        执行命令并返回验证结果
+        
+        Args:
+            command_type: 命令类型
+            action: 操作描述
+            symbol: 交易对
+            params: 执行参数
+        
+        Returns:
+            执行结果（包含验证信息）
+        """
+        if not self.execution_verifier:
+            logger.warning("执行验证器未初始化")
+            return None
+        
+        result = await self.execution_verifier.execute(
+            command_type=command_type,
+            action=action,
+            symbol=symbol,
+            params=params
+        )
+        
+        return result
+    
+    async def query_execution_status(self, query: str) -> Dict[str, Any]:
+        """
+        查询执行状态（自然语言查询）
+        
+        Args:
+            query: 查询内容，如"最近执行了什么"、"查看持仓"、"有什么失败的"
+        
+        Returns:
+            查询结果
+        """
+        if not self.execution_verifier:
+            return {"error": "执行验证器未初始化"}
+        
+        return await self.execution_verifier.query_execution(query)
+    
+    async def get_recent_executions(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """获取最近的执行记录"""
+        if not self.execution_verifier:
+            return []
+        
+        executions = await self.execution_verifier.get_recent_executions(limit)
+        return [e.to_dict() for e in executions]
+    
+    async def get_execution_stats(self) -> Dict[str, Any]:
+        """获取执行统计信息"""
+        if not self.execution_verifier:
+            return {"error": "执行验证器未初始化"}
+        
+        return self.execution_verifier.get_stats()
+    
+    async def verify_position_opened(self, symbol: str) -> Dict[str, Any]:
+        """验证仓位是否已开"""
+        if not self.execution_verifier:
+            return {"verified": False, "error": "执行验证器未初始化"}
+        
+        recent = await self.execution_verifier.get_recent_executions(10)
+        for execution in recent:
+            if (execution.command_type == CommandType.OPEN_POSITION and 
+                execution.symbol == symbol and 
+                execution.status == ExecutionStatus.SUCCESS):
+                return {
+                    "verified": True,
+                    "execution_id": execution.execution_id,
+                    "details": execution.details
+                }
+        
+        return {"verified": False, "message": f"未找到 {symbol} 的开仓记录"}
+    
+    async def verify_stop_loss_set(self, symbol: str) -> Dict[str, Any]:
+        """验证止损是否已设置"""
+        if not self.stop_loss_manager:
+            return {"verified": False, "error": "止盈止损管理器未初始化"}
+        
+        order = await self.stop_loss_manager.get_order(symbol)
+        if order:
+            return {
+                "verified": True,
+                "stop_loss": order.stop_loss_price,
+                "take_profit": order.take_profit_price,
+                "trailing_activated": order.trailing_stop_activated
+            }
+        
+        return {"verified": False, "message": f"未找到 {symbol} 的止盈止损设置"}
 
 
 # 使用示例

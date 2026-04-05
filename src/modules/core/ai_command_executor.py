@@ -72,7 +72,7 @@ class AICommandExecutor:
             from .unified_intelligent_memory import get_unified_memory
             from .user_intent_recognizer import UserIntentRecognizer
             
-            self.unified_memory = get_unified_memory()
+            self.unified_memory = await get_unified_memory()
             self.user_intent_recognizer = UserIntentRecognizer
             logger.info("✅ 统一记忆系统和用户意图识别器已加载")
             

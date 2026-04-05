@@ -11,6 +11,7 @@
 
 import asyncio
 import logging
+import os
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from pathlib import Path
@@ -98,8 +99,12 @@ class CodeDeveloperSkill(SkillBase):
         )
         
         self.generated_files: List[GeneratedCode] = []
-        self.templates_dir = Path("/home/cool/.openclaw-trading/templates")
-        self.templates_dir.mkdir(parents=True, exist_ok=True)
+        self.templates_dir = Path(os.environ.get("OPENCLAW_TEMPLATES_DIR", "/app/templates"))
+        try:
+            self.templates_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            self.templates_dir = Path("/tmp/openclaw_templates")
+            self.templates_dir.mkdir(parents=True, exist_ok=True)
         
         self._init_templates()
         

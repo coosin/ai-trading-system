@@ -200,7 +200,7 @@ class CacheManager:
 
         # 连接Redis（如果配置了）
         redis_config = await self._get_redis_config()
-        if redis_config:
+        if redis_config and HAS_AIOREDIS and aioredis:
             try:
                 self.redis_client = await aioredis.from_url(
                     f"redis://{redis_config.get('host', 'localhost')}:{redis_config.get('port', 6379)}",
@@ -214,6 +214,8 @@ class CacheManager:
                 logger.info("Redis连接成功")
             except Exception as e:
                 logger.warning(f"Redis连接失败: {e}, 将使用内存缓存")
+        elif redis_config:
+            logger.debug("aioredis未正确加载，跳过Redis连接")
 
         # 创建磁盘缓存目录
         import os
@@ -850,8 +852,18 @@ class CacheManager:
 
     async def _get_redis_config(self) -> Optional[Dict[str, Any]]:
         """获取Redis配置"""
+        import os
         if self.config_manager:
-            return await self.config_manager.get_config("redis", None)
+            config = await self.config_manager.get_config("redis", None)
+            if config:
+                return config
+        
+        if os.path.exists("/.dockerenv"):
+            return {
+                "host": os.environ.get("REDIS_HOST", "openclaw-redis"),
+                "port": int(os.environ.get("REDIS_PORT", 6379)),
+                "db": 0
+            }
         return None
 
     async def _cleanup_worker(self) -> None:

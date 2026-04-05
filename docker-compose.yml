@@ -14,18 +14,15 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./workspace:/app/workspace
+    env_file:
+      - .env
     environment:
       - MODE=${MODE:-simulation}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HTTP_PROXY=http://host.docker.internal:7890
       - HTTPS_PROXY=http://host.docker.internal:7890
-      - XUNFEI_API_KEY=${XUNFEI_API_KEY:-}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - OKX_API_KEY=${OKX_API_KEY:-}
-      - OKX_SECRET=${OKX_SECRET:-}
-      - OKX_PASSPHRASE=${OKX_PASSPHRASE:-}
-      - QIANFAN_API_KEY=${QIANFAN_API_KEY:-}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     networks:
       - trading-network
     extra_hosts:
