@@ -105,6 +105,7 @@ class MemoryGateway:
         if self._should_skip_store(category=category, content=content, importance=importance, metadata=metadata):
             return "skipped"
         md = dict(metadata or {})
+        md.setdefault("created_at", datetime.now().isoformat())
         md.setdefault("scope", scope or self.DEFAULT_SCOPE)
         mapped_category = self._map_category(category)
         mapped_layer = self._map_layer(category)
@@ -251,6 +252,50 @@ class MemoryGateway:
             importance=importance,
             metadata=md,
         )
+
+    async def recent_conversation(
+        self,
+        *,
+        scope: Optional[str] = None,
+        limit: int = 6,
+    ) -> List[MemoryRecord]:
+        """
+        Return most recent conversation memories, independent of query similarity.
+        This is the "sessionMemory" style safety net to prevent amnesia.
+        """
+        try:
+            memories = getattr(self.memory_backend, "_memories", {})
+            items = []
+            for _id, entry in (memories or {}).items():
+                try:
+                    if getattr(entry, "category", None) != MemoryCategory.CONVERSATION:
+                        continue
+                    md = dict(getattr(entry, "metadata", {}) or {})
+                    if scope and str(md.get("scope", "")).strip() != scope:
+                        continue
+                    created_at = getattr(entry, "created_at", None)
+                    if created_at is None:
+                        created_at_raw = md.get("created_at")
+                        created_at = datetime.fromisoformat(created_at_raw) if isinstance(created_at_raw, str) else datetime.now()
+                    items.append((created_at, _id, entry, md))
+                except Exception:
+                    continue
+            items.sort(key=lambda x: x[0], reverse=True)
+            out: List[MemoryRecord] = []
+            for created_at, _id, entry, md in items[: max(1, int(limit))]:
+                out.append(
+                    MemoryRecord(
+                        id=str(_id),
+                        content=str(getattr(entry, "content", "")),
+                        importance=float(getattr(entry, "importance", 0.5)),
+                        metadata=md,
+                        timestamp=created_at.isoformat(),
+                        access_count=int(md.get("access_count", 0)) if isinstance(md, dict) else 0,
+                    )
+                )
+            return out
+        except Exception:
+            return []
 
     def _should_skip_store(
         self,

@@ -14,6 +14,7 @@ import os
 import json
 import logging
 import re
+import uuid
 from typing import Dict, Any, Optional, List
 
 from src.modules.core.llm_integration import EnhancedLLMIntegration
@@ -43,6 +44,8 @@ class NaturalLanguageInterface:
         self.llm_integration = llm_integration
         self.main_controller = main_controller
         self.system_prompt = "你是一个专业的量化交易助手。"
+        self.session_id = f"nli:{uuid.uuid4()}"
+        self._session_history: List[Dict[str, str]] = []
         
         self.command_templates = {
             "get_system_status": {
@@ -280,6 +283,10 @@ class NaturalLanguageInterface:
             memory_filter_result = await self._try_handle_memory_filter_learning(query)
             if memory_filter_result is not None:
                 return memory_filter_result
+
+            self._session_history.append({"role": "user", "content": str(query)})
+            if len(self._session_history) > 20:
+                self._session_history = self._session_history[-20:]
             
             command = await self._identify_command(query)
             
@@ -296,9 +303,23 @@ class NaturalLanguageInterface:
                         return skill_result
                 
                 result = await self._execute_command(command, query, context)
+                # store assistant side in session buffer for continuity even if recall fails
+                try:
+                    if isinstance(result, dict):
+                        msg = result.get("message") or (result.get("data") and str(result.get("data"))) or ""
+                        if msg:
+                            self._session_history.append({"role": "assistant", "content": str(msg)[:800]})
+                except Exception:
+                    pass
                 return result
             else:
-                return await self._general_qa(query, context)
+                result = await self._general_qa(query, context)
+                try:
+                    if isinstance(result, dict) and result.get("answer"):
+                        self._session_history.append({"role": "assistant", "content": str(result["answer"])[:800]})
+                except Exception:
+                    pass
+                return result
         except Exception as e:
             logger.error(f"处理自然语言查询时出错: {e}")
             return {
@@ -580,11 +601,29 @@ class NaturalLanguageInterface:
         memory_context = ""
         if self.memory:
             try:
-                relevant_memories = await self.memory.retrieve_memories(query=query, limit=3)
+                # 1) session "working memory" (always include last few turns)
+                recent_turns = self._session_history[-8:]
+                session_block = ""
+                if recent_turns:
+                    session_block = "\n".join([f"{t['role']}: {t['content']}" for t in recent_turns])
+
+                # 2) recent conversation memories from gateway (recency-first safety net)
+                recent_memories = []
+                if hasattr(self.memory, "recent_conversation"):
+                    recent_memories = await self.memory.recent_conversation(scope=f"channel:{(context or {}).get('source','system')}", limit=6)
+
+                # 3) relevant long-term recall (similarity-based)
+                relevant_memories = await self.memory.retrieve_memories(query=query, limit=5)
+
+                blocks = []
+                if session_block:
+                    blocks.append("[会话上下文(最近)]\n" + session_block)
+                if recent_memories:
+                    blocks.append("[最近对话记忆]\n" + "\n".join([f"- {m.get('content', str(m))}" for m in recent_memories]))
                 if relevant_memories:
-                    memory_context = "\n\n相关记忆:\n" + "\n".join([
-                        f"- {m.get('content', str(m))}" for m in relevant_memories
-                    ])
+                    blocks.append("[相关长期记忆]\n" + "\n".join([f"- {m.get('content', str(m))}" for m in relevant_memories]))
+                if blocks:
+                    memory_context = "\n\n" + "\n\n".join(blocks)
             except Exception as e:
                 logger.warning(f"检索记忆失败: {e}")
         

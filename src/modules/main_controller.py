@@ -417,12 +417,41 @@ class MainController:
         Unified communication entrypoint.
         Route user command to primary AI brain first.
         """
+        # Always capture the incoming message as conversation memory (scope by channel).
+        if getattr(self, "memory_gateway", None):
+            try:
+                await self.memory_gateway.add_memory(
+                    memory_type="conversation",
+                    content=f"[user@{source}] {command}",
+                    metadata={"scope": f"channel:{source}", "role": "user"},
+                    source_module="main_controller",
+                    importance=0.35,
+                    tags=["conversation"],
+                )
+            except Exception:
+                pass
+
         brain = await self.get_primary_ai_brain()
         if brain and hasattr(brain, "process_user_command"):
             try:
                 result = await brain.process_user_command(command)
                 if isinstance(result, dict):
                     result.setdefault("source", getattr(brain, "__class__", type(brain)).__name__)
+                    # capture assistant response if present
+                    if getattr(self, "memory_gateway", None):
+                        try:
+                            resp_text = result.get("response") or result.get("message") or ""
+                            if resp_text:
+                                await self.memory_gateway.add_memory(
+                                    memory_type="conversation",
+                                    content=f"[assistant@{result.get('source')}] {resp_text}",
+                                    metadata={"scope": f"channel:{source}", "role": "assistant"},
+                                    source_module="main_controller",
+                                    importance=0.35,
+                                    tags=["conversation"],
+                                )
+                        except Exception:
+                            pass
                 return result if isinstance(result, dict) else {"success": True, "response": str(result)}
             except Exception as e:
                 logger.error(f"核心大脑处理失败(source={source}): {e}")
