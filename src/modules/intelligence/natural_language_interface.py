@@ -13,6 +13,7 @@
 import os
 import json
 import logging
+import re
 from typing import Dict, Any, Optional, List
 
 from src.modules.core.llm_integration import EnhancedLLMIntegration
@@ -148,6 +149,11 @@ class NaturalLanguageInterface:
                 "description": "更新系统配置（支持通知/心跳/研究门控等）",
                 "keywords": ["配置", "改配置", "更新配置", "修改配置", "通知频率", "通知", "心跳", "研究门控", "阈值", "冷却", "限流"],
                 "function": "update_config"
+            },
+            "learn_memory_filter": {
+                "description": "学习记忆过滤规则（把低价值/垃圾信息加入过滤）",
+                "keywords": ["垃圾信息", "别记忆", "不要记住", "不需要记忆", "加入过滤", "过滤这类", "这类别存"],
+                "function": "learn_memory_filter",
             }
         }
         
@@ -269,6 +275,11 @@ class NaturalLanguageInterface:
         try:
             if context is None:
                 context = {}
+
+            # Direct intent: user explicitly teaches what should not be stored in memory.
+            memory_filter_result = await self._try_handle_memory_filter_learning(query)
+            if memory_filter_result is not None:
+                return memory_filter_result
             
             command = await self._identify_command(query)
             
@@ -294,6 +305,72 @@ class NaturalLanguageInterface:
                 "error": str(e),
                 "message": "处理查询时发生错误"
             }
+
+    async def _try_handle_memory_filter_learning(self, query: str) -> Optional[Dict[str, Any]]:
+        q = (query or "").strip()
+        if not q:
+            return None
+        lowered = q.lower()
+        markers = ["垃圾", "别记忆", "不要记住", "不需要记忆", "过滤这类", "这类别存", "low value", "noise"]
+        if not any(m in lowered for m in markers):
+            return None
+        return await self._execute_memory_filter_learning(query)
+
+    async def _execute_memory_filter_learning(self, query: str) -> Dict[str, Any]:
+        if not self.main_controller or not getattr(self.main_controller, "config_manager", None):
+            return {"success": False, "message": "配置管理器不可用", "data": None}
+        cm = self.main_controller.config_manager
+
+        # Extract candidate phrase after trigger words; fallback to full query.
+        fragment = self._extract_filter_fragment(query)
+        if not fragment:
+            fragment = query.strip()
+
+        policy = cm.get_config_path_sync("memory.auto_capture.policy", {}) or {}
+        if not isinstance(policy, dict):
+            policy = {}
+        deny_contains = list(policy.get("deny_content_contains", []) or [])
+        if fragment not in deny_contains:
+            deny_contains.append(fragment)
+        policy["deny_content_contains"] = deny_contains
+
+        ok = await cm.set_config_path("memory.auto_capture.policy", policy, validate=False)
+        if not ok:
+            return {"success": False, "message": "更新过滤策略失败", "data": {"fragment": fragment}}
+
+        # audit + memory record
+        try:
+            if hasattr(self.main_controller, "log_audit_event"):
+                from src.modules.core.audit_logger import AuditEventType, AuditSeverity
+                await self.main_controller.log_audit_event(
+                    event_type=AuditEventType.CONFIG_CHANGE,
+                    severity=AuditSeverity.INFO,
+                    action="learn_memory_filter",
+                    details={"query": query, "fragment": fragment},
+                    source="natural_language_interface",
+                )
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "message": f"已学习过滤规则：后续包含“{fragment}”的内容将优先不入记忆",
+            "data": {"fragment": fragment, "path": "memory.auto_capture.policy.deny_content_contains"},
+        }
+
+    def _extract_filter_fragment(self, query: str) -> str:
+        q = (query or "").strip()
+        patterns = [
+            r"(?:这类|这种|像这种|把|将)?(.+?)(?:不要记住|别记忆|不需要记忆|加入过滤|过滤掉)",
+            r"(?:过滤|屏蔽)(.+)",
+        ]
+        for p in patterns:
+            m = re.search(p, q)
+            if m:
+                frag = (m.group(1) or "").strip(" ，。,:：")
+                if frag:
+                    return frag[:80]
+        return ""
     
     async def _identify_command(self, query: str) -> Optional[str]:
         query_lower = query.lower()

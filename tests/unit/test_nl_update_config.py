@@ -4,10 +4,15 @@ import pytest
 class _FakeConfigManager:
     def __init__(self):
         self.calls = []
+        self.path_store = {}
 
     async def set_config_path(self, path: str, value, validate: bool = True):
         self.calls.append((path, value, validate))
+        self.path_store[path] = value
         return True
+
+    def get_config_path_sync(self, path: str, default=None):
+        return self.path_store.get(path, default)
 
 
 class _FakeMC:
@@ -58,4 +63,20 @@ async def test_nl_update_config_denies_secrets_like_tokens():
     assert res["success"] is False
     assert len(res["data"]["applied"]) == 0
     assert len(res["data"]["rejected"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_nl_memory_filter_learning_updates_policy():
+    from src.modules.intelligence.natural_language_interface import NaturalLanguageInterface
+
+    mc = _FakeMC()
+    nli = NaturalLanguageInterface(llm_integration=None, main_controller=mc)  # type: ignore[arg-type]
+    res = await nli.process_query("像这种 市场机会 提示是垃圾信息，不要记住")
+
+    assert res["success"] is True
+    assert "过滤规则" in res["message"]
+    policy = mc.config_manager.path_store.get("memory.auto_capture.policy", {})
+    deny_contains = policy.get("deny_content_contains", [])
+    assert isinstance(deny_contains, list)
+    assert any("市场机会" in str(x) for x in deny_contains)
 
