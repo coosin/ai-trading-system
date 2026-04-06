@@ -33,7 +33,8 @@ class SmartNotificationSystem:
         self,
         send_func: Optional[Callable] = None,
         quiet_hours_start: time = time(23, 0),
-        quiet_hours_end: time = time(7, 0)
+        quiet_hours_end: time = time(7, 0),
+        config: Optional[Dict[str, Any]] = None,
     ):
         self.send_func = send_func
         self.quiet_hours_start = quiet_hours_start
@@ -72,6 +73,41 @@ class SmartNotificationSystem:
         self.last_reset_time = datetime.now()
         
         logger.info("智能通知系统初始化完成")
+        if config:
+            self.apply_config(config)
+
+    def apply_config(self, config: Dict[str, Any]) -> None:
+        """Apply runtime config (best-effort)."""
+        try:
+            batch = config.get("batch_interval_sec")
+            if isinstance(batch, (int, float)) and batch >= 60:
+                self.batch_interval = int(batch)
+
+            rl = config.get("rate_limits_per_hour")
+            if isinstance(rl, dict):
+                for k, v in rl.items():
+                    try:
+                        p = NotificationPriority(str(k).lower())
+                        if isinstance(v, (int, float)) and v >= 0:
+                            self.rate_limits[p] = int(v)
+                    except Exception:
+                        continue
+
+            dw = config.get("dedup_windows_sec")
+            if isinstance(dw, dict):
+                for k, v in dw.items():
+                    try:
+                        p = NotificationPriority(str(k).lower())
+                        if isinstance(v, (int, float)) and v >= 0:
+                            self._dedup_windows_sec[p] = int(v)
+                    except Exception:
+                        continue
+
+            mk = config.get("dedup_max_keys")
+            if isinstance(mk, (int, float)) and mk >= 100:
+                self._dedup_max_keys = int(mk)
+        except Exception:
+            return
     
     async def send(
         self,

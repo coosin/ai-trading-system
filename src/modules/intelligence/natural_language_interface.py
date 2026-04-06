@@ -143,6 +143,12 @@ class NaturalLanguageInterface:
                 "use_skill": True,
                 "skill_name": "self_learning"
             }
+            ,
+            "update_config": {
+                "description": "更新系统配置（支持通知/心跳/研究门控等）",
+                "keywords": ["配置", "改配置", "更新配置", "修改配置", "通知频率", "通知", "心跳", "研究门控", "阈值", "冷却", "限流"],
+                "function": "update_config"
+            }
         }
         
         self._load_personality_files()
@@ -317,6 +323,8 @@ class NaturalLanguageInterface:
             }
         
         params = await self._extract_parameters(command, query, context)
+        if command == "update_config":
+            return await self._execute_update_config(query=query, params=params)
         
         prompt = f"""请执行以下命令并返回结果：
 
@@ -344,9 +352,103 @@ class NaturalLanguageInterface:
             }
         
         return result
+
+    async def _execute_update_config(self, query: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Apply natural-language config changes through ConfigManager.
+
+        Expected params format (LLM extracted):
+        {
+          "changes": [
+            {"path": "notifications.smart.dedup_windows_sec.high", "value": 1200, "reason": "..."},
+            {"path": "heartbeat.interval_sec", "value": 900}
+          ]
+        }
+        """
+        if not self.main_controller or not getattr(self.main_controller, "config_manager", None):
+            return {"success": False, "data": None, "message": "配置管理器不可用"}
+        cm = self.main_controller.config_manager
+
+        allowed_prefixes = (
+            "notifications.",
+            "heartbeat.",
+            "research.",
+            "controller.health_check_interval",
+        )
+        changes = params.get("changes", [])
+        if not isinstance(changes, list):
+            changes = []
+
+        applied = []
+        rejected = []
+        for ch in changes:
+            if not isinstance(ch, dict):
+                continue
+            path = str(ch.get("path") or "").strip()
+            if not path or not any(path.startswith(p) for p in allowed_prefixes):
+                rejected.append({"path": path, "reason": "path_not_allowed"})
+                continue
+            value = ch.get("value")
+            ok = await cm.set_config_path(path, value, validate=False)
+            if ok:
+                applied.append({"path": path, "value": value, "reason": ch.get("reason")})
+            else:
+                rejected.append({"path": path, "reason": "apply_failed"})
+
+        # audit + memory
+        try:
+            if hasattr(self.main_controller, "log_audit_event"):
+                from src.modules.core.audit_logger import AuditEventType, AuditSeverity
+
+                await self.main_controller.log_audit_event(
+                    event_type=AuditEventType.CONFIG_CHANGE,
+                    severity=AuditSeverity.INFO,
+                    action="nl_update_config",
+                    details={"query": query, "applied": applied, "rejected": rejected},
+                    source="natural_language_interface",
+                )
+        except Exception:
+            pass
+        try:
+            if hasattr(self.main_controller, "memory_gateway") and self.main_controller.memory_gateway:
+                await self.main_controller.memory_gateway.add_memory(
+                    memory_type="config",
+                    content=f"自然语言配置变更: {query}",
+                    metadata={"applied": applied, "rejected": rejected},
+                    source_module="natural_language_interface",
+                    importance=0.7,
+                    tags=["config", "nl"],
+                )
+        except Exception:
+            pass
+
+        return {
+            "success": len(applied) > 0,
+            "data": {"applied": applied, "rejected": rejected},
+            "message": f"已应用 {len(applied)} 项配置变更，拒绝 {len(rejected)} 项",
+        }
     
     async def _extract_parameters(self, command: str, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
-        prompt = f'''请从查询 '{query}' 中提取命令 '{command}' 的参数：
+        if command == "update_config":
+            prompt = f'''你将从用户的自然语言中提取“配置变更”参数。
+
+用户话术: "{query}"
+
+请只输出 JSON，格式如下：
+{{
+  "changes": [
+    {{"path": "notifications.smart.dedup_windows_sec.high", "value": 1200, "reason": "将高优先级去重窗口改成20分钟"}},
+    {{"path": "heartbeat.interval_sec", "value": 900}}
+  ]
+}}
+
+约束：
+- 只能输出上述 JSON（不要 Markdown、不要解释）
+- path 必须使用点号路径，优先使用这些前缀：notifications., heartbeat., research., controller.health_check_interval
+- value 用秒/数值，时间类都转换成“秒”
+'''
+        else:
+            prompt = f'''请从查询 '{query}' 中提取命令 '{command}' 的参数：
 
 命令描述: {self.command_templates[command]['description']}
 

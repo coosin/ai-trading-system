@@ -32,6 +32,7 @@ class HeartbeatMonitor:
         self.memory_manager = memory_manager
         self.notification_handler = notification_handler
         self.interval = interval
+        self.market_opportunity_cooldown_sec = 6 * 3600
         
         self._running = False
         self._last_heartbeat: Optional[datetime] = None
@@ -143,7 +144,7 @@ class HeartbeatMonitor:
             # Avoid spamming the same low-priority hint every heartbeat.
             now = datetime.now()
             last = self._last_notice_at.get("market_opportunity")
-            if last and (now - last).total_seconds() < 6 * 3600:
+            if last and (now - last).total_seconds() < self.market_opportunity_cooldown_sec:
                 return
             self._last_notice_at["market_opportunity"] = now
             await self._send_notification(

@@ -233,6 +233,57 @@ class ConfigManager:
                 "enabled": True,
             },
         },
+        "notifications": {
+            "enabled": True,
+            "smart": {
+                "quiet_hours_start": "23:00",
+                "quiet_hours_end": "07:00",
+                "batch_interval_sec": 3600,
+                "rate_limits_per_hour": {
+                    "low": 10,
+                    "medium": 20,
+                    "high": 50,
+                    "critical": 100,
+                },
+                "dedup_windows_sec": {
+                    "critical": 60,
+                    "high": 600,
+                    "medium": 3600,
+                    "low": 21600,
+                },
+                "dedup_max_keys": 2000,
+            },
+            "telegram": {
+                # repeated send failures (chat_id/proxy) log suppression window
+                "failure_dedup_window_sec": 1800,
+            },
+        },
+        "heartbeat": {
+            "enabled": True,
+            "interval_sec": 1800,
+            "market_opportunity_notice_cooldown_sec": 21600,
+        },
+        "research": {
+            "enabled": True,
+            "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
+            "timeframe": "1h",
+            "lookback_days": 30,
+            "gates": {
+                "min_sharpe": 0.8,
+                "max_drawdown": 0.25,
+                "min_trades": 8,
+            },
+            "cost_model": {
+                # applied in walk-forward scoring
+                "fee_rate": 0.0005,
+                "slippage_rate": 0.0003,
+            },
+            "walk_forward": {
+                "enabled": True,
+                "folds": 3,
+                "train_ratio": 0.7,
+            },
+        },
     }
 
     def __init__(self, config_dir: str = None, watch_interval: int = 30):
@@ -453,6 +504,62 @@ class ConfigManager:
 
             logger.info(f"配置已更新: {section}.{key} = {value}")
             return True
+
+    async def set_config_path(self, path: str, value: Any, validate: bool = True) -> bool:
+        """
+        Set nested config with dotted path, e.g. "notifications.smart.dedup_windows_sec.high".
+        This updates the corresponding top-level section dict and persists it.
+        """
+        parts = [p for p in (path or "").split(".") if p]
+        if len(parts) < 2:
+            return False
+        section = parts[0]
+        nested = parts[1:]
+        async with self._lock:
+            section_cfg = self._config.get(section)
+            if not isinstance(section_cfg, dict):
+                section_cfg = {}
+                self._config[section] = section_cfg
+
+            old_value = None
+            cur = section_cfg
+            for k in nested[:-1]:
+                if k not in cur or not isinstance(cur.get(k), dict):
+                    cur[k] = {}
+                cur = cur[k]
+            leaf = nested[-1]
+            if isinstance(cur, dict) and leaf in cur:
+                old_value = cur.get(leaf)
+            cur[leaf] = value
+
+            # record as ConfigChange using the full nested key
+            change = ConfigChange(
+                section=section,
+                key=".".join(nested),
+                old_value=old_value,
+                new_value=value,
+                timestamp=asyncio.get_event_loop().time(),
+            )
+            self._change_history.append(change)
+            await self._save_section_to_file(section)
+            await self._notify_watchers(section, ".".join(nested), old_value, value)
+            logger.info(f"配置已更新: {section}.{'.'.join(nested)} = {value}")
+            return True
+
+    def get_config_path_sync(self, path: str, default: Any = None) -> Any:
+        parts = [p for p in (path or "").split(".") if p]
+        if not parts:
+            return default
+        section = parts[0]
+        keys = parts[1:]
+        cur: Any = self.get_config_sync(section, None, default if not keys else {})
+        for k in keys:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(k)
+            if cur is None:
+                return default
+        return cur
 
     def _validate_value(self, value: Any) -> bool:
         """简化验证"""

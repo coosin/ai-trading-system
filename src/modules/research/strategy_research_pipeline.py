@@ -36,8 +36,33 @@ class StrategyResearchPipeline:
         self.main_controller = main_controller
         self.gates = gates or ResearchGates()
         self.engine = BacktestEngine()
+        self.fee_rate = 0.0005
+        self.slippage_rate = 0.0003
+        self.fold_count = 3
+        self.train_ratio = 0.7
 
     async def run_cycle(self, symbols: List[str], timeframe: str = "1h", lookback_days: int = 30) -> Dict[str, Any]:
+        # load config (best-effort)
+        try:
+            cm = getattr(self.main_controller, "config_manager", None)
+            cfg = await cm.get_config("research", {}) if cm else {}
+            if isinstance(cfg, dict):
+                gates = cfg.get("gates", {})
+                if isinstance(gates, dict):
+                    self.gates.min_sharpe = float(gates.get("min_sharpe", self.gates.min_sharpe))
+                    self.gates.max_drawdown = float(gates.get("max_drawdown", self.gates.max_drawdown))
+                    self.gates.min_trades = int(gates.get("min_trades", self.gates.min_trades))
+                cost = cfg.get("cost_model", {})
+                if isinstance(cost, dict):
+                    self.fee_rate = float(cost.get("fee_rate", self.fee_rate))
+                    self.slippage_rate = float(cost.get("slippage_rate", self.slippage_rate))
+                wf = cfg.get("walk_forward", {})
+                if isinstance(wf, dict):
+                    self.fold_count = int(wf.get("folds", self.fold_count))
+                    self.train_ratio = float(wf.get("train_ratio", self.train_ratio))
+        except Exception:
+            pass
+
         results: Dict[str, Any] = {"published": [], "rejected": [], "errors": []}
         for sym in symbols:
             try:
@@ -58,17 +83,25 @@ class StrategyResearchPipeline:
         if df is None or len(df) < 120:
             return []
 
-        train_df, test_df = self._walk_forward_split(df, train_ratio=0.7)
+        folds = self._walk_forward_folds(df, folds=max(1, self.fold_count), train_ratio=self.train_ratio)
         candidates = self._generate_candidates(symbol, timeframe)
 
         published: List[Dict[str, Any]] = []
         for dsl in candidates:
             validate_dsl(dsl)
-            best_dsl, train_metrics = await self._optimize_candidate(dsl, train_df)
-            test_metrics = await self._backtest(best_dsl, test_df)
+            # multi-fold walk-forward: optimize on each train window, score on test windows
+            fold_scores: List[Dict[str, Any]] = []
+            best_dsl = dsl
+            best_train = {}
+            for train_df, test_df in folds:
+                best_dsl, train_metrics = await self._optimize_candidate(best_dsl, train_df)
+                test_metrics = await self._backtest(best_dsl, test_df)
+                fold_scores.append(test_metrics)
+                best_train = train_metrics
+            test_metrics = self._aggregate_fold_metrics(fold_scores)
 
             if self._passes_gates(test_metrics):
-                item = await self._publish(best_dsl, test_metrics, train_metrics)
+                item = await self._publish(best_dsl, test_metrics, best_train)
                 if item:
                     published.append(item)
         return published
@@ -106,10 +139,43 @@ class StrategyResearchPipeline:
         df = df.sort_values("timestamp").set_index("timestamp")
         return df
 
-    def _walk_forward_split(self, df: pd.DataFrame, train_ratio: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def _walk_forward_folds(self, df: pd.DataFrame, folds: int, train_ratio: float) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
         n = len(df)
+        folds = max(1, min(folds, 6))
         cut = max(50, int(n * train_ratio))
-        return df.iloc[:cut].copy(), df.iloc[cut:].copy()
+        # expanding window walk-forward
+        out: List[Tuple[pd.DataFrame, pd.DataFrame]] = []
+        if n - cut < 30:
+            out.append((df.iloc[:cut].copy(), df.iloc[cut:].copy()))
+            return out
+        step = max(20, int((n - cut) / folds))
+        for i in range(folds):
+            test_start = cut + i * step
+            test_end = min(n, test_start + step)
+            if test_end - test_start < 20:
+                break
+            train = df.iloc[:test_start].copy()
+            test = df.iloc[test_start:test_end].copy()
+            if len(train) >= 80 and len(test) >= 20:
+                out.append((train, test))
+        return out or [(df.iloc[:cut].copy(), df.iloc[cut:].copy())]
+
+    def _aggregate_fold_metrics(self, folds: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not folds:
+            return {"sharpe_ratio": 0.0, "max_drawdown": 1.0, "total_trades": 0, "win_rate": 0.0, "total_pnl": 0.0}
+        sharpe = sum(float(f.get("sharpe_ratio", 0)) for f in folds) / len(folds)
+        max_dd = max(float(f.get("max_drawdown", 0)) for f in folds)
+        trades = sum(int(f.get("total_trades", 0)) for f in folds)
+        win = sum(float(f.get("win_rate", 0)) for f in folds) / len(folds)
+        pnl = sum(float(f.get("total_pnl", 0)) for f in folds)
+        return {
+            "sharpe_ratio": sharpe,
+            "max_drawdown": max_dd,
+            "total_trades": trades,
+            "win_rate": win,
+            "total_pnl": pnl,
+            "folds": folds,
+        }
 
     def _generate_candidates(self, symbol: str, timeframe: str) -> List[Dict[str, Any]]:
         symbol = normalize_symbol(symbol)
@@ -188,13 +254,23 @@ class StrategyResearchPipeline:
         )
         strat = DSLStrategy({"name": dsl.get("name", "dsl"), "dsl": dsl})
         res = await self.engine.run_backtest(strat, df.copy(), config)
+        # cost model: approximate fee+slippage on notional traded
+        cost = 0.0
+        try:
+            traded_notional = 0.0
+            for t in res.trades:
+                traded_notional += float(getattr(t, "price", 0) or 0) * float(getattr(t, "quantity", 0) or 0)
+            cost = traded_notional * float(self.fee_rate + self.slippage_rate)
+        except Exception:
+            cost = 0.0
         return {
             "final_balance": res.final_balance,
-            "total_pnl": res.total_pnl,
+            "total_pnl": float(res.total_pnl) - float(cost),
             "win_rate": float(res.win_rate) / 100.0 if res.win_rate > 1 else float(res.win_rate),
             "max_drawdown": float(res.max_drawdown) / 100.0 if res.max_drawdown > 1 else float(res.max_drawdown),
             "sharpe_ratio": float(res.sharpe_ratio),
             "total_trades": int(res.total_trades),
+            "estimated_cost": float(cost),
         }
 
     def _passes_gates(self, metrics: Dict[str, Any]) -> bool:

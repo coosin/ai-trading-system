@@ -653,8 +653,15 @@ class MainController:
             logger.info("✅ 自主开发框架已初始化")
             
             # 初始化智能通知系统
+            notification_cfg = {}
+            try:
+                notification_cfg = await self.config_manager.get_config("notifications", {})
+            except Exception:
+                notification_cfg = {}
+            smart_cfg = notification_cfg.get("smart", {}) if isinstance(notification_cfg, dict) else {}
             self.smart_notification = SmartNotificationSystem(
-                send_func=self._send_notification_handler
+                send_func=self._send_notification_handler,
+                config=smart_cfg,
             )
             logger.info("✅ 智能通知系统初始化完成")
             
@@ -1582,13 +1589,25 @@ class MainController:
                     # 启动心跳监控器
                     if not self.heartbeat_monitor and self.ai_trading_engine and self.skill_manager:
                         try:
+                            hb_cfg = {}
+                            try:
+                                hb_cfg = await self.config_manager.get_config("heartbeat", {}) if self.config_manager else {}
+                            except Exception:
+                                hb_cfg = {}
                             self.heartbeat_monitor = HeartbeatMonitor(
                                 trading_engine=self.ai_trading_engine,
                                 skill_manager=self.skill_manager,
                                 memory_manager=self.hierarchical_memory,
                                 notification_handler=self._send_notification_handler,
-                                interval=1800  # 30分钟
+                                interval=int(hb_cfg.get("interval_sec", 1800)) if isinstance(hb_cfg, dict) else 1800,
                             )
+                            if isinstance(hb_cfg, dict):
+                                try:
+                                    self.heartbeat_monitor.market_opportunity_cooldown_sec = int(
+                                        hb_cfg.get("market_opportunity_notice_cooldown_sec", 21600)
+                                    )
+                                except Exception:
+                                    pass
                             logger.info("✅ 心跳监控器已初始化")
                         except Exception as e:
                             logger.error(f"心跳监控器初始化失败: {e}")
@@ -3705,9 +3724,16 @@ class MainController:
                 except Exception as e:
                     # Avoid log spam when chat_id/proxy is misconfigured.
                     now = datetime.now()
+                    window_sec = 1800
+                    try:
+                        cfg = await self.config_manager.get_config("notifications", {}) if self.config_manager else {}
+                        if isinstance(cfg, dict):
+                            window_sec = int(cfg.get("telegram", {}).get("failure_dedup_window_sec", window_sec))
+                    except Exception:
+                        pass
                     key = str(e)
                     last = self._telegram_fail_dedup.get(key)  # type: ignore[attr-defined]
-                    if not last or (now - last).total_seconds() > 1800:
+                    if not last or (now - last).total_seconds() > window_sec:
                         self._telegram_fail_dedup[key] = now  # type: ignore[attr-defined]
                         logger.error(f"Telegram通知发送失败: {e}")
             

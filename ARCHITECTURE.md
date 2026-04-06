@@ -611,6 +611,24 @@ stop_loss:
   trailing_stop_offset: 0.02
 
 # 记忆系统配置（MemoryGateway + provider）
+#### 8.2.x 自然语言配置修改（推荐）
+
+系统支持通过自然语言让核心大脑自动修改常用配置（例如通知频率、心跳间隔、研究门控阈值）。
+
+- **方式**：在任意对话入口（Telegram/Web API `/ai/chat`）直接说你的需求
+- **机制**：NLI 会抽取 `changes[]` → `ConfigManager.set_config_path()` 应用 → 写入审计与记忆
+- **安全**：只允许修改白名单前缀（`notifications.*`, `heartbeat.*`, `research.*`, `controller.health_check_interval`）
+
+示例（自然语言 → 自动变更）：
+
+- “把 high 级别通知去重窗口改成 20 分钟”
+  - `notifications.smart.dedup_windows_sec.high = 1200`
+- “把心跳改成 10 分钟一次”
+  - `heartbeat.interval_sec = 600`
+- “研究策略门控：最小夏普 1.2，最大回撤 0.2”
+  - `research.gates.min_sharpe = 1.2`
+  - `research.gates.max_drawdown = 0.2`
+
 memory:
   provider: "native"
   default_scope: "global"
