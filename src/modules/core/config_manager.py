@@ -241,6 +241,8 @@ class ConfigManager:
                         "保证金占用率0.0%",
                         "浮亏-0.0%",
                     ],
+                    # Optional explicit blacklist for known polluted historical IDs.
+                    "deny_memory_ids": [],
                     # Only store conversation automatically above this importance
                     "min_importance_by_category": {
                         "conversation": 0.2,

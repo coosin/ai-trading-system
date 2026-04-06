@@ -167,7 +167,7 @@ class MemoryGateway:
             md = dict(item.metadata or {})
             md.setdefault("score", item.score)
             md.setdefault("reasons", item.reasons)
-            if self._is_noise_content(str(item.content)):
+            if self._is_noise_entry(memory_id=str(item.id), content=str(item.content), metadata=md):
                 continue
             records.append(
                 MemoryRecord(
@@ -273,7 +273,7 @@ class MemoryGateway:
                     if getattr(entry, "category", None) != MemoryCategory.CONVERSATION:
                         continue
                     md = dict(getattr(entry, "metadata", {}) or {})
-                    if self._is_noise_content(str(getattr(entry, "content", ""))):
+                    if self._is_noise_entry(memory_id=str(_id), content=str(getattr(entry, "content", "")), metadata=md):
                         continue
                     if scope and str(md.get("scope", "")).strip() != scope:
                         continue
@@ -301,7 +301,7 @@ class MemoryGateway:
         except Exception:
             return []
 
-    def _is_noise_content(self, content: str) -> bool:
+    def _is_noise_entry(self, memory_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
         text = (content or "").strip().lower()
         if not text:
             return True
@@ -309,6 +309,9 @@ class MemoryGateway:
             cfg = self.config_manager.get_config_sync("memory", None, {}) if self.config_manager else {}
             auto = cfg.get("auto_capture", {}) if isinstance(cfg, dict) else {}
             policy = auto.get("policy", {}) if isinstance(auto, dict) else {}
+            deny_ids = {str(x) for x in (policy.get("deny_memory_ids", []) or [])}
+            if memory_id and memory_id in deny_ids:
+                return True
             deny_contains = [str(x).lower() for x in (policy.get("deny_content_contains", []) or [])]
             for frag in deny_contains:
                 if frag and frag in text:
