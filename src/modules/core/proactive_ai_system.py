@@ -887,6 +887,10 @@ class ProactiveActionTrigger:
         self._action_queue: List[Dict] = []
         self._last_action_time: Dict[str, datetime] = {}
         self._action_cooldown = self.config.get("action_cooldown", 60)
+        notif_cfg = self.config.get("notifications", {}) if isinstance(self.config.get("notifications", {}), dict) else {}
+        self._opportunity_notification_enabled = bool(notif_cfg.get("opportunity_enabled", False))
+        self._opportunity_min_confidence = float(notif_cfg.get("opportunity_min_confidence", 0.85))
+        self._opportunity_notification_cooldown = int(notif_cfg.get("opportunity_cooldown_sec", 3600))
     
     async def initialize(self) -> bool:
         """初始化"""
@@ -907,12 +911,28 @@ class ProactiveActionTrigger:
     def queue_action(self, action: Dict) -> None:
         """添加行动到队列"""
         action_type = action.get('type', 'unknown')
-        
-        if action_type in self._last_action_time:
-            elapsed = (datetime.now() - self._last_action_time[action_type]).total_seconds()
-            if elapsed < self._action_cooldown:
-                logger.debug(f"行动 {action_type} 冷却中，跳过")
+
+        if action_type == "send_notification" and action.get("kind") == "opportunity":
+            if not self._opportunity_notification_enabled:
+                logger.debug("机会通知已禁用，跳过")
                 return
+            confidence = float(action.get("confidence", 0.0) or 0.0)
+            if confidence < self._opportunity_min_confidence:
+                logger.debug(f"机会通知置信度不足({confidence:.2f}<{self._opportunity_min_confidence:.2f})，跳过")
+                return
+            cooldown_key = str(action.get("cooldown_key") or "send_notification:opportunity")
+            if cooldown_key in self._last_action_time:
+                elapsed = (datetime.now() - self._last_action_time[cooldown_key]).total_seconds()
+                if elapsed < self._opportunity_notification_cooldown:
+                    logger.debug(f"机会通知冷却中({cooldown_key})，跳过")
+                    return
+            action["_cooldown_key"] = cooldown_key
+        else:
+            if action_type in self._last_action_time:
+                elapsed = (datetime.now() - self._last_action_time[action_type]).total_seconds()
+                if elapsed < self._action_cooldown:
+                    logger.debug(f"行动 {action_type} 冷却中，跳过")
+                    return
         
         self._action_queue.append(action)
         logger.info(f"📥 行动已加入队列: {action_type}")
@@ -952,7 +972,8 @@ class ProactiveActionTrigger:
             logger.error(f"执行行动失败: {e}")
             return False
         finally:
-            self._last_action_time[action_type] = datetime.now()
+            cooldown_key = action.get("_cooldown_key") if isinstance(action, dict) else None
+            self._last_action_time[str(cooldown_key or action_type)] = datetime.now()
     
     async def _execute_open_position(self, action: Dict) -> bool:
         """执行开仓"""
@@ -1006,13 +1027,18 @@ class ProactiveActionTrigger:
         """执行发送通知"""
         if not self.main_controller:
             return False
-        
-        telegram = getattr(self.main_controller, 'telegram_bot', None)
-        if not telegram:
-            return False
-        
+
         try:
-            await telegram.send_message(action.get('message', ''))
+            title = action.get("title", "系统通知")
+            message = action.get("message", "")
+            priority = action.get("priority", "low")
+            if hasattr(self.main_controller, "_send_notification_handler"):
+                await self.main_controller._send_notification_handler(title, message, priority)
+            else:
+                telegram = getattr(self.main_controller, 'telegram_bot', None)
+                if not telegram:
+                    return False
+                await telegram.send_message(message)
             return True
         except Exception as e:
             logger.error(f"发送通知失败: {e}")
@@ -1065,7 +1091,12 @@ class ProactiveAIOrchestrator:
         async def on_opportunity(opportunity):
             self.action_trigger.queue_action({
                 'type': 'send_notification',
-                'message': f"🎯 发现机会: {opportunity.symbol} {opportunity.direction}\n\n{opportunity.reasoning}"
+                'kind': 'opportunity',
+                'title': "机会提示",
+                'priority': "low",
+                'confidence': float(getattr(opportunity, "confidence", 0.0) or 0.0),
+                'cooldown_key': f"opportunity:{opportunity.symbol}:{opportunity.direction}",
+                'message': f"🎯 发现机会: {opportunity.symbol} {opportunity.direction}\n\n{opportunity.reasoning}",
             })
         
         self.market_scanner.add_alert_callback(on_opportunity)

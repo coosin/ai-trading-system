@@ -196,6 +196,14 @@ class ConfigManager:
             "deep_scan_interval": 300,
             "collect_interval": 300,
             "action_cooldown": 60,
+            "notifications": {
+                # Root-cause fix: default OFF to avoid spam.
+                "opportunity_enabled": False,
+                # Only notify high-confidence opportunities.
+                "opportunity_min_confidence": 0.85,
+                # Per symbol+direction cooldown.
+                "opportunity_cooldown_sec": 3600,
+            },
         },
         "system_monitor": {},
         "intelligent_monitoring": {},
