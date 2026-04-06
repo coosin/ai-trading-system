@@ -355,7 +355,16 @@ class AITradingEngine:
         # 加载配置
         if self.main_controller and self.main_controller.config_manager:
             config = await self.main_controller.config_manager.get_config("ai_trading", {})
-            self.ai_config.update(config)
+            if isinstance(config, dict):
+                symbols = config.get("symbols")
+                if isinstance(symbols, list) and symbols:
+                    self.symbols = symbols
+                contract_config = config.get("contract_config", {})
+                if isinstance(contract_config, dict):
+                    self.contract_config.update(contract_config)
+                ai_cfg = config.get("ai_config", {})
+                if isinstance(ai_cfg, dict):
+                    self.ai_config.update(ai_cfg)
         
         self._running = True
         logger.info(f"✅ 全智能AI交易引擎初始化完成")

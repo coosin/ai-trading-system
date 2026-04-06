@@ -96,6 +96,29 @@ class SystemMaintenanceSkill(SkillBase):
             SkillResult: 维护结果
         """
         start_time = datetime.now()
+
+        # Cache config snapshot for sync helpers / file ops
+        self._base_path = None
+        self._log_path = None
+        mc = context.get("main_controller")
+        cm = getattr(mc, "config_manager", None) if mc else context.get("config_manager")
+        if cm:
+            try:
+                self._base_path = await cm.get_config("paths", "base_path", None)
+            except Exception:
+                self._base_path = None
+            try:
+                self._log_path = await cm.get_config("paths", "log_path", None)
+            except Exception:
+                self._log_path = None
+            try:
+                cfg = await cm.get_config("system_maintenance", {})
+                if isinstance(cfg, dict):
+                    thresholds = cfg.get("health_thresholds", {})
+                    if isinstance(thresholds, dict):
+                        self.health_thresholds.update(thresholds)
+            except Exception:
+                pass
         
         health = await self.diagnose(context)
         
@@ -294,7 +317,10 @@ class SystemMaintenanceSkill(SkillBase):
     
     def _check_logs(self) -> Dict[str, Any]:
         """检查日志状态"""
-        log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
+        log_path = Path(
+            self._log_path
+            or "/app/logs"
+        )
         
         total_size = 0
         file_count = 0
@@ -439,7 +465,7 @@ class SystemMaintenanceSkill(SkillBase):
     async def _rotate_logs(self) -> bool:
         """轮转日志"""
         try:
-            log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
+            log_path = Path(self._log_path or "/app/logs")
             if not log_path.exists():
                 return False
             
@@ -460,7 +486,7 @@ class SystemMaintenanceSkill(SkillBase):
     async def _clean_temp_files(self) -> bool:
         """清理临时文件"""
         try:
-            base_path = Path(os.environ.get("OPENCLAW_BASE_PATH", "/app"))
+            base_path = Path(self._base_path or "/app")
             temp_paths = [
                 base_path / "temp",
                 base_path / "cache",

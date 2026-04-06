@@ -368,6 +368,52 @@ class MainController:
 
         logger.info("主控制器初始化完成")
 
+    # --- lightweight accessors (reduce attribute coupling) ---
+    def get_exchange(self):
+        """Best-effort exchange accessor (keeps backward compatibility)."""
+        if getattr(self, "okx_exchange", None) is not None:
+            return self.okx_exchange
+        return getattr(self, "exchange", None)
+
+    def get_llm_integration(self):
+        return getattr(self, "llm_integration", None)
+
+    def get_telegram_bot(self):
+        return getattr(self, "telegram_bot", None)
+
+    def get_strategy_manager(self):
+        return getattr(self, "strategy_manager", None)
+
+    def get_data_integration(self):
+        return getattr(self, "data_integration", None)
+
+    def get_third_party_data_integrator(self):
+        return getattr(self, "third_party_data_integrator", None)
+
+    def get_onchain_integrator(self):
+        return getattr(self, "onchain_integrator", None)
+
+    def _deep_merge_dict(self, base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(base or {})
+        for k, v in (updates or {}).items():
+            if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                merged[k] = self._deep_merge_dict(merged[k], v)
+            else:
+                merged[k] = v
+        return merged
+
+    async def get_ai_managed_config(self, section: str, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Unified config entrypoint for AI-managed modules."""
+        cfg: Dict[str, Any] = dict(defaults or {})
+        if self.config_manager:
+            try:
+                section_cfg = await self.config_manager.get_config(section, {})
+                if isinstance(section_cfg, dict):
+                    cfg = self._deep_merge_dict(cfg, section_cfg)
+            except Exception as e:
+                logger.debug(f"读取模块配置失败 [{section}]，使用默认值: {e}")
+        return cfg
+
     async def initialize(self) -> None:
         """
         初始化主控制器
@@ -423,8 +469,15 @@ class MainController:
         # 初始化统一记忆系统（整合所有记忆功能）
         from src.modules.core.unified_memory_system import UnifiedMemorySystem
         import os
-        
-        workspace_path = os.environ.get("WORKSPACE_PATH", "/app/workspace")
+
+        # Prefer centralized config paths; fallback to env/default.
+        cfg_workspace_path = None
+        try:
+            cfg_workspace_path = await self.config_manager.get_config("paths", "workspace_path", None)
+        except Exception:
+            cfg_workspace_path = None
+
+        workspace_path = cfg_workspace_path or os.environ.get("WORKSPACE_PATH", "/app/workspace")
         
         self.unified_memory = UnifiedMemorySystem(workspace_path=workspace_path)
         await self.unified_memory.initialize()
@@ -439,10 +492,19 @@ class MainController:
         # 初始化统一交易历史服务（新增）
         try:
             from src.modules.core.trade_history_service import TradeHistoryService
+
+            trade_history_base_path = "data/trade_history"
+            try:
+                trade_history_base_path = await self.config_manager.get_config(
+                    "paths", "trade_history_path", trade_history_base_path
+                )
+            except Exception:
+                pass
+
             self.trade_history_service = TradeHistoryService(
                 config={
                     "cache_max_size": 1000,
-                    "base_path": "data/trade_history"
+                    "base_path": trade_history_base_path
                 }
             )
             await self.trade_history_service.initialize()
@@ -471,7 +533,7 @@ class MainController:
             self.skill_manager.register_skill(AutoRepairSkill())
             self.skill_manager.register_skill(SystemMaintenanceSkill())
             self.skill_manager.register_skill(CodeEditorSkill())
-            self.skill_manager.register_skill(CodeDeveloperSkill())
+            self.skill_manager.register_skill(CodeDeveloperSkill(config_manager=self.config_manager))
             self.skill_manager.register_skill(CodeReviewerSkill())
             self.skill_manager.register_skill(ExternalResourceSkill())
             self.skill_manager.register_skill(WebSearchSkill())
@@ -483,7 +545,7 @@ class MainController:
             logger.info("✅ 系统稳定性分析器已初始化")
             
             # 初始化自主开发框架
-            self.autonomous_developer = AutonomousDeveloper()
+            self.autonomous_developer = AutonomousDeveloper(config_manager=self.config_manager)
             self.autonomous_developer.set_skills(
                 code_editor=self.skill_manager.get_skill("code_editor"),
                 code_developer=self.skill_manager.get_skill("code_developer"),
@@ -650,7 +712,8 @@ class MainController:
         # 初始化智能监控系统
         try:
             from src.modules.monitoring.intelligent_monitoring import IntelligentMonitoringSystem
-            self.intelligent_monitoring = IntelligentMonitoringSystem()
+            intelligent_monitoring_cfg = await self.get_ai_managed_config("intelligent_monitoring", {})
+            self.intelligent_monitoring = IntelligentMonitoringSystem(intelligent_monitoring_cfg)
             logger.info("✅ 智能监控系统已初始化")
         except Exception as e:
             logger.warning(f"⚠️ 智能监控系统初始化失败: {e}")
@@ -816,7 +879,8 @@ class MainController:
         # 初始化系统监控器
         try:
             from src.modules.core.system_monitor import SystemMonitor
-            self.system_monitor = SystemMonitor()
+            system_monitor_cfg = await self.get_ai_managed_config("system_monitor", {})
+            self.system_monitor = SystemMonitor(system_monitor_cfg)
             await self.system_monitor.initialize()
             logger.info("✅ 系统监控器已初始化")
         except Exception as e:
@@ -843,12 +907,14 @@ class MainController:
         # 初始化主动性AI系统
         try:
             from src.modules.core.proactive_ai_system import ProactiveAIOrchestrator
-            self.proactive_ai = ProactiveAIOrchestrator(self, {
+            proactive_defaults = {
                 "scan_interval": 30,
                 "deep_scan_interval": 300,
                 "collect_interval": 300,
                 "action_cooldown": 60
-            })
+            }
+            proactive_cfg = await self.get_ai_managed_config("proactive_ai", proactive_defaults)
+            self.proactive_ai = ProactiveAIOrchestrator(self, proactive_cfg)
             await self.proactive_ai.initialize()
             logger.info("✅ 主动性AI系统已初始化")
         except Exception as e:
@@ -937,7 +1003,8 @@ class MainController:
         
         # 初始化增强监控系统
         try:
-            self.enhanced_monitoring = EnhancedMonitoringSystem()
+            enhanced_monitoring_cfg = await self.get_ai_managed_config("enhanced_monitoring", {})
+            self.enhanced_monitoring = EnhancedMonitoringSystem(enhanced_monitoring_cfg)
             await self.enhanced_monitoring.initialize()
             
             # 设置Telegram机器人
@@ -1093,7 +1160,8 @@ class MainController:
             # 初始化统一数据管理器（复用已存在的组件）
             try:
                 from src.modules.data.unified_data_manager import UnifiedDataManager
-                self.unified_data_manager = UnifiedDataManager()
+                unified_data_cfg = await self.get_ai_managed_config("unified_data_manager", {})
+                self.unified_data_manager = UnifiedDataManager(unified_data_cfg)
                 # 复用已初始化的组件
                 if self.data_storage:
                     self.unified_data_manager.storage = self.data_storage
@@ -1108,7 +1176,8 @@ class MainController:
             # 初始化统一策略系统（复用已存在的组件）
             try:
                 from src.modules.strategies.unified_strategy_system import UnifiedStrategySystem
-                self.unified_strategy_system = UnifiedStrategySystem()
+                unified_strategy_cfg = await self.get_ai_managed_config("unified_strategy_system", {})
+                self.unified_strategy_system = UnifiedStrategySystem(unified_strategy_cfg)
                 # 复用已初始化的组件
                 if self.strategy_manager:
                     self.unified_strategy_system.manager = self.strategy_manager
@@ -1131,7 +1200,8 @@ class MainController:
             # 初始化统一交易系统
             try:
                 from src.modules.trading.unified_trade_system import UnifiedTradeSystem
-                self.unified_trade_system = UnifiedTradeSystem()
+                unified_trade_cfg = await self.get_ai_managed_config("unified_trade_system", {})
+                self.unified_trade_system = UnifiedTradeSystem(unified_trade_cfg)
                 # 复用已初始化的组件
                 if self.trading_monitor:
                     self.unified_trade_system.monitor = self.trading_monitor
@@ -1144,7 +1214,8 @@ class MainController:
             # 初始化统一风险系统
             try:
                 from src.modules.risk.unified_risk_system import UnifiedRiskSystem
-                self.unified_risk_system = UnifiedRiskSystem()
+                unified_risk_cfg = await self.get_ai_managed_config("unified_risk_system", {})
+                self.unified_risk_system = UnifiedRiskSystem(unified_risk_cfg)
                 # 复用已初始化的组件
                 if hasattr(self, 'intelligent_monitoring') and self.intelligent_monitoring:
                     self.unified_risk_system.monitor = self.intelligent_monitoring

@@ -91,7 +91,7 @@ class CodeDeveloperSkill(SkillBase):
     赋予AI自主开发新功能和模块的能力
     """
     
-    def __init__(self):
+    def __init__(self, config_manager: Any = None):
         super().__init__(
             name="code_developer",
             description="AI代码开发能力，包括生成模块、功能、API、测试等",
@@ -99,7 +99,10 @@ class CodeDeveloperSkill(SkillBase):
         )
         
         self.generated_files: List[GeneratedCode] = []
-        self.templates_dir = Path(os.environ.get("OPENCLAW_TEMPLATES_DIR", "/app/templates"))
+        self.templates_dir = Path(
+            (config_manager.get_path_sync("templates_dir", None) if config_manager else None)
+            or "/app/templates"
+        )
         try:
             self.templates_dir.mkdir(parents=True, exist_ok=True)
         except PermissionError:

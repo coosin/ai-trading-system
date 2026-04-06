@@ -535,6 +535,10 @@ volumes:
 
 ### 8.1 环境变量 (.env)
 
+推荐规则（配置收敛后）：
+- 推荐：`OPENCLAW__section__key=value`（支持多级嵌套）
+- 兼容：`TRADING_SECTION_KEY=value`（已弃用，后续将移除）
+
 ```bash
 # 百度千帆API
 QIANFAN_API_KEY=bce-v3/ALTAKSP-xxx/xxx

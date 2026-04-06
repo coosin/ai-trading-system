@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+from .timing_constants import SLEEP_5S, SLEEP_60S
+
 
 @dataclass
 class Intent:
@@ -62,7 +64,9 @@ class AICommandExecutor:
         logger.info("初始化AI指令执行器（智能增强版）...")
         
         if self.main_controller:
-            if hasattr(self.main_controller, 'llm_integration'):
+            if hasattr(self.main_controller, "get_llm_integration"):
+                self.llm_integration = self.main_controller.get_llm_integration()
+            elif hasattr(self.main_controller, 'llm_integration'):
                 self.llm_integration = self.main_controller.llm_integration
             
             if hasattr(self.main_controller, 'ai_memory_manager'):
@@ -1224,7 +1228,7 @@ class AICommandExecutor:
         """自主工作循环"""
         while self._autonomous_running:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(SLEEP_60S)
                 
                 if not self.authorization.get("auto_trading"):
                     continue
@@ -1243,7 +1247,11 @@ class AICommandExecutor:
         if not self.main_controller or not hasattr(self.main_controller, 'strategy_manager'):
             return
         
-        sm = self.main_controller.strategy_manager
+        sm = (
+            self.main_controller.get_strategy_manager()
+            if hasattr(self.main_controller, "get_strategy_manager")
+            else self.main_controller.strategy_manager
+        )
         strategy_configs = getattr(sm, 'strategy_configs', {})
         
         if not strategy_configs and self.authorization.get("auto_strategy"):
@@ -1258,6 +1266,6 @@ class AICommandExecutor:
         for symbol in symbols[:2]:
             try:
                 await self._analyze_market({'symbol': symbol})
-                await asyncio.sleep(5)
+                await asyncio.sleep(SLEEP_5S)
             except Exception as e:
                 logger.error(f"扫描 {symbol} 失败: {e}")

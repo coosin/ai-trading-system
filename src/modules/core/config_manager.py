@@ -30,6 +30,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_TRADING_PREFIX_DEPRECATION_LOGGED = False
+
 
 class ConfigValidationError(Exception):
     """配置验证错误"""
@@ -86,6 +88,116 @@ class ConfigManager:
         "/app/config"
     ]
 
+    # Minimal built-in defaults to reduce config scattering. File configs and env
+    # overrides will take precedence.
+    DEFAULT_CONFIG: Dict[str, Dict[str, Any]] = {
+        "system": {
+            "environment": "development",
+            "debug": False,
+        },
+        "controller": {
+            "auto_restart_modules": True,
+            "max_restart_attempts": 3,
+            "health_check_interval": 30,
+            "event_history_limit": 1000,
+        },
+        "api": {
+            "host": "0.0.0.0",
+            "port": 8000,
+            "enable_cors": True,
+            "enable_swagger": True,
+        },
+        "paths": {
+            "base_path": "/app",
+            "data_path": "/app/data",
+            "log_path": "/app/logs",
+            "workspace_path": "/app/workspace",
+            "trade_history_path": "data/trade_history",
+            "templates_dir": "/app/templates",
+            "models_path": "/app/data/models",
+            "memory_path": "/app/workspace/memory",
+            "trading_path": "/app",
+        },
+        "timing": {
+            "config_watch_interval": 30,
+        },
+        "active_trader": {
+            "min_trade_interval": 300,
+            "contract_config": {
+                "leverage_min": 10,
+                "leverage_max": 50,
+                "default_leverage": 20,
+                "max_positions": 5,
+                "min_positions": 3,
+                "margin_mode": "cross",
+            },
+        },
+        "proactive_scanner": {
+            "scan_interval": 30,
+            "deep_scan_interval": 300,
+            "default_symbols": [
+                "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+                "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT",
+                "DOT/USDT", "MATIC/USDT", "LINK/USDT", "ATOM/USDT",
+            ],
+        },
+        "system_maintenance": {
+            "health_thresholds": {
+                "cpu_warning": 70,
+                "cpu_critical": 90,
+                "memory_warning": 75,
+                "memory_critical": 90,
+                "disk_warning": 80,
+                "disk_critical": 95,
+                "error_rate_warning": 0.05,
+                "error_rate_critical": 0.15,
+            },
+        },
+        "ai_trading": {
+            "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
+            "contract_config": {
+                "enabled": True,
+                "trade_type": "swap",
+                "leverage_min": 10,
+                "leverage_max": 50,
+                "default_leverage": 20,
+                "max_positions": 5,
+                "min_positions": 1,
+                "margin_mode": "cross",
+                "grid_trading": False,
+                "grid_levels": 5,
+                "grid_spacing": 0.02,
+            },
+            "ai_config": {
+                "enabled": True,
+                "model_id": "astron-code-latest",
+                "analysis_interval": 120,
+                "min_confidence": 0.75,
+                "max_positions": 5,
+                "risk_per_trade": 0.01,
+                "trade_mode": "real",
+                "auto_risk_management": True,
+                "critical_risk_auto_close": True,
+                "max_loss_per_position": 0.05,
+                "daily_loss_limit": 0.10,
+                "max_drawdown_limit": 0.15,
+            },
+        },
+        "proactive_ai": {
+            "scan_interval": 30,
+            "deep_scan_interval": 300,
+            "collect_interval": 300,
+            "action_cooldown": 60,
+        },
+        "system_monitor": {},
+        "intelligent_monitoring": {},
+        "enhanced_monitoring": {},
+        "unified_data_manager": {},
+        "unified_strategy_system": {},
+        "unified_trade_system": {},
+        "unified_risk_system": {},
+    }
+
     def __init__(self, config_dir: str = None, watch_interval: int = 30):
         """
         初始化配置管理器
@@ -114,6 +226,15 @@ class ConfigManager:
 
         for d in self._config_dirs:
             d.mkdir(parents=True, exist_ok=True)
+
+    def _deep_update(self, base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively merge dictionaries (updates win)."""
+        for k, v in (updates or {}).items():
+            if isinstance(v, dict) and isinstance(base.get(k), dict):
+                base[k] = self._deep_update(base[k], v)
+            else:
+                base[k] = v
+        return base
 
     def _find_config_dir(self) -> Path:
         """查找第一个存在的配置目录"""
@@ -209,6 +330,29 @@ class ConfigManager:
             else:
                 # 如果没有指定key，返回整个section
                 return self._config.get(section, default)
+
+    def get_config_sync(self, section: str, key: Optional[str] = None, default: Any = None) -> Any:
+        """
+        同步读取配置快照（只读）。
+
+        适用于 sync 方法/构造函数等无法 await 的场景。该方法不加锁，
+        返回的是当前内存配置快照；热重载时可能短暂读到旧值，但不会抛错。
+        """
+        try:
+            if key:
+                section_config = self._config.get(section, {})
+                if isinstance(section_config, dict):
+                    value = section_config.get(key)
+                    return default if value is None else value
+                return default
+            return self._config.get(section, default)
+        except Exception:
+            return default
+
+    def get_path_sync(self, key: str, default: Optional[str] = None) -> str:
+        """同步读取 `paths.<key>`，用于统一路径配置入口。"""
+        value = self.get_config_sync("paths", key, default)
+        return value if isinstance(value, str) and value else (default or "")
 
     async def set_config(self, section: str, key: str, value: Any, validate: bool = True) -> bool:
         """
@@ -374,14 +518,34 @@ class ConfigManager:
 
     async def _load_all_configs(self) -> None:
         """加载所有配置文件（从多个配置目录）"""
+        # Start from built-in defaults every time (reload-safe)
+        self._config = {}
+        self._deep_update(self._config, self.DEFAULT_CONFIG)
+
         loaded_files = set()
         
         for config_dir in self._config_dirs:
-            config_files = list(config_dir.glob("*.json"))
-            
+            # Deterministic priority: default.* first, then other files sorted.
+            config_files: List[Path] = []
+            default_candidates: List[Path] = []
+            other_candidates: List[Path] = []
+
+            default_candidates.extend(sorted(config_dir.glob("default.json")))
             if yaml:
-                config_files.extend(list(config_dir.glob("*.yaml")))
-                config_files.extend(list(config_dir.glob("*.yml")))
+                default_candidates.extend(sorted(config_dir.glob("default.yaml")))
+                default_candidates.extend(sorted(config_dir.glob("default.yml")))
+
+            other_candidates.extend(sorted(config_dir.glob("*.json")))
+            if yaml:
+                other_candidates.extend(sorted(config_dir.glob("*.yaml")))
+                other_candidates.extend(sorted(config_dir.glob("*.yml")))
+
+            # Remove defaults from other_candidates to avoid double load
+            default_set = {p.resolve() for p in default_candidates}
+            other_candidates = [p for p in other_candidates if p.resolve() not in default_set]
+
+            config_files.extend(default_candidates)
+            config_files.extend(other_candidates)
             
             for config_file in config_files:
                 file_key = f"{config_dir.name}/{config_file.name}"
@@ -422,7 +586,8 @@ class ConfigManager:
                 if section not in self._config:
                     self._config[section] = {}
 
-                self._config[section].update(values)
+                # Deep merge to avoid losing nested defaults
+                self._deep_update(self._config[section], values)
 
             logger.info(f"已加载配置文件: {config_file}")
 
@@ -431,29 +596,57 @@ class ConfigManager:
 
     async def _load_environment_configs(self) -> None:
         """加载环境变量配置"""
-        # 环境变量前缀
-        env_prefix = "TRADING_"
+        # Supported prefixes (backward compatible)
+        prefixes = ("OPENCLAW_", "TRADING_")
 
-        for key, value in os.environ.items():
-            if key.startswith(env_prefix):
-                # 解析配置键：TRADING_SECTION_KEY -> section.key
-                parts = key[len(env_prefix) :].split("_", 1)
-                if len(parts) == 2:
-                    section = parts[0].lower()
-                    config_key = parts[1].lower()
+        def parse_value(raw: str) -> Any:
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                return raw
 
-                    # 转换值类型
-                    try:
-                        # 尝试解析为JSON
-                        parsed_value = json.loads(value)
-                    except (json.JSONDecodeError, ValueError):
-                        # 如果失败，保持字符串
-                        parsed_value = value
+        def set_nested(cfg: Dict[str, Any], path: List[str], value: Any) -> None:
+            cur = cfg
+            for part in path[:-1]:
+                if part not in cur or not isinstance(cur[part], dict):
+                    cur[part] = {}
+                cur = cur[part]
+            cur[path[-1]] = value
 
-                    if section not in self._config:
-                        self._config[section] = {}
+        for env_key, raw_value in os.environ.items():
+            prefix = next((p for p in prefixes if env_key.startswith(p)), None)
+            if not prefix:
+                continue
+            if prefix == "TRADING_":
+                global _TRADING_PREFIX_DEPRECATION_LOGGED
+                if not _TRADING_PREFIX_DEPRECATION_LOGGED:
+                    logger.warning(
+                        "环境变量前缀 TRADING_ 已弃用，建议迁移到 OPENCLAW__section__key 形式。"
+                    )
+                    _TRADING_PREFIX_DEPRECATION_LOGGED = True
 
-                    self._config[section][config_key] = parsed_value
+            remainder = env_key[len(prefix) :]
+            if not remainder:
+                continue
+
+            # Prefer explicit nesting with "__": OPENCLAW__section__key__subkey
+            if remainder.startswith("__"):
+                parts = [p for p in remainder.split("__") if p]
+                parts = [p.lower() for p in parts]
+                if len(parts) >= 2:
+                    set_nested(self._config, parts, parse_value(raw_value))
+                continue
+
+            # Fallback: PREFIX_SECTION_KEY -> section.key (1-level)
+            parts = remainder.split("_", 1)
+            if len(parts) != 2:
+                continue
+            section = parts[0].lower()
+            config_key = parts[1].lower()
+            if section not in self._config:
+                self._config[section] = {}
+            if isinstance(self._config[section], dict):
+                self._config[section][config_key] = parse_value(raw_value)
 
         logger.debug("已加载环境变量配置")
 

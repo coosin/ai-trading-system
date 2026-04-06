@@ -124,6 +124,11 @@ trading:
   max_loss_per_trade: 0.02
 ```
 
+### 配置覆盖（推荐）
+
+- 推荐使用：`OPENCLAW__section__key=value`（例如 `OPENCLAW__api__port=8080`）
+- 旧格式：`TRADING_SECTION_KEY=value` 仍兼容，但已弃用
+
 ---
 
 ## 常用命令

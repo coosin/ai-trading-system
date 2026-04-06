@@ -27,6 +27,16 @@ class AutoRepairSkill(SkillBase):
     
     async def execute(self, context: Dict[str, Any]) -> SkillResult:
         """执行自动修复"""
+        # Cache config snapshot for sync helpers
+        self._log_path = None
+        mc = context.get("main_controller")
+        cm = getattr(mc, "config_manager", None) if mc else context.get("config_manager")
+        if cm:
+            try:
+                self._log_path = await cm.get_config("paths", "log_path", None)
+            except Exception:
+                self._log_path = None
+
         repairs = await self.diagnose(context)
         
         fixed_issues = []
@@ -80,7 +90,7 @@ class AutoRepairSkill(SkillBase):
     def _check_log_files(self) -> List[Dict[str, Any]]:
         """检查日志文件"""
         issues = []
-        log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
+        log_path = Path(self._log_path or "/app/logs")
         
         if log_path.exists():
             log_files = list(log_path.glob("*.log"))
@@ -154,7 +164,7 @@ class AutoRepairSkill(SkillBase):
     async def _rotate_logs(self) -> bool:
         """轮转日志"""
         try:
-            log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
+            log_path = Path(self._log_path or "/app/logs")
             if not log_path.exists():
                 return False
             

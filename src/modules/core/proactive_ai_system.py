@@ -20,6 +20,8 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+from .timing_constants import SLEEP_1S, SLEEP_5S, SLEEP_10S, SLEEP_30S, SLEEP_60S, SLEEP_5MIN
+
 
 class ProactiveLevel(Enum):
     """主动性等级"""
@@ -117,6 +119,20 @@ class ProactiveMarketScanner:
         logger.info("🚀 初始化主动性市场扫描器...")
         
         if self.main_controller:
+            config_manager = getattr(self.main_controller, "config_manager", None)
+            if config_manager:
+                try:
+                    cfg = await config_manager.get_config("proactive_scanner", {})
+                    if isinstance(cfg, dict):
+                        merged = dict(cfg)
+                        merged.update(self.config)
+                        self.config = merged
+                except Exception as e:
+                    logger.debug(f"读取proactive_scanner配置失败，使用当前配置: {e}")
+
+            self._scan_interval = self.config.get("scan_interval", self._scan_interval)
+            self._deep_scan_interval = self.config.get("deep_scan_interval", self._deep_scan_interval)
+
             self.exchange = getattr(self.main_controller, 'okx_exchange', None) or \
                            getattr(self.main_controller, 'exchange', None)
             self.llm = getattr(self.main_controller, 'llm_integration', None)
@@ -171,7 +187,7 @@ class ProactiveMarketScanner:
                 
             except Exception as e:
                 logger.error(f"持续扫描循环错误: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(SLEEP_5S)
     
     async def _deep_analysis_loop(self) -> None:
         """深度分析循环 - 全面市场分析"""
@@ -196,7 +212,7 @@ class ProactiveMarketScanner:
                 
             except Exception as e:
                 logger.error(f"深度分析循环错误: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(SLEEP_60S)
     
     async def _opportunity_monitoring_loop(self) -> None:
         """机会监控循环 - 监控并执行机会"""
@@ -213,29 +229,29 @@ class ProactiveMarketScanner:
                         if opp.confidence >= 0.7:
                             await self._evaluate_and_execute(opp)
                 
-                await asyncio.sleep(10)
+                await asyncio.sleep(SLEEP_10S)
                 
             except Exception as e:
                 logger.error(f"机会监控循环错误: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(SLEEP_5S)
     
     async def _market_state_update_loop(self) -> None:
         """市场状态更新循环"""
         while self._running:
             try:
                 self._market_state = await self._assess_market_state()
-                await asyncio.sleep(60)
+                await asyncio.sleep(SLEEP_60S)
             except Exception as e:
                 logger.error(f"市场状态更新错误: {e}")
-                await asyncio.sleep(30)
+                await asyncio.sleep(SLEEP_30S)
     
     async def _get_active_symbols(self) -> List[str]:
         """获取活跃交易对"""
-        default_symbols = [
+        default_symbols = self.config.get("default_symbols", [
             "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
             "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT",
             "DOT/USDT", "MATIC/USDT", "LINK/USDT", "ATOM/USDT"
-        ]
+        ])
         
         if not self.exchange:
             return default_symbols
@@ -629,7 +645,7 @@ class ProactiveInformationCollector:
                 
             except Exception as e:
                 logger.error(f"信息收集循环错误: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(SLEEP_60S)
     
     async def _collect_news(self) -> None:
         """收集新闻"""
@@ -637,7 +653,11 @@ class ProactiveInformationCollector:
             return
         
         try:
-            data_integration = getattr(self.main_controller, 'data_integration', None)
+            data_integration = (
+                self.main_controller.get_data_integration()
+                if hasattr(self.main_controller, "get_data_integration")
+                else getattr(self.main_controller, "data_integration", None)
+            )
             if data_integration and hasattr(data_integration, 'get_crypto_news'):
                 news = await data_integration.get_crypto_news(limit=10)
                 if news:
@@ -650,7 +670,11 @@ class ProactiveInformationCollector:
         """收集社交媒体情绪"""
         try:
             if self.main_controller:
-                third_party = getattr(self.main_controller, 'third_party_data_integrator', None)
+                third_party = (
+                    self.main_controller.get_third_party_data_integrator()
+                    if hasattr(self.main_controller, "get_third_party_data_integrator")
+                    else getattr(self.main_controller, "third_party_data_integrator", None)
+                )
                 if third_party and hasattr(third_party, 'get_social_sentiment'):
                     symbols = ["BTC", "ETH", "SOL"]
                     for symbol in symbols:
@@ -664,7 +688,11 @@ class ProactiveInformationCollector:
         """收集链上数据"""
         try:
             if self.main_controller:
-                onchain = getattr(self.main_controller, 'onchain_integrator', None)
+                onchain = (
+                    self.main_controller.get_onchain_integrator()
+                    if hasattr(self.main_controller, "get_onchain_integrator")
+                    else getattr(self.main_controller, "onchain_integrator", None)
+                )
                 if onchain and hasattr(onchain, 'get_onchain_metrics'):
                     metrics = await onchain.get_onchain_metrics()
                     if metrics:
@@ -750,11 +778,11 @@ class ProactiveStrategySelector:
                 
                 await self._select_best_strategy()
                 
-                await asyncio.sleep(300)
+                await asyncio.sleep(SLEEP_5MIN)
                 
             except Exception as e:
                 logger.error(f"策略评估循环错误: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(SLEEP_60S)
     
     async def _evaluate_all_strategies(self) -> None:
         """评估所有策略"""
@@ -864,11 +892,11 @@ class ProactiveActionTrigger:
                     action = self._action_queue.pop(0)
                     await self._execute_action(action)
                 
-                await asyncio.sleep(1)
+                await asyncio.sleep(SLEEP_1S)
                 
             except Exception as e:
                 logger.error(f"行动执行循环错误: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(SLEEP_5S)
     
     async def _execute_action(self, action: Dict) -> bool:
         """执行行动"""

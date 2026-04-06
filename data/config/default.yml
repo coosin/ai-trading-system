@@ -60,10 +60,10 @@ exchanges:
     enabled: false
     passphrase: ''
   okx:
-    api_key: bf73ac3f-6552-48b0-99dd-f279bf47b336
-    api_secret: 8A550FDA562D66523D175599D8166BE1
+    api_key: ''
+    api_secret: ''
     enabled: true
-    passphrase: Cool+095136
+    passphrase: ''
     sandbox: false
     testnet: false
 llm:
@@ -197,7 +197,7 @@ task_model_mapping:
   - llama3
 telegram:
   allowed_users: []
-  bot_token: 8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60
+  bot_token: ''
   chat_ids:
   - 6716232147
   command_prefix: /

@@ -65,6 +65,18 @@ class SystemDiagnosisSkill(SkillBase):
     
     async def diagnose(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """诊断系统状态"""
+        # Cache config snapshot for sync helpers
+        self._config_manager = None
+        self._log_path = None
+        mc = context.get("main_controller")
+        cm = getattr(mc, "config_manager", None) if mc else context.get("config_manager")
+        if cm:
+            self._config_manager = cm
+            try:
+                self._log_path = await cm.get_config("paths", "log_path", None)
+            except Exception:
+                self._log_path = None
+
         diagnosis = {
             "timestamp": datetime.now().isoformat(),
             "cpu": self._check_cpu(),
@@ -72,9 +84,9 @@ class SystemDiagnosisSkill(SkillBase):
             "disk": self._check_disk(),
             "network": self._check_network(),
             "processes": self._check_processes(),
-            "logs": self._check_logs()
+            "logs": self._check_logs(),
         }
-        
+
         return diagnosis
     
     def _check_cpu(self) -> Dict[str, Any]:
@@ -138,7 +150,20 @@ class SystemDiagnosisSkill(SkillBase):
     
     def _check_logs(self) -> Dict[str, Any]:
         """检查日志状态"""
-        log_path = Path(os.environ.get("OPENCLAW_LOG_PATH", "/app/logs"))
+        # Prefer centralized config if available in context; fallback to env/default.
+        config_manager = getattr(self, "_config_manager", None)
+        if config_manager:
+            try:
+                # get_config is async; this method is sync, so we read cached snapshot.
+                cfg_log_path = getattr(self, "_log_path", None)
+                if cfg_log_path:
+                    log_path = Path(cfg_log_path)
+                else:
+                    log_path = Path("/app/logs")
+            except Exception:
+                log_path = Path("/app/logs")
+        else:
+            log_path = Path("/app/logs")
         if not log_path.exists():
             return {"exists": False, "size_mb": 0}
         
@@ -149,3 +174,5 @@ class SystemDiagnosisSkill(SkillBase):
             "size_mb": total_size / (1024**2),
             "files": len(list(log_path.glob("*.log")))
         }
+
+    # NOTE: diagnose() defined above; keep single definition.

@@ -73,9 +73,12 @@ class HistoricalDataStorage:
     4. 支持数据查询和导出
     """
     
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, config_manager: Any = None):
         if db_path is None:
-            data_dir = Path(os.environ.get("OPENCLAW_DATA_PATH", "/app/data"))
+            data_dir = Path(
+                (config_manager.get_path_sync("data_path", None) if config_manager else None)
+                or "/app/data"
+            )
             try:
                 data_dir.mkdir(parents=True, exist_ok=True)
             except PermissionError:

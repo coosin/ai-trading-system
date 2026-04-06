@@ -97,7 +97,7 @@ class AutonomousDeveloper:
     AI使用此框架自主完成开发任务
     """
     
-    def __init__(self):
+    def __init__(self, config_manager: Any = None):
         self.tasks: List[DevelopmentTask] = []
         self.current_task: Optional[DevelopmentTask] = None
         
@@ -114,7 +114,10 @@ class AutonomousDeveloper:
             DevelopmentStage.INTEGRATING: self._integrate_code,
         }
         
-        self._workspace = Path(os.environ.get("OPENCLAW_WORKSPACE", "/app"))
+        self._workspace = Path(
+            (config_manager.get_path_sync("workspace_path", None) if config_manager else None)
+            or "/app"
+        )
         self._auto_test = True
         self._auto_review = True
         self._min_review_score = 70.0

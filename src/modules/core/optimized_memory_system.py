@@ -206,7 +206,8 @@ class OptimizedMemorySystem:
         self,
         storage_path: Optional[str] = None,
         workspace_path: Optional[str] = None,
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[Dict[str, Any]] = None,
+        config_manager: Any = None
     ):
         if hasattr(self, '_initialized') and self._initialized:
             return
@@ -215,8 +216,12 @@ class OptimizedMemorySystem:
         
         if storage_path:
             self.storage_path = Path(storage_path)
-        elif os.environ.get("OPENCLAW_DATA_PATH"):
-            self.storage_path = Path(os.environ["OPENCLAW_DATA_PATH"]) / "memory"
+        elif config_manager:
+            data_path = config_manager.get_path_sync("data_path", None)
+            if data_path:
+                self.storage_path = Path(data_path) / "memory"
+            else:
+                self.storage_path = None
         elif os.path.exists("/.dockerenv"):
             self.storage_path = Path("/app/data/memory")
         else:

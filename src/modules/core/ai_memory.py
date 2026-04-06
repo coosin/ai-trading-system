@@ -131,7 +131,8 @@ class SmartMemoryManager:
     
     def __init__(self, config: Optional[SmartMemoryConfig] = None,
                  storage_path: Optional[str] = None,
-                 workspace_path: Optional[str] = None):
+                 workspace_path: Optional[str] = None,
+                 config_manager: Any = None):
         self.config = config or SmartMemoryConfig()
         
         if storage_path:
@@ -140,7 +141,10 @@ class SmartMemoryManager:
             self.storage_path = Path(workspace_path) / "memory"
         else:
             import os
-            base_path = os.environ.get("OPENCLAW_DATA_PATH", "/app/data")
+            base_path = (
+                config_manager.get_path_sync("data_path", None) if config_manager else None
+                or "/app/data"
+            )
             self.storage_path = Path(base_path) / "memory"
         
         try:

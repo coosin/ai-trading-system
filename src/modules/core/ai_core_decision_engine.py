@@ -18,6 +18,15 @@ from src.modules.core.unified_intelligent_memory import UnifiedMemoryType
 
 logger = logging.getLogger(__name__)
 
+from src.modules.core.timing_constants import (
+    SLEEP_1S,
+    SLEEP_2S,
+    SLEEP_5S,
+    SLEEP_30S,
+    SLEEP_5MIN,
+    SLEEP_1H,
+)
+
 
 @dataclass
 class TradeDecision:
@@ -229,10 +238,10 @@ class AICoreDecisionEngine:
                     break
                 except Exception as e:
                     logger.debug(f"交易所未就绪，等待... ({i+1}/10): {e}")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(SLEEP_1S)
             else:
                 logger.debug(f"交易所未连接，等待... ({i+1}/10)")
-                await asyncio.sleep(1)
+                await asyncio.sleep(SLEEP_1S)
         
         # 启动时同步持仓和交易上下文
         await self._sync_positions_on_startup()
@@ -356,13 +365,13 @@ class AICoreDecisionEngine:
                         else:
                             logger.info(f"📊 {symbol} 暂无机会，继续监控")
                     
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(SLEEP_2S)
                 
-                await asyncio.sleep(30)
+                await asyncio.sleep(SLEEP_30S)
                 
             except Exception as e:
                 logger.error(f"AI决策循环错误: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(SLEEP_5S)
     
     async def _auto_select_trading_symbols(self) -> List[str]:
         """AI自主选择交易币种 - 根据市场波动和机会，自由选择"""
@@ -431,7 +440,7 @@ class AICoreDecisionEngine:
         while self._running:
             try:
                 # 不再定时执行，改为交易后触发
-                await asyncio.sleep(3600)  # 每小时检查一次是否有需要优化的策略
+                await asyncio.sleep(SLEEP_1H)  # 每小时检查一次是否有需要优化的策略
                 
                 logger.info("🔄 AI进行定期策略检查...")
                 
@@ -443,7 +452,7 @@ class AICoreDecisionEngine:
                 
             except Exception as e:
                 logger.error(f"策略管理循环错误: {e}")
-                await asyncio.sleep(300)
+                await asyncio.sleep(SLEEP_5MIN)
     
     async def _analyze_trade_and_update_strategy(self, decision: TradeDecision, result: Dict) -> None:
         """交易后分析并更新策略 - 每次交易后调用"""
@@ -608,7 +617,7 @@ class AICoreDecisionEngine:
         """AI风险监控循环 - 忽略黑名单币种风险"""
         while self._running:
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(SLEEP_30S)
                 
                 if not self.risk_monitor:
                     continue
@@ -655,7 +664,7 @@ class AICoreDecisionEngine:
                 
             except Exception as e:
                 logger.error(f"风险监控循环错误: {e}")
-                await asyncio.sleep(30)
+                await asyncio.sleep(SLEEP_30S)
     
     async def _handle_high_risk(self, risk_data) -> None:
         """AI处理高风险情况 - 主动平仓黑名单持仓"""

@@ -183,7 +183,10 @@ class NaturalLanguageInterface:
             "workspace/TRADING.md"
         ]
         
-        base_path = os.environ.get("OPENCLAW_TRADING_PATH", "/app")
+        cm = getattr(self, "config_manager", None)
+        base_path = (
+            cm.get_path_sync("trading_path", None) if cm else None
+        ) or "/app"
         
         for file_path in personality_files:
             full_path = os.path.join(base_path, file_path)

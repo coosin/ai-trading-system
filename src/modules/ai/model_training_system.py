@@ -319,9 +319,12 @@ class ClassificationTrainer(BaseModelTrainer):
 
 
 class ModelTrainingPipeline:
-    def __init__(self, base_dir: str = None):
+    def __init__(self, base_dir: str = None, config_manager: Any = None):
         if base_dir is None:
-            base_dir = os.environ.get("OPENCLAW_MODELS_PATH", "/app/data/models")
+            base_dir = (
+                (config_manager.get_path_sync("models_path", None) if config_manager else None)
+                or "/app/data/models"
+            )
         self.base_dir = Path(base_dir)
         self.models_dir = self.base_dir / "trained"
         self.checkpoints_dir = self.base_dir / "checkpoints"

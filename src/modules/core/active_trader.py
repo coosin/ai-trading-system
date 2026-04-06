@@ -13,6 +13,8 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+from .timing_constants import SLEEP_2S, SLEEP_5S, SLEEP_10S, SLEEP_60S, SLEEP_1H
+
 
 class TradeMode(Enum):
     SIMULATION = "simulation"
@@ -80,13 +82,29 @@ class ActiveTrader:
         logger.info("初始化主动交易执行器...")
         
         if self.main_controller:
-            if hasattr(self.main_controller, 'okx_exchange'):
+            if hasattr(self.main_controller, "get_exchange"):
+                self.exchange = self.main_controller.get_exchange()
+            elif hasattr(self.main_controller, 'okx_exchange'):
                 self.exchange = self.main_controller.okx_exchange
             elif hasattr(self.main_controller, 'exchange'):
                 self.exchange = self.main_controller.exchange
             
-            if hasattr(self.main_controller, 'llm_integration'):
+            if hasattr(self.main_controller, "get_llm_integration"):
+                self.llm = self.main_controller.get_llm_integration()
+            elif hasattr(self.main_controller, 'llm_integration'):
                 self.llm = self.main_controller.llm_integration
+
+            config_manager = getattr(self.main_controller, "config_manager", None)
+            if config_manager:
+                try:
+                    cfg = await config_manager.get_config("active_trader", {})
+                    if isinstance(cfg, dict):
+                        ccfg = cfg.get("contract_config", {})
+                        if isinstance(ccfg, dict):
+                            self.contract_config.update(ccfg)
+                        self._min_trade_interval = cfg.get("min_trade_interval", self._min_trade_interval)
+                except Exception as e:
+                    logger.debug(f"读取active_trader配置失败，使用默认值: {e}")
         
         try:
             from .unified_intelligent_memory import get_unified_memory
@@ -221,13 +239,13 @@ class ActiveTrader:
                     except Exception as e:
                         logger.error(f"扫描 {symbol} 失败: {e}")
                     
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(SLEEP_2S)
                 
-                await asyncio.sleep(60)
+                await asyncio.sleep(SLEEP_60S)
                 
             except Exception as e:
                 logger.error(f"主交易循环错误: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(SLEEP_10S)
     
     async def _scan_for_opportunity(self, symbol: str) -> Optional[TradeOpportunity]:
         """扫描交易机会"""
@@ -490,7 +508,7 @@ class ActiveTrader:
         while self._running:
             try:
                 if not self.exchange:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(SLEEP_10S)
                     continue
                 
                 positions = await self.exchange.get_positions()
@@ -534,11 +552,11 @@ class ActiveTrader:
                                 logger.info(f"🎯 {symbol} {close_reason}，执行平仓")
                                 await self._close_position(symbol, close_reason)
                 
-                await asyncio.sleep(10)
+                await asyncio.sleep(SLEEP_10S)
                 
             except Exception as e:
                 logger.error(f"持仓监控错误: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(SLEEP_10S)
     
     async def _close_position(self, symbol: str, reason: str) -> bool:
         """平仓"""
@@ -576,7 +594,7 @@ class ActiveTrader:
         """策略优化循环"""
         while self._running:
             try:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(SLEEP_1H)
                 
                 if len(self.trade_history) >= 5:
                     logger.info("🔄 执行策略优化...")
@@ -646,9 +664,13 @@ class ActiveTrader:
 """
         logger.info(message)
         
-        if self.main_controller and hasattr(self.main_controller, 'telegram_bot'):
+        if self.main_controller:
             try:
-                bot = self.main_controller.telegram_bot
+                bot = (
+                    self.main_controller.get_telegram_bot()
+                    if hasattr(self.main_controller, "get_telegram_bot")
+                    else getattr(self.main_controller, "telegram_bot", None)
+                )
                 if bot and hasattr(bot, 'send_message'):
                     await bot.send_message(message)
             except Exception as e:

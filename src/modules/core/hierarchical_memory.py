@@ -38,9 +38,12 @@ class MemoryLevel:
 class HierarchicalMemoryManager:
     """层次化记忆管理器"""
     
-    def __init__(self, base_path: str = None):
+    def __init__(self, base_path: str = None, config_manager: Any = None):
         if base_path is None:
-            base_path = os.environ.get("OPENCLAW_MEMORY_PATH", "/app/workspace/memory")
+            base_path = (
+                config_manager.get_path_sync("memory_path", None) if config_manager else None
+                or "/app/workspace/memory"
+            )
         self.base_path = Path(base_path)
         try:
             self.base_path.mkdir(parents=True, exist_ok=True)
