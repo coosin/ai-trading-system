@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import secrets
 import traceback
 import uuid
@@ -263,6 +264,10 @@ class APIServer:
         """
         self.config_manager = config_manager
         self.main_controller = main_controller
+        # In Docker, binding to 127.0.0.1 prevents host port publishing.
+        in_docker = os.path.exists("/.dockerenv")
+        if in_docker and (host or "").strip() in {"127.0.0.1", "localhost"}:
+            host = "0.0.0.0"
         self.host = host
         self.port = port
 

@@ -37,6 +37,9 @@ class HeartbeatMonitor:
         self._last_heartbeat: Optional[datetime] = None
         self.heartbeat_count = 0
         self.heartbeat_history: List[Dict[str, Any]] = []
+
+        # Notification dedup at source (in addition to SmartNotificationSystem).
+        self._last_notice_at: Dict[str, datetime] = {}
         
         self.tasks = [
             self._check_system_health,
@@ -137,6 +140,12 @@ class HeartbeatMonitor:
         positions = getattr(trading_engine, 'positions', {})
         
         if len(positions) < 3:
+            # Avoid spamming the same low-priority hint every heartbeat.
+            now = datetime.now()
+            last = self._last_notice_at.get("market_opportunity")
+            if last and (now - last).total_seconds() < 6 * 3600:
+                return
+            self._last_notice_at["market_opportunity"] = now
             await self._send_notification(
                 "💡 市场机会",
                 "当前持仓较少，可以关注新的交易机会",

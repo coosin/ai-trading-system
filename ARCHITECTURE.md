@@ -1,7 +1,7 @@
 # OpenClaw Trading System - 系统架构文档
 
-**版本**: 2.1.0  
-**最后更新**: 2026-04-05  
+**版本**: 2.1.1  
+**最后更新**: 2026-04-06  
 **状态**: 生产运行中
 
 ---
@@ -297,6 +297,17 @@ CorrelationMonitorConfig:
 **功能**:
 - 完整的操作日志记录
 - 敏感操作审计
+
+### 5.5 自动策略研究流水线 (StrategyResearchPipeline)
+
+**文件**: `src/modules/research/strategy_research_pipeline.py`  
+**相关**: `src/modules/strategies/strategy_dsl.py`, `src/modules/backtesting/strategies/dsl_strategy.py`
+
+- **策略 DSL**：AI 输出结构化策略（组合原语），避免“只能生成代码字符串”的不可控问题
+- **候选生成**：基于原语与参数空间生成候选组合
+- **Walk-forward**：训练窗优化 + 测试窗验证，降低过拟合
+- **上线门控**：按 \(Sharpe/回撤/交易次数\) 等指标阈值进行 gating，通过才发布到 `StrategyManager`
+- **审计/记忆闭环**：发布/优化事件写入 `AuditLogger` 与 `MemoryGateway`，可追溯“策略版本 → 行为结果”
 - 日志查询和分析
 - 合规性报告生成
 
@@ -697,6 +708,10 @@ memory:
 - 系统状态通知
 - 错误告警通知
 - 止盈止损触发通知
+- **降噪/去重**：
+  - `SmartNotificationSystem` 对同类通知做 **去重冷却窗口**（按优先级区分）与 **频率限流**
+  - 心跳任务中的低优先级提示做 **6小时冷却**，避免重复刷屏
+  - Telegram 发送失败（chat_id/代理等）会做 **30分钟降噪**，避免重复错误日志
 
 ### 11.3 健康检查
 

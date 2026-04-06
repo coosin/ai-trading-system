@@ -454,10 +454,27 @@ class AICoreDecisionEngine:
                 
                 # 检查是否有表现不佳的策略需要优化
                 await self._check_and_optimize_underperforming_strategies()
+
+                # 自动研究并发布候选策略（walk-forward 门控）
+                await self._run_research_pipeline()
                 
             except Exception as e:
                 logger.error(f"策略管理循环错误: {e}")
                 await asyncio.sleep(SLEEP_5MIN)
+
+    async def _run_research_pipeline(self) -> None:
+        pipeline = None
+        if self.main_controller and hasattr(self.main_controller, "strategy_research_pipeline"):
+            pipeline = self.main_controller.strategy_research_pipeline
+        if not pipeline or not self.authorization.get("auto_strategy"):
+            return
+        try:
+            symbols = self.config.get("symbols", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"])
+            result = await pipeline.run_cycle(symbols=symbols[:4], timeframe="1h", lookback_days=30)
+            if result.get("published"):
+                logger.info(f"✅ 策略研究发布 {len(result['published'])} 个策略")
+        except Exception as e:
+            logger.warning(f"策略研究流水线执行失败: {e}")
     
     async def _analyze_trade_and_update_strategy(self, decision: TradeDecision, result: Dict) -> None:
         """交易后分析并更新策略 - 每次交易后调用"""
@@ -1131,6 +1148,51 @@ class AICoreDecisionEngine:
             if hasattr(config, "parameters") and isinstance(config.parameters, dict):
                 config.parameters.update(new_params)
                 config.updated_at = datetime.now()
+                # bump strategy version for audit/versioning linkage
+                if hasattr(config, "version"):
+                    try:
+                        from src.modules.strategies.strategy_dsl import bump_version as _bump
+
+                        config.version = _bump(getattr(config, "version", "1.0.0"))
+                    except Exception:
+                        pass
+
+                # link optimization to audit + memory
+                if self.main_controller and hasattr(self.main_controller, "log_audit_event"):
+                    try:
+                        from src.modules.core.audit_logger import AuditEventType, AuditSeverity
+
+                        await self.main_controller.log_audit_event(
+                            event_type=AuditEventType.CONFIG_CHANGE,
+                            severity=AuditSeverity.INFO,
+                            action="strategy_optimize",
+                            details={
+                                "strategy_id": strategy_id,
+                                "version": getattr(config, "version", None),
+                                "old_params": base_params,
+                                "new_params": new_params,
+                            },
+                            source="ai_core_decision_engine",
+                        )
+                    except Exception:
+                        pass
+                if self.main_controller and hasattr(self.main_controller, "memory_gateway") and self.main_controller.memory_gateway:
+                    try:
+                        await self.main_controller.memory_gateway.add_memory(
+                            memory_type="strategy",
+                            content=f"优化策略 {strategy_id} v{getattr(config,'version',None)}: {base_params} -> {new_params}",
+                            metadata={
+                                "strategy_id": strategy_id,
+                                "version": getattr(config, "version", None),
+                                "old": base_params,
+                                "new": new_params,
+                            },
+                            source_module="ai_core_decision_engine",
+                            importance=0.8,
+                            tags=["strategy", "optimize", "versioning"],
+                        )
+                    except Exception:
+                        pass
 
             return {
                 "strategy_id": strategy_id,
@@ -1998,6 +2060,39 @@ class AICoreDecisionEngine:
             if decision.quantity > max_quantity:
                 logger.info(f"📊 调整数量: {decision.quantity} -> {max_quantity} (根据余额)")
                 decision.quantity = max(1, max_quantity)
+
+            # 3.1 动态仓位/组合风险预算（波动率/相关性/总仓位比例）
+            try:
+                if self.main_controller and hasattr(self.main_controller, "get_dynamic_position_manager"):
+                    dpm = self.main_controller.get_dynamic_position_manager()
+                else:
+                    dpm = None
+                if dpm:
+                    positions = await self.exchange.get_positions()
+                    current_positions = {p.get("symbol"): p for p in (positions or []) if p.get("symbol")}
+                    base_value = float(decision.quantity) * float(current_price)
+                    adjusted_value, details = await dpm.calculate_dynamic_position_size(
+                        symbol=decision.symbol,
+                        base_size=base_value,
+                        account_balance=float(available or 0),
+                        current_positions=current_positions,
+                        market_data={"volatility": 0.02},
+                    )
+                    new_qty = max(1, int(float(adjusted_value) / float(current_price)))
+                    if new_qty != decision.quantity:
+                        logger.info(f"📊 动态仓位调整数量: {decision.quantity} -> {new_qty}")
+                        decision.quantity = new_qty
+                    if self.main_controller and hasattr(self.main_controller, "memory_gateway") and self.main_controller.memory_gateway:
+                        await self.main_controller.memory_gateway.add_memory(
+                            memory_type="risk_setting",
+                            content=f"动态仓位调整: {decision.symbol} qty={decision.quantity} details={details}",
+                            metadata={"symbol": decision.symbol, "details": details},
+                            source_module="ai_core_decision_engine",
+                            importance=0.65,
+                            tags=["position_sizing", "risk_budget"],
+                        )
+            except Exception as e:
+                logger.debug(f"动态仓位调整失败: {e}")
             
             decision.leverage = leverage
             

@@ -3,8 +3,10 @@
 """
 
 import logging
-from datetime import datetime, time
-from typing import Dict, List, Any, Optional, Callable
+import re
+import hashlib
+from datetime import datetime, time, timedelta
+from typing import Dict, List, Any, Optional, Callable, Tuple
 from enum import Enum
 from collections import defaultdict
 
@@ -42,7 +44,22 @@ class SmartNotificationSystem:
         self.max_history = 1000
         
         self.batch_interval = 3600  # 1小时批量发送
-        self.last_batch_time: Optional[datetime] = None
+        # Initialize to "now" so periodic batch flushing works.
+        self.last_batch_time: Optional[datetime] = datetime.now()
+
+        # De-dup / throttle: avoid repeated alerts spamming.
+        # key -> (last_sent_at, suppressed_count)
+        self._dedup_state: Dict[str, Tuple[datetime, int]] = {}
+        self._dedup_windows_sec = {
+            NotificationPriority.CRITICAL: 60,        # 1 min
+            NotificationPriority.HIGH: 10 * 60,      # 10 min
+            NotificationPriority.MEDIUM: 60 * 60,    # 1 h
+            NotificationPriority.LOW: 6 * 60 * 60,   # 6 h
+        }
+        # Keep dedup map bounded.
+        self._dedup_max_keys = 2000
+        self._dedup_gc_interval = 600  # 10 min
+        self._dedup_last_gc = datetime.now()
         
         self.rate_limits = {
             NotificationPriority.LOW: 10,      # 每小时最多10条
@@ -65,6 +82,11 @@ class SmartNotificationSystem:
     ) -> bool:
         """发送通知"""
         priority_enum = NotificationPriority(priority.lower())
+
+        # Deduplicate repeated notifications (same semantic content) within a window.
+        dedup_key = self._build_dedup_key(title=title, message=message, priority=priority_enum, category=category)
+        if self._should_suppress(dedup_key, priority_enum):
+            return True
         
         if not self._check_rate_limit(priority_enum):
             logger.warning(f"通知频率限制: {priority}")
@@ -96,6 +118,51 @@ class SmartNotificationSystem:
                 await self._send_batch()
             
             return True
+
+    def _build_dedup_key(
+        self,
+        title: str,
+        message: str,
+        priority: NotificationPriority,
+        category: str,
+    ) -> str:
+        # Normalize dynamic bits (timestamps, counts) to reduce false "uniqueness".
+        t = (title or "").strip().lower()
+        m = (message or "").strip().lower()
+        m = re.sub(r"\b\d{4}-\d{2}-\d{2}[ t]\d{2}:\d{2}(:\d{2})?(\.\d+)?\b", "<ts>", m)
+        m = re.sub(r"\b\d+(\.\d+)?\b", "<n>", m)
+        base = f"{category}:{priority.value}:{t}:{m[:500]}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+    def _should_suppress(self, key: str, priority: NotificationPriority) -> bool:
+        now = datetime.now()
+        self._dedup_gc_if_needed(now)
+        window = int(self._dedup_windows_sec.get(priority, 3600))
+        if key not in self._dedup_state:
+            self._dedup_state[key] = (now, 0)
+            return False
+        last_sent, suppressed = self._dedup_state[key]
+        if (now - last_sent).total_seconds() < window:
+            self._dedup_state[key] = (last_sent, suppressed + 1)
+            return True
+        # window passed: allow send again, reset suppressed count
+        self._dedup_state[key] = (now, 0)
+        return False
+
+    def _dedup_gc_if_needed(self, now: datetime) -> None:
+        if (now - self._dedup_last_gc).total_seconds() < self._dedup_gc_interval:
+            return
+        self._dedup_last_gc = now
+        # Remove very old keys to keep memory bounded.
+        cutoff = now - timedelta(days=2)
+        if len(self._dedup_state) > self._dedup_max_keys:
+            items = sorted(self._dedup_state.items(), key=lambda kv: kv[1][0])
+            for k, (ts, _) in items[: max(0, len(items) - self._dedup_max_keys)]:
+                self._dedup_state.pop(k, None)
+        # Opportunistic cleanup of stale keys.
+        for k, (ts, _) in list(self._dedup_state.items()):
+            if ts < cutoff:
+                self._dedup_state.pop(k, None)
     
     async def _send_immediately(self, notification: Dict[str, Any]) -> bool:
         """立即发送"""

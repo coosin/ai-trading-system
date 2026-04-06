@@ -733,6 +733,16 @@ class MainController:
         
         # 初始化增强回测系统
         self.enhanced_backtester = BacktestEngine()
+
+        # 初始化策略研究流水线（DSL + walk-forward）
+        try:
+            from src.modules.research.strategy_research_pipeline import StrategyResearchPipeline
+
+            self.strategy_research_pipeline = StrategyResearchPipeline(main_controller=self)
+            logger.info("✅ 策略研究流水线已初始化（walk-forward + 门控）")
+        except Exception as e:
+            self.strategy_research_pipeline = None
+            logger.warning(f"⚠️ 策略研究流水线初始化失败: {e}")
         
         # 初始化增强数据存储系统
         self.data_storage = EnhancedDataStorage()
@@ -3679,6 +3689,12 @@ class MainController:
             priority: 优先级
         """
         try:
+            # Notification de-noise: suppress identical telegram failures & repeated alerts
+            if not hasattr(self, "_notification_dedup"):
+                self._notification_dedup = {}  # type: ignore[attr-defined]
+            if not hasattr(self, "_telegram_fail_dedup"):
+                self._telegram_fail_dedup = {}  # type: ignore[attr-defined]
+
             # 发送到Telegram
             if self.telegram_bot:
                 try:
@@ -3687,7 +3703,13 @@ class MainController:
                     )
                     logger.debug(f"Telegram通知已发送: {title}")
                 except Exception as e:
-                    logger.error(f"Telegram通知发送失败: {e}")
+                    # Avoid log spam when chat_id/proxy is misconfigured.
+                    now = datetime.now()
+                    key = str(e)
+                    last = self._telegram_fail_dedup.get(key)  # type: ignore[attr-defined]
+                    if not last or (now - last).total_seconds() > 1800:
+                        self._telegram_fail_dedup[key] = now  # type: ignore[attr-defined]
+                        logger.error(f"Telegram通知发送失败: {e}")
             
             # 记录到日志
             log_level = {

@@ -41,12 +41,32 @@ async def cleanup_config_manager() -> None:
         await _config_manager.cleanup()
         _config_manager = None
 
+def _resolve_app_log_path() -> str:
+    log_candidates = [
+        Path("logs/app.log"),
+        Path("/tmp/openclaw-trading/logs/app.log"),
+    ]
+    for p in log_candidates:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            # probe write access
+            with open(p, "a", encoding="utf-8"):
+                pass
+            return str(p)
+        except PermissionError:
+            continue
+        except Exception:
+            continue
+    # final fallback: disable file logging by using /dev/null
+    return "/dev/null"
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/app.log", encoding="utf-8"),
+        logging.FileHandler(_resolve_app_log_path(), encoding="utf-8"),
     ],
 )
 
