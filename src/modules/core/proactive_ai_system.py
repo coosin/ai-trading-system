@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
 
+from src.modules.core.module_config_utils import resolve_module_config
+
 logger = logging.getLogger(__name__)
 
 from .timing_constants import SLEEP_1S, SLEEP_5S, SLEEP_10S, SLEEP_30S, SLEEP_60S, SLEEP_5MIN
@@ -989,14 +991,21 @@ class ProactiveActionTrigger:
 class ProactiveAIOrchestrator:
     """主动性AI协调器 - 统一管理所有主动性模块"""
     
-    def __init__(self, main_controller=None, config: Optional[Dict] = None):
+    def __init__(self, main_controller=None, config: Optional[Dict] = None, config_manager=None):
         self.main_controller = main_controller
-        self.config = config or {}
+        if config_manager is None and main_controller is not None:
+            config_manager = getattr(main_controller, "config_manager", None)
+        self.config = resolve_module_config(
+            config=config,
+            config_manager=config_manager,
+            section="proactive_ai",
+            defaults={},
+        )
         
-        self.market_scanner = ProactiveMarketScanner(main_controller, config)
-        self.info_collector = ProactiveInformationCollector(main_controller, config)
-        self.strategy_selector = ProactiveStrategySelector(main_controller, config)
-        self.action_trigger = ProactiveActionTrigger(main_controller, config)
+        self.market_scanner = ProactiveMarketScanner(main_controller, self.config)
+        self.info_collector = ProactiveInformationCollector(main_controller, self.config)
+        self.strategy_selector = ProactiveStrategySelector(main_controller, self.config)
+        self.action_trigger = ProactiveActionTrigger(main_controller, self.config)
         
         self._running = False
         self._initialized = False

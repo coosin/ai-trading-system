@@ -414,6 +414,49 @@ class MainController:
                 logger.debug(f"读取模块配置失败 [{section}]，使用默认值: {e}")
         return cfg
 
+    async def _get_ai_brain_policy(self) -> Dict[str, Any]:
+        return await self.get_ai_managed_config(
+            "ai_brain",
+            {
+                "primary_controller": "ai_core",
+                "enable_secondary_controller": False,
+                "enable_autonomous_executor": True,
+            },
+        )
+
+    async def _start_ai_brain_controllers(self) -> None:
+        policy = await self._get_ai_brain_policy()
+        primary = str(policy.get("primary_controller", "ai_core")).strip().lower()
+        enable_secondary = bool(policy.get("enable_secondary_controller", False))
+
+        if primary == "ai_trading_engine":
+            if self.ai_trading_engine:
+                await self.ai_trading_engine.start()
+                logger.info("🧠 AI主控已启动: ai_trading_engine")
+            if enable_secondary and hasattr(self, "ai_core") and self.ai_core:
+                await self.ai_core.start()
+                logger.info("🧠 次级AI控制器已启动: ai_core")
+            return
+
+        # default primary: ai_core
+        if hasattr(self, "ai_core") and self.ai_core:
+            await self.ai_core.start()
+            logger.info("🧠 AI主控已启动: ai_core")
+        if enable_secondary and self.ai_trading_engine:
+            await self.ai_trading_engine.start()
+            logger.info("🧠 次级AI控制器已启动: ai_trading_engine")
+
+    async def _start_ai_autonomous_supervision(self) -> None:
+        policy = await self._get_ai_brain_policy()
+        if not bool(policy.get("enable_autonomous_executor", True)):
+            return
+        if hasattr(self, "ai_command_executor") and self.ai_command_executor:
+            try:
+                await self.ai_command_executor.start_autonomous_work()
+                logger.info("🤖 AICommandExecutor 自主监督循环已启动")
+            except Exception as e:
+                logger.error(f"启动 AICommandExecutor 自主监督失败: {e}")
+
     async def initialize(self) -> None:
         """
         初始化主控制器
@@ -713,7 +756,10 @@ class MainController:
         try:
             from src.modules.monitoring.intelligent_monitoring import IntelligentMonitoringSystem
             intelligent_monitoring_cfg = await self.get_ai_managed_config("intelligent_monitoring", {})
-            self.intelligent_monitoring = IntelligentMonitoringSystem(intelligent_monitoring_cfg)
+            self.intelligent_monitoring = IntelligentMonitoringSystem(
+                intelligent_monitoring_cfg,
+                config_manager=self.config_manager,
+            )
             logger.info("✅ 智能监控系统已初始化")
         except Exception as e:
             logger.warning(f"⚠️ 智能监控系统初始化失败: {e}")
@@ -880,7 +926,10 @@ class MainController:
         try:
             from src.modules.core.system_monitor import SystemMonitor
             system_monitor_cfg = await self.get_ai_managed_config("system_monitor", {})
-            self.system_monitor = SystemMonitor(system_monitor_cfg)
+            self.system_monitor = SystemMonitor(
+                system_monitor_cfg,
+                config_manager=self.config_manager,
+            )
             await self.system_monitor.initialize()
             logger.info("✅ 系统监控器已初始化")
         except Exception as e:
@@ -914,7 +963,11 @@ class MainController:
                 "action_cooldown": 60
             }
             proactive_cfg = await self.get_ai_managed_config("proactive_ai", proactive_defaults)
-            self.proactive_ai = ProactiveAIOrchestrator(self, proactive_cfg)
+            self.proactive_ai = ProactiveAIOrchestrator(
+                self,
+                proactive_cfg,
+                config_manager=self.config_manager,
+            )
             await self.proactive_ai.initialize()
             logger.info("✅ 主动性AI系统已初始化")
         except Exception as e:
@@ -1004,7 +1057,10 @@ class MainController:
         # 初始化增强监控系统
         try:
             enhanced_monitoring_cfg = await self.get_ai_managed_config("enhanced_monitoring", {})
-            self.enhanced_monitoring = EnhancedMonitoringSystem(enhanced_monitoring_cfg)
+            self.enhanced_monitoring = EnhancedMonitoringSystem(
+                enhanced_monitoring_cfg,
+                config_manager=self.config_manager,
+            )
             await self.enhanced_monitoring.initialize()
             
             # 设置Telegram机器人
@@ -1161,7 +1217,10 @@ class MainController:
             try:
                 from src.modules.data.unified_data_manager import UnifiedDataManager
                 unified_data_cfg = await self.get_ai_managed_config("unified_data_manager", {})
-                self.unified_data_manager = UnifiedDataManager(unified_data_cfg)
+                self.unified_data_manager = UnifiedDataManager(
+                    unified_data_cfg,
+                    config_manager=self.config_manager,
+                )
                 # 复用已初始化的组件
                 if self.data_storage:
                     self.unified_data_manager.storage = self.data_storage
@@ -1177,7 +1236,10 @@ class MainController:
             try:
                 from src.modules.strategies.unified_strategy_system import UnifiedStrategySystem
                 unified_strategy_cfg = await self.get_ai_managed_config("unified_strategy_system", {})
-                self.unified_strategy_system = UnifiedStrategySystem(unified_strategy_cfg)
+                self.unified_strategy_system = UnifiedStrategySystem(
+                    unified_strategy_cfg,
+                    config_manager=self.config_manager,
+                )
                 # 复用已初始化的组件
                 if self.strategy_manager:
                     self.unified_strategy_system.manager = self.strategy_manager
@@ -1201,7 +1263,10 @@ class MainController:
             try:
                 from src.modules.trading.unified_trade_system import UnifiedTradeSystem
                 unified_trade_cfg = await self.get_ai_managed_config("unified_trade_system", {})
-                self.unified_trade_system = UnifiedTradeSystem(unified_trade_cfg)
+                self.unified_trade_system = UnifiedTradeSystem(
+                    unified_trade_cfg,
+                    config_manager=self.config_manager,
+                )
                 # 复用已初始化的组件
                 if self.trading_monitor:
                     self.unified_trade_system.monitor = self.trading_monitor
@@ -1215,7 +1280,10 @@ class MainController:
             try:
                 from src.modules.risk.unified_risk_system import UnifiedRiskSystem
                 unified_risk_cfg = await self.get_ai_managed_config("unified_risk_system", {})
-                self.unified_risk_system = UnifiedRiskSystem(unified_risk_cfg)
+                self.unified_risk_system = UnifiedRiskSystem(
+                    unified_risk_cfg,
+                    config_manager=self.config_manager,
+                )
                 # 复用已初始化的组件
                 if hasattr(self, 'intelligent_monitoring') and self.intelligent_monitoring:
                     self.unified_risk_system.monitor = self.intelligent_monitoring
@@ -1430,15 +1498,9 @@ class MainController:
                     # 验证关键模块连接状态
                     await self._verify_module_connections()
                     
-                    # 启动全智能AI交易引擎
-                    if self.ai_trading_engine:
-                        await self.ai_trading_engine.start()
-                        logger.info("🚀 全智能AI交易引擎已启动，开始全自动交易")
-
-                    # 启动AI核心决策引擎 - AI全权决策
-                    if hasattr(self, 'ai_core') and self.ai_core:
-                        await self.ai_core.start()
-                        logger.info("🧠 AI核心决策引擎已启动 - AI全权决策模式")
+                    # 启动AI核心控制器（单脑仲裁，避免双控制器并行下单）
+                    await self._start_ai_brain_controllers()
+                    await self._start_ai_autonomous_supervision()
                     
                     # 启动主动性AI系统 - 让AI主动工作
                     if self.proactive_ai:
@@ -1767,23 +1829,13 @@ class MainController:
             if not await self.start_module(name):
                 success = False
 
-        # 启动全智能AI交易引擎
-        if self.ai_trading_engine:
-            try:
-                await self.ai_trading_engine.start()
-                logger.info("🚀 全智能AI交易引擎已启动，开始全自动交易")
-            except Exception as e:
-                logger.error(f"AI交易引擎启动失败: {e}")
-                success = False
-
-        # 启动主动交易执行器
-        if hasattr(self, 'active_trader') and self.active_trader:
-            try:
-                await self.active_trader.start()
-                logger.info("🎯 主动交易执行器已启动，开始实盘交易")
-            except Exception as e:
-                logger.error(f"主动交易执行器启动失败: {e}")
-                success = False
+        # 启动AI控制器（单脑仲裁）
+        try:
+            await self._start_ai_brain_controllers()
+            await self._start_ai_autonomous_supervision()
+        except Exception as e:
+            logger.error(f"AI主控启动失败: {e}")
+            success = False
 
         # 启动主动性AI系统
         if self.proactive_ai:
@@ -1806,6 +1858,14 @@ class MainController:
             是否所有模块都停止成功
         """
         logger.info("停止所有模块..." + (" (逆序)" if reverse else ""))
+
+        # 停止AI自主监督循环
+        if hasattr(self, "ai_command_executor") and self.ai_command_executor:
+            try:
+                await self.ai_command_executor.stop_autonomous_work()
+                logger.info("🛑 AICommandExecutor 自主监督循环已停止")
+            except Exception as e:
+                logger.error(f"停止 AICommandExecutor 自主监督失败: {e}")
 
         # 先停止AI核心决策引擎
         if hasattr(self, 'ai_core') and self.ai_core:

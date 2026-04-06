@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Callable
 
 import psutil
 
+from src.modules.core.module_config_utils import resolve_module_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,8 +50,13 @@ class HealthStatus:
 class SystemMonitor:
     """系统监控器"""
     
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
+    def __init__(self, config: Optional[Dict] = None, config_manager=None):
+        self.config = resolve_module_config(
+            config=config,
+            config_manager=config_manager,
+            section="system_monitor",
+            defaults={},
+        )
         
         self._metrics_history: List[SystemMetrics] = []
         self._max_history = self.config.get("max_history", 1000)

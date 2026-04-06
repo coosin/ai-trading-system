@@ -1792,24 +1792,59 @@ class AICoreDecisionEngine:
             logger.info(f"   理由: {decision.reasoning}")
             logger.info(f"   策略: {decision.strategy_used}")
             
-            if decision.action == 'close':
-                order = await self.exchange.close_position(
-                    symbol=decision.symbol.replace('/', '-'),
-                    side=decision.side
-                )
-            else:
-                await self.exchange.set_leverage(
-                    symbol=decision.symbol.replace('/', '-'),
-                    leverage=decision.leverage,
-                    margin_mode='cross'
-                )
-                
-                order = await self.exchange.open_swap_position(
-                    symbol=decision.symbol.replace('/', '-'),
-                    side=decision.side,
-                    size=decision.quantity,
-                    leverage=decision.leverage
-                )
+            order = None
+
+            # 优先走主控制器执行验证网关，避免直接裸下单
+            if self.main_controller and hasattr(self.main_controller, "execute_command"):
+                try:
+                    from src.modules.core.execution_verifier import CommandType
+                    command_type = CommandType.CLOSE_POSITION if decision.action == "close" else CommandType.OPEN_POSITION
+                    action = f"{decision.action}_{decision.side}"
+                    exec_result = await self.main_controller.execute_command(
+                        command_type=command_type,
+                        action=action,
+                        symbol=decision.symbol,
+                        params={
+                            "symbol": decision.symbol,
+                            "side": decision.side,
+                            "quantity": decision.quantity,
+                            "leverage": decision.leverage,
+                            "entry_price": decision.entry_price,
+                            "stop_loss": decision.stop_loss,
+                            "take_profit": decision.take_profit,
+                        },
+                    )
+                    if exec_result and getattr(exec_result, "status", None) and exec_result.status.value == "success":
+                        order = {
+                            "success": True,
+                            "orderId": exec_result.execution_id,
+                            "details": exec_result.details,
+                        }
+                    elif exec_result and getattr(exec_result, "error_message", None):
+                        order = {"success": False, "error": exec_result.error_message}
+                except Exception as e:
+                    logger.warning(f"执行验证网关调用失败，回退交易所直连: {e}")
+
+            # 回退：直接调用交易所接口（兼容旧路径）
+            if order is None:
+                if decision.action == 'close':
+                    order = await self.exchange.close_position(
+                        symbol=decision.symbol.replace('/', '-'),
+                        side=decision.side
+                    )
+                else:
+                    await self.exchange.set_leverage(
+                        symbol=decision.symbol.replace('/', '-'),
+                        leverage=decision.leverage,
+                        margin_mode='cross'
+                    )
+                    
+                    order = await self.exchange.open_swap_position(
+                        symbol=decision.symbol.replace('/', '-'),
+                        side=decision.side,
+                        size=decision.quantity,
+                        leverage=decision.leverage
+                    )
             
             if order and order.get('success'):
                 logger.info(f"✅ AI决策执行成功: {order.get('orderId')}")

@@ -16,6 +16,8 @@ from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 import json
 
+from src.modules.core.module_config_utils import resolve_module_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,8 +79,13 @@ class MonitoringMetric:
 class EnhancedMonitoringSystem:
     """增强监控系统"""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        self.config = config or {}
+    def __init__(self, config: Optional[Dict[str, Any]] = None, config_manager=None):
+        self.config = resolve_module_config(
+            config=config,
+            config_manager=config_manager,
+            section="enhanced_monitoring",
+            defaults={},
+        )
         
         self.rules: Dict[str, AlertRule] = {}
         self.alerts: List[Alert] = []

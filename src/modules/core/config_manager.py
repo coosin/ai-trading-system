@@ -101,6 +101,14 @@ class ConfigManager:
             "health_check_interval": 30,
             "event_history_limit": 1000,
         },
+        "ai_brain": {
+            # single brain arbitration: ai_core | ai_trading_engine
+            "primary_controller": "ai_core",
+            # keep secondary loop disabled by default to avoid dual-dispatch
+            "enable_secondary_controller": False,
+            # enable autonomous executor supervision loop by default
+            "enable_autonomous_executor": True,
+        },
         "api": {
             "host": "0.0.0.0",
             "port": 8000,

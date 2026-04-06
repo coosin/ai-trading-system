@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 
+from src.modules.core.module_config_utils import resolve_module_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,14 +26,19 @@ class UnifiedStrategySystem:
     整合所有策略管理功能，提供统一接口
     """
     
-    def __init__(self, config: Dict[str, Any] = None):
+    def __init__(self, config: Dict[str, Any] = None, config_manager=None):
         """
         初始化统一策略系统
         
         Args:
             config: 配置字典
         """
-        self.config = config or {}
+        self.config = resolve_module_config(
+            config=config,
+            config_manager=config_manager,
+            section="unified_strategy_system",
+            defaults={},
+        )
         
         # 子模块（保留现有模块的引用）
         self.manager = None

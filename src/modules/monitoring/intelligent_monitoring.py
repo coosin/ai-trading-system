@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable
 
+from src.modules.core.module_config_utils import resolve_module_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,8 +54,13 @@ class Alert:
 class IntelligentMonitoringSystem:
     """智能监控系统"""
     
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
+    def __init__(self, config: Optional[Dict] = None, config_manager=None):
+        self.config = resolve_module_config(
+            config=config,
+            config_manager=config_manager,
+            section="intelligent_monitoring",
+            defaults={},
+        )
         
         self._metrics: Dict[str, List[MonitoringMetric]] = {}
         self._max_metrics = self.config.get("max_metrics", 1000)
