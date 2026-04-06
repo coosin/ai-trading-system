@@ -237,6 +237,9 @@ class ConfigManager:
                     "deny_content_contains": [
                         "当前持仓较少",
                         "市场机会",
+                        "系统启动时持仓同步",
+                        "保证金占用率0.0%",
+                        "浮亏-0.0%",
                     ],
                     # Only store conversation automatically above this importance
                     "min_importance_by_category": {

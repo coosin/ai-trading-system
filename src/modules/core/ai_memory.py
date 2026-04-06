@@ -194,6 +194,15 @@ class SmartMemoryManager:
                 "instruction": 0
             }
         }
+        # Risk-event noise suppression (for markdown daily logs)
+        self._risk_event_last_seen: Dict[str, datetime] = {}
+        self._risk_event_cooldown_sec: int = 30 * 60
+        self._risk_event_daily_limit: int = 80
+        self._risk_event_noise_markers = [
+            "保证金占用率0.0%",
+            "浮亏-0.0%",
+            "浮亏0.0%",
+        ]
         
         logger.info("✅ 智能记忆管理器V2.0初始化完成")
     
@@ -583,7 +592,16 @@ class SmartMemoryManager:
                         content = f.read()
                         risk_section = self._extract_section(content, "风险")
                         if risk_section:
-                            parts.append(f"[{date}] {risk_section[:100]}")
+                            clean_lines = []
+                            for line in risk_section.split("\n"):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                if self._is_noise_risk_text(line):
+                                    continue
+                                clean_lines.append(line)
+                            if clean_lines:
+                                parts.append(f"[{date}] {' | '.join(clean_lines[:3])[:120]}")
                 except:
                     pass
         
@@ -746,6 +764,21 @@ class SmartMemoryManager:
     
     async def record_risk_event(self, event: str, level: str = "warning"):
         """记录风险事件"""
+        text = (event or "").strip()
+        if not text:
+            return
+        # Drop known low-value/noisy risk events.
+        lowered = text.lower()
+        if any(marker.lower() in lowered for marker in self._risk_event_noise_markers):
+            return
+
+        # Cooldown dedup for repeated identical events.
+        now = datetime.now()
+        last = self._risk_event_last_seen.get(text)
+        if last and (now - last).total_seconds() < self._risk_event_cooldown_sec:
+            return
+        self._risk_event_last_seen[text] = now
+
         today = datetime.now().strftime("%Y-%m-%d")
         daily_file = self.storage_path / "daily" / f"{today}.md"
         
@@ -757,6 +790,14 @@ class SmartMemoryManager:
             
             if "## 风险事件" not in existing:
                 existing += "\n\n## 风险事件\n"
+
+            # Guardrail: avoid unbounded risk-event spam in one day.
+            section_lines = []
+            for line in existing.splitlines():
+                if line.strip().startswith("- [") and ("risk" in line.lower() or "风险" in line):
+                    section_lines.append(line)
+            if len(section_lines) >= self._risk_event_daily_limit:
+                return
             
             time_str = datetime.now().strftime("%H:%M")
             emoji = "⚠️" if level == "warning" else "🚨"
@@ -863,10 +904,20 @@ class SmartMemoryManager:
                     if section:
                         for line in section.split("\n"):
                             if line.strip().startswith("-"):
-                                risks.append(line.strip()[1:].strip())
+                                event_text = line.strip()[1:].strip()
+                                if self._is_noise_risk_text(event_text):
+                                    continue
+                                risks.append(event_text)
             except:
                 pass
         return risks
+
+    def _is_noise_risk_text(self, text: str) -> bool:
+        t = (text or "").strip().lower()
+        if not t:
+            return True
+        markers = [m.lower() for m in self._risk_event_noise_markers]
+        return any(m in t for m in markers)
     
     async def cleanup_old_memories(self):
         """清理过期记忆"""

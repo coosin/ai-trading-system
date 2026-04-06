@@ -431,10 +431,22 @@ class MainController:
             except Exception:
                 pass
 
+        # Build a recency-first short context block for primary brain to reduce
+        # "immediate amnesia" when semantic retrieval misses.
+        command_with_context = command
+        if getattr(self, "memory_gateway", None):
+            try:
+                recent = await self.memory_gateway.recent_conversation(scope=f"channel:{source}", limit=6)
+                if recent:
+                    ctx = "\n".join([f"- {m.content}" for m in recent[-4:]])
+                    command_with_context = f"{command}\n\n[最近对话上下文]\n{ctx}"
+            except Exception:
+                command_with_context = command
+
         brain = await self.get_primary_ai_brain()
         if brain and hasattr(brain, "process_user_command"):
             try:
-                result = await brain.process_user_command(command)
+                result = await brain.process_user_command(command_with_context)
                 if isinstance(result, dict):
                     result.setdefault("source", getattr(brain, "__class__", type(brain)).__name__)
                     # capture assistant response if present
