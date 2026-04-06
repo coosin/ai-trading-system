@@ -21,6 +21,8 @@ from src.modules.core.optimized_memory_system import (
     OptimizedMemorySystem,
 )
 
+from src.modules.memory.providers.native import NativeMemoryProvider
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +68,7 @@ class MemoryGateway:
         self.memory_backend = memory_backend
         self.workspace_path = Path(workspace_path)
         self.config_manager = config_manager
+        self.provider = NativeMemoryProvider(backend=memory_backend)
 
     @classmethod
     async def create(
@@ -119,27 +122,48 @@ class MemoryGateway:
         limit: int = 10,
         min_importance: float = 0.0,
     ) -> List[MemoryRecord]:
-        entries = await self.memory_backend.recall(query=query, limit=max(limit * 3, limit))
-        scope_name = (scope or "").strip()
+        # Resolve retrieval config (if available)
+        retrieval_mode = "hybrid"
+        vector_weight = 0.7
+        bm25_weight = 0.3
+        min_score = 0.0
+        try:
+            if self.config_manager:
+                cfg = self.config_manager.get_config_sync("memory", None, {}) or {}
+                retrieval = cfg.get("retrieval", {}) if isinstance(cfg, dict) else {}
+                if isinstance(retrieval, dict):
+                    retrieval_mode = str(retrieval.get("mode", retrieval_mode))
+                    vector_weight = float(retrieval.get("vector_weight", vector_weight))
+                    bm25_weight = float(retrieval.get("bm25_weight", bm25_weight))
+                    min_score = float(retrieval.get("min_score", min_score))
+        except Exception:
+            pass
+
+        result = await self.provider.recall(
+            query=query,
+            scope=scope,
+            limit=limit,
+            min_importance=min_importance,
+            retrieval_mode=retrieval_mode,
+            vector_weight=vector_weight,
+            bm25_weight=bm25_weight,
+            min_score=min_score,
+        )
         records: List[MemoryRecord] = []
-        for entry in entries:
-            entry_scope = str((entry.metadata or {}).get("scope", self.DEFAULT_SCOPE))
-            if scope_name and entry_scope != scope_name:
-                continue
-            if float(getattr(entry, "importance", 0.0)) < float(min_importance):
-                continue
+        for item in result.items:
+            md = dict(item.metadata or {})
+            md.setdefault("score", item.score)
+            md.setdefault("reasons", item.reasons)
             records.append(
                 MemoryRecord(
-                    id=entry.id,
-                    content=entry.content,
-                    importance=float(entry.importance),
-                    metadata=dict(entry.metadata or {}),
-                    timestamp=entry.created_at.isoformat(),
-                    access_count=int(entry.access_count),
+                    id=item.id,
+                    content=item.content,
+                    importance=float(item.importance),
+                    metadata=md,
+                    timestamp=datetime.now().isoformat(),
+                    access_count=int(md.get("access_count", 0)) if isinstance(md, dict) else 0,
                 )
             )
-            if len(records) >= limit:
-                break
         return records
 
     async def update(self, memory_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> bool:

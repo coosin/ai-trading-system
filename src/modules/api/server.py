@@ -1994,9 +1994,20 @@ class APIServer:
                     limit=int(query_data.get("limit", 10)),
                     min_importance=float(query_data.get("min_importance", 0.0)),
                 )
+                include_trace = bool(query_data.get("include_trace", False))
+                trace = {}
+                if include_trace and hasattr(memory_manager, "provider"):
+                    try:
+                        # best-effort: provider may expose last trace via recall metadata
+                        trace = {"provider": memory_manager.provider.__class__.__name__}
+                    except Exception:
+                        trace = {}
                 return {
                     "status": "success",
-                    "data": {"items": [r.to_dict() if hasattr(r, "to_dict") else r for r in records]},
+                    "data": {
+                        "items": [r.to_dict() if hasattr(r, "to_dict") else r for r in records],
+                        **({"trace": trace} if include_trace else {}),
+                    },
                     "timestamp": datetime.now().isoformat()
                 }
             except Exception as e:
