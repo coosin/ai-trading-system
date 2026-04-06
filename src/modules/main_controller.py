@@ -701,7 +701,7 @@ class MainController:
                 notification_cfg = {}
             smart_cfg = notification_cfg.get("smart", {}) if isinstance(notification_cfg, dict) else {}
             self.smart_notification = SmartNotificationSystem(
-                send_func=self._send_notification_handler,
+                send_func=self._send_notification_direct,
                 config=smart_cfg,
             )
             logger.info("✅ 智能通知系统初始化完成")
@@ -1641,6 +1641,7 @@ class MainController:
                                 memory_manager=self.hierarchical_memory,
                                 notification_handler=self._send_notification_handler,
                                 interval=int(hb_cfg.get("interval_sec", 1800)) if isinstance(hb_cfg, dict) else 1800,
+                                config_manager=self.config_manager,
                             )
                             if isinstance(hb_cfg, dict):
                                 try:
@@ -3742,6 +3743,40 @@ class MainController:
 
         logger.info("健康检查工作线程停止")
 
+    async def _send_notification_direct(self, title: str, message: str, priority: str = "medium"):
+        """直接发送通知到底层渠道（不做智能去重/节流）。"""
+        # 发送到Telegram
+        if self.telegram_bot:
+            try:
+                await self.telegram_bot.send_message(f"{title}\n\n{message}")
+                logger.debug(f"Telegram通知已发送: {title}")
+            except Exception as e:
+                # Avoid log spam when chat_id/proxy is misconfigured.
+                now = datetime.now()
+                window_sec = 1800
+                try:
+                    cfg = await self.config_manager.get_config("notifications", {}) if self.config_manager else {}
+                    if isinstance(cfg, dict):
+                        window_sec = int(cfg.get("telegram", {}).get("failure_dedup_window_sec", window_sec))
+                except Exception:
+                    pass
+                if not hasattr(self, "_telegram_fail_dedup"):
+                    self._telegram_fail_dedup = {}  # type: ignore[attr-defined]
+                key = str(e)
+                last = self._telegram_fail_dedup.get(key)  # type: ignore[attr-defined]
+                if not last or (now - last).total_seconds() > window_sec:
+                    self._telegram_fail_dedup[key] = now  # type: ignore[attr-defined]
+                    logger.error(f"Telegram通知发送失败: {e}")
+
+        # 记录到日志
+        log_level = {
+            "critical": logging.CRITICAL,
+            "high": logging.WARNING,
+            "medium": logging.INFO,
+            "low": logging.DEBUG
+        }.get(priority.lower(), logging.INFO)
+        logger.log(log_level, f"📢 [{priority.upper()}] {title}: {message[:100]}")
+
     async def _send_notification_handler(self, title: str, message: str, priority: str = "medium"):
         """
         通知处理方法 - 统一的通知发送接口
@@ -3767,44 +3802,18 @@ class MainController:
             except Exception:
                 pass
 
-            # Notification de-noise: suppress identical telegram failures & repeated alerts
-            if not hasattr(self, "_notification_dedup"):
-                self._notification_dedup = {}  # type: ignore[attr-defined]
-            if not hasattr(self, "_telegram_fail_dedup"):
-                self._telegram_fail_dedup = {}  # type: ignore[attr-defined]
-
-            # 发送到Telegram
-            if self.telegram_bot:
+            # Route through SmartNotificationSystem so dedup/rate-limit/batch always applies.
+            if self.smart_notification:
                 try:
-                    await self.telegram_bot.send_message(
-                        f"{title}\n\n{message}"
-                    )
-                    logger.debug(f"Telegram通知已发送: {title}")
-                except Exception as e:
-                    # Avoid log spam when chat_id/proxy is misconfigured.
-                    now = datetime.now()
-                    window_sec = 1800
-                    try:
-                        cfg = await self.config_manager.get_config("notifications", {}) if self.config_manager else {}
-                        if isinstance(cfg, dict):
-                            window_sec = int(cfg.get("telegram", {}).get("failure_dedup_window_sec", window_sec))
-                    except Exception:
-                        pass
-                    key = str(e)
-                    last = self._telegram_fail_dedup.get(key)  # type: ignore[attr-defined]
-                    if not last or (now - last).total_seconds() > window_sec:
-                        self._telegram_fail_dedup[key] = now  # type: ignore[attr-defined]
-                        logger.error(f"Telegram通知发送失败: {e}")
-            
-            # 记录到日志
-            log_level = {
-                "critical": logging.CRITICAL,
-                "high": logging.WARNING,
-                "medium": logging.INFO,
-                "low": logging.DEBUG
-            }.get(priority.lower(), logging.INFO)
-            
-            logger.log(log_level, f"📢 [{priority.upper()}] {title}: {message[:100]}")
+                    cfg = await self.config_manager.get_config("notifications", {}) if self.config_manager else {}
+                    smart_cfg = cfg.get("smart", {}) if isinstance(cfg, dict) and isinstance(cfg.get("smart"), dict) else {}
+                    self.smart_notification.apply_config(smart_cfg)
+                except Exception:
+                    pass
+                await self.smart_notification.send(title, message, priority=priority, category="general")
+                return
+
+            await self._send_notification_direct(title, message, priority)
             
         except Exception as e:
             logger.error(f"通知处理失败: {e}")

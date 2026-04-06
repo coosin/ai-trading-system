@@ -895,6 +895,41 @@ class ProactiveActionTrigger:
         self._opportunity_require_trend_alignment = bool(notif_cfg.get("opportunity_require_trend_alignment", True))
         self._opportunity_trend_strength_threshold = float(notif_cfg.get("opportunity_trend_strength_threshold", 0.05))
         self._opportunity_notification_cooldown = int(notif_cfg.get("opportunity_cooldown_sec", 3600))
+
+    def _reload_opportunity_notification_config(self) -> None:
+        """Load latest opportunity gates from ConfigManager snapshot if available."""
+        if not self.main_controller:
+            return
+        config_manager = getattr(self.main_controller, "config_manager", None)
+        if config_manager is None:
+            return
+        try:
+            notif_cfg = config_manager.get_config_path_sync("proactive_ai.notifications", {})
+            if not isinstance(notif_cfg, dict):
+                return
+            self._opportunity_notification_enabled = bool(
+                notif_cfg.get("opportunity_enabled", self._opportunity_notification_enabled)
+            )
+            self._opportunity_min_confidence = float(
+                notif_cfg.get("opportunity_min_confidence", self._opportunity_min_confidence)
+            )
+            self._opportunity_min_priority = int(
+                notif_cfg.get("opportunity_min_priority", self._opportunity_min_priority)
+            )
+            self._opportunity_min_risk_reward = float(
+                notif_cfg.get("opportunity_min_risk_reward", self._opportunity_min_risk_reward)
+            )
+            self._opportunity_require_trend_alignment = bool(
+                notif_cfg.get("opportunity_require_trend_alignment", self._opportunity_require_trend_alignment)
+            )
+            self._opportunity_trend_strength_threshold = float(
+                notif_cfg.get("opportunity_trend_strength_threshold", self._opportunity_trend_strength_threshold)
+            )
+            self._opportunity_notification_cooldown = int(
+                notif_cfg.get("opportunity_cooldown_sec", self._opportunity_notification_cooldown)
+            )
+        except Exception as e:
+            logger.debug(f"刷新机会通知阈值失败，使用现有配置: {e}")
     
     async def initialize(self) -> bool:
         """初始化"""
@@ -917,6 +952,7 @@ class ProactiveActionTrigger:
         action_type = action.get('type', 'unknown')
 
         if action_type == "send_notification" and action.get("kind") == "opportunity":
+            self._reload_opportunity_notification_config()
             if not self._opportunity_notification_enabled:
                 logger.debug("机会通知已禁用，跳过")
                 return

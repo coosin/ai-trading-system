@@ -25,12 +25,14 @@ class HeartbeatMonitor:
         skill_manager,
         memory_manager,
         notification_handler: Optional[Callable] = None,
-        interval: int = 1800  # 30分钟
+        interval: int = 1800,  # 30分钟
+        config_manager=None,
     ):
         self.trading_engine = trading_engine
         self.skill_manager = skill_manager
         self.memory_manager = memory_manager
         self.notification_handler = notification_handler
+        self.config_manager = config_manager
         self.interval = interval
         self.market_opportunity_cooldown_sec = 6 * 3600
         # Default off: this notification is often low-value/noisy.
@@ -54,6 +56,24 @@ class HeartbeatMonitor:
         ]
         
         logger.info(f"心跳监控器初始化完成，间隔: {interval}秒")
+
+    def _reload_runtime_config(self) -> None:
+        """在运行期刷新心跳配置，避免每次改配置都重启。"""
+        if not self.config_manager:
+            return
+        try:
+            hb_cfg = self.config_manager.get_config_sync("heartbeat", {}) or {}
+            if not isinstance(hb_cfg, dict):
+                return
+            self.interval = int(hb_cfg.get("interval_sec", self.interval))
+            self.market_opportunity_cooldown_sec = int(
+                hb_cfg.get("market_opportunity_notice_cooldown_sec", self.market_opportunity_cooldown_sec)
+            )
+            self.market_opportunity_notice_enabled = bool(
+                hb_cfg.get("market_opportunity_notice_enabled", self.market_opportunity_notice_enabled)
+            )
+        except Exception as e:
+            logger.debug(f"刷新心跳配置失败，继续使用当前参数: {e}")
     
     async def start(self):
         """启动心跳监控"""
@@ -75,6 +95,7 @@ class HeartbeatMonitor:
     
     async def _execute_heartbeat(self):
         """执行心跳任务"""
+        self._reload_runtime_config()
         self.heartbeat_count += 1
         self._last_heartbeat = datetime.now()
         
