@@ -65,6 +65,9 @@ async def test_memory_gateway_store_and_scope_recall(tmp_path):
     assert len(scoped) == 1
     assert scoped[0].content == "BTC signal"
     assert isinstance(scoped[0].metadata, dict)
+    trace = gateway.get_last_recall_trace()
+    assert isinstance(trace, dict)
+    assert "provider" in trace
 
 
 @pytest.mark.asyncio

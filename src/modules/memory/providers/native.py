@@ -99,6 +99,8 @@ class NativeMemoryProvider:
         vector_weight: float = 0.7,
         bm25_weight: float = 0.3,
         min_score: float = 0.0,
+        rerank_enabled: bool = False,
+        rerank_candidate_pool_size: int = 12,
     ) -> RecallResult:
         # Pull a wider candidate pool from backend
         candidates = await self.backend.recall(query=query, limit=max(limit * 8, 50))
@@ -165,6 +167,23 @@ class NativeMemoryProvider:
                 )
 
         items.sort(key=lambda x: x.score, reverse=True)
+
+        # Optional rerank slot (cheap heuristic for now).
+        rerank_applied = False
+        if rerank_enabled and items:
+            pool = items[: max(int(rerank_candidate_pool_size), limit)]
+
+            q_tokens = set(_tokenize(query))
+
+            def rerank_score(it: RecallItem) -> float:
+                t = set(_tokenize(it.content))
+                overlap = len(q_tokens.intersection(t))
+                return it.score + 0.05 * (overlap / max(len(q_tokens), 1))
+
+            pool.sort(key=rerank_score, reverse=True)
+            items = pool + items[len(pool) :]
+            rerank_applied = True
+
         items = items[:limit]
         trace = {
             "provider": "native",
@@ -172,6 +191,11 @@ class NativeMemoryProvider:
             "candidate_pool": len(docs),
             "weights": {"vector_weight": vector_weight, "bm25_weight": bm25_weight},
             "min_score": min_score,
+            "rerank": {
+                "enabled": bool(rerank_enabled),
+                "candidate_pool_size": int(rerank_candidate_pool_size),
+                "applied": rerank_applied,
+            },
         }
         return RecallResult(items=items, trace=trace)
 

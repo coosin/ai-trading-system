@@ -1996,10 +1996,9 @@ class APIServer:
                 )
                 include_trace = bool(query_data.get("include_trace", False))
                 trace = {}
-                if include_trace and hasattr(memory_manager, "provider"):
+                if include_trace and hasattr(memory_manager, "get_last_recall_trace"):
                     try:
-                        # best-effort: provider may expose last trace via recall metadata
-                        trace = {"provider": memory_manager.provider.__class__.__name__}
+                        trace = memory_manager.get_last_recall_trace()
                     except Exception:
                         trace = {}
                 return {

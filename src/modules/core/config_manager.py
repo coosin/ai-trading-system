@@ -220,6 +220,11 @@ class ConfigManager:
                 "bm25_weight": 0.3,
                 "min_score": 0.3,
                 "max_results": 10,
+                "rerank": {
+                    "enabled": False,
+                    "candidate_pool_size": 12,
+                    "min_score": 0.0,
+                },
             },
             "auto_capture": {
                 "enabled": True,

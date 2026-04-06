@@ -69,6 +69,7 @@ class MemoryGateway:
         self.workspace_path = Path(workspace_path)
         self.config_manager = config_manager
         self.provider = NativeMemoryProvider(backend=memory_backend)
+        self._last_recall_trace: Dict[str, Any] = {}
 
     @classmethod
     async def create(
@@ -127,6 +128,8 @@ class MemoryGateway:
         vector_weight = 0.7
         bm25_weight = 0.3
         min_score = 0.0
+        rerank_enabled = False
+        rerank_candidate_pool_size = 12
         try:
             if self.config_manager:
                 cfg = self.config_manager.get_config_sync("memory", None, {}) or {}
@@ -136,6 +139,10 @@ class MemoryGateway:
                     vector_weight = float(retrieval.get("vector_weight", vector_weight))
                     bm25_weight = float(retrieval.get("bm25_weight", bm25_weight))
                     min_score = float(retrieval.get("min_score", min_score))
+                    rr = retrieval.get("rerank", {})
+                    if isinstance(rr, dict):
+                        rerank_enabled = bool(rr.get("enabled", rerank_enabled))
+                        rerank_candidate_pool_size = int(rr.get("candidate_pool_size", rerank_candidate_pool_size))
         except Exception:
             pass
 
@@ -148,7 +155,10 @@ class MemoryGateway:
             vector_weight=vector_weight,
             bm25_weight=bm25_weight,
             min_score=min_score,
+            rerank_enabled=rerank_enabled,
+            rerank_candidate_pool_size=rerank_candidate_pool_size,
         )
+        self._last_recall_trace = dict(result.trace or {})
         records: List[MemoryRecord] = []
         for item in result.items:
             md = dict(item.metadata or {})
@@ -165,6 +175,10 @@ class MemoryGateway:
                 )
             )
         return records
+
+    def get_last_recall_trace(self) -> Dict[str, Any]:
+        """Best-effort recall trace for observability."""
+        return dict(self._last_recall_trace or {})
 
     async def update(self, memory_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
         try:

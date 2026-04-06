@@ -42,6 +42,8 @@ class MemoryProvider(Protocol):
         vector_weight: float = 0.7,
         bm25_weight: float = 0.3,
         min_score: float = 0.0,
+        rerank_enabled: bool = False,
+        rerank_candidate_pool_size: int = 12,
     ) -> RecallResult: ...
 
     async def forget(self, memory_id: str) -> bool: ...
