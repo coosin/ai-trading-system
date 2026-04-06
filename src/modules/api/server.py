@@ -1808,13 +1808,34 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
                 
-                # 优先使用AI指令执行器（具备完整的系统感知能力）
-                ai_executor = getattr(self.main_controller, 'ai_command_executor', None)
-                
-                if ai_executor:
-                    logger.debug(f"使用AICommandExecutor处理: {message[:50]}...")
-                    result = await ai_executor.process_input(message)
+                # 优先走主控制器核心大脑统一路由
+                if hasattr(self.main_controller, "process_user_command"):
+                    logger.debug(f"使用核心大脑统一路由处理: {message[:50]}...")
+                    result = await self.main_controller.process_user_command(message, source="api_chat")
                     
+                    if result.get("success"):
+                        return {
+                            "status": "success",
+                            "message": "AI响应成功",
+                            "data": {
+                                "response": result.get("response", ""),
+                                "data": result.get("data"),
+                                "source": result.get("source", "core_brain_router")
+                            },
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    else:
+                        return {
+                            "status": "error",
+                            "message": result.get("response", "AI处理失败"),
+                            "timestamp": datetime.now().isoformat()
+                        }
+                
+                # 回退：AI指令执行器（兼容旧路径）
+                ai_executor = getattr(self.main_controller, 'ai_command_executor', None)
+                if ai_executor:
+                    logger.debug(f"回退到AICommandExecutor处理: {message[:50]}...")
+                    result = await ai_executor.process_input(message)
                     if result.get("success"):
                         return {
                             "status": "success",
@@ -1824,12 +1845,6 @@ class APIServer:
                                 "data": result.get("data"),
                                 "source": "ai_command_executor"
                             },
-                            "timestamp": datetime.now().isoformat()
-                        }
-                    else:
-                        return {
-                            "status": "error",
-                            "message": result.get("response", "AI处理失败"),
                             "timestamp": datetime.now().isoformat()
                         }
                 

@@ -393,6 +393,50 @@ class MainController:
     def get_onchain_integrator(self):
         return getattr(self, "onchain_integrator", None)
 
+    async def get_primary_ai_brain(self):
+        """Return the current primary AI brain controller instance."""
+        policy = await self._get_ai_brain_policy()
+        primary = str(policy.get("primary_controller", "ai_core")).strip().lower()
+        if primary == "ai_trading_engine":
+            brain = getattr(self, "ai_trading_engine", None)
+            if brain:
+                return brain
+            return getattr(self, "ai_core", None)
+        brain = getattr(self, "ai_core", None)
+        if brain:
+            return brain
+        return getattr(self, "ai_trading_engine", None)
+
+    async def process_user_command(self, command: str, source: str = "system") -> Dict[str, Any]:
+        """
+        Unified communication entrypoint.
+        Route user command to primary AI brain first.
+        """
+        brain = await self.get_primary_ai_brain()
+        if brain and hasattr(brain, "process_user_command"):
+            try:
+                result = await brain.process_user_command(command)
+                if isinstance(result, dict):
+                    result.setdefault("source", getattr(brain, "__class__", type(brain)).__name__)
+                return result if isinstance(result, dict) else {"success": True, "response": str(result)}
+            except Exception as e:
+                logger.error(f"核心大脑处理失败(source={source}): {e}")
+
+        if getattr(self, "ai_command_executor", None):
+            result = await self.ai_command_executor.process_input(command)
+            if isinstance(result, dict):
+                result.setdefault("source", "ai_command_executor")
+            return result if isinstance(result, dict) else {"success": True, "response": str(result)}
+
+        if getattr(self, "natural_language_interface", None):
+            result = await self.natural_language_interface.process_and_respond(command, {"source": source})
+            if isinstance(result, dict):
+                result.setdefault("source", "natural_language_interface")
+                return result
+            return {"success": True, "response": str(result), "source": "natural_language_interface"}
+
+        return {"success": False, "response": "核心大脑未就绪", "source": "none"}
+
     def _deep_merge_dict(self, base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(base or {})
         for k, v in (updates or {}).items():

@@ -200,20 +200,16 @@ class TelegramBot:
         """处理自然语言消息 - 直接调用AI核心决策引擎"""
         try:
             logger.info(f"📩 收到消息 [{message.from_user}]: {message.text[:100] if len(message.text) > 100 else message.text}")
-            
-            ai_core = getattr(self.main_controller, 'ai_core', None) if self.main_controller else None
-            
-            logger.info(f"Telegram处理消息: main_controller={'存在' if self.main_controller else '不存在'}, ai_core={'存在' if ai_core else '不存在'}")
-            
-            if ai_core:
-                logger.info(f"🤖 调用ai_core.process_user_command: {message.text[:50]}")
-                result = await ai_core.process_user_command(message.text)
-                
-                response_text = result.get("response", "处理完成")
-                success = result.get("success", False)
-                
+
+            if self.main_controller and hasattr(self.main_controller, "process_user_command"):
+                logger.info(f"🤖 通过主控制器核心大脑路由处理: {message.text[:50]}")
+                result = await self.main_controller.process_user_command(
+                    message.text,
+                    source="telegram",
+                )
+                response_text = (result or {}).get("response", "处理完成")
+                success = (result or {}).get("success", False)
                 logger.info(f"📤 AI响应: success={success}, response长度={len(response_text)}")
-                
                 await self._send_message(TelegramResponse(
                     chat_id=message.chat_id,
                     text=response_text,

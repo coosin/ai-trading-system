@@ -75,8 +75,14 @@ class AICommandExecutor:
         try:
             from .unified_intelligent_memory import get_unified_memory
             from .user_intent_recognizer import UserIntentRecognizer
-            
-            self.unified_memory = await get_unified_memory()
+
+            # 优先使用主控制器核心记忆，保持与核心大脑一致
+            self.unified_memory = (
+                getattr(self.main_controller, "ai_memory_manager", None)
+                if self.main_controller else None
+            )
+            if self.unified_memory is None:
+                self.unified_memory = await get_unified_memory()
             self.user_intent_recognizer = UserIntentRecognizer
             logger.info("✅ 统一记忆系统和用户意图识别器已加载")
             

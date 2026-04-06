@@ -166,6 +166,11 @@ class NaturalLanguageInterface:
     
     async def _ensure_memory_initialized(self):
         if self.memory is None:
+            if self.main_controller and hasattr(self.main_controller, "ai_memory_manager"):
+                self.memory = self.main_controller.ai_memory_manager
+                if self.memory is not None:
+                    logger.info("✅ 记忆系统已连接到自然语言接口（主控制器核心记忆）")
+                    return
             try:
                 from src.modules.core.unified_intelligent_memory import get_unified_memory
                 self.memory = await get_unified_memory()

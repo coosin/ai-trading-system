@@ -175,13 +175,17 @@ class AICoreDecisionEngine:
             self.plugin_manager = self.main_controller.plugin_manager
             logger.info("✅ 插件管理器已连接")
         
-        # 获取记忆系统
-        try:
-            from .unified_intelligent_memory import get_unified_memory
-            self.memory = await get_unified_memory()
-            logger.info("✅ 记忆系统已连接")
-        except Exception as e:
-            logger.warning(f"记忆系统连接失败: {e}")
+        # 获取记忆系统（优先复用主控制器核心记忆）
+        self.memory = getattr(self.main_controller, "ai_memory_manager", None)
+        if self.memory:
+            logger.info("✅ 记忆系统已连接（主控制器核心记忆）")
+        else:
+            try:
+                from .unified_intelligent_memory import get_unified_memory
+                self.memory = await get_unified_memory()
+                logger.info("✅ 记忆系统已连接")
+            except Exception as e:
+                logger.warning(f"记忆系统连接失败: {e}")
         
         # 加载用户规则
         await self._load_user_rules()
