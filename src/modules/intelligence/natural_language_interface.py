@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import uuid
+from datetime import datetime
 from typing import Dict, Any, Optional, List
 
 from src.modules.core.llm_integration import EnhancedLLMIntegration
@@ -40,12 +41,23 @@ logger = logging.getLogger(__name__)
 
 
 class NaturalLanguageInterface:
-    def __init__(self, llm_integration: EnhancedLLMIntegration, main_controller=None):
+    def __init__(
+        self,
+        llm_integration: EnhancedLLMIntegration,
+        main_controller=None,
+        config_manager=None,
+    ):
         self.llm_integration = llm_integration
         self.main_controller = main_controller
+        self.config_manager = config_manager or (
+            getattr(main_controller, "config_manager", None) if main_controller else None
+        )
         self.system_prompt = "你是一个专业的量化交易助手。"
         self.session_id = f"nli:{uuid.uuid4()}"
         self._session_history: List[Dict[str, str]] = []
+        self._turn_counter = 0
+        self._market_context_last_turn = -999
+        self._market_context_last_at: Optional[datetime] = None
         
         self.command_templates = {
             "get_system_status": {
@@ -203,17 +215,26 @@ class NaturalLanguageInterface:
     def _load_personality_files(self):
         personality_parts = []
         
+        # 合并为一套 system_prompt：顺序即优先级（越靠后越可覆盖语气）。
+        # AGENTS.md：工作空间规则/流程说明（与 IDENTITY 人设互补，非重复「第二套人格」）。
         personality_files = [
             "workspace/SOUL.md",
-            "workspace/IDENTITY.md", 
+            "workspace/IDENTITY.md",
+            "workspace/AGENTS.md",
             "workspace/USER.md",
-            "workspace/TRADING.md"
+            "workspace/TRADING.md",
         ]
         
         cm = getattr(self, "config_manager", None)
-        base_path = (
-            cm.get_path_sync("trading_path", None) if cm else None
-        ) or "/app"
+        base_path = "/app"
+        if cm is not None:
+            try:
+                if hasattr(cm, "get_path_sync"):
+                    base_path = cm.get_path_sync("trading_path", None) or base_path
+                elif hasattr(cm, "get_config_sync"):
+                    base_path = cm.get_config_sync("paths", "trading_path", base_path) or base_path
+            except Exception:
+                base_path = "/app"
         
         for file_path in personality_files:
             full_path = os.path.join(base_path, file_path)
@@ -278,6 +299,7 @@ class NaturalLanguageInterface:
         try:
             if context is None:
                 context = {}
+            self._turn_counter += 1
 
             # Direct intent: user explicitly teaches what should not be stored in memory.
             memory_filter_result = await self._try_handle_memory_filter_learning(query)
@@ -587,6 +609,61 @@ class NaturalLanguageInterface:
             params = {}
         
         return params
+
+    def _query_needs_market_context(self, query: str) -> bool:
+        text = str(query or "").lower()
+        keywords = [
+            "行情", "价格", "k线", "持仓", "仓位", "账户", "余额", "风险", "敞口",
+            "market", "price", "position", "portfolio", "balance", "exposure", "ticker",
+        ]
+        return any(k in text for k in keywords)
+
+    def _should_attach_market_snapshot(self, query: str) -> bool:
+        if self._query_needs_market_context(query):
+            return True
+        turn_gap = self._turn_counter - self._market_context_last_turn
+        if turn_gap >= 4:
+            return True
+        if self._market_context_last_at is None:
+            return False
+        return (datetime.now() - self._market_context_last_at).total_seconds() >= 300
+
+    def _sanitize_text_for_prompt(self, text: str, max_len: int = 500) -> str:
+        s = str(text or "")
+        s = re.sub(r"```.*?```", "[代码片段已省略]", s, flags=re.S)
+        s = re.sub(r"`([^`]*)`", r"\1", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        if len(s) > max_len:
+            return s[:max_len] + "..."
+        return s
+
+    async def _build_market_snapshot(self) -> str:
+        mc = self.main_controller
+        if not mc:
+            return ""
+        try:
+            engine = getattr(mc, "ai_trading_engine", None)
+            positions = getattr(engine, "positions", {}) if engine else {}
+            balance = getattr(engine, "balance", None) if engine else None
+            state_parts: List[str] = []
+            if isinstance(balance, (int, float)):
+                state_parts.append(f"账户余额: {float(balance):.2f} USDT")
+            if isinstance(positions, dict):
+                state_parts.append(f"持仓数量: {len(positions)}")
+                if positions:
+                    state_parts.append("持仓品种: " + ", ".join(list(positions.keys())[:5]))
+            if hasattr(mc, "get_simulated_market_state"):
+                try:
+                    mkt = mc.get_simulated_market_state()
+                    if isinstance(mkt, dict) and "error" not in mkt:
+                        vol = mkt.get("volatility")
+                        if isinstance(vol, (int, float)):
+                            state_parts.append(f"模拟市场波动: {float(vol):.4f}")
+                except Exception:
+                    pass
+            return "\n".join(state_parts[:6])
+        except Exception:
+            return ""
     
     async def _general_qa(self, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
         user_emotion = UserEmotion.NEUTRAL if UserEmotion else None
@@ -605,7 +682,9 @@ class NaturalLanguageInterface:
                 recent_turns = self._session_history[-8:]
                 session_block = ""
                 if recent_turns:
-                    session_block = "\n".join([f"{t['role']}: {t['content']}" for t in recent_turns])
+                    session_block = "\n".join(
+                        [f"{t['role']}: {self._sanitize_text_for_prompt(t['content'], max_len=220)}" for t in recent_turns]
+                    )
 
                 # 2) recent conversation memories from gateway (recency-first safety net)
                 recent_memories = []
@@ -619,19 +698,38 @@ class NaturalLanguageInterface:
                 if session_block:
                     blocks.append("[会话上下文(最近)]\n" + session_block)
                 if recent_memories:
-                    blocks.append("[最近对话记忆]\n" + "\n".join([f"- {m.get('content', str(m))}" for m in recent_memories]))
+                    blocks.append(
+                        "[最近对话记忆]\n"
+                        + "\n".join(
+                            [f"- {self._sanitize_text_for_prompt(m.get('content', str(m)), max_len=220)}" for m in recent_memories]
+                        )
+                    )
                 if relevant_memories:
-                    blocks.append("[相关长期记忆]\n" + "\n".join([f"- {m.get('content', str(m))}" for m in relevant_memories]))
+                    blocks.append(
+                        "[相关长期记忆]\n"
+                        + "\n".join(
+                            [f"- {self._sanitize_text_for_prompt(m.get('content', str(m)), max_len=220)}" for m in relevant_memories]
+                        )
+                    )
                 if blocks:
                     memory_context = "\n\n" + "\n\n".join(blocks)
             except Exception as e:
                 logger.warning(f"检索记忆失败: {e}")
+
+        market_context = ""
+        if self._should_attach_market_snapshot(query):
+            snapshot = await self._build_market_snapshot()
+            if snapshot:
+                market_context = "\n\n[交易状态摘要]\n" + snapshot
+                self._market_context_last_turn = self._turn_counter
+                self._market_context_last_at = datetime.now()
         
         personality_prompt = self._get_personality_prompt()
         
         prompt = f"""{personality_prompt}
 
 {memory_context}
+{market_context}
 
 请回答用户的问题：
 
@@ -641,7 +739,12 @@ class NaturalLanguageInterface:
 - answer: 回答内容
 - confidence: 置信度（0-1）
 - source: 回答来源
-- related_commands: 相关命令（可选）"""
+- related_commands: 相关命令（可选）
+
+回复要求：
+1) 默认简洁直接；
+2) 不输出长代码块；
+3) 不输出大段原始JSON或字典；如需数据，只给摘要。"""
         
         response = await self.llm_integration.generate(prompt)
         content = self._get_response_content(response)
@@ -685,11 +788,20 @@ class NaturalLanguageInterface:
         return result
     
     async def generate_response(self, result: Dict[str, Any], query: str) -> str:
+        compact_result = dict(result or {})
+        if "answer" in compact_result:
+            compact_result["answer"] = self._sanitize_text_for_prompt(compact_result["answer"], max_len=1000)
+        if "data" in compact_result:
+            compact_result["data"] = self._sanitize_text_for_prompt(
+                json.dumps(compact_result["data"], ensure_ascii=False),
+                max_len=400,
+            )
         prompt = f"""请根据以下执行结果，生成一个自然友好的回答，回复用户的查询 '{query}'：
 
-执行结果: {json.dumps(result, ensure_ascii=False)}
+执行结果: {json.dumps(compact_result, ensure_ascii=False)}
 
-请直接返回回答内容，不要包含任何格式标记。"""
+请直接返回回答内容，不要包含任何格式标记。
+不要附加代码块，不要输出大段原始数据。"""
         
         response = await self.llm_integration.generate(prompt)
         return self._get_response_content(response)

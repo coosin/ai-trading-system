@@ -805,8 +805,9 @@ class MainController:
         
         # 初始化自然语言接口（传入main_controller以支持技能包和情感智能）
         self.natural_language_interface = NaturalLanguageInterface(
-            self.llm_integration, 
-            main_controller=self
+            self.llm_integration,
+            main_controller=self,
+            config_manager=self.config_manager,
         )
         
         # 初始化Telegram机器人（仅当有config_manager时）
