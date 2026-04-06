@@ -1647,6 +1647,9 @@ class MainController:
                                     self.heartbeat_monitor.market_opportunity_cooldown_sec = int(
                                         hb_cfg.get("market_opportunity_notice_cooldown_sec", 21600)
                                     )
+                                    self.heartbeat_monitor.market_opportunity_notice_enabled = bool(
+                                        hb_cfg.get("market_opportunity_notice_enabled", False)
+                                    )
                                 except Exception:
                                     pass
                             logger.info("✅ 心跳监控器已初始化")
@@ -3749,6 +3752,21 @@ class MainController:
             priority: 优先级
         """
         try:
+            # Hard-block low-value "opportunity discovery" notifications.
+            try:
+                block_phrases = []
+                if self.config_manager:
+                    ncfg = await self.config_manager.get_config("notifications", {}) or {}
+                    if isinstance(ncfg, dict):
+                        smart = ncfg.get("smart", {}) if isinstance(ncfg.get("smart", {}), dict) else {}
+                        block_phrases = [str(x) for x in smart.get("block_phrases", []) or []]
+                text = f"{title}\n{message}"
+                if any(p and p in text for p in block_phrases):
+                    logger.debug(f"通知已过滤(命中关键词): {title}")
+                    return
+            except Exception:
+                pass
+
             # Notification de-noise: suppress identical telegram failures & repeated alerts
             if not hasattr(self, "_notification_dedup"):
                 self._notification_dedup = {}  # type: ignore[attr-defined]

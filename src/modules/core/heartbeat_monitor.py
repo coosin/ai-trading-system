@@ -33,6 +33,8 @@ class HeartbeatMonitor:
         self.notification_handler = notification_handler
         self.interval = interval
         self.market_opportunity_cooldown_sec = 6 * 3600
+        # Default off: this notification is often low-value/noisy.
+        self.market_opportunity_notice_enabled = False
         
         self._running = False
         self._last_heartbeat: Optional[datetime] = None
@@ -132,6 +134,8 @@ class HeartbeatMonitor:
     
     async def _analyze_market_opportunities(self, context: Dict[str, Any]):
         """分析市场机会"""
+        if not self.market_opportunity_notice_enabled:
+            return
         logger.info("📈 分析市场机会...")
         
         trading_engine = context.get("trading_engine")

@@ -257,6 +257,8 @@ class ConfigManager:
         "notifications": {
             "enabled": True,
             "smart": {
+                # Block noisy phrases before sending notifications.
+                "block_phrases": ["市场机会", "发现机会", "交易机会"],
                 "quiet_hours_start": "23:00",
                 "quiet_hours_end": "07:00",
                 "batch_interval_sec": 3600,
@@ -283,6 +285,7 @@ class ConfigManager:
             "enabled": True,
             "interval_sec": 1800,
             "market_opportunity_notice_cooldown_sec": 21600,
+            "market_opportunity_notice_enabled": False,
         },
         "research": {
             "enabled": True,

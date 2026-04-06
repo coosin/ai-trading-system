@@ -167,6 +167,8 @@ class MemoryGateway:
             md = dict(item.metadata or {})
             md.setdefault("score", item.score)
             md.setdefault("reasons", item.reasons)
+            if self._is_noise_content(str(item.content)):
+                continue
             records.append(
                 MemoryRecord(
                     id=item.id,
@@ -271,6 +273,8 @@ class MemoryGateway:
                     if getattr(entry, "category", None) != MemoryCategory.CONVERSATION:
                         continue
                     md = dict(getattr(entry, "metadata", {}) or {})
+                    if self._is_noise_content(str(getattr(entry, "content", ""))):
+                        continue
                     if scope and str(md.get("scope", "")).strip() != scope:
                         continue
                     created_at = getattr(entry, "created_at", None)
@@ -296,6 +300,22 @@ class MemoryGateway:
             return out
         except Exception:
             return []
+
+    def _is_noise_content(self, content: str) -> bool:
+        text = (content or "").strip().lower()
+        if not text:
+            return True
+        try:
+            cfg = self.config_manager.get_config_sync("memory", None, {}) if self.config_manager else {}
+            auto = cfg.get("auto_capture", {}) if isinstance(cfg, dict) else {}
+            policy = auto.get("policy", {}) if isinstance(auto, dict) else {}
+            deny_contains = [str(x).lower() for x in (policy.get("deny_content_contains", []) or [])]
+            for frag in deny_contains:
+                if frag and frag in text:
+                    return True
+        except Exception:
+            pass
+        return False
 
     def _should_skip_store(
         self,
