@@ -282,8 +282,9 @@ class AITradingEngine:
             binance_source = BinanceDataSource(proxy_url=proxy_url)
             coingecko_source = CoinGeckoDataSource(proxy_url=proxy_url)
             
-            await self.data_fusion.register_data_source("binance", binance_source)
-            await self.data_fusion.register_data_source("coingecko", coingecko_source)
+            # register_data_source is synchronous; awaiting it causes NoneType await errors.
+            self.data_fusion.register_data_source("binance", binance_source)
+            self.data_fusion.register_data_source("coingecko", coingecko_source)
             
             logger.info("✅ 多源数据融合分析器已初始化")
         except Exception as e:
@@ -1307,8 +1308,11 @@ class AITradingEngine:
                 else:
                     result = maybe
             
-            if result:
-                logger.info(f"✅ 订单执行成功: {result.get('id', 'N/A')}")
+            if self._is_order_result_success(result):
+                order_id = ""
+                if isinstance(result, dict):
+                    order_id = result.get("id") or result.get("order_id") or "N/A"
+                logger.info(f"✅ 订单执行成功: {order_id}")
                 
                 trade_record = {
                     "timestamp": datetime.now().isoformat(),
@@ -1367,12 +1371,41 @@ class AITradingEngine:
                 
                 return True
             else:
-                logger.error("❌ 订单执行失败")
+                logger.error(f"❌ 订单执行失败: {result}")
                 return False
                 
         except Exception as e:
             logger.error(f"执行决策失败: {e}", exc_info=True)
             return False
+
+    def _is_order_result_success(self, result: Any) -> bool:
+        """Normalize exchange order response success semantics."""
+        if result is None:
+            return False
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, dict):
+            # Common failure shapes
+            if result.get("success") is False:
+                return False
+            status = str(result.get("status", "")).lower()
+            if status in {"error", "failed", "fail"}:
+                return False
+            if "error" in result and result.get("error"):
+                return False
+            message = str(result.get("message", "")).lower()
+            if "error" in message or "failed" in message:
+                return False
+            # Common success shapes
+            if result.get("success") is True:
+                return True
+            if status in {"ok", "success", "filled"}:
+                return True
+            if result.get("order_id") or result.get("id"):
+                return True
+            return False
+        # Non-dict truthy values from mocks/adapters
+        return bool(result)
     
     async def _save_trade_to_memory(self, decision: AIDecision, result: Dict) -> None:
         """保存交易记录到增强记忆"""

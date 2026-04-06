@@ -163,12 +163,12 @@ class UnifiedInfoCollector:
             
             # 配置数据源
             for symbol in self.config.symbols[:4]:  # 限制前4个
-                await self.realtime_collector.add_data_source({
-                    "name": f"{symbol}_ws",
-                    "source_type": "websocket",
-                    "symbol": symbol,
-                    "enabled": True
-                })
+                # add_data_source is synchronous and expects named args.
+                self.realtime_collector.add_data_source(
+                    name=f"{symbol}_ws",
+                    source_type="websocket",
+                    symbol=symbol,
+                )
             
             logger.info("✅ 实时数据采集器已初始化")
         except Exception as e:

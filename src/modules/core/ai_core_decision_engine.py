@@ -10,6 +10,7 @@ import asyncio
 import logging
 import json
 import re
+import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
@@ -988,9 +989,6 @@ class AICoreDecisionEngine:
             return None
         
         try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=self.config["backtest_lookback_days"])
-            
             strategies = getattr(self.strategy_manager, 'strategy_configs', {})
             config = strategies.get(strategy_id)
             
@@ -1007,18 +1005,26 @@ class AICoreDecisionEngine:
             
             if not klines:
                 return None
-            
-            total_return = 0.05
-            max_drawdown = 0.1
-            win_rate = 0.55
-            sharpe_ratio = 1.2
-            
+
+            closes = self._extract_close_prices(klines)
+            if len(closes) < 80:
+                logger.warning(f"回测样本不足: {strategy_id} close_count={len(closes)}")
+                return None
+
+            params = self._resolve_strategy_ma_params(config)
+            metrics = self._simulate_ma_backtest(closes, params["fast"], params["slow"])
+
             return {
                 "strategy_id": strategy_id,
-                "total_return": total_return,
-                "max_drawdown": max_drawdown,
-                "win_rate": win_rate,
-                "sharpe_ratio": sharpe_ratio,
+                "symbol": symbol,
+                "timeframe": "1H",
+                "samples": len(closes),
+                "total_return": metrics["total_return"],
+                "max_drawdown": metrics["max_drawdown"],
+                "win_rate": metrics["win_rate"],
+                "sharpe_ratio": metrics["sharpe_ratio"],
+                "trade_count": metrics["trade_count"],
+                "parameters": params,
                 "backtest_date": datetime.now().isoformat(),
             }
             
@@ -1050,17 +1056,234 @@ class AICoreDecisionEngine:
             return None
         
         try:
-            result = {
+            if not self.exchange or not self.strategy_manager:
+                return None
+
+            strategies = getattr(self.strategy_manager, 'strategy_configs', {})
+            config = strategies.get(strategy_id)
+            if not config:
+                return None
+
+            symbols = getattr(config, 'symbols', [])
+            if not symbols:
+                return None
+
+            symbol = symbols[0].replace('/', '-')
+            klines = await self.exchange.get_klines(symbol, '1H', limit=720)
+            closes = self._extract_close_prices(klines or [])
+            if len(closes) < 120:
+                logger.warning(f"策略优化样本不足: {strategy_id} close_count={len(closes)}")
+                return None
+
+            base_params = self._resolve_strategy_ma_params(config)
+            base_metrics = self._simulate_ma_backtest(closes, base_params["fast"], base_params["slow"])
+
+            fast_candidates = [6, 8, 10, 12, 16, 20, 24]
+            slow_candidates = [30, 40, 50, 60, 72, 84, 100]
+            drawdown_limit = float(self.config.get("max_drawdown_limit", 0.15))
+
+            best = None
+            for fast in fast_candidates:
+                for slow in slow_candidates:
+                    if fast >= slow:
+                        continue
+                    metrics = self._simulate_ma_backtest(closes, fast, slow)
+                    # Score balances risk-adjusted return and drawdown.
+                    score = (
+                        metrics["sharpe_ratio"] * 1.2
+                        + metrics["total_return"] * 0.8
+                        - metrics["max_drawdown"] * 1.0
+                    )
+                    if metrics["trade_count"] < 4:
+                        score -= 0.2
+                    candidate = {
+                        "fast": fast,
+                        "slow": slow,
+                        "metrics": metrics,
+                        "score": score,
+                    }
+                    if metrics["max_drawdown"] <= drawdown_limit:
+                        if best is None or candidate["score"] > best["score"]:
+                            best = candidate
+
+            # If no candidate satisfies drawdown limit, fallback to global best score.
+            if best is None:
+                for fast in fast_candidates:
+                    for slow in slow_candidates:
+                        if fast >= slow:
+                            continue
+                        metrics = self._simulate_ma_backtest(closes, fast, slow)
+                        score = (
+                            metrics["sharpe_ratio"] * 1.2
+                            + metrics["total_return"] * 0.8
+                            - metrics["max_drawdown"] * 1.0
+                        )
+                        if metrics["trade_count"] < 4:
+                            score -= 0.2
+                        candidate = {"fast": fast, "slow": slow, "metrics": metrics, "score": score}
+                        if best is None or candidate["score"] > best["score"]:
+                            best = candidate
+
+            if not best:
+                return None
+
+            new_params = self._build_updated_strategy_params(config, best["fast"], best["slow"])
+            if hasattr(config, "parameters") and isinstance(config.parameters, dict):
+                config.parameters.update(new_params)
+                config.updated_at = datetime.now()
+
+            return {
                 "strategy_id": strategy_id,
-                "improvement": "参数已优化",
-                "new_sharpe": 1.5,
+                "symbol": symbol,
+                "old": {"parameters": base_params, "metrics": base_metrics},
+                "new": {"parameters": new_params, "metrics": best["metrics"]},
+                "improvement": {
+                    "delta_sharpe": best["metrics"]["sharpe_ratio"] - base_metrics["sharpe_ratio"],
+                    "delta_return": best["metrics"]["total_return"] - base_metrics["total_return"],
+                    "delta_drawdown": best["metrics"]["max_drawdown"] - base_metrics["max_drawdown"],
+                },
+                "optimized_at": datetime.now().isoformat(),
             }
-            
-            return result
             
         except Exception as e:
             logger.error(f"策略优化失败: {e}")
             return None
+
+    def _extract_close_prices(self, klines: List[Any]) -> List[float]:
+        """Normalize exchange kline payload to close-price list."""
+        closes: List[float] = []
+        for k in klines:
+            close_val = None
+            if isinstance(k, dict):
+                close_val = k.get("close") or k.get("c")
+            elif isinstance(k, (list, tuple)) and len(k) >= 5:
+                close_val = k[4]
+            try:
+                if close_val is not None:
+                    closes.append(float(close_val))
+            except (TypeError, ValueError):
+                continue
+        return closes
+
+    def _resolve_strategy_ma_params(self, strategy_config: Any) -> Dict[str, int]:
+        """Read MA-like parameters from strategy config with sane defaults."""
+        params = {}
+        if hasattr(strategy_config, "parameters") and isinstance(strategy_config.parameters, dict):
+            params = strategy_config.parameters
+        elif isinstance(strategy_config, dict):
+            params = strategy_config.get("parameters", {})
+        fast = int(
+            params.get("ma_fast")
+            or params.get("short_window")
+            or params.get("fast_period")
+            or 12
+        )
+        slow = int(
+            params.get("ma_slow")
+            or params.get("long_window")
+            or params.get("slow_period")
+            or 48
+        )
+        if fast >= slow:
+            fast = max(6, slow // 4)
+            slow = max(fast + 4, slow)
+        return {"fast": fast, "slow": slow}
+
+    def _build_updated_strategy_params(self, strategy_config: Any, fast: int, slow: int) -> Dict[str, Any]:
+        """Write optimized MA params back using existing key style."""
+        params = {}
+        if hasattr(strategy_config, "parameters") and isinstance(strategy_config.parameters, dict):
+            params = strategy_config.parameters
+        elif isinstance(strategy_config, dict):
+            params = strategy_config.get("parameters", {})
+
+        updated: Dict[str, Any] = {}
+        if "short_window" in params or "long_window" in params:
+            updated["short_window"] = fast
+            updated["long_window"] = slow
+        if "fast_period" in params or "slow_period" in params:
+            updated["fast_period"] = fast
+            updated["slow_period"] = slow
+        if "ma_fast" in params or "ma_slow" in params:
+            updated["ma_fast"] = fast
+            updated["ma_slow"] = slow
+
+        if not updated:
+            updated["short_window"] = fast
+            updated["long_window"] = slow
+        return updated
+
+    def _simulate_ma_backtest(self, closes: List[float], fast: int, slow: int) -> Dict[str, float]:
+        """Simple deterministic MA crossover simulation on close prices."""
+        if len(closes) <= slow + 2:
+            return {
+                "total_return": 0.0,
+                "max_drawdown": 1.0,
+                "win_rate": 0.0,
+                "sharpe_ratio": -1.0,
+                "trade_count": 0,
+            }
+
+        equity = 1.0
+        peak = 1.0
+        max_drawdown = 0.0
+        period_returns: List[float] = []
+        trade_returns: List[float] = []
+        last_signal = 0
+        current_trade_ret = 0.0
+
+        for i in range(slow, len(closes)):
+            fast_ma = sum(closes[i - fast + 1 : i + 1]) / fast
+            slow_ma = sum(closes[i - slow + 1 : i + 1]) / slow
+            signal = 1 if fast_ma > slow_ma else -1
+
+            prev_close = closes[i - 1]
+            cur_close = closes[i]
+            if prev_close <= 0:
+                continue
+            raw_ret = (cur_close - prev_close) / prev_close
+            strat_ret = raw_ret * signal
+            period_returns.append(strat_ret)
+            equity *= (1.0 + strat_ret)
+            peak = max(peak, equity)
+            if peak > 0:
+                max_drawdown = max(max_drawdown, (peak - equity) / peak)
+
+            if last_signal == 0:
+                last_signal = signal
+                current_trade_ret = 0.0
+            elif signal != last_signal:
+                trade_returns.append(current_trade_ret)
+                current_trade_ret = 0.0
+                last_signal = signal
+            current_trade_ret += strat_ret
+
+        if current_trade_ret != 0.0:
+            trade_returns.append(current_trade_ret)
+
+        total_return = equity - 1.0
+        trade_count = len(trade_returns)
+        win_count = len([r for r in trade_returns if r > 0])
+        win_rate = (win_count / trade_count) if trade_count > 0 else 0.0
+
+        if len(period_returns) > 1:
+            mean_r = sum(period_returns) / len(period_returns)
+            var = sum((r - mean_r) ** 2 for r in period_returns) / max(1, len(period_returns) - 1)
+            std_r = math.sqrt(var)
+            if std_r > 1e-12:
+                sharpe_ratio = (mean_r / std_r) * math.sqrt(24 * 365)
+            else:
+                sharpe_ratio = 0.0
+        else:
+            sharpe_ratio = 0.0
+
+        return {
+            "total_return": float(total_return),
+            "max_drawdown": float(max_drawdown),
+            "win_rate": float(win_rate),
+            "sharpe_ratio": float(sharpe_ratio),
+            "trade_count": int(trade_count),
+        }
     
     async def _ai_analyze_and_decide(self, symbol: str) -> Optional[TradeDecision]:
         """AI分析市场并做出决策 - 使用所有模块数据，全部实时获取"""

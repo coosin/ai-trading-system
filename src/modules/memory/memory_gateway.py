@@ -230,16 +230,23 @@ class MemoryGateway:
         summary: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         source_module: Optional[str] = None,
+        **kwargs: Any,
     ) -> str:
         md = dict(metadata or {})
         if summary:
             md["summary"] = summary
         if source_module:
             md["source_module"] = source_module
+        # Backward-compatible passthrough for legacy callers that provide
+        # extra semantic hints (e.g. priority, tags) on add_memory().
+        for key in ("priority", "tags", "memory_scope", "context", "timestamp"):
+            if key in kwargs and kwargs[key] is not None:
+                md[key] = kwargs[key]
+        importance = float(kwargs.get("importance", md.pop("importance", 0.5)))
         return await self.store(
             content=content,
             category=memory_type or "conversation",
-            importance=float(md.pop("importance", 0.5)),
+            importance=importance,
             metadata=md,
         )
 

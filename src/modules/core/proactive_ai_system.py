@@ -305,7 +305,7 @@ class ProactiveMarketScanner:
                 try:
                     klines = await self.exchange.get_klines(symbol.replace('/', '-'), '1h', limit=24)
                     if klines and len(klines) >= 20:
-                        closes = [float(k[4]) for k in klines]
+                        closes = self._extract_kline_values(klines, "close")
                         high_24h = max(closes)
                         low_24h = min(closes)
                         current_price = closes[-1]
@@ -365,10 +365,12 @@ class ProactiveMarketScanner:
             if not klines_1h or len(klines_1h) < 20:
                 return None
             
-            closes_1h = [float(k[4]) for k in klines_1h]
-            highs_1h = [float(k[2]) for k in klines_1h]
-            lows_1h = [float(k[3]) for k in klines_1h]
-            volumes_1h = [float(k[5]) for k in klines_1h]
+            closes_1h = self._extract_kline_values(klines_1h, "close")
+            highs_1h = self._extract_kline_values(klines_1h, "high")
+            lows_1h = self._extract_kline_values(klines_1h, "low")
+            volumes_1h = self._extract_kline_values(klines_1h, "volume")
+            if len(closes_1h) < 20 or len(highs_1h) < 20 or len(lows_1h) < 20:
+                return None
             
             ma20 = sum(closes_1h[-20:]) / 20
             ma50 = sum(closes_1h[-50:]) / 50 if len(closes_1h) >= 50 else ma20
@@ -426,6 +428,35 @@ class ProactiveMarketScanner:
         except Exception as e:
             logger.error(f"深度分析 {symbol} 失败: {e}")
             return None
+
+    def _extract_kline_values(self, klines: List[Any], field: str) -> List[float]:
+        """
+        Normalize kline payloads from dict/list formats.
+        Expected list format: [ts, open, high, low, close, volume, ...]
+        """
+        idx_map = {"high": 2, "low": 3, "close": 4, "volume": 5}
+        dict_keys = {
+            "high": ("high", "h"),
+            "low": ("low", "l"),
+            "close": ("close", "c"),
+            "volume": ("volume", "v"),
+        }
+        values: List[float] = []
+        for k in klines:
+            raw = None
+            if isinstance(k, dict):
+                for key in dict_keys[field]:
+                    if key in k:
+                        raw = k.get(key)
+                        break
+            elif isinstance(k, (list, tuple)) and len(k) > idx_map[field]:
+                raw = k[idx_map[field]]
+            try:
+                if raw is not None:
+                    values.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+        return values
     
     def _find_levels(self, price_series: List[float], closes: List[float], 
                      is_support: bool = False) -> List[float]:

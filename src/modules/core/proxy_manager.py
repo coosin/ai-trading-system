@@ -132,6 +132,19 @@ class ProxyManager:
         # 回调函数
         self.on_proxy_change: Optional[Callable] = None
         self.on_proxy_error: Optional[Callable] = None
+
+    def _normalize_proxy_host_for_runtime(self, host: Optional[str]) -> str:
+        """
+        In Docker, loopback proxy host points to container itself.
+        Auto-rewrite localhost/127.0.0.1 to host.docker.internal.
+        """
+        h = (host or "").strip()
+        if not h:
+            return h
+        in_docker = os.path.exists("/.dockerenv")
+        if in_docker and h in {"127.0.0.1", "localhost"}:
+            return "host.docker.internal"
+        return h
     
     async def initialize(self, config: Dict[str, Any] = None):
         """初始化代理管理器"""
@@ -169,6 +182,8 @@ class ProxyManager:
                 # 确保必要字段存在
                 if "name" not in global_config:
                     global_config["name"] = "global_proxy"
+                if "host" in global_config:
+                    global_config["host"] = self._normalize_proxy_host_for_runtime(global_config.get("host"))
                 
                 self.global_proxy = ProxyConfig(**global_config)
                 self.use_global_proxy = config.get("use_global_proxy", False)
@@ -184,6 +199,8 @@ class ProxyManager:
                 if "password_env" in proxy_conf:
                     env_key = proxy_conf.pop("password_env")
                     proxy_conf["password"] = os.environ.get(env_key, "")
+                if "host" in proxy_conf:
+                    proxy_conf["host"] = self._normalize_proxy_host_for_runtime(proxy_conf.get("host"))
                 await self.add_proxy(ProxyConfig(**proxy_conf))
             
             # 加载黑白名单

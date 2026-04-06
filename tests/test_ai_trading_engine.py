@@ -161,6 +161,39 @@ class TestAITradingEngine(AsyncTestCase):
         
         # 验证订单已创建
         trading_engine.exchange.create_order.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_decision_error_result_should_fail(self, trading_engine):
+        """回归：交易所返回error时，不应被判定为成功"""
+        from src.modules.core.ai_trading_engine import AIDecision, TradeAction
+
+        decision = AIDecision(
+            action=TradeAction.OPEN_LONG,
+            symbol="BTC/USDT",
+            price=50000.0,
+            quantity=0.001,
+            confidence=0.8,
+            reasoning="Test buy"
+        )
+
+        trading_engine.exchange.place_order = AsyncMock(
+            return_value={"status": "error", "message": "insufficient balance"}
+        )
+        trading_engine._save_trade_to_memory = AsyncMock()
+        trading_engine._update_positions = AsyncMock()
+
+        result = await trading_engine._execute_decision(decision)
+
+        assert result is False
+        trading_engine._save_trade_to_memory.assert_not_called()
+        trading_engine._update_positions.assert_not_called()
+
+    def test_order_result_success_semantics(self, trading_engine):
+        """回归：订单结果成功语义判定"""
+        assert trading_engine._is_order_result_success({"status": "error"}) is False
+        assert trading_engine._is_order_result_success({"success": False, "error": "x"}) is False
+        assert trading_engine._is_order_result_success({"status": "success", "order_id": "123"}) is True
+        assert trading_engine._is_order_result_success({"id": "abc"}) is True
     
     @pytest.mark.asyncio
     async def test_update_positions(self, trading_engine):

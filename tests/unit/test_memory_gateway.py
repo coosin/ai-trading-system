@@ -93,3 +93,25 @@ async def test_memory_gateway_workspace_file_update(tmp_path):
 
     files = gateway.get_workspace_memory("USER.md")
     assert files["USER.md"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_memory_gateway_add_memory_accepts_legacy_kwargs(tmp_path):
+    backend = _FakeBackend()
+    gateway = await MemoryGateway.create(backend, str(tmp_path))
+
+    memory_id = await gateway.add_memory(
+        memory_type="strategy",
+        content="legacy add_memory payload",
+        source_module="ai_core_decision_engine",
+        importance=0.9,
+        priority="high",
+        tags=["ai_strategy", "auto_generated"],
+    )
+    assert memory_id
+
+    recalled = await gateway.retrieve_memories("legacy add_memory", min_importance=0.0, limit=5)
+    assert recalled
+    assert recalled[0].importance == 0.9
+    assert recalled[0].metadata.get("priority") == "high"
+    assert recalled[0].metadata.get("tags") == ["ai_strategy", "auto_generated"]

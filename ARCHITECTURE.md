@@ -732,6 +732,15 @@ curl http://localhost:8000/api/v1/executions
 - 优化记忆加载策略（固定最小+按需动态）
 - 移除ETH/USDT黑名单
 
+**V2.1.1 (2026-04-07)**
+- 修复交易执行结果语义：下单失败不再误标记为成功
+- 修复 Telegram 兼容调用：`send_message(text)` 与 `send_message(chat_id, text)` 双模式
+- 修复 MemoryGateway 兼容参数：支持 `importance/priority/tags` 透传
+- 回测逻辑改为真实行情驱动：输出收益、最大回撤、夏普、胜率、交易次数
+- 参数优化改为真实搜索流程：自动扫描参数空间并回写策略参数
+- 修复多源数据融合初始化错误（移除同步方法误 await）
+- 修复主动深度分析 K 线解析兼容问题（dict/list 双格式）
+
 **V2.0.0**
 - 初始版本
 

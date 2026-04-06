@@ -15,6 +15,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable, Awaitable
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
@@ -82,6 +83,7 @@ class TelegramBot:
             return
         
         self.proxy = self.config.get("proxy") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "http://host.docker.internal:7890"
+        self.proxy = self._normalize_proxy_for_runtime(self.proxy)
         logger.info(f"📱 Telegram使用代理: {self.proxy}")
         
         self.session = aiohttp.ClientSession()
@@ -91,6 +93,22 @@ class TelegramBot:
             logger.info(f"✅ Telegram机器人已连接: @{me.get('username', 'unknown')}")
         else:
             logger.warning("⚠️ Telegram机器人连接失败")
+
+    def _normalize_proxy_for_runtime(self, proxy_url: Optional[str]) -> Optional[str]:
+        """In Docker, rewrite loopback proxy URL to host gateway."""
+        if not proxy_url:
+            return proxy_url
+        if not os.path.exists("/.dockerenv"):
+            return proxy_url
+        try:
+            parsed = urlparse(proxy_url)
+            host = (parsed.hostname or "").strip().lower()
+            if host not in {"127.0.0.1", "localhost"}:
+                return proxy_url
+            netloc = parsed.netloc.replace(parsed.hostname or "", "host.docker.internal")
+            return urlunparse(parsed._replace(netloc=netloc))
+        except Exception:
+            return proxy_url
 
     async def start(self):
         """启动轮询"""
@@ -514,11 +532,35 @@ class TelegramBot:
             await self.session.close()
         logger.info("Telegram机器人已清理")
 
-    async def send_message(self, chat_id: int, text: str, parse_mode: str = None):
-        """发送消息的便捷方法"""
+    async def send_message(self, chat_id: Any, text: Optional[str] = None, parse_mode: str = None):
+        """发送消息的便捷方法。
+
+        兼容两种调用方式：
+        1) send_message(chat_id, text, parse_mode)
+        2) send_message(text)  # 自动发送到第一个配置的 chat_id
+        """
+        resolved_chat_id: Optional[int] = None
+        resolved_text: Optional[str] = text
+
+        if text is None:
+            # Compatibility mode: first arg is text
+            resolved_text = str(chat_id) if chat_id is not None else ""
+            if self.chat_ids:
+                resolved_chat_id = int(self.chat_ids[0])
+        else:
+            try:
+                resolved_chat_id = int(chat_id)
+            except (TypeError, ValueError):
+                resolved_chat_id = int(self.chat_ids[0]) if self.chat_ids else None
+
+        if resolved_chat_id is None:
+            raise ValueError("No chat_id available for Telegram message delivery")
+        if not resolved_text:
+            return
+
         await self._send_message(TelegramResponse(
-            chat_id=chat_id,
-            text=text,
+            chat_id=resolved_chat_id,
+            text=resolved_text,
             parse_mode=parse_mode
         ))
     
