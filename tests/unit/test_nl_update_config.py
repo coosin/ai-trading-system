@@ -44,3 +44,18 @@ async def test_nl_update_config_applies_whitelisted_paths():
     assert mc.config_manager.calls[0][0] == "heartbeat.interval_sec"
     assert mc.config_manager.calls[1][0] == "notifications.smart.dedup_windows_sec.high"
 
+
+@pytest.mark.asyncio
+async def test_nl_update_config_denies_secrets_like_tokens():
+    from src.modules.intelligence.natural_language_interface import NaturalLanguageInterface
+
+    mc = _FakeMC()
+    nli = NaturalLanguageInterface(llm_integration=None, main_controller=mc)  # type: ignore[arg-type]
+    res = await nli._execute_update_config(
+        query="把telegram token改一下",
+        params={"changes": [{"path": "notifications.telegram.token", "value": "abc"}]},
+    )
+    assert res["success"] is False
+    assert len(res["data"]["applied"]) == 0
+    assert len(res["data"]["rejected"]) == 1
+

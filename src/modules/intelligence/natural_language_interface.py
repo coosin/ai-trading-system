@@ -172,6 +172,13 @@ class NaturalLanguageInterface:
     
     async def _ensure_memory_initialized(self):
         if self.memory is None:
+            # Prefer unified MemoryGateway if available.
+            if self.main_controller and hasattr(self.main_controller, "memory_gateway"):
+                mg = getattr(self.main_controller, "memory_gateway", None)
+                if mg is not None:
+                    self.memory = mg
+                    logger.info("✅ 记忆系统已连接到自然语言接口（MemoryGateway）")
+                    return
             if self.main_controller and hasattr(self.main_controller, "ai_memory_manager"):
                 self.memory = self.main_controller.ai_memory_manager
                 if self.memory is not None:
@@ -369,11 +376,25 @@ class NaturalLanguageInterface:
             return {"success": False, "data": None, "message": "配置管理器不可用"}
         cm = self.main_controller.config_manager
 
+        # Looser by default, but still block obvious secrets/paths.
         allowed_prefixes = (
             "notifications.",
             "heartbeat.",
             "research.",
-            "controller.health_check_interval",
+            "controller.",
+            "ai_trading.",
+            "proactive_ai.",
+            "api.",
+            "memory.",
+        )
+        denied_fragments = (
+            "api_key",
+            "secret",
+            "token",
+            "password",
+            "private_key",
+            "paths.",
+            ".env",
         )
         changes = params.get("changes", [])
         if not isinstance(changes, list):
@@ -387,6 +408,10 @@ class NaturalLanguageInterface:
             path = str(ch.get("path") or "").strip()
             if not path or not any(path.startswith(p) for p in allowed_prefixes):
                 rejected.append({"path": path, "reason": "path_not_allowed"})
+                continue
+            lowered = path.lower()
+            if any(d in lowered for d in denied_fragments):
+                rejected.append({"path": path, "reason": "path_denied_sensitive"})
                 continue
             value = ch.get("value")
             ok = await cm.set_config_path(path, value, validate=False)
@@ -478,10 +503,7 @@ class NaturalLanguageInterface:
         memory_context = ""
         if self.memory:
             try:
-                relevant_memories = await self.memory.retrieve_memories(
-                    query=query,
-                    limit=3
-                )
+                relevant_memories = await self.memory.retrieve_memories(query=query, limit=3)
                 if relevant_memories:
                     memory_context = "\n\n相关记忆:\n" + "\n".join([
                         f"- {m.get('content', str(m))}" for m in relevant_memories
@@ -527,10 +549,20 @@ class NaturalLanguageInterface:
         
         if self.memory:
             try:
-                await self.memory.store_memory(
-                    content=f"用户问: {query}\n助手答: {result.get('answer', '')}",
-                    memory_type="conversation"
-                )
+                # MemoryGateway compatibility: prefer add_memory, fallback store_memory
+                if hasattr(self.memory, "add_memory"):
+                    await self.memory.add_memory(
+                        memory_type="conversation",
+                        content=f"用户问: {query}\n助手答: {result.get('answer', '')}",
+                        importance=0.3,
+                        tags=["conversation"],
+                        source_module="natural_language_interface",
+                    )
+                else:
+                    await self.memory.store_memory(
+                        content=f"用户问: {query}\n助手答: {result.get('answer', '')}",
+                        memory_type="conversation"
+                    )
             except Exception as e:
                 logger.warning(f"存储记忆失败: {e}")
         

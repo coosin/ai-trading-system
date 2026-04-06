@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from src.modules.core.optimized_memory_system import (
     MemoryCategory,
@@ -102,6 +102,8 @@ class MemoryGateway:
         importance: float = 0.5,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
+        if self._should_skip_store(category=category, content=content, importance=importance, metadata=metadata):
+            return "skipped"
         md = dict(metadata or {})
         md.setdefault("scope", scope or self.DEFAULT_SCOPE)
         mapped_category = self._map_category(category)
@@ -249,6 +251,53 @@ class MemoryGateway:
             importance=importance,
             metadata=md,
         )
+
+    def _should_skip_store(
+        self,
+        *,
+        category: str,
+        content: str,
+        importance: float,
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        try:
+            cfg = {}
+            if self.config_manager:
+                cfg = self.config_manager.get_config_sync("memory", None, {}) or {}
+            auto = cfg.get("auto_capture", {}) if isinstance(cfg, dict) else {}
+            if not isinstance(auto, dict) or not bool(auto.get("enabled", True)):
+                return False
+            policy = auto.get("policy", {}) if isinstance(auto, dict) else {}
+            if not isinstance(policy, dict):
+                return False
+
+            deny_categories = set(policy.get("deny_categories", []) or [])
+            if category in deny_categories:
+                return True
+
+            deny_contains = [str(x).lower() for x in (policy.get("deny_content_contains", []) or [])]
+            lowered = (content or "").lower()
+            for frag in deny_contains:
+                if frag and frag in lowered:
+                    return True
+
+            md = dict(metadata or {})
+            tags_val = md.get("tags")
+            tags: Set[str] = set()
+            if isinstance(tags_val, (list, set, tuple)):
+                tags = {str(t) for t in tags_val}
+            deny_tags = set(policy.get("deny_tags", []) or [])
+            if tags and deny_tags and any(t in deny_tags for t in tags):
+                return True
+
+            min_by_cat = policy.get("min_importance_by_category", {}) if isinstance(policy, dict) else {}
+            if isinstance(min_by_cat, dict):
+                min_imp = float(min_by_cat.get(category, 0.0))
+                if float(importance) < min_imp:
+                    return True
+        except Exception:
+            return False
+        return False
 
     async def process_user_input(self, user_input: str) -> Dict[str, Any]:
         text = (user_input or "").strip()

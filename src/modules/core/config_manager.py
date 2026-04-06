@@ -228,6 +228,24 @@ class ConfigManager:
             },
             "auto_capture": {
                 "enabled": True,
+                "policy": {
+                    # If a memory is tagged as noise, skip it.
+                    "deny_tags": ["noise", "low_value"],
+                    # Skip known low-value categories.
+                    "deny_categories": ["notification_hint", "market_opportunity_hint"],
+                    # Simple content deny patterns (case-insensitive contains)
+                    "deny_content_contains": [
+                        "当前持仓较少",
+                        "市场机会",
+                    ],
+                    # Only store conversation automatically above this importance
+                    "min_importance_by_category": {
+                        "conversation": 0.2,
+                        "config": 0.5,
+                        "strategy": 0.6,
+                        "risk_setting": 0.6,
+                    },
+                },
             },
             "auto_recall": {
                 "enabled": True,
