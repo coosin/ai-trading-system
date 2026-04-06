@@ -197,12 +197,15 @@ class ConfigManager:
             "collect_interval": 300,
             "action_cooldown": 60,
             "notifications": {
-                # Root-cause fix: default OFF to avoid spam.
-                "opportunity_enabled": False,
-                # Only notify high-confidence opportunities.
-                "opportunity_min_confidence": 0.85,
+                # Enable with strict multi-condition gating to improve accuracy.
+                "opportunity_enabled": True,
+                "opportunity_min_confidence": 0.9,
+                "opportunity_min_priority": 8,
+                "opportunity_min_risk_reward": 1.8,
+                "opportunity_require_trend_alignment": True,
+                "opportunity_trend_strength_threshold": 0.04,
                 # Per symbol+direction cooldown.
-                "opportunity_cooldown_sec": 3600,
+                "opportunity_cooldown_sec": 14400,
             },
         },
         "system_monitor": {},
@@ -267,8 +270,8 @@ class ConfigManager:
         "notifications": {
             "enabled": True,
             "smart": {
-                # Block noisy phrases before sending notifications.
-                "block_phrases": ["市场机会", "发现机会", "交易机会"],
+                # Optional phrase blocking; keep empty by default.
+                "block_phrases": [],
                 "quiet_hours_start": "23:00",
                 "quiet_hours_end": "07:00",
                 "batch_interval_sec": 3600,

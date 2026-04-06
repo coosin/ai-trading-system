@@ -890,6 +890,10 @@ class ProactiveActionTrigger:
         notif_cfg = self.config.get("notifications", {}) if isinstance(self.config.get("notifications", {}), dict) else {}
         self._opportunity_notification_enabled = bool(notif_cfg.get("opportunity_enabled", False))
         self._opportunity_min_confidence = float(notif_cfg.get("opportunity_min_confidence", 0.85))
+        self._opportunity_min_priority = int(notif_cfg.get("opportunity_min_priority", 7))
+        self._opportunity_min_risk_reward = float(notif_cfg.get("opportunity_min_risk_reward", 1.5))
+        self._opportunity_require_trend_alignment = bool(notif_cfg.get("opportunity_require_trend_alignment", True))
+        self._opportunity_trend_strength_threshold = float(notif_cfg.get("opportunity_trend_strength_threshold", 0.05))
         self._opportunity_notification_cooldown = int(notif_cfg.get("opportunity_cooldown_sec", 3600))
     
     async def initialize(self) -> bool:
@@ -920,6 +924,25 @@ class ProactiveActionTrigger:
             if confidence < self._opportunity_min_confidence:
                 logger.debug(f"机会通知置信度不足({confidence:.2f}<{self._opportunity_min_confidence:.2f})，跳过")
                 return
+            priority = int(action.get("priority_score", 0) or 0)
+            if priority < self._opportunity_min_priority:
+                logger.debug(f"机会通知优先级不足({priority}<{self._opportunity_min_priority})，跳过")
+                return
+            rr = float(action.get("risk_reward", 0.0) or 0.0)
+            if rr < self._opportunity_min_risk_reward:
+                logger.debug(f"机会通知盈亏比不足({rr:.2f}<{self._opportunity_min_risk_reward:.2f})，跳过")
+                return
+            if self._opportunity_require_trend_alignment:
+                trend = str(action.get("trend", "unknown")).lower()
+                trend_strength = float(action.get("trend_strength", 0.0) or 0.0)
+                direction = str(action.get("direction", "")).lower()
+                if trend in {"bullish", "bearish"} and trend_strength >= self._opportunity_trend_strength_threshold:
+                    if direction == "long" and trend == "bearish":
+                        logger.debug("机会通知趋势冲突（long vs bearish），跳过")
+                        return
+                    if direction == "short" and trend == "bullish":
+                        logger.debug("机会通知趋势冲突（short vs bullish），跳过")
+                        return
             cooldown_key = str(action.get("cooldown_key") or "send_notification:opportunity")
             if cooldown_key in self._last_action_time:
                 elapsed = (datetime.now() - self._last_action_time[cooldown_key]).total_seconds()
@@ -1089,14 +1112,50 @@ class ProactiveAIOrchestrator:
     def _setup_internal_callbacks(self) -> None:
         """设置内部回调"""
         async def on_opportunity(opportunity):
+            # enrich with trend context and risk/reward score
+            trend = "unknown"
+            trend_strength = 0.0
+            try:
+                insight = self.market_scanner.get_insights().get(opportunity.symbol)
+                if insight:
+                    trend = str(getattr(insight, "trend", "unknown"))
+                    trend_strength = float(getattr(insight, "trend_strength", 0.0) or 0.0)
+            except Exception:
+                pass
+            rr = 0.0
+            try:
+                entry = float(getattr(opportunity, "entry_price", 0.0) or 0.0)
+                sl = float(getattr(opportunity, "stop_loss", 0.0) or 0.0)
+                tp = float(getattr(opportunity, "take_profit", 0.0) or 0.0)
+                if entry > 0:
+                    if str(getattr(opportunity, "direction", "")).lower() == "long":
+                        risk = max(entry - sl, 1e-9)
+                        reward = max(tp - entry, 0.0)
+                    else:
+                        risk = max(sl - entry, 1e-9)
+                        reward = max(entry - tp, 0.0)
+                    rr = reward / risk if risk > 0 else 0.0
+            except Exception:
+                rr = 0.0
             self.action_trigger.queue_action({
                 'type': 'send_notification',
                 'kind': 'opportunity',
                 'title': "机会提示",
                 'priority': "low",
                 'confidence': float(getattr(opportunity, "confidence", 0.0) or 0.0),
+                'priority_score': int(getattr(opportunity, "priority", 0) or 0),
+                'risk_reward': float(rr),
+                'trend': trend,
+                'trend_strength': float(trend_strength),
+                'direction': str(getattr(opportunity, "direction", "")),
                 'cooldown_key': f"opportunity:{opportunity.symbol}:{opportunity.direction}",
-                'message': f"🎯 发现机会: {opportunity.symbol} {opportunity.direction}\n\n{opportunity.reasoning}",
+                'message': (
+                    f"🎯 发现机会: {opportunity.symbol} {opportunity.direction}\n"
+                    f"置信度: {float(getattr(opportunity, 'confidence', 0.0) or 0.0):.0%} | "
+                    f"优先级: {int(getattr(opportunity, 'priority', 0) or 0)} | "
+                    f"盈亏比: {rr:.2f} | 趋势: {trend}/{trend_strength:.2%}\n\n"
+                    f"{opportunity.reasoning}"
+                ),
             })
         
         self.market_scanner.add_alert_callback(on_opportunity)
