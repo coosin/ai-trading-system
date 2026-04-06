@@ -1,271 +1,237 @@
-# 全智能量化交易系统 - 默认配置文件
-
-# 系统配置
-system:
-  name: "OpenClaw Trading System"
-  version: "1.0.0"
-  environment: "development"  # development, production, testing
-  debug: true
-
-# API 服务器配置
 api:
-  host: "0.0.0.0"
-  port: 8000
-  enable_cors: true
-  enable_swagger: true
-  enable_rate_limit: true
-  secret_key: "your-secret-key-change-in-production"
   access_token_expire_minutes: 30
+  enable_cors: true
+  enable_rate_limit: true
+  enable_swagger: true
+  host: 0.0.0.0
+  port: 8000
   rate_limits:
     default:
-      requests_per_minute: 60
-      requests_per_hour: 1000
-      requests_per_day: 10000
       burst_size: 10
-
-# 控制器配置
+      requests_per_day: 10000
+      requests_per_hour: 1000
+      requests_per_minute: 60
+  secret_key: your-secret-key-change-in-production
+backtest:
+  commission: 0.001
+  data_source: local
+  initial_capital: 10000
+  slippage: 0.0005
+cache:
+  redis_url: redis://localhost:6379/0
+  ttl: 300
+  type: memory
 controller:
   auto_restart_modules: true
-  max_restart_attempts: 3
-  health_check_interval: 30
   event_history_limit: 1000
-
-# 增强大模型配置
-llm:
-  enabled: true
-  default_model: "astron-code-latest"
-  
-  task_model_mapping:
-    market_analysis: ["astron-code-latest", "llama3"]
-    strategy_generation: ["astron-code-latest", "llama3"]
-    signal_generation: ["astron-code-latest", "llama3"]
-    risk_assessment: ["astron-code-latest", "llama3"]
-    news_analysis: ["astron-code-latest", "llama3"]
-    natural_language: ["astron-code-latest", "llama3"]
-  
-  models:
-    - model_id: "llama3"
-      provider: "local"
-      display_name: "Llama 3 (本地)"
-      base_url: "http://localhost:11434/api/chat"
-      temperature: 0.7
-      max_tokens: 2000
-      timeout: 60.0
-      cost_per_input_token: 0.0
-      cost_per_output_token: 0.0
-      context_window: 8192
-      enabled: false
-      priority: 5
-
-trading:
-  mode: "simulation"  # 交易模式: simulation(模拟交易), paper(纸面交易), live(实盘交易)
-  
-  # 模拟交易配置
-  simulation:
-    enabled: true
-    initial_capital: 100000  # 初始资金 (USDT)
-    symbols:
-      - "BTC/USDT"
-      - "ETH/USDT"
-      - "SOL/USDT"
-      - "BNB/USDT"
-    leverage: 10  # 合约杠杆倍数
-    margin_mode: "cross"  # 保证金模式: cross(全仓), isolated(逐仓)
-    contract_type: "perpetual"  # 合约类型: perpetual(永续), futures(交割)
-    fee_rate:
-      maker: 0.0002  # 挂单手续费
-      taker: 0.0005  # 吃单手续费
-    
-  # 纸面交易配置
-  paper:
-    enabled: false
-    exchange: "okx"  # 使用 OKX 交易所数据
-    initial_capital: 100000
-    
-  # 实盘交易配置
-  live:
-    enabled: false
-    exchange: "okx"
-    risk_control: true
-    max_daily_loss: 1000  # 最大日亏损
-
-# 策略配置
-strategy:
-  default_symbols:
-    - "BTC/USDT"
-    - "ETH/USDT"
-    - "SOL/USDT"
-  default_timeframe: "1h"
-  risk_management:
-    max_position_size: 0.1
-    stop_loss: 0.02
-    take_profit: 0.05
-    max_drawdown: 0.15
-    risk_per_trade: 0.01
-
-# 数据库配置
-database:
-  type: "sqlite"  # sqlite, postgresql
-  url: "sqlite:///database/trading.db"
-  # postgresql配置示例:
-  # url: "postgresql://user:password@localhost:5432/trading"
-  pool_size: 5
-  max_overflow: 10
-  echo: false
-
-# 缓存配置
-cache:
-  type: "memory"  # memory, redis
-  redis_url: "redis://localhost:6379/0"
-  ttl: 300
-
-# 日志配置
-logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: "logs/app.log"
-  max_size: "10MB"
-  backup_count: 5
-
-# 监控配置
-monitoring:
-  enabled: true
-  metrics_port: 9090
   health_check_interval: 30
-  alert_thresholds:
-    cpu_usage: 80
-    memory_usage: 80
-    disk_usage: 90
-
-# 交易所配置
+  max_restart_attempts: 3
+data:
+  backup_path: data/backup
+  default_timeframes:
+  - 1m
+  - 5m
+  - 15m
+  - 1h
+  - 4h
+  - 1d
+  retention_days: 365
+  storage_path: data/market
+database:
+  echo: false
+  max_overflow: 10
+  pool_size: 5
+  type: sqlite
+  url: sqlite:///database/trading.db
+domains:
+  domains: []
+  letsencrypt:
+    email: ''
+    staging: false
 exchanges:
   binance:
+    api_key: ''
+    api_secret: ''
     enabled: false
-    api_key: ""
-    api_secret: ""
     sandbox: true
   coinbase:
+    api_key: ''
+    api_secret: ''
     enabled: false
-    api_key: ""
-    api_secret: ""
-    passphrase: ""
+    passphrase: ''
   okx:
+    api_key: bf73ac3f-6552-48b0-99dd-f279bf47b336
+    api_secret: 8A550FDA562D66523D175599D8166BE1
     enabled: true
-    api_key: "bf73ac3f-6552-48b0-99dd-f279bf47b336"
-    api_secret: "8A550FDA562D66523D175599D8166BE1"
-    passphrase: "Cool+095136"
+    passphrase: Cool+095136
     sandbox: false
     testnet: false
-
-# 通知配置
+llm:
+  default_model: astron-code-latest
+  enabled: true
+  models:
+  - base_url: http://localhost:11434/api/chat
+    context_window: 8192
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    display_name: Llama 3 (本地)
+    enabled: false
+    max_tokens: 2000
+    model_id: llama3
+    priority: 5
+    provider: local
+    temperature: 0.7
+    timeout: 60.0
+  - api_key_env: DEEPSEEK_API_KEY
+    base_url: https://api.deepseek.com/v1/chat/completions
+    context_window: 128000
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    display_name: DeepSeek Chat (智能对话)
+    enabled: true
+    max_tokens: 4000
+    model_id: deepseek-chat
+    priority: 1
+    provider: openai
+    temperature: 0.8
+    timeout: 90.0
+  task_model_mapping:
+    market_analysis:
+    - astron-code-latest
+    - lite
+    natural_language:
+    - astron-code-latest
+    - lite
+    news_analysis:
+    - astron-code-latest
+    - lite
+    risk_assessment:
+    - astron-code-latest
+    signal_generation:
+    - astron-code-latest
+    - lite
+    strategy_generation:
+    - astron-code-latest
+logging:
+  backup_count: 5
+  file: logs/app.log
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  level: INFO
+  max_size: 10MB
+memory:
+  db_path: data/memory.db
+  enabled: true
+  max_conversation_history: 50
+  retention_days:
+    critical: 3650
+    high: 365
+    low: 7
+    normal: 30
+monitoring:
+  alert_thresholds:
+    cpu_usage: 80
+    disk_usage: 90
+    memory_usage: 80
+  enabled: true
+  health_check_interval: 30
+  metrics_port: 9090
 notifications:
   email:
     enabled: false
-    smtp_host: "smtp.gmail.com"
+    from_address: ''
+    password: ''
+    smtp_host: smtp.gmail.com
     smtp_port: 587
-    username: ""
-    password: ""
-    from_address: ""
     to_addresses: []
-
-# Telegram机器人配置
-telegram:
-  enabled: true
-  bot_token: "8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60"  # Telegram Bot Token
-  chat_ids: [6716232147]  # 接收通知的聊天ID列表
-  allowed_users: []  # 允许使用机器人的用户名列表（为空则允许所有）
-  
-  # 通知设置
-  notifications:
-    trade_signals: true  # 交易信号通知
-    risk_alerts: true  # 风险警报通知
-    system_alerts: true  # 系统警报通知
-    daily_report: true  # 每日报告通知
-  
-  # 命令前缀
-  command_prefix: "/"
-  
-  # 消息格式
-  message_format:
-    parse_mode: "Markdown"  # Markdown, HTML
-    disable_web_page_preview: true
-
-# 回测配置
-backtest:
-  initial_capital: 10000
-  commission: 0.001
-  slippage: 0.0005
-  data_source: "local"
-
-# 数据配置
-data:
-  storage_path: "data/market"
-  backup_path: "data/backup"
-  default_timeframes:
-    - "1m"
-    - "5m"
-    - "15m"
-    - "1h"
-    - "4h"
-    - "1d"
-  retention_days: 365
-
-# 代理配置
+    username: ''
 proxy:
+  blacklist_domains: []
   enabled: true
-  use_global_proxy: true
   global_proxy:
-    name: "clash-http"
-    proxy_type: "http"  # http, https, socks5, socks4
-    host: "host.docker.internal"
-    port: 7890
-    username: null
-    password: null
     enabled: true
+    host: host.docker.internal
+    name: clash-http
+    password: null
+    port: 7890
+    proxy_type: http
+    username: null
   proxies:
-    - name: "clash-http"
-      proxy_type: "http"
-      host: "host.docker.internal"
-      port: 7890
-      enabled: true
-      priority: 0
-      timeout: 30
-      retry_count: 3
-    - name: "clash-socks5"
-      proxy_type: "socks5"
-      host: "host.docker.internal"
-      port: 7891
-      enabled: true
-      priority: 1
-      timeout: 30
-      retry_count: 3
-  whitelist_domains: []  # 仅对这些域名使用代理
-  blacklist_domains: []  # 不对这些域名使用代理
-
-# 记忆配置
-memory:
+  - enabled: true
+    host: host.docker.internal
+    name: clash-http
+    port: 7890
+    priority: 0
+    proxy_type: http
+    retry_count: 3
+    timeout: 30
+  - enabled: true
+    host: host.docker.internal
+    name: clash-socks5
+    port: 7891
+    priority: 1
+    proxy_type: socks5
+    retry_count: 3
+    timeout: 30
+  use_global_proxy: true
+  whitelist_domains: []
+strategy:
+  default_symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  default_timeframe: 1h
+  risk_management:
+    max_drawdown: 0.15
+    max_position_size: 0.1
+    risk_per_trade: 0.01
+    stop_loss: 0.02
+    take_profit: 0.05
+system:
+  debug: true
+  environment: development
+  name: OpenClaw Trading System
+  version: 1.0.0
+task_model_mapping:
+  natural_language:
+  - deepseek-chat
+  - llama3
+telegram:
+  allowed_users: []
+  bot_token: 8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60
+  chat_ids:
+  - 6716232147
+  command_prefix: /
   enabled: true
-  db_path: "data/memory.db"
-  max_conversation_history: 50
-  retention_days:
-    critical: 3650  # 10年
-    high: 365       # 1年
-    normal: 30      # 30天
-    low: 7          # 7天
-
-# 域名和SSL配置
-domains:
-  letsencrypt:
-    email: ""  # Let's Encrypt 邮箱
-    staging: false  # 使用测试环境
-  domains: []
-  # 域名配置示例:
-  # - domain: "trading.example.com"
-  #   enabled: true
-  #   backend_host: "localhost"
-  #   backend_port: 8000
-  #   ssl_enabled: true
-  #   force_https: true
-  #   ssl_certificate:
-  #     source: "letsencrypt"
-  #     auto_renew: true
+  message_format:
+    disable_web_page_preview: true
+    parse_mode: Markdown
+  notifications:
+    daily_report: true
+    risk_alerts: true
+    system_alerts: true
+    trade_signals: true
+trading:
+  live:
+    enabled: false
+    exchange: okx
+    max_daily_loss: 1000
+    risk_control: true
+  mode: simulation
+  paper:
+    enabled: false
+    exchange: okx
+    initial_capital: 100000
+  simulation:
+    contract_type: perpetual
+    enabled: true
+    fee_rate:
+      maker: 0.0002
+      taker: 0.0005
+    initial_capital: 100000
+    leverage: 10
+    margin_mode: cross
+    symbols:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+    - BNB/USDT

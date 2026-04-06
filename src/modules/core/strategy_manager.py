@@ -1477,9 +1477,17 @@ class StrategyManager:
             except Exception as e:
                 logger.warning(f"获取策略配置失败: {e}")
 
-        # 不再加载默认策略 - AI将根据市场情况动态生成策略
+        # 没有外部配置时注入最小默认策略，保证基础运行和测试
         if not self.strategy_configs:
-            logger.info("未加载任何策略配置，AI将根据市场情况动态生成策略")
+            try:
+                default_tpl = (await self.get_strategy_templates()).get("trend_following_ma")
+                if default_tpl:
+                    await self.load_strategy_config(
+                        {"strategy_id": "default_trend_following_ma", **default_tpl}
+                    )
+                logger.info("未加载任何策略配置，已注入默认策略配置")
+            except Exception as e:
+                logger.info(f"未加载任何策略配置，默认策略注入失败: {e}")
 
     async def create_ai_strategy(self, strategy_data: Dict) -> Optional[str]:
         """AI动态创建策略"""

@@ -1,20 +1,48 @@
+"""
+自然语言接口 - 支持情感智能、技能包和主动关怀
+
+功能：
+1. 自然语言命令识别
+2. 情感智能集成
+3. 人格文件加载
+4. 主动关怀系统
+5. 技能包集成
+6. 记忆系统集成
+"""
+
+import os
 import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from src.modules.core.llm_integration import EnhancedLLMIntegration
 
+try:
+    from src.modules.core.emotional_intelligence import EmotionalIntelligence, UserEmotion
+    from src.modules.core.proactive_care import ProactiveCareSystem
+    from src.modules.core.personality_config import get_personality_summary, CONVERSATION_TEMPLATES
+    EMOTIONAL_ENABLED = True
+except ImportError as e:
+    EMOTIONAL_ENABLED = False
+    UserEmotion = None
+    logging.warning(f"情感智能模块导入失败: {e}")
+
+try:
+    from src.modules.skills.skill_manager import SkillManager
+    SKILL_ENABLED = True
+except ImportError as e:
+    SKILL_ENABLED = False
+    logging.warning(f"技能包模块导入失败: {e}")
+
 logger = logging.getLogger(__name__)
 
-class NaturalLanguageInterface:
-    def __init__(self, llm_integration: EnhancedLLMIntegration):
-        """
-        初始化自然语言接口
 
-        Args:
-            llm_integration: 大模型集成实例
-        """
+class NaturalLanguageInterface:
+    def __init__(self, llm_integration: EnhancedLLMIntegration, main_controller=None):
         self.llm_integration = llm_integration
+        self.main_controller = main_controller
+        self.system_prompt = "你是一个专业的量化交易助手。"
+        
         self.command_templates = {
             "get_system_status": {
                 "description": "获取系统状态",
@@ -65,30 +93,179 @@ class NaturalLanguageInterface:
                 "description": "获取告警历史",
                 "keywords": ["告警历史", "预警记录", "异常记录", "告警信息"],
                 "function": "get_alert_history"
+            },
+            "diagnose_system": {
+                "description": "诊断系统问题",
+                "keywords": ["诊断", "检查问题", "系统诊断", "故障排查"],
+                "function": "diagnose_system",
+                "use_skill": True,
+                "skill_name": "system_diagnosis"
+            },
+            "repair_system": {
+                "description": "自动修复系统",
+                "keywords": ["修复", "自动修复", "修好", "解决问题"],
+                "function": "repair_system",
+                "use_skill": True,
+                "skill_name": "auto_repair"
+            },
+            "optimize_system": {
+                "description": "优化系统性能",
+                "keywords": ["优化系统", "性能优化", "系统优化"],
+                "function": "optimize_system",
+                "use_skill": True,
+                "skill_name": "optimization"
+            },
+            "write_code": {
+                "description": "编写代码",
+                "keywords": ["写代码", "编写", "开发", "实现功能"],
+                "function": "write_code",
+                "use_skill": True,
+                "skill_name": "code_developer"
+            },
+            "review_code": {
+                "description": "代码审查",
+                "keywords": ["代码审查", "检查代码", "代码review"],
+                "function": "review_code",
+                "use_skill": True,
+                "skill_name": "code_reviewer"
+            },
+            "search_web": {
+                "description": "搜索网络",
+                "keywords": ["搜索", "查一下", "搜索网络", "网上查"],
+                "function": "search_web",
+                "use_skill": True,
+                "skill_name": "web_search"
+            },
+            "self_learn": {
+                "description": "自主学习",
+                "keywords": ["学习", "自主学习", "提升", "改进自己"],
+                "function": "self_learn",
+                "use_skill": True,
+                "skill_name": "self_learning"
             }
         }
+        
+        self._load_personality_files()
+        
+        self.skill_manager = None
+        if SKILL_ENABLED and main_controller:
+            self.skill_manager = getattr(main_controller, 'skill_manager', None)
+            if self.skill_manager:
+                logger.info(f"✅ 技能管理器已连接 - {len(self.skill_manager.skills)} 个技能可用")
+        
+        if EMOTIONAL_ENABLED:
+            self.emotional_intelligence = EmotionalIntelligence()
+            self.proactive_care = ProactiveCareSystem(main_controller)
+            logger.info("✅ 情感智能和主动关怀系统已初始化")
+        else:
+            self.emotional_intelligence = None
+            self.proactive_care = None
+            logger.warning("⚠️ 情感智能模块未加载")
+        
+        self.memory = None
+    
+    async def _ensure_memory_initialized(self):
+        if self.memory is None:
+            try:
+                from src.modules.core.unified_intelligent_memory import get_unified_memory
+                self.memory = await get_unified_memory()
+                logger.info("✅ 记忆系统已连接到自然语言接口")
+            except Exception as e:
+                logger.warning(f"记忆系统连接失败: {e}")
+    
+    def _load_personality_files(self):
+        personality_parts = []
+        
+        personality_files = [
+            "workspace/SOUL.md",
+            "workspace/IDENTITY.md", 
+            "workspace/USER.md",
+            "workspace/TRADING.md"
+        ]
+        
+        base_path = os.environ.get("OPENCLAW_TRADING_PATH", "/app")
+        
+        for file_path in personality_files:
+            full_path = os.path.join(base_path, file_path)
+            try:
+                if os.path.exists(full_path):
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        content_text = f.read()
+                        personality_parts.append(f"\n### {file_path}\n{content_text}")
+                        logger.info(f"✅ 加载人格文件: {file_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ 加载人格文件失败: {file_path} - {e}")
+        
+        if personality_parts:
+            self.system_prompt = "\n\n".join(personality_parts)
+            logger.info(f"✅ 系统提示词已更新，长度: {len(self.system_prompt)} 字符")
+        else:
+            self.system_prompt = "你是一个专业的量化交易助手，名叫小智。你专业、友善、有同理心。"
+            logger.warning("⚠️ 未找到人格文件，使用默认提示词")
+    
+    def _get_personality_prompt(self) -> str:
+        return self.system_prompt
+    
+    def _get_response_content(self, response) -> str:
+        if hasattr(response, 'content'):
+            return response.content
+        elif isinstance(response, str):
+            return response
+        return str(response)
+    
+    def get_available_skills(self) -> List[str]:
+        if self.skill_manager:
+            return list(self.skill_manager.skills.keys())
+        return []
+    
+    async def execute_skill(self, skill_name: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.skill_manager:
+            logger.warning("技能管理器未初始化")
+            return None
+        
+        skill = self.skill_manager.get_skill(skill_name)
+        if not skill:
+            logger.warning(f"技能不存在: {skill_name}")
+            return None
+        
+        try:
+            result = await self.skill_manager.execute_skill(skill_name, context)
+            if result:
+                return {
+                    "success": result.status.value == "success",
+                    "skill_name": skill_name,
+                    "output": result.output,
+                    "recommendations": result.recommendations,
+                    "execution_time": result.execution_time
+                }
+        except Exception as e:
+            logger.error(f"执行技能失败: {skill_name} - {e}")
+            return {"success": False, "error": str(e)}
+        
+        return None
     
     async def process_query(self, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        处理自然语言查询
-
-        Args:
-            query: 自然语言查询
-            context: 上下文信息
-
-        Returns:
-            处理结果
-        """
         try:
-            # 识别查询类型
+            if context is None:
+                context = {}
+            
             command = await self._identify_command(query)
             
             if command:
-                # 执行命令
+                command_info = self.command_templates.get(command, {})
+                
+                if command_info.get("use_skill") and command_info.get("skill_name"):
+                    skill_result = await self.execute_skill(command_info["skill_name"], {
+                        **context,
+                        "query": query,
+                        "command": command
+                    })
+                    if skill_result:
+                        return skill_result
+                
                 result = await self._execute_command(command, query, context)
                 return result
             else:
-                # 通用问答
                 return await self._general_qa(query, context)
         except Exception as e:
             logger.error(f"处理自然语言查询时出错: {e}")
@@ -98,16 +275,13 @@ class NaturalLanguageInterface:
             }
     
     async def _identify_command(self, query: str) -> Optional[str]:
-        """
-        识别查询对应的命令
-
-        Args:
-            query: 自然语言查询
-
-        Returns:
-            命令名称
-        """
-        # 使用大模型识别命令
+        query_lower = query.lower()
+        
+        for cmd, info in self.command_templates.items():
+            for keyword in info.get("keywords", []):
+                if keyword in query_lower:
+                    return cmd
+        
         prompt = f"""请从以下命令中识别用户查询 '{query}' 对应的命令：
 
 可用命令：
@@ -118,7 +292,8 @@ class NaturalLanguageInterface:
 只返回命令名称，不要返回其他内容。"""
         
         response = await self.llm_integration.generate(prompt)
-        command = response.content.strip() if response and response.success else 'unknown'
+        content = self._get_response_content(response)
+        command = content.strip() if response and hasattr(response, 'success') and response.success else 'unknown'
         
         if command not in self.command_templates and command != 'unknown':
             command = 'unknown'
@@ -127,27 +302,14 @@ class NaturalLanguageInterface:
         return command
     
     async def _execute_command(self, command: str, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        执行命令
-
-        Args:
-            command: 命令名称
-            query: 原始查询
-            context: 上下文信息
-
-        Returns:
-            命令执行结果
-        """
         if command not in self.command_templates:
             return {
                 "error": "命令不存在",
                 "message": f"未知命令: {command}"
             }
         
-        # 提取命令参数
         params = await self._extract_parameters(command, query, context)
         
-        # 构建命令执行提示
         prompt = f"""请执行以下命令并返回结果：
 
 命令: {command}
@@ -161,31 +323,21 @@ class NaturalLanguageInterface:
 - details: 详细信息（可选）"""
         
         response = await self.llm_integration.generate(prompt)
+        content = self._get_response_content(response)
         
         try:
-            result = json.loads(response)
+            result = json.loads(content)
         except json.JSONDecodeError:
             result = {
                 "success": False,
                 "data": None,
                 "message": "命令执行失败",
-                "details": f"无法解析命令执行结果: {response}"
+                "details": f"无法解析命令执行结果: {content}"
             }
         
         return result
     
     async def _extract_parameters(self, command: str, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        提取命令参数
-
-        Args:
-            command: 命令名称
-            query: 原始查询
-            context: 上下文信息
-
-        Returns:
-            命令参数
-        """
         prompt = f'''请从查询 '{query}' 中提取命令 '{command}' 的参数：
 
 命令描述: {self.command_templates[command]['description']}
@@ -194,26 +346,46 @@ class NaturalLanguageInterface:
 如果没有参数，请返回空对象 {{}}。'''
         
         response = await self.llm_integration.generate(prompt)
+        content = self._get_response_content(response)
         
         try:
-            params = json.loads(response)
+            params = json.loads(content)
         except json.JSONDecodeError:
             params = {}
         
         return params
     
     async def _general_qa(self, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        通用问答
+        user_emotion = UserEmotion.NEUTRAL if UserEmotion else None
+        emotion_confidence = 0.0
+        
+        if self.emotional_intelligence and UserEmotion:
+            user_emotion, emotion_confidence = self.emotional_intelligence.detect_emotion(query)
+            logger.info(f"检测到用户情绪: {user_emotion.value}, 置信度: {emotion_confidence:.2f}")
+        
+        await self._ensure_memory_initialized()
+        
+        memory_context = ""
+        if self.memory:
+            try:
+                relevant_memories = await self.memory.retrieve_memories(
+                    query=query,
+                    limit=3
+                )
+                if relevant_memories:
+                    memory_context = "\n\n相关记忆:\n" + "\n".join([
+                        f"- {m.get('content', str(m))}" for m in relevant_memories
+                    ])
+            except Exception as e:
+                logger.warning(f"检索记忆失败: {e}")
+        
+        personality_prompt = self._get_personality_prompt()
+        
+        prompt = f"""{personality_prompt}
 
-        Args:
-            query: 自然语言查询
-            context: 上下文信息
+{memory_context}
 
-        Returns:
-            问答结果
-        """
-        prompt = f"""请回答用户的问题：
+请回答用户的问题：
 
 问题: {query}
 
@@ -224,30 +396,37 @@ class NaturalLanguageInterface:
 - related_commands: 相关命令（可选）"""
         
         response = await self.llm_integration.generate(prompt)
+        content = self._get_response_content(response)
         
         try:
-            result = json.loads(response)
+            result = json.loads(content)
         except json.JSONDecodeError:
             result = {
-                "answer": response,
+                "answer": content,
                 "confidence": 0.8,
                 "source": "llm",
                 "related_commands": []
             }
         
+        if self.emotional_intelligence and user_emotion and UserEmotion:
+            result["answer"] = self.emotional_intelligence.adapt_response(
+                result.get("answer", ""), user_emotion
+            )
+            result["emotion_detected"] = user_emotion.value
+            result["emotion_confidence"] = emotion_confidence
+        
+        if self.memory:
+            try:
+                await self.memory.store_memory(
+                    content=f"用户问: {query}\n助手答: {result.get('answer', '')}",
+                    memory_type="conversation"
+                )
+            except Exception as e:
+                logger.warning(f"存储记忆失败: {e}")
+        
         return result
     
     async def generate_response(self, result: Dict[str, Any], query: str) -> str:
-        """
-        生成自然语言响应
-
-        Args:
-            result: 命令执行结果
-            query: 原始查询
-
-        Returns:
-            自然语言响应
-        """
         prompt = f"""请根据以下执行结果，生成一个自然友好的回答，回复用户的查询 '{query}'：
 
 执行结果: {json.dumps(result, ensure_ascii=False)}
@@ -255,45 +434,21 @@ class NaturalLanguageInterface:
 请直接返回回答内容，不要包含任何格式标记。"""
         
         response = await self.llm_integration.generate(prompt)
-        return response
+        return self._get_response_content(response)
     
     async def process_and_respond(self, query: str, context: Dict[str, Any] = None) -> str:
-        """
-        处理查询并生成响应
-
-        Args:
-            query: 自然语言查询
-            context: 上下文信息
-
-        Returns:
-            自然语言响应
-        """
         result = await self.process_query(query, context)
         response = await self.generate_response(result, query)
+        
+        if self.proactive_care:
+            self.proactive_care.record_user_message(query)
+        
         return response
     
     def get_available_commands(self) -> Dict[str, Dict[str, Any]]:
-        """
-        获取可用命令
-
-        Returns:
-            可用命令列表
-        """
         return self.command_templates
     
     def add_command(self, command_name: str, description: str, keywords: list, function: str) -> bool:
-        """
-        添加新命令
-
-        Args:
-            command_name: 命令名称
-            description: 命令描述
-            keywords: 关键词列表
-            function: 关联函数
-
-        Returns:
-            是否添加成功
-        """
         if command_name in self.command_templates:
             return False
         
@@ -305,15 +460,6 @@ class NaturalLanguageInterface:
         return True
     
     def remove_command(self, command_name: str) -> bool:
-        """
-        删除命令
-
-        Args:
-            command_name: 命令名称
-
-        Returns:
-            是否删除成功
-        """
         if command_name in self.command_templates:
             del self.command_templates[command_name]
             return True

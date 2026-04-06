@@ -229,6 +229,7 @@ class MainController:
             config_manager: 配置管理器实例
         """
         self.config_manager = config_manager
+        self._owns_config_manager = False
 
         # 模块管理
         self.modules: Dict[str, ModuleInfo] = {}
@@ -378,6 +379,13 @@ class MainController:
 
         logger.info("初始化主控制器...")
 
+        # 如果未显式传入配置管理器，则创建默认实例，保证可独立初始化（单测/脚本场景）
+        if self.config_manager is None:
+            from src.modules.core.config_manager import ConfigManager
+            self.config_manager = ConfigManager()
+            self._owns_config_manager = True
+            await self.config_manager.initialize()
+
         # 设置默认配置
         self.auto_restart_modules = True
         self.max_restart_attempts = 3
@@ -427,6 +435,27 @@ class MainController:
         self.hierarchical_memory = self.unified_memory.get_hierarchical_memory()
         self.memory_optimizer = self.unified_memory.get_memory_optimizer()
         logger.info("✅ 记忆系统接口已设置（向后兼容）")
+        
+        # 初始化统一交易历史服务（新增）
+        try:
+            from src.modules.core.trade_history_service import TradeHistoryService
+            self.trade_history_service = TradeHistoryService(
+                config={
+                    "cache_max_size": 1000,
+                    "base_path": "data/trade_history"
+                }
+            )
+            await self.trade_history_service.initialize()
+            
+            # 连接记忆管理器
+            if self.hierarchical_memory:
+                await self.trade_history_service.set_memory_manager(self.hierarchical_memory)
+                logger.info("✅ 交易历史服务已连接到记忆系统")
+            
+            logger.info("✅ 统一交易历史服务初始化完成")
+        except Exception as e:
+            logger.warning(f"⚠️ 交易历史服务初始化失败: {e}")
+            self.trade_history_service = None
         
         # 初始化智能系统组件
         try:
@@ -555,8 +584,11 @@ class MainController:
         # 初始化策略评估器
         self.strategy_evaluator = StrategyEvaluator("main")
         
-        # 初始化自然语言接口
-        self.natural_language_interface = NaturalLanguageInterface(self.llm_integration)
+        # 初始化自然语言接口（传入main_controller以支持技能包和情感智能）
+        self.natural_language_interface = NaturalLanguageInterface(
+            self.llm_integration, 
+            main_controller=self
+        )
         
         # 初始化Telegram机器人（仅当有config_manager时）
         if self.config_manager:
@@ -693,6 +725,11 @@ class MainController:
         await self.ai_trading_engine.initialize()
         logger.info("✅ 全智能AI交易引擎初始化完成")
         
+        # 连接交易历史服务到AI交易引擎（新增）
+        if self.ai_trading_engine and self.trade_history_service:
+            self.ai_trading_engine.trade_history_service = self.trade_history_service
+            logger.info("✅ 交易历史服务已连接到AI交易引擎")
+        
         # 设置便捷引用（用于AICommandExecutor等模块访问）
         if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'exchange'):
             self.okx_exchange = self.ai_trading_engine.exchange
@@ -784,7 +821,39 @@ class MainController:
             logger.info("✅ 系统监控器已初始化")
         except Exception as e:
             logger.warning(f"⚠️ 系统监控器初始化失败: {e}")
+        
+        # 初始化性能监控器
+        try:
+            from src.modules.core.performance_monitor import performance_monitor
+            self.performance_monitor = performance_monitor
+            
+            async def on_performance_alert(alert):
+                if self.telegram_bot:
+                    level_emoji = "⚠️" if alert.get("level") == "warning" else "🚨"
+                    await self.telegram_bot.send_message(
+                        f"{level_emoji} 性能告警\n\n{alert.get('message', '未知告警')}"
+                    )
+            
+            self.performance_monitor.add_alert_callback(on_performance_alert)
+            logger.info("✅ 性能监控器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 性能监控器初始化失败: {e}")
             self.system_monitor = None
+        
+        # 初始化主动性AI系统
+        try:
+            from src.modules.core.proactive_ai_system import ProactiveAIOrchestrator
+            self.proactive_ai = ProactiveAIOrchestrator(self, {
+                "scan_interval": 30,
+                "deep_scan_interval": 300,
+                "collect_interval": 300,
+                "action_cooldown": 60
+            })
+            await self.proactive_ai.initialize()
+            logger.info("✅ 主动性AI系统已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 主动性AI系统初始化失败: {e}")
+            self.proactive_ai = None
         
         # 初始化风险管理器
         try:
@@ -1242,6 +1311,15 @@ class MainController:
             
         self._initialized = False
 
+        # 清理默认创建的配置管理器
+        if getattr(self, "_owns_config_manager", False) and self.config_manager:
+            try:
+                await self.config_manager.cleanup()
+            except Exception:
+                pass
+            self.config_manager = None
+            self._owns_config_manager = False
+
         logger.info("主控制器清理完成")
 
     async def start_system(self) -> bool:
@@ -1290,6 +1368,17 @@ class MainController:
                     if hasattr(self, 'ai_core') and self.ai_core:
                         await self.ai_core.start()
                         logger.info("🧠 AI核心决策引擎已启动 - AI全权决策模式")
+                    
+                    # 启动主动性AI系统 - 让AI主动工作
+                    if self.proactive_ai:
+                        try:
+                            await self.proactive_ai.start()
+                            logger.info("🚀 主动性AI系统已启动 - AI将主动扫描市场、分析信息、执行交易")
+                        except Exception as e:
+                            logger.error(f"❌ 主动性AI系统启动失败: {e}")
+                    
+                    # 启动止盈止损监控
+                    await self.start_stop_loss_monitoring()
                     
                     # 启动心跳监控器
                     if not self.heartbeat_monitor and self.ai_trading_engine and self.skill_manager:
@@ -1625,6 +1714,14 @@ class MainController:
                 logger.error(f"主动交易执行器启动失败: {e}")
                 success = False
 
+        # 启动主动性AI系统
+        if self.proactive_ai:
+            try:
+                await self.proactive_ai.start()
+                logger.info("🚀 主动性AI系统已启动 - AI将主动扫描市场、分析信息、执行交易")
+            except Exception as e:
+                logger.error(f"主动性AI系统启动失败: {e}")
+
         return success
 
     async def stop_all_modules(self, reverse: bool = False) -> bool:
@@ -1646,6 +1743,14 @@ class MainController:
                 logger.info("🛑 AI核心决策引擎已停止")
             except Exception as e:
                 logger.error(f"AI核心决策引擎停止失败: {e}")
+
+        # 停止主动性AI系统
+        if hasattr(self, 'proactive_ai') and self.proactive_ai:
+            try:
+                await self.proactive_ai.stop()
+                logger.info("🛑 主动性AI系统已停止")
+            except Exception as e:
+                logger.error(f"主动性AI系统停止失败: {e}")
 
         success = True
         module_names = list(self.modules.keys())
@@ -1688,7 +1793,36 @@ class MainController:
             }
             
             core_event_type = core_event_type_map.get(event_type, CoreEventType.SYSTEM_START)
-            self.event_system.subscribe(core_event_type, handler)
+
+            core_to_legacy_map = {
+                CoreEventType.SYSTEM_START: EventType.SYSTEM_START,
+                CoreEventType.SYSTEM_STOP: EventType.SYSTEM_STOP,
+                CoreEventType.MODULE_STARTED: EventType.MODULE_STARTED,
+                CoreEventType.MODULE_STOPPED: EventType.MODULE_STOPPED,
+                CoreEventType.MODULE_ERROR: EventType.MODULE_ERROR,
+                CoreEventType.CONFIG_CHANGED: EventType.CONFIG_CHANGED,
+                CoreEventType.DATA_RECEIVED: EventType.DATA_RECEIVED,
+                CoreEventType.TRADE_SIGNAL: EventType.TRADE_SIGNAL,
+                CoreEventType.RISK_ALERT: EventType.ALERT,
+            }
+
+            async def _wrapper(core_event):
+                try:
+                    legacy_event = SystemEvent(
+                        id=getattr(core_event, "id", str(uuid.uuid4())),
+                        type=core_to_legacy_map.get(getattr(core_event, "type", None), event_type),
+                        source=getattr(core_event, "source", "unknown"),
+                        data=getattr(core_event, "data", {}) or {},
+                        priority=0,
+                    )
+                    if asyncio.iscoroutinefunction(handler):
+                        await handler(legacy_event)
+                    else:
+                        handler(legacy_event)
+                except Exception as e:
+                    logger.error(f"事件处理器执行错误: {e}")
+
+            self.event_system.subscribe(core_event_type, _wrapper)
         
         logger.debug(f"注册事件处理器: {event_type.value} -> {handler.__name__}")
 
@@ -1762,17 +1896,6 @@ class MainController:
         if len(self.event_history) > self.event_history_limit:
             self.event_history = self.event_history[-self.event_history_limit:]
         
-        # 调用旧的事件处理器（如果有）
-        if event_type in self.event_handlers:
-            for handler in self.event_handlers[event_type]:
-                try:
-                    if asyncio.iscoroutinefunction(handler):
-                        await handler(event)
-                    else:
-                        handler(event)
-                except Exception as e:
-                    logger.error(f"事件处理器执行错误: {e}")
-        
         if self.event_system:
             # 转换为核心事件类型
             core_event_type_map = {
@@ -1811,6 +1934,17 @@ class MainController:
             self.metrics["total_events"] += 1
             logger.debug(f"发送事件: {event_type.value} from {source}")
         else:
+            # 回退路径：仅在无增强事件系统时调用旧处理器，避免重复派发
+            if event_type in self.event_handlers:
+                for handler in self.event_handlers[event_type]:
+                    try:
+                        if asyncio.iscoroutinefunction(handler):
+                            await handler(event)
+                        else:
+                            handler(event)
+                    except Exception as e:
+                        logger.error(f"事件处理器执行错误: {e}")
+
             # 回退到旧的事件队列
             try:
                 await self.event_queue.put(event)
@@ -3396,7 +3530,7 @@ class MainController:
                     error_msg = event.data.get("error")
 
                     # 自动重启模块
-                    if self.auto_restart_modules and module_name and module_name in self.modules:
+                    if self._running and self.auto_restart_modules and module_name and module_name in self.modules:
                         module_info = self.modules[module_name]
                         if module_info.error_count <= self.max_restart_attempts:
                             logger.info(f"尝试自动重启模块: {module_name}")
@@ -3422,7 +3556,7 @@ class MainController:
                 error_msg = event.data.get("error")
 
                 # 自动重启模块
-                if self.auto_restart_modules and module_name and module_name in self.modules:
+                if self._running and self.auto_restart_modules and module_name and module_name in self.modules:
                     module_info = self.modules[module_name]
                     if module_info.error_count <= self.max_restart_attempts:
                         logger.info(f"尝试自动重启模块: {module_name}")
@@ -3835,12 +3969,18 @@ class MainController:
     
     async def start_stop_loss_monitoring(self):
         """启动止盈止损监控"""
+        logger.info("🔄 正在启动止盈止损监控...")
         if self.stop_loss_manager:
-            # 设置交易所
+            logger.info("✅ 止损管理器存在，设置交易所...")
             if hasattr(self, 'okx_exchange') and self.okx_exchange:
                 self.stop_loss_manager.set_exchange(self.okx_exchange)
+                logger.info("✅ 交易所已设置给止损管理器")
+            else:
+                logger.warning("⚠️ OKX交易所未设置，止损监控将无法获取价格")
             await self.stop_loss_manager.start()
             logger.info("✅ 止盈止损监控已启动")
+        else:
+            logger.warning("⚠️ 止损管理器未初始化，跳过启动")
     
     async def stop_stop_loss_monitoring(self):
         """停止止盈止损监控"""

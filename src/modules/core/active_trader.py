@@ -52,7 +52,7 @@ class ActiveTrader:
         self.memory = None
         
         self.trade_mode = TradeMode.LIVE
-        self.blacklist = set(["ETH/USDT"])
+        self.blacklist = set()  # 空黑名单，允许所有交易对
         
         self.contract_config = {
             "leverage_min": 10,
@@ -91,8 +91,8 @@ class ActiveTrader:
         try:
             from .unified_intelligent_memory import get_unified_memory
             self.memory = get_unified_memory()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"初始化统一记忆系统失败，继续无记忆模式: {e}")
         
         await self._load_user_rules()
         
@@ -115,8 +115,9 @@ class ActiveTrader:
                 limit=5
             )
             for mem in blacklist_mems:
+                # 不再自动将ETH加入黑名单
                 if "ETH" in mem.content or "以太坊" in mem.content:
-                    self.blacklist.add("ETH/USDT")
+                    logger.info(f"ℹ️ 忽略ETH黑名单记忆: 已移除ETH限制")
             
             logger.info(f"📋 已加载黑名单: {self.blacklist}")
         except Exception as e:
@@ -650,8 +651,8 @@ class ActiveTrader:
                 bot = self.main_controller.telegram_bot
                 if bot and hasattr(bot, 'send_message'):
                     await bot.send_message(message)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"发送交易执行通知失败: {e}")
     
     def get_status(self) -> Dict:
         """获取状态"""

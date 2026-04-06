@@ -46,6 +46,23 @@ for dir in data logs workspace config; do
     fi
 done
 
+# 创建记忆系统所需子目录
+MEMORY_DIRS=(
+    "data/memory/daily"
+    "data/memory/long_term"
+    "data/memory/trade_records"
+    "data/memory/risk_events"
+    "workspace/memory/daily"
+    "workspace/memory/long_term"
+    "workspace/memory/trade_records"
+)
+for dir in "${MEMORY_DIRS[@]}"; do
+    if [ ! -d "$dir" ]; then
+        mkdir -p "$dir"
+        echo -e "${GREEN}✓${NC} 创建记忆目录: $dir"
+    fi
+done
+
 # 检查代理设置
 if [ -n "$HTTP_PROXY" ] || [ -n "$HTTPS_PROXY" ]; then
     echo -e "${GREEN}✓${NC} 代理已配置: ${HTTP_PROXY:-$HTTPS_PROXY}"

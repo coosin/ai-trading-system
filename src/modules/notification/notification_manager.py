@@ -9,8 +9,14 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, List, Optional, Any, Tuple
 
-from telegram import Bot
-from telegram.error import TelegramError
+try:
+    from telegram import Bot
+    from telegram.error import TelegramError
+    HAS_TELEGRAM = True
+except Exception:  # pragma: no cover
+    Bot = None  # type: ignore[assignment]
+    TelegramError = Exception  # type: ignore[assignment]
+    HAS_TELEGRAM = False
 
 logger = logging.getLogger(__name__)
 
@@ -60,14 +66,17 @@ class NotificationManager:
             # 初始化Telegram
             telegram_config = self.config.get("telegram", {})
             if telegram_config.get("enabled", False):
-                token = telegram_config.get("token")
-                chat_id = telegram_config.get("chat_id")
-                if token and chat_id:
-                    self.telegram_bot = Bot(token=token)
-                    self.telegram_chat_id = chat_id
-                    logger.info("Telegram notification initialized")
+                if not HAS_TELEGRAM:
+                    logger.warning("Telegram enabled but python-telegram-bot is not installed")
                 else:
-                    logger.warning("Telegram enabled but missing token or chat_id")
+                    token = telegram_config.get("token")
+                    chat_id = telegram_config.get("chat_id")
+                    if token and chat_id:
+                        self.telegram_bot = Bot(token=token)
+                        self.telegram_chat_id = chat_id
+                        logger.info("Telegram notification initialized")
+                    else:
+                        logger.warning("Telegram enabled but missing token or chat_id")
 
             # 初始化邮件
             email_config = self.config.get("email", {})

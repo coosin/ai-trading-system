@@ -1,4 +1,14 @@
 # OpenClaw Trading System - 生产环境Docker镜像
+
+# ---- frontend build stage ----
+FROM node:20-bookworm-slim AS frontend-build
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ---- backend runtime stage ----
 FROM python:3.12-slim-bookworm
 
 LABEL maintainer="OpenClaw Trading"
@@ -37,14 +47,29 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # 复制项目文件
 COPY --chown=trader:trader src/ ./src/
 COPY --chown=trader:trader config/ ./config/
+COPY --chown=trader:trader frontend/ ./frontend/
+COPY --from=frontend-build --chown=trader:trader /frontend/dist ./frontend/dist
 COPY --chown=trader:trader workspace/ ./workspace/
 COPY --chown=trader:trader .env.example ./.env.example
 COPY --chown=trader:trader start_production.sh health_check.sh ./
 
-# 创建必要目录并设置权限
-RUN mkdir -p logs data/memory data/models data/historical backups/code backups/config backups/data && \
-    chown -R trader:trader logs data backups && \
-    chmod -R 755 logs data backups && \
+# 创建必要目录并设置权限（包括记忆系统所需的所有子目录）
+RUN mkdir -p logs \
+    data/memory/daily \
+    data/memory/long_term \
+    data/memory/trade_records \
+    data/memory/risk_events \
+    data/models \
+    data/historical \
+    data/config \
+    workspace/memory/daily \
+    workspace/memory/long_term \
+    workspace/memory/trade_records \
+    backups/code \
+    backups/config \
+    backups/data && \
+    chown -R trader:trader logs data workspace backups && \
+    chmod -R 755 logs data workspace backups && \
     chmod +x start_production.sh health_check.sh
 
 # 切换到非root用户

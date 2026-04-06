@@ -290,8 +290,8 @@ class UnifiedTradeSystem:
                         **trade,
                         "monitor_status": status
                     }
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"监控器查询交易状态失败 {trade_id}: {e}")
             
             return trade
             
@@ -344,8 +344,8 @@ class UnifiedTradeSystem:
             if self.monitor:
                 try:
                     await self.monitor.add_trade_execution(trade)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"监控器记录交易失败 {trade_id}: {e}")
             
             logger.debug(f"交易已记录: {trade_id}")
             return True
@@ -395,8 +395,8 @@ class UnifiedTradeSystem:
             if self.notifier:
                 try:
                     await self.notifier.send_trade_notification(notification)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"通知器发送交易通知失败: {e}")
             
             logger.debug(f"交易通知已发送: {notification.get('order_id', 'unknown')}")
             return True

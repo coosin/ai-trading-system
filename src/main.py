@@ -29,7 +29,8 @@ async def get_config_manager() -> ConfigManager:
     """获取配置管理器实例"""
     global _config_manager
     if _config_manager is None:
-        _config_manager = ConfigManager("data/config")
+        # 自动探测并合并配置目录（data/config、config、/app/*），避免配置目录不一致导致缺省配置
+        _config_manager = ConfigManager()
         await _config_manager.initialize()
     return _config_manager
 
@@ -104,7 +105,8 @@ class TradingSystem:
         logger.info("🔄 启动系统主循环...")
 
         try:
-            await self.main_controller.start_all_modules()
+            # 使用 MainController 的完整启动流程（包含依赖顺序、状态管理与健康检查链路）
+            await self.main_controller.start_system()
 
             if self.api_server:
                 await self.api_server.start()

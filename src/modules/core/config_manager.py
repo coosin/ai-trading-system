@@ -76,17 +76,24 @@ class ConfigManager:
     3. 配置验证和默认值设置
     4. 配置热重载支持
     5. 配置变更通知机制
+    6. 多路径配置查找（支持data/config和config目录）
     """
 
-    def __init__(self, config_dir: str = "config", watch_interval: int = 30):
+    DEFAULT_CONFIG_PATHS = [
+        "data/config",
+        "config",
+        "/app/data/config",
+        "/app/config"
+    ]
+
+    def __init__(self, config_dir: str = None, watch_interval: int = 30):
         """
         初始化配置管理器
 
         Args:
-            config_dir: 配置文件目录
+            config_dir: 配置文件目录（如果为None，自动查找）
             watch_interval: 配置监控间隔（秒）
         """
-        self.config_dir = Path(config_dir)
         self.watch_interval = watch_interval
         self._config: Dict[str, Dict[str, Any]] = {}
         self._schemas: Dict[str, ConfigSchema] = {}
@@ -96,9 +103,43 @@ class ConfigManager:
         self._lock = asyncio.Lock()
         self._watch_task: Optional[asyncio.Task] = None
         self._initialized = False
+        self._config_dirs: List[Path] = []
 
-        # 确保配置目录存在
-        self.config_dir.mkdir(exist_ok=True)
+        if config_dir:
+            self.config_dir = Path(config_dir)
+            self._config_dirs = [self.config_dir]
+        else:
+            self.config_dir = self._find_config_dir()
+            self._config_dirs = self._find_all_config_dirs()
+
+        for d in self._config_dirs:
+            d.mkdir(parents=True, exist_ok=True)
+
+    def _find_config_dir(self) -> Path:
+        """查找第一个存在的配置目录"""
+        for path in self.DEFAULT_CONFIG_PATHS:
+            p = Path(path)
+            if p.exists():
+                logger.info(f"使用配置目录: {p}")
+                return p
+        default = Path("data/config")
+        default.mkdir(parents=True, exist_ok=True)
+        logger.info(f"使用默认配置目录: {default}")
+        return default
+
+    def _find_all_config_dirs(self) -> List[Path]:
+        """查找所有存在的配置目录"""
+        dirs = []
+        for path in self.DEFAULT_CONFIG_PATHS:
+            p = Path(path)
+            if p.exists():
+                dirs.append(p)
+        if not dirs:
+            default = Path("data/config")
+            default.mkdir(parents=True, exist_ok=True)
+            dirs.append(default)
+        logger.info(f"配置搜索路径: {[str(d) for d in dirs]}")
+        return dirs
 
     async def initialize(self) -> None:
         """
@@ -133,6 +174,8 @@ class ConfigManager:
                 await self._watch_task
             except asyncio.CancelledError:
                 pass
+            finally:
+                self._watch_task = None
 
         self._initialized = False
         logger.info("配置管理器已清理")
@@ -191,8 +234,10 @@ class ConfigManager:
                 if BaseModel and section in self._schemas:
                     try:
                         schema = self._schemas[section]
-                        # 创建临时配置进行验证
-                        temp_config = {key: value}
+                        # 使用“现有 section 配置 + 本次更新”进行验证
+                        section_config = self._config.get(section, {})
+                        temp_config = dict(section_config) if isinstance(section_config, dict) else {}
+                        temp_config[key] = value
                         schema(**temp_config)
                     except ValidationError as e:
                         logger.error(f"配置验证失败: {e}")
@@ -328,19 +373,24 @@ class ConfigManager:
     # 私有方法
 
     async def _load_all_configs(self) -> None:
-        """加载所有配置文件"""
-        config_files = list(self.config_dir.glob("*.json"))
-
-        # 如果有yaml支持，添加yaml文件
-        if yaml:
-            config_files.extend(list(self.config_dir.glob("*.yaml")))
-            config_files.extend(list(self.config_dir.glob("*.yml")))
-
-        for config_file in config_files:
-            await self._load_config_file(config_file)
-
-        # 加载环境变量
+        """加载所有配置文件（从多个配置目录）"""
+        loaded_files = set()
+        
+        for config_dir in self._config_dirs:
+            config_files = list(config_dir.glob("*.json"))
+            
+            if yaml:
+                config_files.extend(list(config_dir.glob("*.yaml")))
+                config_files.extend(list(config_dir.glob("*.yml")))
+            
+            for config_file in config_files:
+                file_key = f"{config_dir.name}/{config_file.name}"
+                if file_key not in loaded_files:
+                    await self._load_config_file(config_file)
+                    loaded_files.add(file_key)
+        
         await self._load_environment_configs()
+        logger.info(f"已加载 {len(loaded_files)} 个配置文件")
 
     async def _load_config_file(self, config_file: Path) -> None:
         """加载配置文件"""

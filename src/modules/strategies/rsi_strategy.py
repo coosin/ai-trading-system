@@ -12,6 +12,11 @@ from .strategy_base import Strategy
 
 logger = logging.getLogger(__name__)
 
+STOP_LOSS_LONG_RATIO = 0.97
+STOP_LOSS_SHORT_RATIO = 1.03
+TAKE_PROFIT_LONG_RATIO = 1.06
+TAKE_PROFIT_SHORT_RATIO = 0.94
+
 
 class RSIStrategy(Strategy):
     """RSI策略"""
@@ -72,8 +77,8 @@ class RSIStrategy(Strategy):
                 "type": "market",
                 "quantity": 0.1,  # 固定数量
                 "price": price,
-                "stop_loss": price * 0.97,  # 3% 止损
-                "take_profit": price * 1.06  # 6% 止盈
+                "stop_loss": price * STOP_LOSS_LONG_RATIO,
+                "take_profit": price * TAKE_PROFIT_LONG_RATIO
             }
             self.position = "long"
             logger.info(f"RSI买入信号: {self.symbol}, 价格: {price}, RSI: {rsi}")
@@ -86,8 +91,8 @@ class RSIStrategy(Strategy):
                 "type": "market",
                 "quantity": 0.1,  # 固定数量
                 "price": price,
-                "stop_loss": price * 1.03,  # 3% 止损
-                "take_profit": price * 0.94  # 6% 止盈
+                "stop_loss": price * STOP_LOSS_SHORT_RATIO,
+                "take_profit": price * TAKE_PROFIT_SHORT_RATIO
             }
             self.position = "short"
             logger.info(f"RSI卖出信号: {self.symbol}, 价格: {price}, RSI: {rsi}")

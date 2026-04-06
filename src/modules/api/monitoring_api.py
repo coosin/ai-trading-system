@@ -297,3 +297,117 @@ async def add_anomaly_data(data: Dict[str, float]):
     # 检测异常
     score = _anomaly_detector.detect_anomaly(data)
     return {"score": score.score, "is_anomaly": score.is_anomaly, "details": score.anomaly_details}
+
+# 主动性AI系统相关端点
+
+_proactive_ai = None
+
+def set_proactive_ai(proactive_ai):
+    """设置主动性AI系统实例"""
+    global _proactive_ai
+    _proactive_ai = proactive_ai
+
+@router.get("/proactive-ai/status")
+async def get_proactive_ai_status():
+    """获取主动性AI系统状态"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    return _proactive_ai.get_status()
+
+@router.get("/proactive-ai/opportunities")
+async def get_proactive_opportunities():
+    """获取当前交易机会"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    opportunities = _proactive_ai.market_scanner.get_opportunities()
+    return [{
+        "symbol": opp.symbol,
+        "type": opp.opportunity_type.value,
+        "direction": opp.direction,
+        "confidence": opp.confidence,
+        "entry_price": opp.entry_price,
+        "stop_loss": opp.stop_loss,
+        "take_profit": opp.take_profit,
+        "reasoning": opp.reasoning,
+        "priority": opp.priority,
+        "timestamp": opp.timestamp.isoformat() if opp.timestamp else None,
+        "expires_at": opp.expires_at.isoformat() if opp.expires_at else None
+    } for opp in opportunities]
+
+@router.get("/proactive-ai/insights")
+async def get_proactive_insights():
+    """获取市场洞察"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    insights = _proactive_ai.market_scanner.get_insights()
+    result = {}
+    for symbol, insight in insights.items():
+        result[symbol] = {
+            "trend": insight.trend,
+            "trend_strength": insight.trend_strength,
+            "volatility": insight.volatility,
+            "volume_profile": insight.volume_profile,
+            "support_levels": insight.support_levels,
+            "resistance_levels": insight.resistance_levels,
+            "sentiment": insight.sentiment,
+            "sentiment_score": insight.sentiment_score,
+            "news_impact": insight.news_impact,
+            "timestamp": insight.timestamp.isoformat() if insight.timestamp else None
+        }
+    return result
+
+@router.get("/proactive-ai/market-state")
+async def get_proactive_market_state():
+    """获取市场状态"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    return _proactive_ai.market_scanner.get_market_state()
+
+@router.get("/proactive-ai/news")
+async def get_proactive_news():
+    """获取最新新闻"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    news = _proactive_ai.info_collector.get_latest_news()
+    return news
+
+@router.get("/proactive-ai/sentiment")
+async def get_proactive_sentiment():
+    """获取社交情绪"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    return _proactive_ai.info_collector.get_social_sentiment()
+
+@router.get("/proactive-ai/fear-greed")
+async def get_fear_greed_index():
+    """获取恐慌贪婪指数"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    index = _proactive_ai.info_collector.get_fear_greed_index()
+    return {"fear_greed_index": index}
+
+@router.get("/proactive-ai/best-strategy")
+async def get_best_strategy():
+    """获取最佳策略"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    return {
+        "best_strategy": _proactive_ai.strategy_selector.get_best_strategy(),
+        "strategy_scores": _proactive_ai.strategy_selector.get_strategy_scores()
+    }
+
+@router.get("/proactive-ai/stats")
+async def get_proactive_stats():
+    """获取主动性AI统计信息"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    
+    return _proactive_ai.market_scanner.get_stats()

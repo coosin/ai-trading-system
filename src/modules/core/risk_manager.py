@@ -1804,9 +1804,9 @@ class RiskManager:
         except Exception as e:
             logger.error(f"设置止损位失败: {e}")
 
-    async def add_position(self, symbol: str, amount: float, price: float, leverage: float = 1.0, stop_loss: Optional[float] = None, take_profit: Optional[float] = None) -> bool:
+    async def open_position(self, symbol: str, amount: float, price: float, leverage: float = 1.0, stop_loss: Optional[float] = None, take_profit: Optional[float] = None) -> bool:
         """
-        添加持仓
+        开仓（用于风险控制）
 
         Args:
             symbol: 交易对

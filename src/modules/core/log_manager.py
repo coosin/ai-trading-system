@@ -690,8 +690,8 @@ class LogManager:
                 module = module or frame.filename
                 function = function or frame.name
                 line_no = line_no or frame.lineno
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"提取调用栈信息失败: {e}")
 
         # 创建日志条目
         log_id = f"log_{uuid.uuid4().hex[:8]}"
@@ -722,8 +722,8 @@ class LogManager:
                 tb = traceback.format_exc()
                 if tb and "NoneType: None" not in tb:
                     entry.data["traceback"] = tb
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"附加traceback失败: {e}")
 
         # 写入到所有处理器
         await self._write_to_handlers(entry)
@@ -1026,6 +1026,17 @@ class LogManager:
             # 更新配置
             for key, value in new_config.items():
                 if hasattr(self.config, key):
+                    if key == "log_level":
+                        if isinstance(value, str):
+                            value = LogLevel(value)
+                    if key == "outputs" and isinstance(value, list):
+                        normalized = []
+                        for item in value:
+                            if isinstance(item, LogOutput):
+                                normalized.append(item)
+                            else:
+                                normalized.append(LogOutput(str(item)))
+                        value = normalized
                     setattr(self.config, key, value)
 
             # 重新设置处理器

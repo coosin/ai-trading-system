@@ -91,8 +91,8 @@ class RiskAssessmentSkill(SkillBase):
                     "total_equity": current_risk.get("total_equity", 0),
                     "available_balance": current_risk.get("available_balance", 0)
                 }
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"从风险监控器读取账户风险失败: {e}")
         
         positions = getattr(engine, 'positions', {})
         balance = getattr(engine, 'balance', 0)

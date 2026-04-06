@@ -239,7 +239,7 @@ def init_module_control_api(app, main_controller):
                 return {
                     "symbols": engine.symbols,
                     "blacklist": blacklist,
-                    "message": "ETH已在黑名单中"
+                    "message": "ETH已允许交易"
                 }
         return {
             "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],

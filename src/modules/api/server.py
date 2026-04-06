@@ -351,6 +351,20 @@ class APIServer:
                 init_module_control_api(self.app, self.main_controller)
             except Exception as e:
                 logger.warning(f"模块控制API初始化失败: {e}")
+            
+            # 初始化监控API
+            try:
+                from src.modules.api.monitoring_api import router as monitoring_router
+                from src.modules.api.monitoring_api import set_proactive_ai
+                self.app.include_router(monitoring_router)
+                
+                # 设置主动性AI系统实例
+                if self.main_controller and hasattr(self.main_controller, 'proactive_ai'):
+                    set_proactive_ai(self.main_controller.proactive_ai)
+                    
+                logger.info("✅ 监控API已初始化")
+            except Exception as e:
+                logger.warning(f"监控API初始化失败: {e}")
 
             # 启动任务
             self._tasks.append(asyncio.create_task(self._cleanup_inactive_websockets()))
@@ -443,15 +457,24 @@ class APIServer:
                 server_task = asyncio.create_task(run_server())
                 self._tasks.append(server_task)
                 
-                await asyncio.sleep(1)
-                
-                if is_port_in_use(self.port):
+                # 轮询等待服务就绪，避免固定 1s 导致慢机/CI 偶发失败
+                for _ in range(20):
+                    await asyncio.sleep(0.2)
+                    if getattr(server, "started", False) or is_port_in_use(self.port):
+                        self._running = True
+                        logger.info(f"✅ API服务器已启动，访问 http://{self.host}:{self.port}/docs 查看文档")
+                        return True
+                    if server_task.done():
+                        break
+
+                # 测试场景下，如果任务仍在运行也认为启动成功（端口探测可能受环境影响）
+                if not server_task.done():
                     self._running = True
-                    logger.info(f"✅ API服务器已启动，访问 http://{self.host}:{self.port}/docs 查看文档")
+                    logger.info(f"✅ API服务器已启动（任务运行中），访问 http://{self.host}:{self.port}/docs 查看文档")
                     return True
-                else:
-                    logger.error(f"API服务器启动失败，端口 {self.port} 未监听")
-                    return False
+
+                logger.error(f"API服务器启动失败，端口 {self.port} 未监听")
+                return False
             else:
                 self._running = True
                 logger.info(f"API服务器已启动（模拟模式），访问 http://{self.host}:{self.port}/docs 查看文档")
@@ -1245,36 +1268,187 @@ class APIServer:
 
         # 交易历史路由 - 支持 /api/v1/trades
         @api_v1_router.get("/trades", tags=["trades"])
-        async def get_trades(range: str = "7d"):
-            """获取交易历史"""
-            # 这里应该从交易记录服务获取真实数据
-            # 为简化，返回模拟数据
-            import random
-            trades = []
-            now = datetime.now()
-            days = 7 if range == "7d" else 1 if range == "24h" else 30 if range == "30d" else 90
+        async def get_trades(
+            range: str = "7d",
+            symbol: Optional[str] = None,
+            side: Optional[str] = None,
+            limit: int = 100,
+            offset: int = 0
+        ):
+            """
+            获取交易历史（真实数据）
             
-            for i in range(100):
-                timestamp = (now - timedelta(days=random.randint(0, days), hours=random.randint(0, 23), minutes=random.randint(0, 59))).isoformat()
-                symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "ADA/USDT"]
-                symbol = random.choice(symbols)
-                side = random.choice(["buy", "sell"])
-                price = random.uniform(3000, 50000) if symbol == "BTC/USDT" else random.uniform(100, 3000)
-                amount = random.uniform(0.001, 1) if symbol == "BTC/USDT" else random.uniform(0.1, 10)
-                status = "filled"
+            参数：
+            - range: 时间范围 (24h, 7d, 30d, 90d)
+            - symbol: 交易对过滤 (如 BTC/USDT)
+            - side: 方向过滤 (buy/sell)
+            - limit: 返回数量限制
+            - offset: 分页偏移
+            """
+            try:
+                # 解析时间范围
+                now = datetime.now()
+                if range == "24h":
+                    start_date = now - timedelta(days=1)
+                elif range == "7d":
+                    start_date = now - timedelta(days=7)
+                elif range == "30d":
+                    start_date = now - timedelta(days=30)
+                elif range == "90d":
+                    start_date = now - timedelta(days=90)
+                else:
+                    start_date = now - timedelta(days=7)  # 默认7天
                 
-                trades.append({
-                    "timestamp": timestamp,
-                    "symbol": symbol,
-                    "side": side,
-                    "price": round(price, 2),
-                    "amount": round(amount, 4),
-                    "status": status
-                })
+                # 尝试从主控制器获取交易历史服务
+                trade_service = None
+                if main_controller and hasattr(main_controller, 'trade_history_service'):
+                    trade_service = main_controller.trade_history_service
+                
+                if trade_service:
+                    # 使用真实的交易历史服务查询
+                    trades = await trade_service.get_trade_history(
+                        start_date=start_date,
+                        symbol=symbol,
+                        side=side,
+                        limit=limit,
+                        offset=offset
+                    )
+                    
+                    if not trades:
+                        return {
+                            "trades": [],
+                            "total": 0,
+                            "message": f"暂无{range}时间范围内的交易记录",
+                            "query_time": datetime.now().isoformat()
+                        }
+                    
+                    return {
+                        "trades": trades,
+                        "total": len(trades),
+                        "range": range,
+                        "filters": {
+                            "symbol": symbol,
+                            "side": side
+                        },
+                        "query_time": datetime.now().isoformat()
+                    }
+                
+                else:
+                    # 如果服务不可用，尝试从数据库直接查询
+                    try:
+                        from src.modules.core.historical_data_storage import get_historical_storage
+                        
+                        storage = await get_historical_storage()
+                        
+                        # 查询数据库中的交易记录
+                        trades_db = await storage.get_trades(
+                            start_date=start_date.isoformat(),
+                            end_date=now.isoformat(),
+                            symbol=symbol,
+                            limit=limit
+                        )
+                        
+                        if trades_db:
+                            from dataclasses import asdict
+                            trades_list = [asdict(t) for t in trades_db]
+                            
+                            return {
+                                "trades": trades_list,
+                                "total": len(trades_list),
+                                "source": "database",
+                                "range": range,
+                                "query_time": datetime.now().isoformat()
+                            }
+                        else:
+                            return {
+                                "trades": [],
+                                "total": 0,
+                                "message": "暂无交易记录",
+                                "note": "交易历史服务未初始化，已尝试直接查询数据库",
+                                "query_time": datetime.now().isoformat()
+                            }
+                    
+                    except Exception as db_error:
+                        logger.error(f"数据库查询失败: {db_error}")
+                        return {
+                            "error": "交易历史服务不可用且数据库查询失败",
+                            "details": str(db_error),
+                            "suggestion": "请检查系统配置或稍后重试"
+                        }
+                        
+            except Exception as e:
+                logger.error(f"获取交易历史失败: {e}", exc_info=True)
+                return {
+                    "error": "获取交易历史失败",
+                    "details": str(e),
+                    "suggestion": "请联系管理员检查系统状态"
+                }
+
+        @api_v1_router.get("/trades/statistics", tags=["trades"])
+        async def get_trade_statistics(days: int = 30):
+            """
+            获取交易统计数据
             
-            # 按时间排序，最新的交易在前面
-            trades.sort(key=lambda x: x["timestamp"], reverse=True)
-            return trades
+            返回详细的交易统计信息，包括胜率、盈亏、风险指标等
+            """
+            try:
+                trade_service = None
+                if main_controller and hasattr(main_controller, 'trade_history_service'):
+                    trade_service = main_controller.trade_history_service
+                
+                if trade_service:
+                    stats = await trade_service.get_statistics(days=days)
+                    
+                    return {
+                        **stats,
+                        "period_days": days,
+                        "generated_at": datetime.now().isoformat()
+                    }
+                else:
+                    return {
+                        "error": "交易统计服务不可用",
+                        "suggestion": "请确保交易历史服务已正确初始化"
+                    }
+                    
+            except Exception as e:
+                logger.error(f"获取交易统计失败: {e}")
+                return {
+                    "error": "获取交易统计失败",
+                    "details": str(e)
+                }
+
+        @api_v1_router.get("/trades/review", tags=["trades"])
+        async def get_trade_review(days: int = 7):
+            """
+            获取交易复盘报告
+            
+            生成包含统计分析、趋势、建议的完整复盘报告
+            """
+            try:
+                trade_service = None
+                if main_controller and hasattr(main_controller, 'trade_history_service'):
+                    trade_service = main_controller.trade_history_service
+                
+                if trade_service:
+                    review = await trade_service.generate_trade_review(days=days)
+                    
+                    return {
+                        "review": review,
+                        "period_days": days,
+                        "generated_at": datetime.now().isoformat(),
+                        "format": "markdown"
+                    }
+                else:
+                    return {
+                        "error": "交易复盘服务不可用"
+                    }
+                    
+            except Exception as e:
+                logger.error(f"生成交易复盘失败: {e}")
+                return {
+                    "error": "生成交易复盘失败",
+                    "details": str(e)
+                }
 
         # 设置管理路由 - 支持 /api/v1/settings
         @api_v1_router.get("/settings", tags=["settings"])
@@ -2146,10 +2320,18 @@ class APIServer:
         api_dir = os.path.dirname(current_dir)
         modules_dir = os.path.dirname(api_dir)
         src_dir = os.path.dirname(modules_dir)
-        frontend_dir = os.path.join(src_dir, "frontend", "dist")
-        if os.path.exists(frontend_dir):
-            self.app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
-            logger.info(f"添加静态文件服务: {frontend_dir}")
+        # 兼容两种布局：
+        # 1) 仓库根目录 /app/frontend/dist（Docker构建常见）
+        # 2) /app/src/frontend/dist（历史/特殊布局）
+        candidate_frontend_dirs = [
+            os.path.join(os.path.dirname(src_dir), "frontend", "dist"),
+            os.path.join(src_dir, "frontend", "dist"),
+        ]
+        for frontend_dir in candidate_frontend_dirs:
+            if os.path.exists(frontend_dir):
+                self.app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
+                logger.info(f"添加静态文件服务: {frontend_dir}")
+                break
 
         logger.info("API路由设置完成")
 

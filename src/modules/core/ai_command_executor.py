@@ -107,9 +107,9 @@ class AICommandExecutor:
                 limit=10
             )
             for mem in blacklist_memories:
+                # 不再自动将ETH加入黑名单
                 if "ETH" in mem.content or "以太坊" in mem.content:
-                    self.blacklist.add("ETH/USDT")
-                    logger.info(f"🚫 从记忆加载黑名单: ETH/USDT")
+                    logger.info(f"ℹ️ 忽略ETH黑名单记忆: 已移除ETH限制")
             
             auth_memories = await self.unified_memory.retrieve_memories(
                 query="全权 负责 授权 交易",
@@ -198,8 +198,9 @@ class AICommandExecutor:
             context_parts.append("\n🚫 【黑名单/禁区】")
             for mem in blacklist_memories:
                 context_parts.append(f"  • {mem.content}")
+                # 不再自动将ETH加入黑名单
                 if "ETH" in mem.content or "以太坊" in mem.content:
-                    self.blacklist.add("ETH/USDT")
+                    logger.info(f"ℹ️ 忽略ETH黑名单记忆: 已移除ETH限制")
         
         auth_memories = await self.unified_memory.retrieve_memories(
             query="全权 负责 授权",
@@ -984,8 +985,8 @@ class AICommandExecutor:
                                 side = pos.get('posSide', pos.get('side', 'unknown'))
                                 size = pos.get('pos', pos.get('size', 0))
                                 response += f"\n  {symbol}: {side} {size}"
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"查询持仓信息失败: {e}")
                 
                 return {"success": True, "response": response, "data": modules}
             
@@ -1095,8 +1096,8 @@ class AICommandExecutor:
                         recent_data = getattr(mc.multi_source_data_fusion, '_recent_analysis', {})
                         if recent_data:
                             context_parts.append(f"   - 最近分析: {list(recent_data.keys())[:3]}")
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"读取第三方数据最近分析失败: {e}")
             else:
                 context_parts.append(f"\n🔌 第三方数据系统: ❌ 未连接")
             
@@ -1118,8 +1119,8 @@ class AICommandExecutor:
                     if balance:
                         total = sum(v if isinstance(v, (int, float)) else v.get('free', 0) for v in balance.values())
                         context_parts.append(f"   - 账户总资产: ${total:,.2f}")
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"读取账户余额失败: {e}")
             else:
                 context_parts.append(f"\n💱 OKX交易所: ❌ 未连接")
             
@@ -1167,8 +1168,8 @@ class AICommandExecutor:
                             size = pos.get('pos', pos.get('size', 0))
                             pnl = pos.get('upl', pos.get('unrealized_pnl', 0))
                             context_parts.append(f"  {symbol}: {side} {size} | 盈亏: ${pnl:+.2f}")
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"读取持仓详情失败: {e}")
         
         return "\n".join(context_parts)
     

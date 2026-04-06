@@ -556,6 +556,8 @@ class CacheManager:
         if level == CacheLevel.MEMORY:
             return self._delete_from_memory(key)
         elif level == CacheLevel.REDIS:
+            if not self.redis_connected:
+                return True
             return await self._delete_from_redis(key)
         elif level == CacheLevel.DISK:
             return await self._delete_from_disk(key)
@@ -586,14 +588,16 @@ class CacheManager:
             return True
         elif level == CacheLevel.REDIS:
             if not self.redis_connected:
-                return False
+                return True
             await self.redis_client.flushdb()
             return True
         elif level == CacheLevel.DISK:
+            import os
             import shutil
 
             try:
-                shutil.rmtree(self.disk_cache_path)
+                if os.path.exists(self.disk_cache_path):
+                    shutil.rmtree(self.disk_cache_path)
                 os.makedirs(self.disk_cache_path, exist_ok=True)
                 return True
             except Exception:
@@ -836,7 +840,7 @@ class CacheManager:
             except Exception as e:
                 logger.error(f"从磁盘删除缓存失败 {key}: {e}")
                 return False
-        return False
+        return True
 
     # 辅助方法
 

@@ -479,15 +479,39 @@ class EnhancedLLMManager:
         predefined = [
             ModelConfig(
                 provider=ModelProvider.OPENAI,
-                model_id="spark-lite",
+                model_id="astron-code-latest",
+                display_name="讯飞 Astron Code Latest",
+                base_url="https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
+                api_key=xunfei_api_key,
+                cost_per_input_token=0.0,
+                cost_per_output_token=0.0,
+                context_window=32768,
+                priority=15,
+                fallback_models=["deepseek-v3.2", "lite"]
+            ),
+            ModelConfig(
+                provider=ModelProvider.OPENAI,
+                model_id="lite",
                 display_name="讯飞星火 Spark Lite",
                 base_url="https://spark-api-open.xf-yun.com/v1/chat/completions",
                 api_key=xunfei_api_key,
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=32768,
-                priority=12,
-                fallback_models=[]
+                priority=14,
+                fallback_models=["astron-code-latest", "deepseek-v3.2"]
+            ),
+            ModelConfig(
+                provider=ModelProvider.OPENAI,
+                model_id="generalv3.5",
+                display_name="讯飞星火 Spark Max",
+                base_url="https://spark-api-open.xf-yun.com/v1/chat/completions",
+                api_key=xunfei_api_key,
+                cost_per_input_token=0.0,
+                cost_per_output_token=0.0,
+                context_window=98304,
+                priority=13,
+                fallback_models=["astron-code-latest", "lite"]
             ),
             ModelConfig(
                 provider=ModelProvider.OPENAI,
@@ -498,8 +522,8 @@ class EnhancedLLMManager:
                 cost_per_input_token=0.0,
                 cost_per_output_token=0.0,
                 context_window=98304,
-                priority=13,
-                fallback_models=["spark-lite", "astron-code-latest"]
+                priority=12,
+                fallback_models=["astron-code-latest", "lite"]
             ),
             ModelConfig(
                 provider=ModelProvider.OPENAI,
@@ -511,19 +535,7 @@ class EnhancedLLMManager:
                 cost_per_output_token=0.0,
                 context_window=98304,
                 priority=11,
-                fallback_models=["spark-lite", "deepseek-v3.2"]
-            ),
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="astron-code-latest",
-                display_name="讯飞 astron-code-latest",
-                base_url="https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
-                api_key=xunfei_api_key,
-                cost_per_input_token=0.0,
-                cost_per_output_token=0.0,
-                context_window=32768,
-                priority=10,
-                fallback_models=["spark-lite"]
+                fallback_models=["astron-code-latest", "deepseek-v3.2"]
             ),
             ModelConfig(
                 provider=ModelProvider.LOCAL,

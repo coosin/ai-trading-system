@@ -156,8 +156,8 @@ class UnifiedStrategySystem:
             if self.manager:
                 try:
                     await self.manager.create_strategy_instance(strategy_config)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"策略管理器创建实例失败 {strategy_id}: {e}")
             
             self.stats["total_strategies"] += 1
             
@@ -187,8 +187,8 @@ class UnifiedStrategySystem:
             if self.manager:
                 try:
                     await self.manager.start_strategy(strategy_id)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"策略管理器启动失败 {strategy_id}: {e}")
             
             # 更新状态
             self.strategies[strategy_id]["status"] = "running"
@@ -221,8 +221,8 @@ class UnifiedStrategySystem:
             if self.manager:
                 try:
                     await self.manager.stop_strategy(strategy_id)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"策略管理器停止失败 {strategy_id}: {e}")
             
             # 更新状态
             self.strategies[strategy_id]["status"] = "stopped"
@@ -293,8 +293,8 @@ class UnifiedStrategySystem:
                     }
                     
                     return performance
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"策略评估器获取性能失败 {strategy_id}: {e}")
             
             return self.strategies[strategy_id]["performance"]
             

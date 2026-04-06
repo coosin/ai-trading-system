@@ -226,7 +226,8 @@ class UnifiedRiskSystem:
                     max_drawdown = drawdown
             
             return max_drawdown
-        except:
+        except Exception as e:
+            logger.debug(f"计算最大回撤失败: {e}")
             return 0.0
     
     def _calculate_leverage(self, positions: List[Dict]) -> float:
@@ -239,7 +240,8 @@ class UnifiedRiskSystem:
             total_margin = sum(p.get("margin", 0) for p in positions)
             
             return total_value / total_margin if total_margin > 0 else 0.0
-        except:
+        except Exception as e:
+            logger.debug(f"计算杠杆失败: {e}")
             return 0.0
     
     def _calculate_concentration(self, positions: List[Dict]) -> float:
@@ -254,7 +256,8 @@ class UnifiedRiskSystem:
             
             max_position = max(p.get("value", 0) for p in positions)
             return max_position / total_value
-        except:
+        except Exception as e:
+            logger.debug(f"计算仓位集中度失败: {e}")
             return 0.0
     
     def _calculate_volatility(self, returns: List[float]) -> float:
@@ -265,7 +268,8 @@ class UnifiedRiskSystem:
             
             import statistics
             return statistics.stdev(returns) if len(returns) > 1 else 0.0
-        except:
+        except Exception as e:
+            logger.debug(f"计算波动率失败: {e}")
             return 0.0
     
     def _determine_risk_level(self, metrics: Dict[str, float]) -> RiskLevel:
@@ -354,8 +358,8 @@ class UnifiedRiskSystem:
                         "monitor_status": status,
                         "risk_metrics": self.risk_metrics
                     }
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"风险监控器状态获取失败: {e}")
             
             return {
                 "risk_metrics": self.risk_metrics,
@@ -415,7 +419,8 @@ class UnifiedRiskSystem:
                 result = await self.optimizer.risk_parity_optimization(portfolio)
                 logger.info("风险优化完成")
                 return result
-            except:
+            except Exception as e:
+                logger.debug(f"风险优化器执行失败: {e}")
                 return {"error": "optimization_failed"}
             
         except Exception as e:

@@ -369,3 +369,229 @@ class EnhancedRiskController:
         self.circuit_breaker["auto_resume_time"] = None
         
         logger.info("熔断器已手动重置")
+
+    async def check_position_risk(self, positions: Dict[str, Any], exchange=None) -> Dict[str, Any]:
+        """
+        检查持仓风险并返回需要采取的行动
+        
+        Args:
+            positions: 当前持仓字典
+            exchange: 交易所实例（用于执行平仓）
+        
+        Returns:
+            风险检查结果和需要采取的行动
+        """
+        result = {
+            "risk_level": RiskLevel.LOW,
+            "positions_at_risk": [],
+            "actions_required": [],
+            "total_unrealized_pnl": 0.0,
+            "total_margin_ratio": 0.0,
+        }
+        
+        if not positions:
+            return result
+        
+        total_pnl = 0.0
+        critical_positions = []
+        high_risk_positions = []
+        
+        for symbol, pos in positions.items():
+            pnl_percent = pos.get("unrealized_pnl_percent", 0)
+            margin_ratio = pos.get("margin_ratio", 0)
+            liquidation_price = pos.get("liquidation_price", 0)
+            current_price = pos.get("current_price", 0)
+            
+            total_pnl += pos.get("unrealized_pnl", 0)
+            
+            if margin_ratio > 0:
+                result["total_margin_ratio"] = max(result["total_margin_ratio"], margin_ratio)
+            
+            if pnl_percent < -0.10 or margin_ratio > 0.8:
+                critical_positions.append({
+                    "symbol": symbol,
+                    "pnl_percent": pnl_percent,
+                    "margin_ratio": margin_ratio,
+                    "action": "emergency_close",
+                    "reason": f"严重风险: 亏损{pnl_percent*100:.1f}%, 保证金率{margin_ratio*100:.1f}%"
+                })
+            elif pnl_percent < -0.05 or margin_ratio > 0.6:
+                high_risk_positions.append({
+                    "symbol": symbol,
+                    "pnl_percent": pnl_percent,
+                    "margin_ratio": margin_ratio,
+                    "action": "reduce_position",
+                    "reason": f"高风险: 亏损{pnl_percent*100:.1f}%, 保证金率{margin_ratio*100:.1f}%"
+                })
+        
+        result["total_unrealized_pnl"] = total_pnl
+        result["positions_at_risk"] = critical_positions + high_risk_positions
+        
+        if critical_positions:
+            result["risk_level"] = RiskLevel.CRITICAL
+            result["actions_required"].append({
+                "type": "emergency_close",
+                "positions": [p["symbol"] for p in critical_positions],
+                "reason": "存在严重风险持仓，需要立即平仓"
+            })
+        elif high_risk_positions:
+            result["risk_level"] = RiskLevel.HIGH
+            result["actions_required"].append({
+                "type": "reduce_position",
+                "positions": high_risk_positions,
+                "reason": "存在高风险持仓，建议减仓"
+            })
+        
+        if result["risk_level"] in [RiskLevel.CRITICAL, RiskLevel.HIGH]:
+            logger.warning(f"⚠️ 持仓风险检查: {result['risk_level'].value} - {len(result['positions_at_risk'])}个持仓需要关注")
+        
+        return result
+
+    async def auto_reduce_positions(
+        self, 
+        positions: List[Dict], 
+        exchange,
+        reduce_ratio: float = 0.5
+    ) -> Dict[str, Any]:
+        """
+        自动减仓
+        
+        Args:
+            positions: 需要减仓的持仓列表
+            exchange: 交易所实例
+            reduce_ratio: 减仓比例
+        
+        Returns:
+            减仓结果
+        """
+        results = []
+        
+        for pos in positions:
+            symbol = pos.get("symbol")
+            try:
+                current_qty = pos.get("quantity", 0)
+                reduce_qty = current_qty * reduce_ratio
+                
+                if reduce_qty > 0:
+                    side = "sell" if pos.get("side") == "long" else "buy"
+                    
+                    logger.warning(f"🔄 自动减仓: {symbol} {side} {reduce_qty}")
+                    
+                    if exchange and hasattr(exchange, 'place_order'):
+                        order = await exchange.place_order(
+                            symbol=symbol,
+                            side=side,
+                            order_type="market",
+                            quantity=reduce_qty,
+                            reduce_only=True
+                        )
+                        results.append({
+                            "symbol": symbol,
+                            "success": True,
+                            "order": order
+                        })
+                    else:
+                        results.append({
+                            "symbol": symbol,
+                            "success": False,
+                            "error": "交易所不可用"
+                        })
+            except Exception as e:
+                logger.error(f"减仓失败 {symbol}: {e}")
+                results.append({
+                    "symbol": symbol,
+                    "success": False,
+                    "error": str(e)
+                })
+        
+        return {
+            "action": "auto_reduce",
+            "timestamp": datetime.now().isoformat(),
+            "results": results
+        }
+
+    async def emergency_close_all(
+        self, 
+        positions: Dict[str, Any], 
+        exchange,
+        reason: str = "风险控制"
+    ) -> Dict[str, Any]:
+        """
+        紧急平仓所有持仓
+        
+        Args:
+            positions: 所有持仓
+            exchange: 交易所实例
+            reason: 平仓原因
+        
+        Returns:
+            平仓结果
+        """
+        logger.critical(f"🚨 紧急平仓触发: {reason}")
+        
+        results = []
+        
+        for symbol, pos in positions.items():
+            try:
+                quantity = pos.get("quantity", 0)
+                side = "sell" if pos.get("side") == "long" else "buy"
+                
+                if quantity > 0 and exchange and hasattr(exchange, 'place_order'):
+                    order = await exchange.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=quantity,
+                        reduce_only=True
+                    )
+                    results.append({
+                        "symbol": symbol,
+                        "success": True,
+                        "order": order
+                    })
+                    logger.info(f"✅ 紧急平仓成功: {symbol}")
+            except Exception as e:
+                logger.error(f"紧急平仓失败 {symbol}: {e}")
+                results.append({
+                    "symbol": symbol,
+                    "success": False,
+                    "error": str(e)
+                })
+        
+        await self._trigger_circuit_breaker(f"紧急平仓: {reason}")
+        
+        return {
+            "action": "emergency_close_all",
+            "reason": reason,
+            "timestamp": datetime.now().isoformat(),
+            "results": results
+        }
+
+    async def get_risk_report(self) -> Dict[str, Any]:
+        """获取详细风险报告"""
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "circuit_breaker": {
+                "status": self.circuit_breaker["status"].value,
+                "trigger_reason": self.circuit_breaker["trigger_reason"],
+                "trigger_time": self.circuit_breaker["trigger_time"].isoformat() if self.circuit_breaker["trigger_time"] else None,
+                "auto_resume_time": self.circuit_breaker["auto_resume_time"].isoformat() if self.circuit_breaker["auto_resume_time"] else None,
+            },
+            "trading_state": {
+                "daily_trades": self.trading_state.daily_trade_count,
+                "hourly_trades": self.trading_state.hourly_trade_count,
+                "consecutive_losses": self.trading_state.consecutive_losses,
+                "current_drawdown": f"{self.trading_state.current_drawdown:.2%}",
+                "daily_pnl": self.trading_state.daily_pnl,
+                "total_pnl": self.trading_state.total_pnl,
+            },
+            "risk_limits": {
+                "max_daily_trades": self.risk_limits.max_daily_trades,
+                "max_hourly_trades": self.risk_limits.max_hourly_trades,
+                "max_consecutive_losses": self.risk_limits.max_consecutive_losses,
+                "max_drawdown": f"{self.risk_limits.max_drawdown_percent:.2%}",
+                "max_leverage": self.risk_limits.max_leverage,
+            },
+            "stats": self.stats,
+            "recent_risk_events": self.risk_history[-10:] if self.risk_history else [],
+        }

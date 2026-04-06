@@ -35,8 +35,8 @@ def safe_json_parse(content: str) -> Dict[str, Any]:
     # 尝试直接解析
     try:
         return json.loads(content)
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"直接JSON解析失败，尝试后备解析: {e}")
     
     # 尝试从markdown代码块中提取
     json_block_patterns = [
@@ -51,7 +51,8 @@ def safe_json_parse(content: str) -> Dict[str, Any]:
             try:
                 json_str = match.group(1) if '```' in pattern else match.group(0)
                 return json.loads(json_str.strip())
-            except:
+            except Exception as e:
+                logger.debug(f"正则提取JSON解析失败: {e}")
                 continue
     
     # 尝试找到第一个 { 和最后一个 }
@@ -60,8 +61,8 @@ def safe_json_parse(content: str) -> Dict[str, Any]:
         end = content.rfind('}')
         if start != -1 and end != -1 and end > start:
             return json.loads(content[start:end+1])
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"括号范围JSON解析失败: {e}")
     
     return {"error": "JSON解析失败", "raw_content": content[:500]}
 
@@ -467,7 +468,8 @@ class EnhancedLLMIntegration:
                 result = json.loads(response.content)
                 result["provider"] = response.provider.value if response.provider else provider
                 return result
-            except:
+            except Exception as e:
+                logger.debug(f"市场分析JSON解析失败，回退文本结果: {e}")
                 return {
                     "analysis": response.content,
                     "provider": response.provider.value if response.provider else provider
@@ -502,7 +504,8 @@ class EnhancedLLMIntegration:
                 result = json.loads(response.content)
                 result["provider"] = response.provider.value if response.provider else provider
                 return result
-            except:
+            except Exception as e:
+                logger.debug(f"策略JSON解析失败，回退文本结果: {e}")
                 return {
                     "strategy": response.content,
                     "provider": response.provider.value if response.provider else provider
@@ -537,7 +540,8 @@ class EnhancedLLMIntegration:
                 result = json.loads(response.content)
                 result["provider"] = response.provider.value if response.provider else provider
                 return result
-            except:
+            except Exception as e:
+                logger.debug(f"新闻分析JSON解析失败，回退文本结果: {e}")
                 return {
                     "analysis": response.content,
                     "provider": response.provider.value if response.provider else provider
@@ -571,7 +575,8 @@ class EnhancedLLMIntegration:
                 result = json.loads(response.content)
                 result["provider"] = response.provider.value if response.provider else provider
                 return result
-            except:
+            except Exception as e:
+                logger.debug(f"风险评估JSON解析失败，回退文本结果: {e}")
                 return {
                     "risk_assessment": response.content,
                     "provider": response.provider.value if response.provider else provider

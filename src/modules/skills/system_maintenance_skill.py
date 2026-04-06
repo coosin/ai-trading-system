@@ -311,8 +311,8 @@ class SystemMaintenanceSkill(SkillBase):
                         with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
                             content = f.read()
                             error_count_24h += content.lower().count('error')
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"读取日志文件失败 {log_file}: {e}")
         
         return {
             "total_size_mb": round(total_size / (1024**2), 2),
@@ -478,8 +478,8 @@ class SystemMaintenanceSkill(SkillBase):
                                 cleaned_size += size
                             elif item.is_dir():
                                 shutil.rmtree(item)
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"清理临时项失败 {item}: {e}")
             
             logger.info(f"✅ 临时文件清理完成: {cleaned_size / (1024**2):.2f}MB")
             return True
@@ -506,8 +506,8 @@ class SystemMaintenanceSkill(SkillBase):
                         try:
                             await main_controller.restart_module(name)
                             restarted += 1
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"重启模块失败 {name}: {e}")
             
             logger.info(f"✅ 重启模块完成: {restarted} 个")
             return restarted > 0

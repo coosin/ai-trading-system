@@ -77,12 +77,12 @@ class AccountRiskMonitor:
         self._monitor_task = None
         
         self.risk_config = {
-            "margin_ratio_warning": 0.5,
-            "margin_ratio_critical": 0.8,
-            "unrealized_loss_warning": -0.05,
-            "unrealized_loss_critical": -0.10,
-            "liquidation_distance_warning": 0.10,
-            "liquidation_distance_critical": 0.05,
+            "margin_ratio_warning": 0.6,      # 保证金率警告 (60%)
+            "margin_ratio_critical": 0.9,     # 保证金率强平 (90%) - 调高减少强平
+            "unrealized_loss_warning": -0.08, # 浮亏警告 (-8%)
+            "unrealized_loss_critical": -0.15,# 浮亏强平 (-15%) - 调宽减少强平
+            "liquidation_distance_warning": 0.15,  # 距离强平警告 (15%)
+            "liquidation_distance_critical": 0.08, # 距离强平 (8%) - 调高减少强平
             "monitor_interval": 10
         }
         

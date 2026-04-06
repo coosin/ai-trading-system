@@ -153,7 +153,13 @@ class SmartMemoryManager:
             logger.warning(f"记忆存储路径权限不足，使用备用路径: {fallback}")
         
         self.workspace_path = Path(workspace_path) if workspace_path else Path("workspace")
-        self.workspace_path.mkdir(parents=True, exist_ok=True)
+        try:
+            self.workspace_path.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            fallback_workspace = Path("/tmp/openclaw_workspace")
+            fallback_workspace.mkdir(parents=True, exist_ok=True)
+            self.workspace_path = fallback_workspace
+            logger.warning(f"工作区路径权限不足，使用备用路径: {fallback_workspace}")
         
         self.intent_keywords = IntentKeywords()
         
@@ -204,7 +210,11 @@ class SmartMemoryManager:
             self.storage_path / "sessions"
         ]
         for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                logger.warning(f"无法创建记忆目录 {d}，权限不足")
+                continue
     
     def _load_workspace_memory(self):
         """加载工作区记忆文件"""
@@ -251,26 +261,32 @@ class SmartMemoryManager:
         user_input_lower = user_input.lower()
         intent_scores: Dict[IntentType, int] = {}
         
-        for intent_type in [IntentType.TRADING, IntentType.MARKET, 
+        # 检查所有意图类型，包括CASUAL日常对话
+        all_intent_types = [IntentType.TRADING, IntentType.MARKET, 
                            IntentType.RISK, IntentType.LEARNING, 
-                           IntentType.INSTRUCTION]:
+                           IntentType.INSTRUCTION, IntentType.CASUAL]
+        
+        for intent_type in all_intent_types:
             keywords = getattr(self.intent_keywords, intent_type.value, set())
             score = sum(1 for kw in keywords if kw in user_input_lower)
             if score > 0:
                 intent_scores[intent_type] = score
         
+        # 如果没有匹配到任何专业意图，默认为CASUAL（日常对话）
         if not intent_scores:
             return IntentType.CASUAL
         
         max_score = max(intent_scores.values())
         top_intents = [k for k, v in intent_scores.items() if v == max_score]
         
+        # 意图优先级：风险 > 指令 > 交易 > 学习 > 市场 > 日常
         priority_order = [
             IntentType.RISK,
             IntentType.INSTRUCTION,
             IntentType.TRADING,
             IntentType.LEARNING,
-            IntentType.MARKET
+            IntentType.MARKET,
+            IntentType.CASUAL
         ]
         
         for intent in priority_order:

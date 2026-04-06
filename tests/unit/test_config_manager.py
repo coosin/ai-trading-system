@@ -19,6 +19,19 @@ from src.modules.core.config_manager import (
 )
 
 
+@pytest.fixture
+async def config_manager(tmp_path):
+    """模块级配置管理器fixture（供多个测试类复用）"""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(exist_ok=True)
+    manager = ConfigManager(config_dir=str(config_dir), watch_interval=0)
+    await manager.initialize()
+    try:
+        yield manager
+    finally:
+        await manager.cleanup()
+
+
 class TestConfigManager:
     """ConfigManager测试类"""
 
@@ -269,10 +282,13 @@ class TestConfigManager:
     async def test_save_config_to_file(self, config_manager, tmp_path):
         """测试保存配置到文件"""
         config_dir = Path(tmp_path) / "config"
+        config_dir.mkdir(exist_ok=True)
+        manager = ConfigManager(config_dir=str(config_dir), watch_interval=0)
+        await manager.initialize()
 
         # 设置配置
-        await config_manager.set_config("test_section", "key1", "value1")
-        await config_manager.set_config("test_section", "key2", {"nested": "value"})
+        await manager.set_config("test_section", "key1", "value1")
+        await manager.set_config("test_section", "key2", {"nested": "value"})
 
         # 验证文件已创建
         config_file = config_dir / "test_section.json"
@@ -284,6 +300,7 @@ class TestConfigManager:
 
         assert saved_config["key1"] == "value1"
         assert saved_config["key2"] == {"nested": "value"}
+        await manager.cleanup()
 
     @pytest.mark.asyncio
     async def test_config_validation_with_schema(self, config_manager):
@@ -307,6 +324,9 @@ class TestConfigManager:
         config_manager.register_schema("database", DatabaseConfig)
 
         # 验证有效的配置
+        await config_manager.set_config("database", "port", 5432, validate=False)
+        await config_manager.set_config("database", "username", "trader", validate=False)
+        await config_manager.set_config("database", "password", "secret", validate=False)
         success = await config_manager.set_config("database", "host", "localhost", validate=True)
         assert success is True
 
@@ -335,7 +355,10 @@ class TestConfigManager:
     async def test_reload_config(self, config_manager, tmp_path):
         """测试重新加载配置"""
         config_dir = Path(tmp_path) / "config"
+        config_dir.mkdir(exist_ok=True)
         config_file = config_dir / "test.json"
+        manager = ConfigManager(config_dir=str(config_dir), watch_interval=0)
+        await manager.initialize()
 
         # 初始配置
         initial_config = {"test": {"key1": "initial"}}
@@ -343,10 +366,10 @@ class TestConfigManager:
             json.dump(initial_config, f)
 
         # 重新加载
-        await config_manager.reload()
+        await manager.reload()
 
         # 验证初始配置
-        value = await config_manager.get_config("test", "key1")
+        value = await manager.get_config("test", "key1")
         assert value == "initial"
 
         # 修改配置文件
@@ -355,14 +378,15 @@ class TestConfigManager:
             json.dump(updated_config, f)
 
         # 再次重新加载
-        await config_manager.reload()
+        await manager.reload()
 
         # 验证更新后的配置
-        value1 = await config_manager.get_config("test", "key1")
-        value2 = await config_manager.get_config("test", "key2")
+        value1 = await manager.get_config("test", "key1")
+        value2 = await manager.get_config("test", "key2")
 
         assert value1 == "updated"
         assert value2 == "new"
+        await manager.cleanup()
 
     @pytest.mark.asyncio
     async def test_cleanup_stops_watching(self, tmp_path):

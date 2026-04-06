@@ -198,6 +198,248 @@ class HierarchicalMemoryManager:
         """清除会话上下文"""
         self.session_context.clear()
 
+    # ==================== 交易记录专用方法 ====================
+    
+    async def save_trade_open(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        quantity: float,
+        reason: str = "",
+        stop_loss: float = None,
+        take_profit: float = None,
+        strategy: str = ""
+    ):
+        """保存开仓记录到记忆"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        trade_record = (
+            f"\n## [{timestamp}] 开仓\n"
+            f"- **交易对**: {symbol}\n"
+            f"- **方向**: {'做多' if side == 'long' else '做空'}\n"
+            f"- **价格**: {price}\n"
+            f"- **数量**: {quantity}\n"
+            f"- **策略**: {strategy or 'AI智能决策'}\n"
+            f"- **原因**: {reason or '市场分析驱动'}\n"
+        )
+        
+        if stop_loss:
+            trade_record += f"- **止损**: {stop_loss}\n"
+        if take_profit:
+            trade_record += f"- **止盈**: {take_profit}\n"
+        
+        # 保存到每日记忆
+        today = datetime.now()
+        existing_memories = await self.load_recent_memories(days=1)
+        
+        if existing_memories:
+            updated_content = existing_memories[0] + trade_record
+        else:
+            updated_content = f"# {today.strftime('%Y-%m-%d')} 交易记录\n\n{trade_record}"
+        
+        await self.save_daily_memory(updated_content, today)
+        
+        logger.info(f"✓ 开仓记录已保存到记忆: {symbol} {'多' if side == 'long' else '空'}")
+    
+    async def save_trade_close(
+        self,
+        symbol: str,
+        side: str,
+        open_price: float,
+        close_price: float,
+        quantity: float,
+        pnl: float = 0,
+        pnl_percent: float = 0,
+        reason: str = ""
+    ):
+        """保存平仓记录到记忆"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result_emoji = "✅ 盈利" if pnl > 0 else "❌ 亏损" if pnl < 0 else "➖ 平局"
+        
+        trade_record = (
+            f"\n## [{timestamp}] 平仓 {result_emoji}\n"
+            f"- **交易对**: {symbol}\n"
+            f"- **方向**: {'做多' if side == 'long' else '做空'}\n"
+            f"- **开仓价**: {open_price}\n"
+            f"- **平仓价**: {close_price}\n"
+            f"- **数量**: {quantity}\n"
+            f"- **盈亏**: {pnl:.4f} ({pnl_percent:.2f}%)\n"
+            f"- **原因**: {reason or '触发止盈止损或AI决策'}\n"
+        )
+        
+        # 保存到每日记忆
+        today = datetime.now()
+        existing_memories = await self.load_recent_memories(days=1)
+        
+        if existing_memories:
+            updated_content = existing_memories[0] + trade_record
+        else:
+            updated_content = f"# {today.strftime('%Y-%m-%d')} 交易记录\n\n{trade_record}"
+        
+        await self.save_daily_memory(updated_content, today)
+        
+        # 同时保存经验教训
+        if abs(pnl) > 0:
+            if pnl > 0:
+                lesson_type = "successful_patterns"
+                lesson = f"{symbol}盈利交易：{'做多' if side == 'long' else '做空'}，从{open_price}到{close_price}，盈利{pnl:.4f}"
+                context = f"成功交易案例 - {symbol} {side}"
+            else:
+                lesson_type = "trading_mistakes"
+                lesson = f"{symbol}亏损交易：{'做多' if side == 'long' else '做空'}，从{open_price}到{close_price}，亏损{abs(pnl):.4f}"
+                context = f"亏损交易反思 - {symbol} {side}"
+            
+            await self.save_lesson_learned(lesson_type, lesson, context)
+        
+        logger.info(f"✓ 平仓记录已保存到记忆: {symbol} {result_emoji}")
+    
+    async def get_trade_history_summary(self, days: int = 7) -> str:
+        """
+        获取交易历史摘要（用于对话上下文）
+        
+        从每日记忆中提取交易记录并生成摘要
+        """
+        memories = await self.load_recent_memories(days=days)
+        
+        if not memories:
+            return "暂无近期交易记录。"
+        
+        summary_parts = [
+            f"# 📊 近 {days} 天交易摘要",
+            "",
+            "## 交易时间线",
+            ""
+        ]
+        
+        total_trades = 0
+        wins = 0
+        losses = 0
+        
+        for memory in memories:
+            # 简单统计开仓和平仓次数
+            total_trades += memory.count("开仓") + memory.count("平仓")
+            if "✅ 盈利" in memory:
+                wins += memory.count("✅ 盈利")
+            if "❌ 亏损" in memory:
+                losses += memory.count("❌ 亏损")
+        
+        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+        
+        summary_parts.extend([
+            f"**总交易数**: 约 {total_trades // 2} 笔",
+            f"**胜率**: {win_rate:.1f}%",
+            f"**盈利笔数**: {wins}",
+            f"**亏损笔数**: {losses}",
+            "",
+            "---",
+            "",
+            "## 详细记录",
+            ""
+        ])
+        
+        # 添加最近3天的详细记录
+        for i, memory in enumerate(memories[:3], 1):
+            date_match = memory.split('\n')[0] if memory.startswith('#') else f"第{i}天"
+            summary_parts.append(f"### {date_match}")
+            summary_parts.append("")
+            
+            # 提取交易记录部分
+            lines = memory.split('\n')
+            in_trade_section = False
+            
+            for line in lines:
+                if '## [' in line and ('开仓' in line or '平仓' in line):
+                    in_trade_section = True
+                
+                if in_trade_section:
+                    summary_parts.append(line)
+                    
+                    # 一个交易块结束
+                    if line.strip() == '' and in_trade_section:
+                        in_trade_section = False
+            
+            summary_parts.append("")
+        
+        return "\n".join(summary_parts)
+    
+    async def save_trading_session_summary(
+        self,
+        session_stats: Dict[str, Any],
+        insights: List[str] = None
+    ):
+        """
+        保存交易会话总结
+        
+        在每个交易日结束时调用，生成当日总结
+        """
+        today = datetime.now()
+        date_str = today.strftime('%Y-%m-%d')
+        
+        summary = f"# {date_str} 交易日总结\n\n"
+        
+        summary += "## 📈 今日表现\n\n"
+        summary += f"- **总交易次数**: {session_stats.get('total_trades', 0)}\n"
+        summary += f"- **胜率**: {session_stats.get('win_rate', 0)}%\n"
+        summary += f"- **总盈亏**: {session_stats.get('total_pnl', 0)} USDT\n"
+        summary += f"- **最佳交易**: {session_stats.get('best_trade', 0)} USDT\n"
+        summary += f"- **最差交易**: {session_stats.get('worst_trade', 0)} USDT\n"
+        
+        if session_stats.get('max_drawdown'):
+            summary += f"- **最大回撤**: {session_stats['max_drawdown']} USDT\n"
+        
+        summary += "\n## 💡 关键洞察\n\n"
+        
+        if insights:
+            for i, insight in enumerate(insights, 1):
+                summary += f"{i}. {insight}\n"
+        else:
+            summary += "*(待补充)*\n"
+        
+        summary += "\n## 🎯 明日计划\n\n"
+        summary += "*(基于今日表现调整策略)*\n"
+        
+        # 保存为每日记忆（覆盖或追加）
+        await self.save_daily_memory(summary, today)
+        
+        # 如果有重要教训，也保存到长期记忆
+        if session_stats.get('total_pnl', 0) < 0:
+            lesson = f"{date_str} 亏损日总结：总亏损{abs(session_stats['total_pnl'])}，需分析原因并调整策略"
+            context = f"亏损日 - {date_str} | 交易{session_stats.get('total_trades', 0)}笔"
+            await self.save_lesson_learned("trading_mistakes", lesson, context)
+        elif session_stats.get('total_pnl', 0) > 0:
+            lesson = f"{date_str} 盈利日总结：总盈利{session_stats['total_pnl']}，成功因素值得保持"
+            context = f"盈利日 - {date_str} | 胜率{session_stats.get('win_rate', 0)}%"
+            await self.save_lesson_learned("successful_patterns", lesson, context)
+        
+        logger.info(f"✓ 交易日总结已保存: {date_str}")
+    
+    async def get_relevant_lessons_for_symbol(self, symbol: str) -> List[str]:
+        """获取与特定币种相关的经验教训"""
+        relevant_lessons = []
+        
+        lessons_path = self.lessons_path
+        
+        if not lessons_path.exists():
+            return []
+        
+        for lesson_file in lessons_path.glob("*.md"):
+            try:
+                content = lesson_file.read_text(encoding='utf-8')
+                
+                if symbol.replace('/', '_') in content or symbol in content:
+                    # 提取相关的教训条目
+                    lines = content.split('\n')
+                    for i, line in enumerate(lines):
+                        if symbol in line or symbol.replace('/', '_') in line:
+                            context_start = max(0, i - 1)
+                            context_end = min(len(lines), i + 2)
+                            relevant_lessons.append('\n'.join(lines[context_start:context_end]))
+            except Exception as e:
+                logger.warning(f"读取教训文件失败 {lesson_file}: {e}")
+        
+        return relevant_lessons[-10:]  # 返回最近10条相关教训
+
 
     async def cleanup(self):
         """清理资源"""

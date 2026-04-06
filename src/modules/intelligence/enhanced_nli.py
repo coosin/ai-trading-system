@@ -171,7 +171,7 @@ class EnhancedNaturalLanguageInterface:
             "- 模式: 实盘交易",
             "- 交易类型: 永续合约",
             "- 杠杆: 10-50倍",
-            "- 黑名单: ETH/USDT"
+            "- 黑名单: 无"
         ]
         
         if self.main_controller:

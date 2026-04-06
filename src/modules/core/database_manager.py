@@ -123,14 +123,14 @@ class DatabaseStats:
 class DatabaseConfig:
     """数据库配置"""
 
-    type: DatabaseType = DatabaseType.SQLITE
+    type: DatabaseType = DatabaseType.POSTGRESQL
     host: str = "localhost"
     port: int = 5432
     database: str = "/app/data/trading_system.db"
     username: str = "postgres"
     password: str = ""
-    pool_size: int = 20
-    max_overflow: int = 30
+    pool_size: int = 10
+    max_overflow: int = 20
     pool_timeout: int = 60
     pool_recycle: int = 1800
     echo: bool = False
@@ -713,7 +713,13 @@ class DatabaseManager:
             连接统计信息
         """
         if not self.engine:
-            return {}
+            stats = {
+                "status": self.status.value,
+                "connected_at": self.connected_at.isoformat() if self.connected_at else None,
+                "last_error": self.last_error,
+            }
+            stats.update(self.stats.__dict__)
+            return stats
 
         try:
             # 获取连接池信息

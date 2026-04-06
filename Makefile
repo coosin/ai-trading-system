@@ -139,7 +139,7 @@ migrate-create:
 # 运行开发服务器
 run:
 	@echo "$(BLUE)启动开发服务器...$(NC)"
-	uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+	./start_production.sh simulation
 
 # 覆盖率报告
 coverage:

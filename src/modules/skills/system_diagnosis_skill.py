@@ -111,7 +111,8 @@ class SystemDiagnosisSkill(SkillBase):
             import socket
             socket.create_connection(("8.8.8.8", 53), timeout=3)
             connected = True
-        except:
+        except Exception as e:
+            logger.debug(f"网络连通性检查失败: {e}")
             connected = False
         
         return {
@@ -127,8 +128,8 @@ class SystemDiagnosisSkill(SkillBase):
                 if 'python' in proc.info['name'].lower():
                     if proc.info['cmdline'] and any('src.main' in cmd for cmd in proc.info['cmdline']):
                         trading_processes += 1
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"读取进程信息失败(pid={getattr(proc, 'pid', 'unknown')}): {e}")
         
         return {
             "total": len(psutil.pids()),

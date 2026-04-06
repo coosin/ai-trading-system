@@ -77,7 +77,7 @@ class AICoreDecisionEngine:
         self.plugin_manager = None
         
         # 用户规则
-        self.blacklist = set(["ETH/USDT"])
+        self.blacklist = set()  # 空黑名单，允许所有交易对
         self.authorization = {
             "full_authorization": True,
             "auto_trading": True,
@@ -86,18 +86,23 @@ class AICoreDecisionEngine:
             "auto_optimize": True,
         }
         
-        # 交易配置 - 积极主动模式
         self.config = {
             "leverage_min": 10,
             "leverage_max": 50,
             "default_leverage": 20,
             "max_positions": 5,
-            "min_trade_interval": 60,  # 缩短到1分钟
-            "strategy_check_interval": 300,  # 缩短到5分钟
+            "min_trade_interval": 120,
+            "strategy_check_interval": 300,
             "backtest_lookback_days": 30,
-            "aggressive_mode": True,  # 积极模式
-            "auto_create_strategy": True,  # 自动创建策略
-            "min_confidence_to_trade": 0.6,  # 降低交易门槛
+            "aggressive_mode": False,
+            "auto_create_strategy": True,
+            "min_confidence_to_trade": 0.75,
+            "max_loss_per_position": 0.05,
+            "daily_loss_limit": 0.10,
+            "max_drawdown_limit": 0.15,
+            "risk_check_interval": 30,
+            "auto_reduce_on_high_risk": True,
+            "emergency_close_on_critical": True,
         }
         
         # 状态
@@ -186,8 +191,9 @@ class AICoreDecisionEngine:
                 limit=5
             )
             for mem in blacklist_mems:
+                # 不再自动将ETH加入黑名单
                 if "ETH" in mem.content or "以太坊" in mem.content:
-                    self.blacklist.add("ETH/USDT")
+                    logger.info(f"ℹ️ 忽略ETH黑名单记忆: 已移除ETH限制")
             
             auth_mems = await self.memory.retrieve_memories(
                 query="全权 负责 授权",
@@ -373,8 +379,8 @@ class AICoreDecisionEngine:
                     all_symbols = [s.replace('-USDT', '/USDT').replace('-SWAP', '') for s in all_symbols]
                     # 去重
                     all_symbols = list(set(all_symbols))
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"获取交易所交易对失败，回退默认列表: {e}")
         
         # 如果无法获取交易所交易对，使用主流币种
         if not all_symbols:
@@ -385,8 +391,8 @@ class AICoreDecisionEngine:
                 "ATOM/USDT", "LTC/USDT", "TRX/USDT", "BCH/USDT"
             ]
         
-        # 过滤黑名单 - ETH不能交易
-        available_symbols = [s for s in all_symbols if s not in self.blacklist and 'ETH' not in s]
+        # 黑名单已清空，不过滤任何交易对
+        available_symbols = all_symbols
         
         if not self.exchange:
             return available_symbols[:5]
@@ -404,8 +410,8 @@ class AICoreDecisionEngine:
                         # 综合评分：波动性 + 成交量
                         score = change_24h * 100 + (volume / 1000000 if volume > 0 else 0)
                         symbol_volatility[symbol] = score
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"获取币种行情失败 {symbol}: {e}")
             
             # 选择评分最高的5个币种
             sorted_symbols = sorted(symbol_volatility.items(), key=lambda x: x[1], reverse=True)
@@ -668,28 +674,7 @@ class AICoreDecisionEngine:
                 pnl_ratio = float(pos.get('uplRatio', 0))
                 pos_side = pos.get('posSide', 'long')
                 
-                # 检查是否在黑名单中 - 支持多种格式
-                symbol_base = symbol.replace('-SWAP', '').replace('/SWAP', '').replace('-USDT-SWAP', '/USDT').replace('-', '/')
-                in_blacklist = False
-                for bl in self.blacklist:
-                    if bl in symbol or bl in symbol_base or symbol_base in bl:
-                        in_blacklist = True
-                        break
-                
-                if in_blacklist:
-                    logger.warning(f"🚨 AI主动平仓黑名单持仓: {symbol} (匹配黑名单)")
-                    try:
-                        result = await self.exchange.close_position(symbol, pos_side)
-                        logger.info(f"✅ AI已平仓黑名单持仓: {symbol} {pos_side}, 结果: {result}")
-                        
-                        if self.telegram_bot and self.telegram_bot.chat_ids:
-                            await self.telegram_bot.send_message(
-                                chat_id=self.telegram_bot.chat_ids[0],
-                                text=f"🚨 AI风险控制: 主动平仓黑名单持仓 {symbol} {pos_side}"
-                            )
-                    except Exception as e:
-                        logger.error(f"平仓黑名单持仓失败: {e}")
-                    continue
+                # 黑名单已清空，不再检查黑名单
                 
                 # 检查亏损是否过大
                 if pnl_ratio < -0.1:
@@ -803,8 +788,8 @@ class AICoreDecisionEngine:
             if hasattr(self.exchange, 'get_symbols'):
                 try:
                     all_symbols = await self.exchange.get_symbols()
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"获取交易对列表失败，使用默认交易对: {e}")
             
             # 如果无法获取所有交易对，使用主流交易对
             if not all_symbols:
@@ -827,7 +812,8 @@ class AICoreDecisionEngine:
                             "change_24h": ticker.get('change', 0),
                             "volume": ticker.get('volume', 0),
                         }
-                except:
+                except Exception as e:
+                    logger.debug(f"获取市场概览行情失败 {symbol}: {e}")
                     continue
                     
         except Exception as e:
@@ -1979,8 +1965,8 @@ class AICoreDecisionEngine:
                         size = pos.get('size', 0)
                         pnl = float(pos.get('unrealized_pnl', 0) or 0)
                         report += f"  {symbol}: {side} {size} | 盈亏: ${pnl:+.2f}\n"
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"获取实时持仓信息失败: {e}")
         
         return report
     
@@ -2333,7 +2319,7 @@ class AICoreDecisionEngine:
 7. 回答任何问题
 
 【重要规则】
-- 黑名单币种（ETH相关）绝对不能操作
+- 黑名单已清空，所有交易对均可操作
 - 用自然语言回复，简洁专业
 - 如果用户要求执行操作，先确认当前状态再执行
 - 保持对话自然流畅

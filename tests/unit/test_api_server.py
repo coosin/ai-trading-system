@@ -4,7 +4,7 @@ APIServer单元测试
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -165,7 +165,7 @@ class TestAPIServer:
 
         # 测试空闲时间
         idle_time = connection.idle_time
-        assert isinstance(idle_time, asyncio.timedelta)
+        assert isinstance(idle_time, timedelta)
         assert idle_time.total_seconds() >= 0
 
     @pytest.mark.asyncio

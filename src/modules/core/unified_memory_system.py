@@ -1,14 +1,13 @@
 """
-统一记忆系统
+统一记忆系统 V3.0 - 兼容适配器
 
-整合所有记忆功能，保留现有功能，提供统一接口
+整合所有记忆功能，使用优化版实现，保持向后兼容
 
 核心功能：
-1. 保留 AIMemoryManager 的核心记忆功能
-2. 保留 HierarchicalMemoryManager 的层次化记忆
-3. 整合 EnhancedMemoryManager 的增强功能
-4. 整合 UnifiedIntelligentMemory 的智能特性
-5. 统一接口，简化使用
+1. 保留原有接口，内部使用 OptimizedMemorySystem
+2. 自动迁移旧记忆数据
+3. 统一存储路径管理
+4. 提供便捷的访问方法
 """
 
 import asyncio
@@ -17,14 +16,23 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
 
+from .optimized_memory_system import (
+    OptimizedMemorySystem,
+    MemoryLayer,
+    MemoryCategory,
+    MemoryEntry,
+    get_memory_system
+)
+
 logger = logging.getLogger(__name__)
 
 
 class UnifiedMemorySystem:
     """
-    统一记忆系统
+    统一记忆系统 - 兼容适配器
     
-    整合所有记忆功能，保留现有接口，提供统一管理
+    整合所有记忆功能，使用优化版实现
+    保持向后兼容的接口
     """
     
     def __init__(self, workspace_path: str = None):
@@ -36,20 +44,19 @@ class UnifiedMemorySystem:
         """
         self.workspace_path = workspace_path or "workspace"
         
-        # 核心记忆管理器（保留现有功能）
+        self._optimized_memory: Optional[OptimizedMemorySystem] = None
+        
         self.ai_memory = None
         self.hierarchical_memory = None
         self.memory_optimizer = None
         
-        # 增强功能（整合自其他模块）
         self.enhanced_features = {
-            "importance_evaluator": None,
+            "importance_evaluator": True,
             "auto_cleanup": True,
             "smart_indexing": True,
             "context_builder": True
         }
         
-        # 记忆统计
         self.stats = {
             "total_memories": 0,
             "short_term_count": 0,
@@ -58,11 +65,10 @@ class UnifiedMemorySystem:
             "last_cleanup": None
         }
         
-        # 缓存
         self._cache: Dict[str, Any] = {}
-        self._cache_ttl = 300  # 5分钟
+        self._cache_ttl = 300
         
-        logger.info("统一记忆系统初始化")
+        logger.info("统一记忆系统初始化 (使用优化版实现)")
     
     async def initialize(self) -> bool:
         """
@@ -74,20 +80,11 @@ class UnifiedMemorySystem:
         try:
             logger.info("🔧 初始化统一记忆系统...")
             
-            # 1. 初始化核心AI记忆管理器（保留现有功能）
-            await self._init_ai_memory()
+            self._optimized_memory = await get_memory_system(
+                workspace_path=self.workspace_path
+            )
             
-            # 2. 初始化层次化记忆管理器（保留现有功能）
-            await self._init_hierarchical_memory()
-            
-            # 3. 初始化内存优化器（保留现有功能）
-            await self._init_memory_optimizer()
-            
-            # 4. 整合增强功能（来自其他模块）
-            await self._integrate_enhanced_features()
-            
-            # 5. 启动后台任务
-            await self._start_background_tasks()
+            self._sync_stats()
             
             logger.info("✅ 统一记忆系统初始化完成")
             return True
@@ -98,113 +95,15 @@ class UnifiedMemorySystem:
             logger.debug(traceback.format_exc())
             return False
     
-    async def _init_ai_memory(self):
-        """初始化AI记忆管理器（保留现有功能）"""
-        try:
-            from src.modules.core.ai_memory import SmartMemoryManager
-            
-            self.ai_memory = SmartMemoryManager(workspace_path=self.workspace_path)
-            await self.ai_memory.initialize()
-            
-            logger.info("✅ AI记忆管理器已初始化（保留现有功能）")
-        except Exception as e:
-            logger.warning(f"⚠️ AI记忆管理器初始化失败: {e}")
-            self.ai_memory = None
-    
-    async def _init_hierarchical_memory(self):
-        """初始化层次化记忆管理器（保留现有功能）"""
-        try:
-            from src.modules.core.hierarchical_memory import HierarchicalMemoryManager
-            
-            memory_path = str(Path(self.workspace_path) / "memory")
-            self.hierarchical_memory = HierarchicalMemoryManager(base_path=memory_path)
-            
-            logger.info("✅ 层次化记忆管理器已初始化（保留现有功能）")
-        except Exception as e:
-            logger.warning(f"⚠️ 层次化记忆管理器初始化失败: {e}")
-            self.hierarchical_memory = None
-    
-    async def _init_memory_optimizer(self):
-        """初始化内存优化器（保留现有功能）"""
-        try:
-            from src.modules.core.memory_optimizer import MemoryOptimizer
-            
-            self.memory_optimizer = MemoryOptimizer({
-                "max_memory_percent": 80,
-                "cleanup_interval": 300,
-                "cache_size_limit": 500
-            })
-            await self.memory_optimizer.start()
-            
-            logger.info("✅ 内存优化器已初始化（保留现有功能）")
-        except Exception as e:
-            logger.warning(f"⚠️ 内存优化器初始化失败: {e}")
-            self.memory_optimizer = None
-    
-    async def _integrate_enhanced_features(self):
-        """整合增强功能（来自其他记忆模块）"""
-        try:
-            self.enhanced_features["importance_evaluator"] = self._create_importance_evaluator()
-            logger.info("✅ 增强功能整合完成")
-        except Exception as e:
-            logger.warning(f"⚠️ 增强功能整合失败: {e}")
-    
-    def _create_importance_evaluator(self):
-        """创建重要性评估器"""
-        try:
-            from src.modules.core.unified_intelligent_memory import MemoryImportanceEvaluator
-            return MemoryImportanceEvaluator()
-        except Exception as e:
-            logger.debug(f"重要性评估器不可用: {e}")
-            return None
-    
-    async def _start_background_tasks(self):
-        """启动后台任务"""
-        try:
-            # 启动定期清理任务
-            asyncio.create_task(self._periodic_cleanup())
-            
-            logger.info("✅ 后台任务已启动")
-        except Exception as e:
-            logger.warning(f"⚠️ 后台任务启动失败: {e}")
-    
-    async def _periodic_cleanup(self):
-        """定期清理任务"""
-        while True:
-            try:
-                await asyncio.sleep(300)  # 每5分钟
-                
-                # 清理过期记忆
-                if self.enhanced_features["auto_cleanup"]:
-                    await self.cleanup_expired_memories()
-                
-                # 更新统计
-                await self._update_stats()
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.debug(f"定期清理失败: {e}")
-    
-    async def _update_stats(self):
-        """更新记忆统计"""
-        try:
-            if self.ai_memory:
-                self.stats["short_term_count"] = len(self.ai_memory.short_term_memory) if hasattr(self.ai_memory, 'short_term_memory') else 0
-                self.stats["long_term_count"] = len(self.ai_memory.long_term_memory) if hasattr(self.ai_memory, 'long_term_memory') else 0
-            
-            if self.hierarchical_memory:
-                self.stats["medium_term_count"] = 0  # 层次化记忆的统计
-                
-            self.stats["total_memories"] = (
-                self.stats["short_term_count"] + 
-                self.stats["medium_term_count"] + 
-                self.stats["long_term_count"]
-            )
-        except Exception as e:
-            logger.debug(f"更新统计失败: {e}")
-    
-    # ==================== 统一记忆接口 ====================
+    def _sync_stats(self):
+        """同步统计信息"""
+        if self._optimized_memory:
+            opt_stats = self._optimized_memory.get_stats()
+            self.stats["total_memories"] = opt_stats.get("total_memories", 0)
+            self.stats["short_term_count"] = opt_stats.get("by_layer", {}).get(MemoryLayer.WORKING, 0)
+            self.stats["medium_term_count"] = opt_stats.get("by_layer", {}).get(MemoryLayer.HISTORY, 0)
+            self.stats["long_term_count"] = opt_stats.get("by_layer", {}).get(MemoryLayer.EXPERIENCE, 0)
+            self.stats["last_cleanup"] = opt_stats.get("last_cleanup")
     
     async def remember(
         self,
@@ -225,56 +124,46 @@ class UnifiedMemorySystem:
         Returns:
             bool: 是否成功
         """
+        if not self._optimized_memory:
+            return False
+        
+        level_map = {
+            "short": MemoryLayer.WORKING,
+            "medium": MemoryLayer.HISTORY,
+            "long": MemoryLayer.EXPERIENCE
+        }
+        
+        layer = level_map.get(level, MemoryLayer.WORKING)
+        
+        content = f"{key}: {value}" if not isinstance(value, str) else value
+        
+        category = MemoryCategory.TRADE_RECORD
+        if metadata and "type" in metadata:
+            type_map = {
+                "trade": MemoryCategory.TRADE_RECORD,
+                "market": MemoryCategory.MARKET_OBSERVATION,
+                "risk": MemoryCategory.RISK_EVENT,
+                "lesson": MemoryCategory.LESSON_LEARNED,
+                "preference": MemoryCategory.USER_PREFERENCE
+            }
+            category = type_map.get(metadata["type"], MemoryCategory.TRADE_RECORD)
+        
         try:
-            # 评估重要性
-            importance = 0.5
-            if self.enhanced_features["importance_evaluator"]:
-                try:
-                    importance = self.enhanced_features["importance_evaluator"].evaluate(key, value)
-                except:
-                    pass
+            await self._optimized_memory.remember(
+                content=content,
+                category=category,
+                layer=layer,
+                importance=0.5,
+                tags={key} if key else set(),
+                metadata=metadata or {}
+            )
             
-            # 根据级别存储
-            if level == "short":
-                return await self._remember_short_term(key, value, metadata)
-            elif level == "medium":
-                return await self._remember_medium_term(key, value, metadata, importance)
-            else:
-                return await self._remember_long_term(key, value, metadata, importance)
-                
+            self._sync_stats()
+            return True
+            
         except Exception as e:
             logger.error(f"记忆失败: {e}")
             return False
-    
-    async def _remember_short_term(self, key: str, value: Any, metadata: Dict = None) -> bool:
-        """短期记忆"""
-        if self.ai_memory:
-            try:
-                await self.ai_memory.add_short_term_memory(key, value, metadata)
-                return True
-            except Exception as e:
-                logger.debug(f"短期记忆失败: {e}")
-        return False
-    
-    async def _remember_medium_term(self, key: str, value: Any, metadata: Dict, importance: float) -> bool:
-        """中期记忆"""
-        if self.hierarchical_memory:
-            try:
-                await self.hierarchical_memory.add_memory(key, value, metadata)
-                return True
-            except Exception as e:
-                logger.debug(f"中期记忆失败: {e}")
-        return False
-    
-    async def _remember_long_term(self, key: str, value: Any, metadata: Dict, importance: float) -> bool:
-        """长期记忆"""
-        if self.ai_memory:
-            try:
-                await self.ai_memory.add_long_term_memory(key, value, metadata)
-                return True
-            except Exception as e:
-                logger.debug(f"长期记忆失败: {e}")
-        return False
     
     async def recall(
         self,
@@ -293,57 +182,41 @@ class UnifiedMemorySystem:
         Returns:
             List[Dict]: 记忆列表
         """
+        if not self._optimized_memory:
+            return []
+        
+        layer = None
+        if level != "all":
+            level_map = {
+                "short": MemoryLayer.WORKING,
+                "medium": MemoryLayer.HISTORY,
+                "long": MemoryLayer.EXPERIENCE
+            }
+            layer = level_map.get(level)
+        
         try:
+            entries = await self._optimized_memory.recall(
+                query=query,
+                layer=layer,
+                limit=limit
+            )
+            
             results = []
+            for entry in entries:
+                results.append({
+                    "key": entry.id,
+                    "value": entry.content,
+                    "importance": entry.importance,
+                    "timestamp": entry.created_at.isoformat(),
+                    "access_count": entry.access_count,
+                    "metadata": entry.metadata
+                })
             
-            # 从不同级别搜索
-            if level in ["all", "short"]:
-                short_term = await self._recall_short_term(query, limit)
-                results.extend(short_term)
-            
-            if level in ["all", "medium"]:
-                medium_term = await self._recall_medium_term(query, limit)
-                results.extend(medium_term)
-            
-            if level in ["all", "long"]:
-                long_term = await self._recall_long_term(query, limit)
-                results.extend(long_term)
-            
-            # 按重要性排序
-            results.sort(key=lambda x: x.get("importance", 0), reverse=True)
-            
-            return results[:limit]
+            return results
             
         except Exception as e:
             logger.error(f"回忆失败: {e}")
             return []
-    
-    async def _recall_short_term(self, query: str, limit: int) -> List[Dict]:
-        """短期记忆回忆"""
-        if self.ai_memory:
-            try:
-                return await self.ai_memory.search_short_term(query, limit)
-            except:
-                pass
-        return []
-    
-    async def _recall_medium_term(self, query: str, limit: int) -> List[Dict]:
-        """中期记忆回忆"""
-        if self.hierarchical_memory:
-            try:
-                return await self.hierarchical_memory.search(query, limit)
-            except:
-                pass
-        return []
-    
-    async def _recall_long_term(self, query: str, limit: int) -> List[Dict]:
-        """长期记忆回忆"""
-        if self.ai_memory:
-            try:
-                return await self.ai_memory.search_long_term(query, limit)
-            except:
-                pass
-        return []
     
     async def retrieve_memories(self, query: str, limit: int = 10) -> List[Dict]:
         """
@@ -358,21 +231,17 @@ class UnifiedMemorySystem:
         """
         return await self.recall(query, level="all", limit=limit)
     
-    # ==================== 保留现有接口 ====================
-    
     def get_ai_memory(self):
         """获取AI记忆管理器（保留现有接口）"""
-        return self.ai_memory
+        return self._optimized_memory
     
     def get_hierarchical_memory(self):
         """获取层次化记忆管理器（保留现有接口）"""
-        return self.hierarchical_memory
+        return self._optimized_memory
     
     def get_memory_optimizer(self):
         """获取内存优化器（保留现有接口）"""
-        return self.memory_optimizer
-    
-    # ==================== 增强功能 ====================
+        return self._optimized_memory
     
     async def build_context(self, query: str, max_tokens: int = 2000) -> str:
         """
@@ -385,131 +254,163 @@ class UnifiedMemorySystem:
         Returns:
             str: 记忆上下文
         """
-        try:
-            # 获取相关记忆
-            memories = await self.recall(query, level="all", limit=20)
-            
-            # 构建上下文
-            context_parts = []
-            current_tokens = 0
-            
-            for memory in memories:
-                memory_text = f"- {memory.get('key', '')}: {memory.get('value', '')}\n"
-                memory_tokens = len(memory_text.split())
-                
-                if current_tokens + memory_tokens <= max_tokens:
-                    context_parts.append(memory_text)
-                    current_tokens += memory_tokens
-                else:
-                    break
-            
-            if context_parts:
-                return "相关记忆：\n" + "".join(context_parts)
-            else:
-                return ""
-                
-        except Exception as e:
-            logger.debug(f"构建上下文失败: {e}")
+        if not self._optimized_memory:
             return ""
+        
+        return await self._optimized_memory.build_context(query, max_tokens)
     
     async def cleanup_expired_memories(self):
         """清理过期记忆（增强功能）"""
-        try:
-            # 清理短期记忆（超过1天）
-            if self.ai_memory:
-                try:
-                    await self.ai_memory.cleanup_expired()
-                except:
-                    pass
-            
-            # 更新统计
-            self.stats["last_cleanup"] = datetime.now()
-            
-            logger.debug("过期记忆清理完成")
-        except Exception as e:
-            logger.debug(f"清理过期记忆失败: {e}")
+        if not self._optimized_memory:
+            return
+        
+        await self._optimized_memory.cleanup_expired()
+        self._sync_stats()
     
     async def optimize(self):
         """优化内存使用（增强功能）"""
-        try:
-            if self.memory_optimizer:
-                await self.memory_optimizer.optimize()
-            
-            # 清理缓存
-            self._cache.clear()
-            
-            logger.debug("内存优化完成")
-        except Exception as e:
-            logger.debug(f"内存优化失败: {e}")
-    
-    # ==================== 统计和监控 ====================
+        self._cache.clear()
+        if self._optimized_memory:
+            await self._optimized_memory.cleanup()
     
     def get_stats(self) -> Dict[str, Any]:
         """获取记忆统计"""
-        return {
-            **self.stats,
-            "ai_memory_available": self.ai_memory is not None,
-            "hierarchical_memory_available": self.hierarchical_memory is not None,
-            "memory_optimizer_available": self.memory_optimizer is not None,
-            "enhanced_features": self.enhanced_features
-        }
+        if self._optimized_memory:
+            return self._optimized_memory.get_stats()
+        return self.stats
     
     async def save_daily_memory(self, content: str):
         """保存每日记忆"""
-        if self.hierarchical_memory:
-            try:
-                await self.hierarchical_memory.save_daily_memory(content)
-            except Exception as e:
-                logger.debug(f"保存每日记忆失败: {e}")
+        if self._optimized_memory:
+            await self._optimized_memory.remember(
+                content=content,
+                category=MemoryCategory.DAILY_SUMMARY,
+                layer=MemoryLayer.WORKING,
+                importance=0.6,
+                tags={"daily", datetime.now().strftime("%Y-%m-%d")}
+            )
     
-    # ==================== 清理和关闭 ====================
+    async def save_trade_record(
+        self,
+        symbol: str,
+        action: str,
+        price: float,
+        quantity: float,
+        pnl: Optional[float] = None,
+        reason: str = "",
+        strategy: str = ""
+    ) -> str:
+        """保存交易记录"""
+        if not self._optimized_memory:
+            return ""
+        
+        return await self._optimized_memory.save_trade_record(
+            symbol=symbol,
+            action=action,
+            price=price,
+            quantity=quantity,
+            pnl=pnl,
+            reason=reason,
+            strategy=strategy
+        )
+    
+    async def save_market_observation(self, observation: str, symbol: Optional[str] = None):
+        """保存市场观察"""
+        if self._optimized_memory:
+            await self._optimized_memory.save_market_observation(observation, symbol)
+    
+    async def save_risk_event(self, event: str, level: str = "warning"):
+        """保存风险事件"""
+        if self._optimized_memory:
+            await self._optimized_memory.save_risk_event(event, level)
+    
+    async def get_trade_history(self, days: int = 7) -> List[Dict]:
+        """获取交易历史"""
+        if not self._optimized_memory:
+            return []
+        
+        entries = await self._optimized_memory.recall(
+            query="trade",
+            category=MemoryCategory.TRADE_RECORD,
+            limit=100
+        )
+        
+        cutoff = datetime.now() - timedelta(days=days)
+        return [
+            {
+                "content": e.content,
+                "timestamp": e.created_at.isoformat(),
+                "metadata": e.metadata
+            }
+            for e in entries
+            if e.created_at >= cutoff
+        ]
+    
+    async def get_lessons_learned(self, limit: int = 20) -> List[Dict]:
+        """获取经验教训"""
+        if not self._optimized_memory:
+            return []
+        
+        entries = await self._optimized_memory.recall(
+            query="",
+            category=MemoryCategory.LESSON_LEARNED,
+            limit=limit
+        )
+        
+        return [
+            {
+                "content": e.content,
+                "timestamp": e.created_at.isoformat(),
+                "importance": e.importance
+            }
+            for e in entries
+        ]
+    
+    async def relate_memories(self, memory_id1: str, memory_id2: str) -> bool:
+        """关联两条记忆"""
+        if not self._optimized_memory:
+            return False
+        return await self._optimized_memory.relate(memory_id1, memory_id2)
+    
+    async def get_related_memories(self, memory_id: str) -> List[Dict]:
+        """获取相关记忆"""
+        if not self._optimized_memory:
+            return []
+        
+        entries = await self._optimized_memory.get_related(memory_id)
+        return [
+            {
+                "id": e.id,
+                "content": e.content,
+                "category": e.category.value
+            }
+            for e in entries
+        ]
+    
+    async def export_memories(self, filepath: str):
+        """导出记忆"""
+        if self._optimized_memory:
+            await self._optimized_memory.export_memories(filepath)
     
     async def cleanup(self):
         """清理资源"""
         try:
             logger.info("清理统一记忆系统...")
             
-            # 清理各组件
-            if self.memory_optimizer:
-                await self.memory_optimizer.stop()
+            if self._optimized_memory:
+                await self._optimized_memory.cleanup()
             
-            if self.ai_memory:
-                try:
-                    await self.ai_memory.cleanup()
-                except:
-                    pass
-            
-            # 清理缓存
             self._cache.clear()
             
             logger.info("✅ 统一记忆系统清理完成")
         except Exception as e:
             logger.error(f"清理失败: {e}")
-    
-    async def export_memories(self, filepath: str):
-        """导出记忆"""
-        try:
-            import json
-            
-            memories = {
-                "short_term": [],
-                "medium_term": [],
-                "long_term": [],
-                "export_time": datetime.now().isoformat()
-            }
-            
-            # 导出短期记忆
-            if self.ai_memory and hasattr(self.ai_memory, 'short_term_memory'):
-                memories["short_term"] = self.ai_memory.short_term_memory
-            
-            # 导出长期记忆
-            if self.ai_memory and hasattr(self.ai_memory, 'long_term_memory'):
-                memories["long_term"] = self.ai_memory.long_term_memory
-            
-            # 保存到文件
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(memories, f, ensure_ascii=False, indent=2)
-            
-            logger.info(f"✅ 记忆已导出到: {filepath}")
-        except Exception as e:
-            logger.error(f"导出记忆失败: {e}")
+
+
+async def get_unified_memory(
+    workspace_path: Optional[str] = None
+) -> UnifiedMemorySystem:
+    """获取统一记忆系统实例"""
+    memory = UnifiedMemorySystem(workspace_path=workspace_path)
+    await memory.initialize()
+    return memory

@@ -164,6 +164,19 @@ OpenClaw Trading System 是一个**全智能、自主运行的量化交易系统
 └── .env                          # 环境变量
 ```
 
+### 3.3 启动与配置加载（工作流对齐）
+
+- **系统启动入口**：`src/main.py`
+  - 初始化 `ConfigManager()`（自动探测并合并 `data/config`、`config`、`/app/data/config`、`/app/config`）。
+  - 初始化 `MainController` 与 `APIServer`。
+  - 运行阶段调用 `MainController.start_system()`（依赖顺序 + 状态管理 + 关键连接验证）。
+
+- **开发启动建议**：
+  - 使用 `make run`（内部调用 `./start_production.sh simulation`）或直接 `python3 src/main.py`。
+
+- **前端静态资源交付**：
+  - 后端会在启动时尝试挂载 `frontend/dist`（兼容 `/app/frontend/dist` 与 `/app/src/frontend/dist` 两种布局）。
+
 ---
 
 ## 4. 核心模块
