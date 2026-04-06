@@ -129,6 +129,32 @@ trading:
 - 推荐使用：`OPENCLAW__section__key=value`（例如 `OPENCLAW__api__port=8080`）
 - 旧格式：`TRADING_SECTION_KEY=value` 仍兼容，但已弃用
 
+### 记忆系统配置（MemoryGateway）
+
+- **核心入口**：系统内部统一通过 `MemoryGateway` 读写记忆（带 `scope`、trace、可选 rerank）。
+- **推荐配置方式**：使用 `OPENCLAW__memory__...` 覆盖。
+
+常用覆盖示例：
+
+```bash
+# 开启/关闭混合检索模式（native provider）
+OPENCLAW__memory__retrieval__mode=hybrid
+OPENCLAW__memory__retrieval__vector_weight=0.7
+OPENCLAW__memory__retrieval__bm25_weight=0.3
+OPENCLAW__memory__retrieval__min_score=0.3
+
+# rerank 插槽（默认关闭）
+OPENCLAW__memory__retrieval__rerank__enabled=false
+OPENCLAW__memory__retrieval__rerank__candidate_pool_size=12
+```
+
+### 记忆 API（REST）
+
+统一记忆 API（`/api/v1`）：
+
+- **写入**：`POST /api/v1/ai/memory/store`
+- **检索**：`POST /api/v1/ai/memory/recall`（支持 `include_trace=true`）
+
 ---
 
 ## 常用命令

@@ -599,12 +599,25 @@ stop_loss:
   enable_trailing_stop: true
   trailing_stop_offset: 0.02
 
-# 记忆系统配置
+# 记忆系统配置（MemoryGateway + provider）
 memory:
-  daily_retention_days: 30
-  weekly_retention_weeks: 12
-  enable_auto_summary: true
-  summary_time: "23:55"
+  provider: "native"
+  default_scope: "global"
+  scopes:
+    enabled: true
+  dual_layer:
+    structured_enabled: true
+    workspace_markdown_enabled: true
+  retrieval:
+    mode: "hybrid"        # keyword / bm25 / hybrid
+    vector_weight: 0.7
+    bm25_weight: 0.3
+    min_score: 0.3
+    max_results: 10
+    rerank:
+      enabled: false
+      candidate_pool_size: 12
+      min_score: 0.0
 ```
 
 ---
@@ -621,7 +634,9 @@ memory:
 | `/api/v1/orders` | GET | 订单历史 |
 | `/api/v1/account` | GET | 账户信息 |
 | `/api/v1/executions` | GET | 执行记录 |
-| `/api/v1/memory/stats` | GET | 记忆统计 |
+| `/api/v1/ai/memory/stats` | GET | 记忆统计 |
+| `/api/v1/ai/memory/store` | POST | 统一记忆写入（支持scope） |
+| `/api/v1/ai/memory/recall` | POST | 统一记忆检索（支持scope，可选trace） |
 
 ### 9.2 Telegram Bot命令
 
