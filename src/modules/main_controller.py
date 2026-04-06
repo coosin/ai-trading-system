@@ -108,6 +108,7 @@ from src.modules.core.smart_notification import SmartNotificationSystem
 
 # 导入统一信息收集分析管理器
 from src.modules.data.unified_info_collector import UnifiedInfoCollector, InfoCollectorConfig
+from src.modules.memory.memory_gateway import MemoryGateway
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +331,7 @@ class MainController:
         
         # AI记忆管理器
         self.ai_memory_manager = None
+        self.memory_gateway = None
         
         # 内存优化器
         self.memory_optimizer = None
@@ -392,6 +394,9 @@ class MainController:
 
     def get_onchain_integrator(self):
         return getattr(self, "onchain_integrator", None)
+
+    def get_memory_gateway(self):
+        return getattr(self, "memory_gateway", None)
 
     async def get_primary_ai_brain(self):
         """Return the current primary AI brain controller instance."""
@@ -569,12 +574,19 @@ class MainController:
         self.unified_memory = UnifiedMemorySystem(workspace_path=workspace_path)
         await self.unified_memory.initialize()
         logger.info("✅ 统一记忆系统初始化完成")
-        
-        # 保留现有接口的引用（向后兼容）
-        self.ai_memory_manager = self.unified_memory.get_ai_memory()
+
+        # 统一记忆网关（单入口）：结构化记忆可召回，workspace markdown 作为日志层
+        self.memory_gateway = await MemoryGateway.create(
+            memory_backend=self.unified_memory.get_ai_memory(),
+            workspace_path=workspace_path,
+            config_manager=self.config_manager,
+        )
+
+        # 保留现有接口名称，实际指向统一网关
+        self.ai_memory_manager = self.memory_gateway
         self.hierarchical_memory = self.unified_memory.get_hierarchical_memory()
         self.memory_optimizer = self.unified_memory.get_memory_optimizer()
-        logger.info("✅ 记忆系统接口已设置（向后兼容）")
+        logger.info("✅ 记忆系统接口已统一到MemoryGateway（向后兼容）")
         
         # 初始化统一交易历史服务（新增）
         try:

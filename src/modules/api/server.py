@@ -1936,6 +1936,77 @@ class APIServer:
                 }
         
         # AI记忆管理路由
+        def _resolve_memory_manager():
+            gateway = None
+            if hasattr(self.main_controller, "get_memory_gateway"):
+                gateway = self.main_controller.get_memory_gateway()
+            if gateway:
+                return gateway
+            return self.main_controller.ai_memory_manager
+
+        @api_v1_router.post("/ai/memory/store", tags=["ai-memory"])
+        async def memory_store(memory_data: Dict[str, Any]):
+            """统一记忆写入入口（支持scope）"""
+            try:
+                content = str(memory_data.get("content", "")).strip()
+                if not content:
+                    return {
+                        "status": "error",
+                        "message": "content不能为空",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                memory_manager = _resolve_memory_manager()
+                memory_id = await memory_manager.store(
+                    content=content,
+                    scope=str(memory_data.get("scope", "global")),
+                    category=str(memory_data.get("category", "conversation")),
+                    importance=float(memory_data.get("importance", 0.5)),
+                    metadata=memory_data.get("metadata", {}) if isinstance(memory_data.get("metadata"), dict) else {},
+                )
+                return {
+                    "status": "success",
+                    "data": {"memory_id": memory_id},
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"统一记忆写入失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"统一记忆写入失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+
+        @api_v1_router.post("/ai/memory/recall", tags=["ai-memory"])
+        async def memory_recall(query_data: Dict[str, Any]):
+            """统一记忆检索入口（支持scope）"""
+            try:
+                query = str(query_data.get("query", "")).strip()
+                if not query:
+                    return {
+                        "status": "error",
+                        "message": "query不能为空",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                memory_manager = _resolve_memory_manager()
+                records = await memory_manager.recall(
+                    query=query,
+                    scope=query_data.get("scope"),
+                    limit=int(query_data.get("limit", 10)),
+                    min_importance=float(query_data.get("min_importance", 0.0)),
+                )
+                return {
+                    "status": "success",
+                    "data": {"items": [r.to_dict() if hasattr(r, "to_dict") else r for r in records]},
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"统一记忆检索失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"统一记忆检索失败: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+
         @api_v1_router.post("/ai/memory/instruction", tags=["ai-memory"])
         async def add_system_instruction(instruction_data: Dict[str, Any]):
             """添加系统指令（工作要求、任务等）"""
@@ -1950,7 +2021,7 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
                 
-                memory_manager = self.main_controller.ai_memory_manager
+                memory_manager = _resolve_memory_manager()
                 memory_id = await memory_manager.add_system_instruction(instruction, context)
                 
                 return {
@@ -1984,7 +2055,7 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
                 
-                memory_manager = self.main_controller.ai_memory_manager
+                memory_manager = _resolve_memory_manager()
                 memory_id = await memory_manager.add_user_preference(key, value, description)
                 
                 return {
@@ -2007,7 +2078,7 @@ class APIServer:
         async def get_memory_stats():
             """获取记忆统计"""
             try:
-                memory_manager = self.main_controller.ai_memory_manager
+                memory_manager = _resolve_memory_manager()
                 stats = memory_manager.get_stats()
                 
                 return {
@@ -2027,7 +2098,7 @@ class APIServer:
         async def get_trading_summary(days: int = 30):
             """获取交易历史总结"""
             try:
-                memory_manager = self.main_controller.ai_memory_manager
+                memory_manager = _resolve_memory_manager()
                 summary = await memory_manager.summarize_trade_history(days)
                 
                 return {
@@ -2050,7 +2121,7 @@ class APIServer:
         async def get_workspace_memory_files():
             """获取工作区记忆文件列表"""
             try:
-                memory_manager = self.main_controller.ai_memory_manager
+                memory_manager = _resolve_memory_manager()
                 memory_files = memory_manager.get_workspace_memory()
                 
                 return {
@@ -2072,7 +2143,7 @@ class APIServer:
         async def get_workspace_memory_file(filename: str):
             """获取工作区记忆文件内容"""
             try:
-                memory_manager = self.main_controller.ai_memory_manager
+                memory_manager = _resolve_memory_manager()
                 memory_files = memory_manager.get_workspace_memory(filename)
                 
                 if filename not in memory_files:
@@ -2112,7 +2183,7 @@ class APIServer:
                         "timestamp": datetime.now().isoformat()
                     }
                 
-                memory_manager = self.main_controller.ai_memory_manager
+                memory_manager = _resolve_memory_manager()
                 success = await memory_manager.update_workspace_memory(filename, content, notify_user)
                 
                 if success:

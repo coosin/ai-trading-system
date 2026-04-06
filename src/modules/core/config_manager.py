@@ -204,6 +204,30 @@ class ConfigManager:
         "unified_strategy_system": {},
         "unified_trade_system": {},
         "unified_risk_system": {},
+        "memory": {
+            "provider": "native",
+            "default_scope": "global",
+            "scopes": {
+                "enabled": True,
+            },
+            "dual_layer": {
+                "structured_enabled": True,
+                "workspace_markdown_enabled": True,
+            },
+            "retrieval": {
+                "mode": "hybrid",
+                "vector_weight": 0.7,
+                "bm25_weight": 0.3,
+                "min_score": 0.3,
+                "max_results": 10,
+            },
+            "auto_capture": {
+                "enabled": True,
+            },
+            "auto_recall": {
+                "enabled": True,
+            },
+        },
     }
 
     def __init__(self, config_dir: str = None, watch_interval: int = 30):
