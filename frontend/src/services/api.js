@@ -96,5 +96,17 @@ export const api = {
   risk: {
     getMetrics: () => request('/risk/metrics'),
   },
+  modules: {
+    getStrategyOptimizationStatus: () => request('/modules/strategy/optimization-status'),
+    updateStrategyOptimizationConfig: (data) =>
+      request('/modules/strategy/optimization-config', { method: 'POST', body: JSON.stringify(data) }),
+  },
+  monitoring: {
+    /** 若后端未实现则返回 404，总控会降级为空列表 */
+    getLogs: (params = {}) => {
+      const q = new URLSearchParams(params).toString();
+      return request(`/monitoring/logs${q ? `?${q}` : ''}`);
+    },
+  },
 };
 
