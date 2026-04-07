@@ -82,5 +82,5 @@ HEALTHCHECK --interval=60s --timeout=30s --start-period=15s --retries=3 \
 # 暴露端口
 EXPOSE 8000
 
-# 启动命令
-CMD ["./start_production.sh", "simulation"]
+# 启动命令（模式由环境变量 MODE 决定，与 .env / compose 一致；勿在此硬编码）
+CMD ["./start_production.sh"]

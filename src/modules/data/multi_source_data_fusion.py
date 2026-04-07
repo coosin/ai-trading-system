@@ -137,13 +137,39 @@ class MultiSourceDataFusion:
             fused.sources.append(dp.source)
             
             if dp.value:
+                # 兼容两类输入：
+                # 1) dict（期望包含 price/volume/sentiment）
+                # 2) MarketData dataclass（price/volume/change_24h）
                 if isinstance(dp.value, dict):
                     if "price" in dp.value:
                         prices.append(dp.value["price"])
                     if "volume" in dp.value:
                         volumes.append(dp.value["volume"])
-                    if "sentiment" in dp.value:
+                    if "sentiment" in dp.value and dp.value["sentiment"] is not None:
                         sentiments.append(dp.value["sentiment"])
+                    elif "change_24h" in dp.value and dp.value.get("change_24h") is not None:
+                        # 用 24h 变化率粗略映射情绪：正向->正，负向->负
+                        try:
+                            sentiments.append(float(dp.value.get("change_24h")) / 5.0)
+                        except Exception:
+                            pass
+                else:
+                    price = getattr(dp.value, "price", None)
+                    volume = getattr(dp.value, "volume", None)
+                    change_24h = getattr(dp.value, "change_24h", None)
+                    if price is not None:
+                        prices.append(price)
+                    if volume is not None:
+                        volumes.append(volume)
+                    if change_24h is not None:
+                        try:
+                            # change_24h 通常是百分比（例如 2.3 / -1.1）
+                            # 归一化到 [-1, 1] 区间，给 LLM 更稳定的数值范围
+                            s = float(change_24h) / 5.0
+                            s = max(-1.0, min(1.0, s))
+                            sentiments.append(s)
+                        except Exception:
+                            pass
         
         if prices:
             fused.price = sum(prices) / len(prices)
@@ -152,7 +178,10 @@ class MultiSourceDataFusion:
         if sentiments:
             fused.sentiment = sum(sentiments) / len(sentiments)
         
-        fused.confidence = min(1.0, len(data_points) / 5.0)
+        # 置信度按“可用数据源数量/已注册数据源数量”归一化，
+        # 避免因为写死分母导致即便多源都返回仍长期偏低。
+        total_sources = len(self._sources) if self._sources else 1
+        fused.confidence = float(min(1.0, len(data_points) / max(1, total_sources)))
         
         return fused
     
@@ -224,7 +253,8 @@ class MultiSourceDataFusion:
                 result["confidence"] = fused_data.confidence
                 result["sources"] = fused_data.sources
                 
-                if fused_data.price and fused_data.technical_indicators:
+                # 技术指标可能不存在（目前 fuse_data 未生成）
+                if fused_data.technical_indicators:
                     rsi = fused_data.technical_indicators.get("rsi", 50)
                     if rsi > 70:
                         result["trend"] = "overbought"
@@ -232,7 +262,6 @@ class MultiSourceDataFusion:
                         result["trend"] = "oversold"
                     else:
                         result["trend"] = "neutral"
-                    
                     result["volatility"] = fused_data.technical_indicators.get("atr", 0)
         except Exception as e:
             logger.warning(f"市场分析失败: {e}")

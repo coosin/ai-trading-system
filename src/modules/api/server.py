@@ -347,29 +347,8 @@ class APIServer:
             # 添加中间件
             await self._add_middleware()
 
-            # 设置路由
+            # 设置路由（模块控制 / 监控 在 _setup_routes 内、静态资源挂载之前注册，避免被 / 的 StaticFiles 吞掉）
             await self._setup_routes()
-            
-            # 初始化模块控制API
-            try:
-                from src.modules.api.module_control_api import init_module_control_api
-                init_module_control_api(self.app, self.main_controller)
-            except Exception as e:
-                logger.warning(f"模块控制API初始化失败: {e}")
-            
-            # 初始化监控API
-            try:
-                from src.modules.api.monitoring_api import router as monitoring_router
-                from src.modules.api.monitoring_api import set_proactive_ai
-                self.app.include_router(monitoring_router)
-                
-                # 设置主动性AI系统实例
-                if self.main_controller and hasattr(self.main_controller, 'proactive_ai'):
-                    set_proactive_ai(self.main_controller.proactive_ai)
-                    
-                logger.info("✅ 监控API已初始化")
-            except Exception as e:
-                logger.warning(f"监控API初始化失败: {e}")
 
             # 启动任务
             self._tasks.append(asyncio.create_task(self._cleanup_inactive_websockets()))
@@ -2412,6 +2391,24 @@ class APIServer:
 
         # 添加策略API路由
         self.app.include_router(strategy_router)
+
+        # 模块控制 API（含 /api/v1/s1/verify）必须在静态资源之前注册
+        try:
+            from src.modules.api.module_control_api import init_module_control_api
+            init_module_control_api(self.app, self.main_controller)
+            logger.info("✅ 模块控制API已初始化")
+        except Exception as e:
+            logger.warning(f"模块控制API初始化失败: {e}")
+
+        try:
+            from src.modules.api.monitoring_api import router as monitoring_router
+            from src.modules.api.monitoring_api import set_proactive_ai
+            self.app.include_router(monitoring_router)
+            if self.main_controller and hasattr(self.main_controller, "proactive_ai"):
+                set_proactive_ai(self.main_controller.proactive_ai)
+            logger.info("✅ 监控API已初始化")
+        except Exception as e:
+            logger.warning(f"监控API初始化失败: {e}")
 
         # 添加静态文件服务
         from fastapi.staticfiles import StaticFiles

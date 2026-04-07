@@ -30,6 +30,23 @@ class UnifiedMemoryType(Enum):
     MARKET_DATA = "market_data"
     USER_PREFERENCE = "user_preference"
     SYSTEM_STATE = "system_state"
+    # Compatibility aliases used by multiple runtime modules
+    TRADING_DECISION = "decision"
+    AI_PREDICTION = "signal"
+    MARKET_INSIGHT = "market_data"
+    RISK_SETTING = "system_state"
+    STRATEGY_GENERATED = "procedural"
+    RL_OPTIMIZATION = "procedural"
+    CONVERSATION = "episodic"
+
+
+class MemoryPriority(Enum):
+    """兼容优先级枚举（旧调用侧会传入该类型）"""
+    LOW = 0.25
+    NORMAL = 0.5
+    MEDIUM = 0.6
+    HIGH = 0.8
+    CRITICAL = 1.0
 
 
 @dataclass
@@ -111,8 +128,18 @@ class UnifiedIntelligentMemory:
         self._memories[memory_id] = memory
         return memory_id
     
-    async def add_memory(self, content: str, memory_type: str = "semantic",
-                         importance: float = 0.5, metadata: Optional[Dict] = None) -> str:
+    async def add_memory(
+        self,
+        content: str,
+        memory_type: Any = "semantic",
+        importance: float = 0.5,
+        metadata: Optional[Dict] = None,
+        summary: Optional[str] = None,
+        priority: Any = None,
+        source_module: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> str:
         """添加记忆（兼容接口）"""
         type_map = {
             "semantic": UnifiedMemoryType.SEMANTIC,
@@ -122,10 +149,40 @@ class UnifiedIntelligentMemory:
             "procedural": UnifiedMemoryType.PROCEDURAL,
             "emotional": UnifiedMemoryType.EMOTIONAL,
             "spatial": UnifiedMemoryType.SPATIAL,
-            "temporal": UnifiedMemoryType.TEMPORAL
+            "temporal": UnifiedMemoryType.TEMPORAL,
+            "decision": UnifiedMemoryType.DECISION,
+            "signal": UnifiedMemoryType.SIGNAL,
+            "market_data": UnifiedMemoryType.MARKET_DATA,
+            "conversation": UnifiedMemoryType.EPISODIC,
         }
-        mtype = type_map.get(memory_type, UnifiedMemoryType.SEMANTIC)
-        return await self.store(content, mtype, importance, metadata)
+        if isinstance(memory_type, UnifiedMemoryType):
+            mtype = memory_type
+        elif hasattr(memory_type, "value"):
+            mtype = type_map.get(str(memory_type.value), UnifiedMemoryType.SEMANTIC)
+        else:
+            mtype = type_map.get(str(memory_type), UnifiedMemoryType.SEMANTIC)
+
+        # normalize metadata from optional compatibility fields
+        merged_meta = dict(metadata or {})
+        if summary:
+            merged_meta.setdefault("summary", summary)
+        if source_module:
+            merged_meta.setdefault("source_module", source_module)
+        if tags:
+            merged_meta.setdefault("tags", list(tags))
+        if priority is not None:
+            try:
+                if hasattr(priority, "value"):
+                    pval = float(priority.value)
+                else:
+                    pval = float(priority)
+                importance = max(float(importance or 0.0), pval)
+            except Exception:
+                pass
+        if kwargs:
+            merged_meta.setdefault("extra", kwargs)
+
+        return await self.store(content, mtype, importance, merged_meta)
     
     async def retrieve(self, memory_id: str) -> Optional[MemoryItem]:
         """检索记忆"""

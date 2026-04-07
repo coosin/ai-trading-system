@@ -1480,12 +1480,16 @@ class StrategyManager:
         # 没有外部配置时注入最小默认策略，保证基础运行和测试
         if not self.strategy_configs:
             try:
-                default_tpl = (await self.get_strategy_templates()).get("trend_following_ma")
-                if default_tpl:
+                templates = await self.get_strategy_templates()
+                # 注入多套默认策略，覆盖更多交易对，提升策略可用性
+                for tpl_key in ["trend_following_ma", "mean_reversion_bollinger", "ml_based"]:
+                    tpl = templates.get(tpl_key)
+                    if not tpl:
+                        continue
                     await self.load_strategy_config(
-                        {"strategy_id": "default_trend_following_ma", **default_tpl}
+                        {"strategy_id": f"default_{tpl_key}", **tpl}
                     )
-                logger.info("未加载任何策略配置，已注入默认策略配置")
+                logger.info("未加载任何策略配置，已注入默认策略配置（多策略）")
             except Exception as e:
                 logger.info(f"未加载任何策略配置，默认策略注入失败: {e}")
 

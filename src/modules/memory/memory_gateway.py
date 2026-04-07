@@ -98,10 +98,19 @@ class MemoryGateway:
         content: str,
         *,
         scope: str = DEFAULT_SCOPE,
-        category: str = "conversation",
+        category: Any = "conversation",
         importance: float = 0.5,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
+        # 兼容：部分调用侧会把 Enum（例如 UnifiedMemoryType）直接当 category 传入
+        # 下游 _map_category/_map_layer 会对字符串调用 strip/lower，需先统一成字符串
+        try:
+            if hasattr(category, "value"):
+                category = str(category.value)
+            else:
+                category = str(category)
+        except Exception:
+            category = "conversation"
         if self._should_skip_store(category=category, content=content, importance=importance, metadata=metadata):
             return "skipped"
         md = dict(metadata or {})

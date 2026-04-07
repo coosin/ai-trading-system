@@ -397,6 +397,126 @@ def init_module_control_api(app, main_controller):
             health["total_count"] = total
         
         return health
+
+    s1_router = APIRouter(prefix="/api/v1/s1", tags=["s1"])
+
+    @s1_router.get("/verify")
+    async def s1_full_verify():
+        """
+        S1 全自动验收探针：主控、ExecutionGateway、策略配置、交易所、止盈止损。
+        供脚本/监控轮询；返回 all_passed 与各子检查项。
+        """
+        checks: List[Dict[str, Any]] = []
+        details: Dict[str, Any] = {}
+
+        def add_check(name: str, passed: bool, detail: str = "") -> None:
+            checks.append({"name": name, "passed": bool(passed), "detail": detail})
+
+        if not main_controller:
+            add_check("main_controller", False, "missing")
+            return {"ok": False, "all_passed": False, "checks": checks, "details": details}
+
+        add_check("main_controller", True, "present")
+        mc = main_controller
+
+        gw = getattr(mc, "execution_gateway", None)
+        add_check("execution_gateway", gw is not None, "missing" if gw is None else "ok")
+        if gw:
+            try:
+                snap = await gw.get_snapshot()
+                details["execution_spine"] = snap
+                add_check(
+                    "execution_spine.single_write_owner",
+                    bool(snap.get("single_write_owner")),
+                    str(snap.get("single_write_owner") or ""),
+                )
+            except Exception as e:
+                add_check("execution_spine", False, str(e))
+
+        ac = getattr(mc, "ai_core", None)
+        add_check("ai_core", ac is not None, "missing" if ac is None else "ok")
+
+        try:
+            brain = await mc.get_ai_managed_config(
+                "ai_brain",
+                {
+                    "primary_controller": "ai_core",
+                    "single_write_owner": "ai_core",
+                    "enable_secondary_controller": False,
+                },
+            )
+            details["ai_brain"] = {
+                "primary_controller": brain.get("primary_controller"),
+                "single_write_owner": brain.get("single_write_owner"),
+                "enable_secondary_controller": brain.get("enable_secondary_controller"),
+            }
+            swo = str(brain.get("single_write_owner") or brain.get("primary_controller") or "").strip().lower()
+            add_check("ai_brain.single_write_owner", bool(swo), swo or "empty")
+            pri = str(brain.get("primary_controller") or "").strip().lower()
+            coherent = (not pri or not swo) or (pri == swo)
+            add_check(
+                "ai_brain.primary_coherent_with_swo",
+                coherent,
+                f"primary={pri} swo={swo}" + ("" if coherent else " (建议保持一致)"),
+            )
+        except Exception as e:
+            add_check("ai_brain_config", False, str(e))
+
+        sl = getattr(mc, "stop_loss_manager", None)
+        add_check("stop_loss_manager", sl is not None, "missing" if sl is None else "ok")
+
+        ex = mc.get_exchange() if hasattr(mc, "get_exchange") else None
+        ex = ex or getattr(mc, "okx_exchange", None)
+        add_check("exchange", ex is not None, "missing" if ex is None else type(ex).__name__)
+
+        ait = getattr(mc, "ai_trading_engine", None)
+        if ait and hasattr(ait, "_autonomous_trading_execution_allowed"):
+            try:
+                allow_loop = await ait._autonomous_trading_execution_allowed()
+                details["ai_trading_engine"] = {
+                    "autonomous_trading_loop_allowed": allow_loop,
+                }
+                try:
+                    pol = await mc.get_ai_managed_config("ai_brain", {})
+                    swo2 = str(
+                        pol.get("single_write_owner") or pol.get("primary_controller") or "ai_core"
+                    ).strip().lower()
+                except Exception:
+                    swo2 = "ai_core"
+                if swo2 == "ai_core":
+                    add_check(
+                        "s1_aitrading_loop_suppressed_when_swo_ai_core",
+                        not allow_loop,
+                        "loop allowed (unexpected)" if allow_loop else "main loop skipped as expected",
+                    )
+                else:
+                    add_check(
+                        "s1_aitrading_loop_policy",
+                        True,
+                        f"swo={swo2} allow_loop={allow_loop}",
+                    )
+            except Exception as e:
+                add_check("ai_trading_engine_policy", False, str(e))
+
+        try:
+            sys_status = await mc.get_system_status()
+            details["system_status_keys"] = list(sys_status.keys()) if isinstance(sys_status, dict) else []
+            if isinstance(sys_status, dict) and "execution_spine" in sys_status:
+                add_check("get_system_status.execution_spine", True, "present")
+            else:
+                add_check("get_system_status.execution_spine", False, "missing in status payload")
+        except Exception as e:
+            add_check("get_system_status", False, str(e))
+
+        all_passed = all(c.get("passed") for c in checks)
+        return {
+            "ok": True,
+            "all_passed": all_passed,
+            "timestamp": datetime.now().isoformat(),
+            "checks": checks,
+            "details": details,
+        }
     
     app.include_router(router)
+    app.include_router(s1_router)
     logger.info("✅ 模块控制API已初始化")

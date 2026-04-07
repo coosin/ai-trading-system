@@ -126,14 +126,19 @@ class HeartbeatMonitor:
         logger.info("🏥 检查系统健康...")
         
         health_report = await self.skill_manager.run_health_check(context)
-        
-        if health_report["status"] == "critical":
+
+        actionable_failures = int(health_report.get("actionable_failures", 0) or 0)
+        critical_issues = int(health_report.get("critical_issues", 0) or 0)
+        status = str(health_report.get("status", "healthy")).lower()
+
+        # 仅当关键失败达到明显阈值时再发严重告警，避免单点诊断误报为“严重问题”。
+        if status == "critical" and critical_issues > 0 and actionable_failures >= 3:
             await self._send_notification(
                 "🚨 系统健康检查",
                 f"发现严重问题！\n{health_report['summary']}",
                 priority="high"
             )
-        elif health_report["status"] == "warning":
+        elif status == "warning" or actionable_failures > 0:
             await self._send_notification(
                 "⚠️ 系统健康检查",
                 f"发现警告\n{health_report['summary']}",

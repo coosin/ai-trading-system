@@ -271,10 +271,17 @@ class OptimizedMemorySystem:
             subdirs = ["core", "working", "experience", "history", "trades", "sessions"]
             for subdir in subdirs:
                 (self.storage_path / subdir).mkdir(exist_ok=True)
+            # 权限探针：目录存在但不可写时尽早切换 fallback
+            probe = self.storage_path / "working" / ".write_probe"
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("")
+            probe.unlink(missing_ok=True)
                 
         except PermissionError:
             fallback = Path("/tmp/openclaw_memory")
             fallback.mkdir(parents=True, exist_ok=True)
+            for subdir in ["core", "working", "experience", "history", "trades", "sessions"]:
+                (fallback / subdir).mkdir(exist_ok=True)
             self.storage_path = fallback
             logger.warning(f"权限不足，使用备用路径: {fallback}")
     
@@ -767,6 +774,20 @@ class OptimizedMemorySystem:
             async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
                 await f.write(json.dumps(entry.to_dict(), ensure_ascii=False, indent=2))
                 
+        except PermissionError:
+            # 运行时写权限突变，切换到 fallback 再重试一次
+            fallback = Path("/tmp/openclaw_memory")
+            fallback.mkdir(parents=True, exist_ok=True)
+            layer_dir = fallback / entry.layer.value
+            layer_dir.mkdir(parents=True, exist_ok=True)
+            file_path = layer_dir / f"{entry.id}.json"
+            try:
+                async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+                    await f.write(json.dumps(entry.to_dict(), ensure_ascii=False, indent=2))
+                self.storage_path = fallback
+                logger.warning("记忆存储路径切换到 fallback: %s", fallback)
+            except Exception as e:
+                logger.error(f"持久化记忆失败: {e}")
         except Exception as e:
             logger.error(f"持久化记忆失败: {e}")
     

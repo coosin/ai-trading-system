@@ -69,6 +69,47 @@ class OKXExchange(ExchangeBase):
         self._request_semaphore = asyncio.Semaphore(10)  # 限制并发请求数
         self._last_request_time = 0
         self._min_request_interval = 0.1  # 最小请求间隔（秒）
+        # 代理/直连自愈：代理不可用时自动降级为直连，避免实盘全链路失败
+        self._proxy_mode: str = "unknown"  # unknown|direct|http|socks
+        self._proxy_url: Optional[str] = None
+        self._proxy_disabled_until: float = 0.0
+        self._session_recreate_lock = asyncio.Lock()
+        # instruments 缓存（公开接口），用于下单前的最小张数/步进预检
+        self._instrument_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._instrument_cache_ttl_s: float = 300.0
+
+    def _proxy_temporarily_disabled(self) -> bool:
+        return time.time() < float(self._proxy_disabled_until or 0.0)
+
+    async def _switch_to_direct_session(self, reason: str) -> None:
+        """
+        代理链路异常时切换为直连会话。
+        说明：不要求用户改配置；只在运行时降级，尽量保证 OKX API 可达。
+        """
+        async with self._session_recreate_lock:
+            # 双重检查，避免重复重建
+            if self._proxy_mode == "direct":
+                return
+            logger.warning("⚠️ OKX代理链路异常，切换为直连: %s (mode=%s url=%s)", reason, self._proxy_mode, self._proxy_url)
+            self._proxy_disabled_until = time.time() + 300  # 5 分钟内不再尝试代理
+            self._proxy_mode = "direct"
+            self._proxy_url = None
+
+            try:
+                ssl_context = ssl.create_default_context()
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                new_session = aiohttp.ClientSession(connector=connector, connector_owner=True)
+            except Exception as e:
+                logger.error("直连会话重建失败: %s", e)
+                return
+
+            old = self._session
+            self._session = new_session
+            if old:
+                try:
+                    await old.close()
+                except Exception:
+                    pass
     
     def _generate_signature(self, timestamp: str, method: str, endpoint: str, body: str = "") -> str:
         """生成OKX API签名"""
@@ -115,8 +156,10 @@ class OKXExchange(ExchangeBase):
             retry_delay = 1.0
             
             proxy = getattr(self, '_proxy_url', None)
-            if proxy:
+            if proxy and not self._proxy_temporarily_disabled():
                 logger.debug(f"📤 使用代理: {proxy}")
+            else:
+                proxy = None
             
             for attempt in range(max_retries + 1):
                 try:
@@ -200,7 +243,26 @@ class OKXExchange(ExchangeBase):
                         raise
                         
                 except aiohttp.ClientError as e:
-                    if attempt < max_retries and "SSL" in str(e):
+                    # 代理/网络链路错误：若当前在用代理，自动降级直连并重试
+                    err_s = str(e)
+                    proxy_related = any(
+                        k in err_s.lower()
+                        for k in (
+                            "proxy",
+                            "all operations failed",
+                            "cannot connect to host",
+                            "connection refused",
+                            "connection reset",
+                            "connect call failed",
+                        )
+                    )
+                    if proxy_related and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None)):
+                        if attempt < max_retries:
+                            await self._switch_to_direct_session(f"{type(e).__name__}: {err_s}")
+                            proxy = None
+                            await asyncio.sleep(min(1.0, retry_delay))
+                            continue
+                    if attempt < max_retries and "SSL" in err_s:
                         logger.warning(f"⚠️ OKX API SSL错误 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
                         await asyncio.sleep(retry_delay)
                         retry_delay *= 2
@@ -211,6 +273,13 @@ class OKXExchange(ExchangeBase):
                         
                 except Exception as e:
                     error_str = str(e)
+                    # 代理链路导致的“全失败”常见报错，自动降级直连再试
+                    if "All operations failed" in error_str and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None)):
+                        if attempt < max_retries:
+                            await self._switch_to_direct_session(error_str)
+                            proxy = None
+                            await asyncio.sleep(min(1.0, retry_delay))
+                            continue
                     if "51001" in error_str or "doesn't exist" in error_str:
                         logger.debug(f"OKX API交易对不存在: {method} {endpoint}")
                     else:
@@ -247,23 +316,28 @@ class OKXExchange(ExchangeBase):
                     if proxy.proxy_type.value in ["socks5", "socks4"]:
                         from aiohttp_socks import ProxyConnector
                         connector = ProxyConnector.from_url(proxy.url, ssl=False)
+                        self._proxy_mode = "socks"
+                        self._proxy_url = proxy.url
                     else:
                         ssl_context = ssl.create_default_context()
                         ssl_context.check_hostname = False
                         ssl_context.verify_mode = ssl.CERT_NONE
                         connector = aiohttp.TCPConnector(ssl=ssl_context)
                         self._proxy_url = proxy.url
+                        self._proxy_mode = "http"
                         logger.info(f"✅ 已配置HTTPS代理SSL上下文 (忽略证书验证)")
                 else:
                     logger.warning("⚠️ 未找到可用代理，使用直连")
                     ssl_context = ssl.create_default_context()
                     connector = aiohttp.TCPConnector(ssl=ssl_context)
+                    self._proxy_mode = "direct"
             except Exception as proxy_error:
                 logger.warning(f"⚠️ 加载代理配置失败: {proxy_error}，使用直连")
                 import traceback
                 traceback.print_exc()
                 ssl_context = ssl.create_default_context()
                 connector = aiohttp.TCPConnector(ssl=ssl_context)
+                self._proxy_mode = "direct"
             
             self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
             await self.get_exchange_info()
@@ -731,6 +805,54 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.error(f"获取OKX交易对信息失败: {e}")
         return {}
+
+    async def get_swap_symbol_info(self, symbol: str) -> Dict[str, Any]:
+        """
+        获取永续合约交易对信息（SWAP instruments）
+
+        返回字段尽量包含：
+        - minSz / maxSz: 最小/最大下单张数
+        - lotSz: 下单张数步进
+        - ctVal / ctValCcy: 合约面值
+        - tickSz: 价格最小变动
+        """
+        # 归一 instId：BTC/USDT -> BTC-USDT-SWAP
+        base = symbol.replace("/SWAP", "").replace("SWAP", "").replace("/", "-").strip()
+        if not base.endswith("-SWAP"):
+            base = base + "-SWAP"
+        okx_inst_id = base.replace("--", "-")
+
+        now = time.time()
+        cached = self._instrument_cache.get(okx_inst_id)
+        if cached:
+            ts, payload = cached
+            if (now - ts) < float(self._instrument_cache_ttl_s):
+                return payload
+
+        endpoint = "/api/v5/public/instruments"
+        params = {"instType": "SWAP", "instId": okx_inst_id}
+        payload: Dict[str, Any] = {}
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            if data and len(data) > 0:
+                inst = data[0]
+                payload = {
+                    "instId": inst.get("instId", okx_inst_id),
+                    "symbol": symbol,
+                    "minSz": float(inst.get("minSz", 0) or 0),
+                    "maxSz": float(inst.get("maxSz", 0) or 0),
+                    "lotSz": float(inst.get("lotSz", 0) or 0),
+                    "tickSz": inst.get("tickSz"),
+                    "ctVal": inst.get("ctVal"),
+                    "ctValCcy": inst.get("ctValCcy"),
+                    "uly": inst.get("uly"),
+                    "state": inst.get("state"),
+                }
+        except Exception as e:
+            logger.warning(f"获取OKX合约交易对信息失败: {okx_inst_id} - {e}")
+
+        self._instrument_cache[okx_inst_id] = (now, payload)
+        return payload
     
     async def subscribe_market_data(self, symbol: str, callback: Any) -> bool:
         """订阅市场数据"""
@@ -921,6 +1043,27 @@ class OKXExchange(ExchangeBase):
             logger.error(f"获取账户配置失败: {e}")
             return {}
     
+    def _normalize_pair_symbol(self, symbol: str) -> str:
+        """Normalize instId (e.g. BTC-USDT-SWAP) or mixed formats to BTC/USDT."""
+        s = (symbol or "").strip()
+        if not s:
+            return s
+        s = s.replace("-SWAP", "").replace("--", "-")
+        if "/" in s:
+            return s
+        parts = [p for p in s.split("-") if p]
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        return s
+
+    async def close_position(self, symbol: str, side: str, size: float = None) -> Dict[str, Any]:
+        """
+        Compatibility shim for ai_core / legacy callers using instId or pair strings.
+        Delegates to close_swap_position with normalized BTC/USDT style symbol.
+        """
+        pair = self._normalize_pair_symbol(symbol)
+        return await self.close_swap_position(pair, side, size)
+
     async def close_swap_position(self, symbol: str, side: str, size: float = None) -> Dict[str, Any]:
         """平永续合约仓位
         

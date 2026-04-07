@@ -7,6 +7,8 @@ services:
       dockerfile: Dockerfile
     image: openclaw-trading:latest
     container_name: openclaw-trading
+    # 与宿主机挂载目录属主一致（常见为 uid 1000），避免 data/logs 写权限错误
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     restart: unless-stopped
     ports:
       - "${API_PORT:-8000}:8000"
@@ -14,6 +16,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./workspace:/app/workspace
+      - ./backups:/app/backups
     env_file:
       - .env
     environment:

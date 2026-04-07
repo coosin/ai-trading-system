@@ -472,7 +472,10 @@ class SystemMaintenanceSkill(SkillBase):
             rotated = 0
             for log_file in log_path.glob("*.log"):
                 if log_file.stat().st_size > 10 * 1024 * 1024:
-                    archive_name = log_file.with_suffix(f".{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+                    # 避免多次 .with_suffix 堆叠导致路径超过文件名长度上限 (ENAMETOOLONG)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    key = hex(abs(hash(log_file.name)))[2:10]
+                    archive_name = log_path / f"rot_{ts}_{key}.log"
                     log_file.rename(archive_name)
                     rotated += 1
             

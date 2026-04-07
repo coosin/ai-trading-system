@@ -96,12 +96,26 @@ class AuditConfig:
 
 class AuditLogger:
     """审计日志记录器"""
+
+    @staticmethod
+    def _resolve_writable_log_dir(preferred: Path) -> Path:
+        """宿主机上 logs/audit 可能权限异常；选用首个可写目录。"""
+        for d in (preferred, Path("data/audit"), Path("/tmp/openclaw_audit")):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                probe = d / ".audit_write_probe"
+                probe.write_bytes(b"")
+                probe.unlink()
+                if d.resolve() != preferred.resolve():
+                    logger.warning("审计目录 %s 不可写，已改用: %s", preferred, d)
+                return d
+            except OSError:
+                continue
+        return preferred
     
     def __init__(self, config: Optional[AuditConfig] = None):
         self.config = config or AuditConfig()
-        
-        self.log_dir = Path(self.config.log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir = self._resolve_writable_log_dir(Path(self.config.log_dir))
         
         self.events: List[AuditEvent] = []
         self.event_index: Dict[str, List[str]] = {}

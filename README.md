@@ -194,6 +194,17 @@ docker exec -it openclaw-trading bash
 
 ---
 
+## 2026-04-07 当日更新
+
+- ✅ **S1 执行主干稳定化**：`ai_core` 作为单一写入所有者（SWO），`ExecutionGateway` 作为统一下单出口，`/api/v1/s1/verify` 可直接校验执行链路。
+- ✅ **止盈止损跟踪对账增强**：启动同步时会将本地 `active` 跟踪单与交易所实时持仓对账，自动清理陈旧跟踪单（返回 `stale_cancelled`）。
+- ✅ **系统状态口径修正**：状态报告兼容 `data_fusion`/`multi_source_fusion` 与 `third_party_data`/`third_party_integrator`，避免模块“误报离线”。
+- ✅ **健康检查告警降噪**：将“缺少人工请求”的工具技能与真实故障分离；仅在关键失败达到阈值时标记 `critical`，其余为 `warning`。
+- ✅ **风险日志语义修正**：风险监控日志改为“当前未发现高风险持仓”，不再误导为“黑名单风险”。
+- ✅ **外部数据源退化可观测**：新增数据源健康状态与退化标记，状态输出可展示退化源列表，便于排障。
+
+---
+
 ## 贡献指南
 
 欢迎贡献！请查看 [贡献指南](CONTRIBUTING.md) 了解详情。

@@ -14,8 +14,8 @@ NC='\033[0m'
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
-# 默认配置
-MODE="${1:-simulation}"
+# 默认配置：命令行优先，否则使用环境变量（与 docker-compose / .env 一致）
+MODE="${1:-${MODE:-simulation}}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 API_PORT="${API_PORT:-8000}"
 

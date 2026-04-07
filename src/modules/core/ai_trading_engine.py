@@ -371,13 +371,41 @@ class AITradingEngine:
         logger.info(f"✅ 全智能AI交易引擎初始化完成")
         logger.info(f"📊 监控交易对: {self.symbols}")
         logger.info(f"🚫 黑名单交易对: {self.symbol_blacklist}")
+
+    async def _autonomous_trading_execution_allowed(self) -> bool:
+        """
+        S1：当 single_write_owner 为 ai_core 时，本引擎不得并行跑自主开平仓循环，
+        避免与 AICoreDecisionEngine 争夺实盘写入权。
+        """
+        mc = self.main_controller
+        if not mc or not hasattr(mc, "get_ai_managed_config"):
+            return True
+        try:
+            policy = await mc.get_ai_managed_config("ai_brain", {})
+            swo = str(
+                policy.get("single_write_owner") or policy.get("primary_controller") or "ai_core"
+            ).strip().lower()
+            return swo != "ai_core"
+        except Exception:
+            return True
     
     async def start(self) -> None:
         """启动AI交易引擎"""
         logger.info("🚀 启动全智能AI交易引擎...")
         
-        # 启动主交易循环
-        self._tasks.append(asyncio.create_task(self._trading_loop()))
+        # 启动主交易循环（受 single_write_owner 约束）
+        if await self._autonomous_trading_execution_allowed():
+            self._tasks.append(asyncio.create_task(self._trading_loop()))
+        else:
+            try:
+                pol = await self.main_controller.get_ai_managed_config("ai_brain", {})
+                swo = pol.get("single_write_owner", "ai_core")
+            except Exception:
+                swo = "ai_core"
+            logger.info(
+                "⏭️ 已跳过 AI 交易引擎主循环（single_write_owner=%s，实盘由 ai_core 独占）",
+                swo,
+            )
         
         # 启动监控任务
         self._tasks.append(asyncio.create_task(self._monitoring_loop()))
@@ -1256,6 +1284,22 @@ class AITradingEngine:
             if not hasattr(decision, 'symbol') or not hasattr(decision, 'action'):
                 logger.error(f"❌ 决策对象缺少必要属性: {type(decision)}")
                 return False
+
+            meta = getattr(decision, "metadata", None) or {}
+            mc = self.main_controller
+            if mc and hasattr(mc, "get_ai_managed_config"):
+                try:
+                    policy = await mc.get_ai_managed_config("ai_brain", {})
+                    swo = str(
+                        policy.get("single_write_owner") or policy.get("primary_controller") or "ai_core"
+                    ).strip().lower()
+                    if swo == "ai_core" and not meta.get("auto_close"):
+                        logger.warning(
+                            "AITradingEngine: 跳过执行（single_write_owner=ai_core，仅保留风险自动平仓）"
+                        )
+                        return False
+                except Exception:
+                    pass
             
             logger.info(f"🚀 执行交易: {decision.action.value} {decision.symbol} "
                        f"@ {decision.price}, 数量={decision.quantity}")

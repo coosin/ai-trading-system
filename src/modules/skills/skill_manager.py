@@ -12,6 +12,23 @@ logger = logging.getLogger(__name__)
 
 
 class SkillManager:
+    @staticmethod
+    def _is_benign_failure(result: SkillResult) -> bool:
+        """不影响系统健康的失败（例如缺少人工输入的工具技能）。"""
+        msg = str(getattr(result, "message", "") or "")
+        lower_msg = msg.lower()
+        benign_markers = (
+            "缺少编辑请求",
+            "缺少开发请求",
+            "缺少审查请求",
+            "missing request",
+            "no request",
+        )
+        if any(m in msg for m in benign_markers):
+            return True
+        if any(m in lower_msg for m in benign_markers):
+            return True
+        return False
 
     async def initialize(self) -> bool:
         """初始化模块"""
@@ -101,10 +118,11 @@ class SkillManager:
         
         results = await self.execute_all_skills(context)
         
-        critical_issues = [
+        actionable_failures = [
             r for r in results 
-            if r.status == SkillStatus.FAILED and r.priority == SkillPriority.CRITICAL
+            if r.status == SkillStatus.FAILED and not self._is_benign_failure(r)
         ]
+        critical_issues = [r for r in actionable_failures if r.priority == SkillPriority.CRITICAL]
         
         warnings = [
             r for r in results
@@ -113,9 +131,11 @@ class SkillManager:
         ]
         
         health_status = "healthy"
-        if critical_issues:
+        # 与告警策略保持一致：只有“关键失败存在且可执行失败数量达到阈值”才判为 critical。
+        # 这样可以避免单点诊断问题导致系统整体被误标“严重”。
+        if critical_issues and len(actionable_failures) >= 3:
             health_status = "critical"
-        elif warnings:
+        elif actionable_failures or warnings:
             health_status = "warning"
         
         report = {
@@ -124,6 +144,7 @@ class SkillManager:
             "total_skills": len(self.skills),
             "executed_skills": len(results),
             "critical_issues": len(critical_issues),
+            "actionable_failures": len(actionable_failures),
             "warnings": len(warnings),
             "results": [r.to_dict() for r in results],
             "summary": self._generate_summary(results)
@@ -135,13 +156,20 @@ class SkillManager:
     def _generate_summary(self, results: List[SkillResult]) -> str:
         """生成摘要"""
         success_count = sum(1 for r in results if r.status == SkillStatus.SUCCESS)
-        failed_count = sum(1 for r in results if r.status == SkillStatus.FAILED)
+        failed_count = sum(
+            1 for r in results if r.status == SkillStatus.FAILED and not self._is_benign_failure(r)
+        )
+        benign_failed_count = sum(
+            1 for r in results if r.status == SkillStatus.FAILED and self._is_benign_failure(r)
+        )
         skipped_count = sum(1 for r in results if r.status == SkillStatus.SKIPPED)
         
         summary = f"执行了 {len(results)} 个技能: "
         summary += f"✅ {success_count} 成功, "
         summary += f"❌ {failed_count} 失败, "
         summary += f"⏭️ {skipped_count} 跳过"
+        if benign_failed_count > 0:
+            summary += f"（另有 {benign_failed_count} 个需人工请求的工具技能未执行）"
         
         return summary
     

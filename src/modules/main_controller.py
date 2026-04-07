@@ -360,6 +360,7 @@ class MainController:
         self.enhanced_monitoring = None          # 增强监控系统
         self.stop_loss_manager = None            # 止盈止损管理器
         self.execution_verifier = None           # 执行验证器
+        self.execution_gateway = None            # 单一执行出口 (S1)
         self.dynamic_symbol_selector = None      # 动态币种筛选器
 
         # 默认配置
@@ -528,6 +529,7 @@ class MainController:
             "ai_brain",
             {
                 "primary_controller": "ai_core",
+                "single_write_owner": "ai_core",
                 "enable_secondary_controller": False,
                 "enable_autonomous_executor": True,
             },
@@ -536,7 +538,21 @@ class MainController:
     async def _start_ai_brain_controllers(self) -> None:
         policy = await self._get_ai_brain_policy()
         primary = str(policy.get("primary_controller", "ai_core")).strip().lower()
+        swo = str(policy.get("single_write_owner", primary)).strip().lower()
         enable_secondary = bool(policy.get("enable_secondary_controller", False))
+
+        logger.info(
+            "🧭 执行策略(S1): primary=%s single_write_owner=%s secondary=%s",
+            primary,
+            swo,
+            enable_secondary,
+        )
+        if primary != swo:
+            logger.warning(
+                "⚠️ primary_controller(%s) 与 single_write_owner(%s) 不一致，请确认配置有意为之",
+                primary,
+                swo,
+            )
 
         if primary == "ai_trading_engine":
             if self.ai_trading_engine:
@@ -977,6 +993,18 @@ class MainController:
         if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'exchange'):
             self.okx_exchange = self.ai_trading_engine.exchange
             logger.info("✅ OKX交易所引用已设置")
+
+        # S1：单一实盘执行出口（与 ai_brain.single_write_owner 协同）
+        try:
+            from src.modules.core.execution_gateway import ExecutionGateway
+
+            self.execution_gateway = ExecutionGateway(self)
+            _pol = await self._get_ai_brain_policy()
+            _swo = str(_pol.get("single_write_owner", "ai_core")).strip().lower()
+            logger.info("✅ ExecutionGateway 已就绪 single_write_owner=%s", _swo)
+        except Exception as e:
+            logger.warning("⚠️ ExecutionGateway 初始化失败: %s", e)
+            self.execution_gateway = None
         
         if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'risk_monitor'):
             self.risk_monitor = self.ai_trading_engine.risk_monitor
@@ -1227,9 +1255,11 @@ class MainController:
                 enable_breakeven=True,
                 breakeven_trigger=0.02,
                 enable_partial_tp=True,
-                check_interval=5
+                check_interval=5,
+                execute_exchange_on_trigger=True,
             )
             self.stop_loss_manager = StopLossTakeProfitManager(sltp_config)
+            self.stop_loss_manager.set_main_controller(self)
             await self.stop_loss_manager.initialize()
             
             # 设置关联组件
@@ -2265,7 +2295,7 @@ class MainController:
                     "stop_time": info.stop_time.isoformat() if info.stop_time else None,
                 }
 
-            return {
+            out: Dict[str, Any] = {
                 "system_status": self.system_status.value,
                 "start_time": self.start_time.isoformat() if self.start_time else None,
                 "stop_time": self.stop_time.isoformat() if self.stop_time else None,
@@ -2281,6 +2311,12 @@ class MainController:
                 "module_statuses": module_statuses,
                 "metrics": self.metrics.copy(),
             }
+            if getattr(self, "execution_gateway", None):
+                try:
+                    out["execution_spine"] = await self.execution_gateway.get_snapshot()
+                except Exception as e:
+                    out["execution_spine"] = {"error": str(e)}
+            return out
 
     async def get_event_history(
         self, limit: int = 100, event_type: Optional[EventType] = None
@@ -4344,6 +4380,15 @@ class MainController:
         if not self.execution_verifier:
             logger.warning("执行验证器未初始化")
             return None
+
+        if getattr(self, "execution_gateway", None):
+            try:
+                self.execution_gateway.record_tick(
+                    "execution_verifier",
+                    f"{command_type.value}:{action}",
+                )
+            except Exception:
+                pass
         
         result = await self.execution_verifier.execute(
             command_type=command_type,

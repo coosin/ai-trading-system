@@ -177,12 +177,19 @@ class AICommandExecutor:
             return result
             
         except Exception as e:
+            # 中文化错误提示：把常见英文异常翻译成“人话”
+            err = str(e)
+            friendly = err
+            if "UnifiedMemoryType" in err and "TRADING_DECISION" in err:
+                friendly = "记忆系统类型枚举不兼容：模块在写入 TRADING_DECISION 记忆时失败。"
+            elif "UnifiedMemoryType" in err and "strip" in err:
+                friendly = "记忆系统类型参数格式不兼容：把枚举当成字符串处理导致失败。"
             logger.error(f"处理用户输入失败: {e}")
             import traceback
             traceback.print_exc()
             return {
                 "success": False,
-                "response": f"处理过程中遇到问题：{str(e)}",
+                "response": f"处理过程中遇到问题：{friendly}",
                 "timestamp": datetime.now().isoformat()
             }
     
@@ -880,7 +887,10 @@ class AICommandExecutor:
             # 1. 检查多源数据融合系统
             if self.main_controller and hasattr(self.main_controller, 'ai_trading_engine'):
                 engine = self.main_controller.ai_trading_engine
-                if engine and hasattr(engine, 'multi_source_fusion') and engine.multi_source_fusion:
+                if engine and (
+                    (hasattr(engine, 'multi_source_fusion') and engine.multi_source_fusion)
+                    or (hasattr(engine, 'data_fusion') and engine.data_fusion)
+                ):
                     data_sources.append({
                         'name': '多源数据融合系统',
                         'type': 'fusion',
@@ -939,8 +949,20 @@ class AICommandExecutor:
                     "LLM集成": hasattr(mc, 'llm_integration') and mc.llm_integration is not None,
                     "记忆系统": self.unified_memory is not None,
                     "回测系统": hasattr(mc, 'enhanced_backtester') and mc.enhanced_backtester is not None,
-                    "多源数据融合": (hasattr(mc, 'ai_trading_engine') and mc.ai_trading_engine and hasattr(mc.ai_trading_engine, 'multi_source_fusion') and mc.ai_trading_engine.multi_source_fusion) or (hasattr(mc, 'multi_source_data_fusion') and mc.multi_source_data_fusion),
-                    "第三方数据集成": hasattr(mc, 'third_party_integrator') and mc.third_party_integrator is not None,
+                    # 兼容历史命名：multi_source_fusion / data_fusion / multi_source_data_fusion
+                    "多源数据融合": (
+                        hasattr(mc, 'ai_trading_engine')
+                        and mc.ai_trading_engine
+                        and (
+                            (hasattr(mc.ai_trading_engine, 'multi_source_fusion') and mc.ai_trading_engine.multi_source_fusion)
+                            or (hasattr(mc.ai_trading_engine, 'data_fusion') and mc.ai_trading_engine.data_fusion)
+                        )
+                    ) or (hasattr(mc, 'multi_source_data_fusion') and mc.multi_source_data_fusion),
+                    # 兼容 third_party_integrator / third_party_data 两种挂载方式
+                    "第三方数据集成": (
+                        (hasattr(mc, 'third_party_integrator') and mc.third_party_integrator is not None)
+                        or (hasattr(mc, 'ai_trading_engine') and mc.ai_trading_engine and hasattr(mc.ai_trading_engine, 'third_party_data') and mc.ai_trading_engine.third_party_data is not None)
+                    ),
                     "AI核心决策引擎": hasattr(mc, 'ai_core') and mc.ai_core is not None,
                 }
                 
@@ -969,6 +991,21 @@ class AICommandExecutor:
                     response += f"已加载插件: {len(plugins_info)}个\n"
                     for plugin_name in list(plugins_info.keys())[:5]:
                         response += f"  • {plugin_name}\n"
+
+                # 外部数据源降级状态（如果系统挂载了 DataIntegration）
+                try:
+                    data_integration = mc.get_data_integration() if hasattr(mc, "get_data_integration") else None
+                    if data_integration and hasattr(data_integration, "get_source_health_report"):
+                        ds_health = data_integration.get_source_health_report()
+                        degraded = ds_health.get("degraded_sources") or []
+                        response += f"\n【外部数据源健康】\n"
+                        if degraded:
+                            response += f"状态: 退化（{len(degraded)}个）\n"
+                            response += f"退化源: {', '.join(degraded[:5])}\n"
+                        else:
+                            response += "状态: 正常\n"
+                except Exception as e:
+                    logger.debug(f"读取外部数据源健康失败: {e}")
                 
                 # AI核心决策引擎详情
                 if hasattr(mc, 'ai_core') and mc.ai_core:

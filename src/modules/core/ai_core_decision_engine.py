@@ -679,7 +679,10 @@ class AICoreDecisionEngine:
                             if non_blacklist_risk:
                                 await self._handle_high_risk(risk_data)
                             else:
-                                logger.info("📋 当前风险来自黑名单币种，AI忽略并继续交易")
+                                if self.blacklist:
+                                    logger.info("📋 当前未发现非黑名单高风险持仓，维持监控")
+                                else:
+                                    logger.info("📋 当前未发现高风险持仓，维持监控")
                                 
                         except Exception as e:
                             logger.error(f"检查持仓风险失败: {e}")
@@ -1418,6 +1421,50 @@ class AICoreDecisionEngine:
                 return None
             
             decision = self._parse_ai_decision(response.content, symbol)
+
+            # 兜底：LLM 可能过度保守长期返回 hold。
+            # 在多源融合置信度高且技术趋势一致时，把 hold 变更为可执行的 buy/sell，
+            # 交由后续 ExecutionGateway 统一走 S1 单写入所有权。
+            if decision and decision.action == "hold":
+                try:
+                    fusion_conf = float(multi_source_analysis.get("confidence", 0) or 0)
+                    fusion_sent = multi_source_analysis.get("sentiment", 0)
+                    strat_count = int(strategy_advice.get("count", 0) or 0)
+                    risk_level = risk_assessment.get("level", "unknown")
+                    tech_trend_1h = technical.get("trend_1h", "unknown")
+                    min_conf = float(self.config.get("min_confidence_to_trade", 0.6))
+
+                    if (
+                        self.authorization.get("full_authorization")
+                        and risk_level in ("low", "medium")
+                        and strat_count > 0
+                        and fusion_conf >= min_conf
+                        and isinstance(fusion_sent, (int, float))
+                    ):
+                        if tech_trend_1h == "bearish" and fusion_sent < -0.05:
+                            decision.action = "sell"
+                            decision.side = "short"
+                            decision.quantity = max(1, int(decision.quantity or 1))
+                            decision.leverage = int(self.config.get("default_leverage", 1) or 1)
+                            decision.confidence = float(max(decision.confidence or 0, min(1.0, fusion_conf)))
+                            decision.reasoning = (
+                                f"hold_avoidance_override: fusion_conf={fusion_conf:.2f}, fusion_sent={fusion_sent:.3f}, "
+                                f"tech_trend_1h=bearish"
+                            )
+                            decision.strategy_used = decision.strategy_used or "s1_fusion_override"
+                        elif tech_trend_1h == "bullish" and fusion_sent > 0.05:
+                            decision.action = "buy"
+                            decision.side = "long"
+                            decision.quantity = max(1, int(decision.quantity or 1))
+                            decision.leverage = int(self.config.get("default_leverage", 1) or 1)
+                            decision.confidence = float(max(decision.confidence or 0, min(1.0, fusion_conf)))
+                            decision.reasoning = (
+                                f"hold_avoidance_override: fusion_conf={fusion_conf:.2f}, fusion_sent={fusion_sent:.3f}, "
+                                f"tech_trend_1h=bullish"
+                            )
+                            decision.strategy_used = decision.strategy_used or "s1_fusion_override"
+                except Exception as e:
+                    logger.debug(f"hold override skipped: {e}")
             
             if decision:
                 self._last_decision_time[symbol] = datetime.now()
@@ -1440,19 +1487,45 @@ class AICoreDecisionEngine:
             # 检查AI交易引擎中的多源数据融合
             if hasattr(self.main_controller, 'ai_trading_engine') and self.main_controller.ai_trading_engine:
                 engine = self.main_controller.ai_trading_engine
+                fusion = None
+                # ai_trading_engine 里实际挂载的是 self.data_fusion（历史命名不一致）
                 if hasattr(engine, 'multi_source_fusion') and engine.multi_source_fusion:
                     fusion = engine.multi_source_fusion
-                    # 调用analyze_market方法
+                elif hasattr(engine, 'data_fusion') and engine.data_fusion:
+                    fusion = engine.data_fusion
+                elif hasattr(engine, 'multi_source_data_fusion') and engine.multi_source_data_fusion:
+                    fusion = engine.multi_source_data_fusion
+
+                if fusion and hasattr(fusion, 'analyze_market'):
                     analysis = await fusion.analyze_market(symbol)
                     if analysis:
-                        result = {
-                            "status": "available",
-                            "sentiment": getattr(analysis, 'overall_sentiment', 'neutral'),
-                            "signal_strength": getattr(analysis, 'signal_strength', 0),
-                            "recommendation": getattr(analysis, 'recommendation', 'neutral'),
-                            "confidence": getattr(analysis, 'confidence', 0),
-                            "trend": getattr(analysis, 'trend', 'unknown'),
-                        }
+                        # fusion.analyze_market 目前返回 dict（而非对象属性）
+                        if isinstance(analysis, dict):
+                            sentiment = analysis.get("sentiment")
+                            if sentiment is None:
+                                sentiment = analysis.get("overall_sentiment", "neutral")
+                            signal_strength = (
+                                analysis.get("signal_strength")
+                                if analysis.get("signal_strength") is not None
+                                else analysis.get("confidence", 0)
+                            )
+                            result = {
+                                "status": "available",
+                                "sentiment": sentiment,
+                                "signal_strength": signal_strength,
+                                "recommendation": analysis.get("recommendation", "neutral"),
+                                "confidence": analysis.get("confidence", 0),
+                                "trend": analysis.get("trend", "unknown"),
+                            }
+                        else:
+                            result = {
+                                "status": "available",
+                                "sentiment": getattr(analysis, 'overall_sentiment', 'neutral'),
+                                "signal_strength": getattr(analysis, 'signal_strength', 0),
+                                "recommendation": getattr(analysis, 'recommendation', 'neutral'),
+                                "confidence": getattr(analysis, 'confidence', 0),
+                                "trend": getattr(analysis, 'trend', 'unknown'),
+                            }
                         logger.info(f"📊 多源数据融合: {symbol} 情绪={result['sentiment']}, 信号强度={result['signal_strength']}")
                         return result
             
@@ -1461,13 +1534,32 @@ class AICoreDecisionEngine:
                 fusion = self.main_controller.multi_source_data_fusion
                 analysis = await fusion.analyze_market(symbol)
                 if analysis:
-                    result = {
-                        "status": "available",
-                        "sentiment": getattr(analysis, 'overall_sentiment', 'neutral'),
-                        "signal_strength": getattr(analysis, 'signal_strength', 0),
-                        "recommendation": getattr(analysis, 'recommendation', 'neutral'),
-                        "confidence": getattr(analysis, 'confidence', 0),
-                    }
+                    if isinstance(analysis, dict):
+                        sentiment = analysis.get("sentiment")
+                        if sentiment is None:
+                            sentiment = analysis.get("overall_sentiment", "neutral")
+                        signal_strength = (
+                            analysis.get("signal_strength")
+                            if analysis.get("signal_strength") is not None
+                            else analysis.get("confidence", 0)
+                        )
+                        result = {
+                            "status": "available",
+                            "sentiment": sentiment,
+                            "signal_strength": signal_strength,
+                            "recommendation": analysis.get("recommendation", "neutral"),
+                            "confidence": analysis.get("confidence", 0),
+                            "trend": analysis.get("trend", "unknown"),
+                        }
+                    else:
+                        result = {
+                            "status": "available",
+                            "sentiment": getattr(analysis, 'overall_sentiment', 'neutral'),
+                            "signal_strength": getattr(analysis, 'signal_strength', 0),
+                            "recommendation": getattr(analysis, 'recommendation', 'neutral'),
+                            "confidence": getattr(analysis, 'confidence', 0),
+                            "trend": getattr(analysis, 'trend', 'unknown'),
+                        }
                     logger.info(f"📊 多源数据融合: {symbol} 情绪={result['sentiment']}")
                     
         except Exception as e:
@@ -1508,6 +1600,39 @@ class AICoreDecisionEngine:
                             "signal_strength": getattr(analysis, 'signal_strength', 0),
                         }
                         logger.info(f"🤖 AI引擎分析: {symbol} 趋势={result['trend']}")
+                
+                # 兜底：ai_trading_engine 可能没有 analyze_market/last_analysis_results
+                # 此时用 data_fusion 情绪映射 bullish/bearish，避免 prompt 缺失 AI 引擎趋势
+                if result["trend"] == "unknown":
+                    fusion = getattr(engine, "data_fusion", None)
+                    if fusion and hasattr(fusion, "analyze_market"):
+                        fusion_analysis = await fusion.analyze_market(symbol)
+                        if isinstance(fusion_analysis, dict) and fusion_analysis:
+                            sentiment = fusion_analysis.get("sentiment", "neutral")
+                            signal_strength = (
+                                fusion_analysis.get("signal_strength")
+                                if fusion_analysis.get("signal_strength") is not None
+                                else fusion_analysis.get("confidence", 0)
+                            )
+
+                            if isinstance(sentiment, (int, float)):
+                                if sentiment > 0.05:
+                                    trend = "bullish"
+                                elif sentiment < -0.05:
+                                    trend = "bearish"
+                                else:
+                                    trend = "neutral"
+                            else:
+                                trend = "neutral"
+                                sentiment = "neutral"
+
+                            result = {
+                                "trend": trend,
+                                "sentiment": sentiment,
+                                "signal_strength": signal_strength,
+                                "prediction": {},
+                            }
+                            logger.info(f"🤖 AI引擎分析(融合兜底): {symbol} 趋势={result['trend']}")
                         
         except Exception as e:
             logger.error(f"获取AI引擎分析失败: {e}")
@@ -1631,18 +1756,50 @@ class AICoreDecisionEngine:
             return {"advice": "策略管理器未连接", "strategies": []}
         
         try:
+            def _norm_sym(s: str) -> str:
+                s = (s or "").strip().upper()
+                s = s.replace("-SWAP", "").replace("SWAP", "")
+                s = s.replace("-", "").replace("/", "")
+                return s
+
+            norm_symbol = _norm_sym(symbol)
+
             strategies = getattr(self.strategy_manager, 'strategy_configs', {})
             
             advice_list = []
             for sid, config in strategies.items():
-                symbols = getattr(config, 'symbols', [])
-                if symbol in symbols or not symbols:
+                if hasattr(config, "enabled") and not getattr(config, "enabled"):
+                    continue
+                symbols = getattr(config, 'symbols', []) or []
+                norm_symbols = [_norm_sym(x) for x in symbols if x]
+                if norm_symbol in norm_symbols or not symbols:
+                    strategy_type = getattr(config, "strategy_type", "unknown")
+                    # 规避 json 序列化错误：Enum 类型必须转成 value/字符串
+                    if hasattr(strategy_type, "value"):
+                        strategy_type = strategy_type.value
                     advice_list.append({
                         "id": sid,
                         "name": getattr(config, 'name', 'Unknown'),
-                        "type": getattr(config, 'strategy_type', 'unknown'),
+                        "type": strategy_type,
                         "performance": self._strategy_performance.get(sid, {}),
                     })
+
+            # 兜底：避免策略建议为 0 导致模型持续 hold
+            if not advice_list and strategies:
+                for sid, config in strategies.items():
+                    if hasattr(config, "enabled") and not getattr(config, "enabled"):
+                        continue
+                    strategy_type = getattr(config, "strategy_type", "unknown")
+                    if hasattr(strategy_type, "value"):
+                        strategy_type = strategy_type.value
+                    advice_list.append({
+                        "id": sid,
+                        "name": getattr(config, "name", "Unknown"),
+                        "type": strategy_type,
+                        "performance": self._strategy_performance.get(sid, {}),
+                    })
+                    if len(advice_list) >= 3:
+                        break
             
             return {
                 "strategies": advice_list,
@@ -1895,7 +2052,7 @@ class AICoreDecisionEngine:
 
 【可用策略】
 - 策略数量: {strategy_advice.get('count', 0)}
-- 策略详情: {json.dumps(strategy_advice.get('strategies', [])[:3], indent=2, ensure_ascii=False)[:2000]}
+- 策略详情: {json.dumps(strategy_advice.get('strategies', [])[:3], indent=2, ensure_ascii=False, default=str)[:2000]}
 {historical_experience}
 【风险评估 - 实时】
 - 风险等级: {risk_assessment.get('level', 'unknown')}
@@ -2142,31 +2299,71 @@ class AICoreDecisionEngine:
                             "orderId": exec_result.execution_id,
                             "details": exec_result.details,
                         }
-                    elif exec_result and getattr(exec_result, "error_message", None):
-                        order = {"success": False, "error": exec_result.error_message}
+                    else:
+                        # 关键：execution_verifier 可能因为交易所缺失 create_order 等原因失败，
+                        # 这时必须让 order 仍保持为 None，强制走下面 ExecutionGateway（S1 窄出口）回退路径。
+                        err = getattr(exec_result, "error_message", None) if exec_result else None
+                        status = getattr(getattr(exec_result, "status", None), "value", None) if exec_result else None
+                        if err or status:
+                            logger.warning(
+                                "execute_command failed; fallback to ExecutionGateway. status=%s err=%s",
+                                status,
+                                err,
+                            )
+                        order = None
                 except Exception as e:
                     logger.warning(f"执行验证网关调用失败，回退交易所直连: {e}")
 
-            # 回退：直接调用交易所接口（兼容旧路径）
+            # 回退：优先 ExecutionGateway（S1 窄出口），再直连交易所
             if order is None:
-                if decision.action == 'close':
-                    order = await self.exchange.close_position(
-                        symbol=decision.symbol.replace('/', '-'),
-                        side=decision.side
-                    )
-                else:
-                    await self.exchange.set_leverage(
-                        symbol=decision.symbol.replace('/', '-'),
-                        leverage=decision.leverage,
-                        margin_mode='cross'
-                    )
-                    
-                    order = await self.exchange.open_swap_position(
-                        symbol=decision.symbol.replace('/', '-'),
-                        side=decision.side,
-                        size=decision.quantity,
-                        leverage=decision.leverage
-                    )
+                gw = (
+                    getattr(self.main_controller, "execution_gateway", None)
+                    if self.main_controller
+                    else None
+                )
+                if gw:
+                    try:
+                        if decision.action == "close":
+                            order = await gw.close_swap(
+                                decision.symbol,
+                                decision.side,
+                                None,
+                                "ai_core",
+                                "ai_decision_close",
+                            )
+                        else:
+                            order = await gw.open_swap(
+                                decision.symbol,
+                                decision.side,
+                                float(decision.quantity),
+                                int(decision.leverage),
+                                "ai_core",
+                                "ai_decision_open",
+                                margin_mode="cross",
+                                price=None,
+                            )
+                    except Exception as e:
+                        logger.warning(f"ExecutionGateway 执行失败，尝试交易所直连: {e}")
+                        order = None
+
+                if order is None:
+                    if decision.action == 'close':
+                        order = await self.exchange.close_position(
+                            symbol=decision.symbol.replace('/', '-'),
+                            side=decision.side
+                        )
+                    else:
+                        await self.exchange.set_leverage(
+                            symbol=decision.symbol.replace('/', '-'),
+                            leverage=decision.leverage,
+                            margin_mode='cross'
+                        )
+                        order = await self.exchange.open_swap_position(
+                            symbol=decision.symbol.replace('/', '-'),
+                            side=decision.side,
+                            size=decision.quantity,
+                            leverage=decision.leverage
+                        )
             
             if order and order.get('success'):
                 logger.info(f"✅ AI决策执行成功: {order.get('orderId')}")

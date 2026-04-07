@@ -170,9 +170,11 @@ class AutoRepairSkill(SkillBase):
             
             for log_file in log_path.glob("*.log"):
                 if log_file.stat().st_size > 10 * 1024 * 1024:
-                    archive_name = log_file.with_suffix(f".{datetime.now().strftime('%Y%m%d')}.log")
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    key = hex(abs(hash(log_file.name)))[2:10]
+                    archive_name = log_path / f"rot_{ts}_{key}.log"
                     log_file.rename(archive_name)
-                    logger.info(f"轮转日志: {log_file.name} -> {archive_name.name}")
+                    logger.info(f"轮转日志: -> {archive_name.name}")
             
             return True
         except Exception as e:

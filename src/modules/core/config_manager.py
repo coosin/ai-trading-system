@@ -104,6 +104,8 @@ class ConfigManager:
         "ai_brain": {
             # single brain arbitration: ai_core | ai_trading_engine
             "primary_controller": "ai_core",
+            # who may originate discretionary live orders (S1 single write owner)
+            "single_write_owner": "ai_core",
             # keep secondary loop disabled by default to avoid dual-dispatch
             "enable_secondary_controller": False,
             # enable autonomous executor supervision loop by default

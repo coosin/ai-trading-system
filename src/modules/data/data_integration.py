@@ -206,11 +206,47 @@ class DataIntegration:
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         self._sources: Dict[str, DataSourceBase] = {}
+        self._source_health: Dict[str, Dict[str, Any]] = {}
     
     def register_source(self, name: str, source: DataSourceBase):
         """注册数据源"""
         self._sources[name] = source
+        self._source_health.setdefault(name, {
+            "ok_count": 0,
+            "fail_count": 0,
+            "last_ok_at": None,
+            "last_error": "",
+            "degraded": False,
+        })
         logger.info(f"注册数据源: {name}")
+
+    def _mark_source_ok(self, name: str):
+        stat = self._source_health.setdefault(name, {
+            "ok_count": 0,
+            "fail_count": 0,
+            "last_ok_at": None,
+            "last_error": "",
+            "degraded": False,
+        })
+        stat["ok_count"] += 1
+        stat["last_ok_at"] = datetime.now().isoformat()
+        stat["last_error"] = ""
+        # 连续成功后恢复健康标记
+        if stat["ok_count"] >= max(1, stat["fail_count"]):
+            stat["degraded"] = False
+
+    def _mark_source_fail(self, name: str, error: str):
+        stat = self._source_health.setdefault(name, {
+            "ok_count": 0,
+            "fail_count": 0,
+            "last_ok_at": None,
+            "last_error": "",
+            "degraded": False,
+        })
+        stat["fail_count"] += 1
+        stat["last_error"] = str(error)
+        # 任意失败先标记退化，供上层可观测
+        stat["degraded"] = True
     
     async def initialize_all(self) -> bool:
         """初始化所有数据源"""
@@ -230,7 +266,11 @@ class DataIntegration:
                 data = await source.get_market_data(symbol)
                 if data:
                     results.append(data)
+                    self._mark_source_ok(name)
+                else:
+                    self._mark_source_fail(name, "no_data")
             except Exception as e:
+                self._mark_source_fail(name, str(e))
                 logger.debug(f"从 {name} 获取价格失败: {e}")
         
         if not results:
@@ -238,6 +278,16 @@ class DataIntegration:
         
         results.sort(key=lambda x: x.timestamp, reverse=True)
         return results[0]
+
+    def get_source_health_report(self) -> Dict[str, Any]:
+        degraded = [name for name, s in self._source_health.items() if s.get("degraded")]
+        return {
+            "total_sources": len(self._sources),
+            "degraded_sources": degraded,
+            "degraded_count": len(degraded),
+            "healthy": len(degraded) == 0,
+            "sources": self._source_health,
+        }
     
     async def close_all(self):
         """关闭所有数据源"""
