@@ -141,12 +141,12 @@ class AICoreDecisionEngine:
             "risk_check_interval": 30,
             "auto_reduce_on_high_risk": True,
             "emergency_close_on_critical": True,
-            # 策略研究任务限流（避免挤占交易/API主路径）
+            # 策略研究任务限流（避免挤占交易/API主路径）；手动 API 不受持仓/冷却限制
             "research_enabled": True,
-            "research_cooldown_seconds": 21600,
-            "research_max_symbols": 2,
-            "research_lookback_days": 20,
-            "research_timeout_seconds": 240,
+            "research_cooldown_seconds": 7200,
+            "research_max_symbols": 4,
+            "research_lookback_days": 28,
+            "research_timeout_seconds": 420,
         }
         
         # 状态
@@ -769,10 +769,10 @@ class AICoreDecisionEngine:
             lookback_days = max(7, int(self.config.get("research_lookback_days", 20) or 20))
             timeout_sec = max(60, int(self.config.get("research_timeout_seconds", 240) or 240))
 
-            # 优先在非繁忙状态运行研究任务，降低对实盘执行链路的干扰。
-            busy = bool(getattr(self, "_monitoring", False)) and len(getattr(self, "_active_positions", {}) or {}) > 0
+            # 优先在非繁忙状态运行自动研究；有持仓时跳过（请用手动 /modules/strategy/research-run）
+            busy = len(getattr(self, "_active_positions", {}) or {}) > 0
             if busy:
-                logger.info("跳过策略研究：当前有活动持仓，优先保障执行链路")
+                logger.info("跳过自动策略研究：当前有活动持仓（可用手动 research-run 接口）")
                 return
 
             result = await asyncio.wait_for(

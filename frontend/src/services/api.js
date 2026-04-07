@@ -61,7 +61,7 @@ export const api = {
     create: (data) => request('/strategies', { method: 'POST', body: JSON.stringify(data) }),
     update: (id, data) => request(`/strategies/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
     delete: (id) => request(`/strategies/${id}`, { method: 'DELETE' }),
-    activate: (id) => request(`/strategies/activate/${id}`, { method: 'POST' }),
+    activate: (id) => request(`/strategies/${id}/activate`, { method: 'POST' }),
   },
   trading: {
     getPositions: () => request('/trading/positions'),
@@ -100,6 +100,8 @@ export const api = {
     getStrategyOptimizationStatus: () => request('/modules/strategy/optimization-status'),
     updateStrategyOptimizationConfig: (data) =>
       request('/modules/strategy/optimization-config', { method: 'POST', body: JSON.stringify(data) }),
+    runStrategyResearch: (body) =>
+      request('/modules/strategy/research-run', { method: 'POST', body: JSON.stringify(body || {}) }),
   },
   monitoring: {
     /** 若后端未实现则返回 404，总控会降级为空列表 */

@@ -38,9 +38,9 @@ build/
 dist/
 *.tar.gz
 
-# Documentation
-*.md
-docs/
+# Documentation：保留 docs/ 供前端构建内嵌手册（不要用 *.md 全量忽略）
+/README.md
+/ARCHITECTURE.md
 
 # Misc
 .DS_Store

@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 def init_module_control_api(app, main_controller):
     """初始化模块控制API"""
     
-    from fastapi import APIRouter
-    
+    from fastapi import APIRouter, Body
+
     router = APIRouter(prefix="/api/v1/modules", tags=["modules"])
     
     @router.get("/list")
@@ -559,6 +559,56 @@ def init_module_control_api(app, main_controller):
             }
         except Exception as e:
             return {"success": False, "message": f"更新策略优化参数失败: {e}"}
+
+    @router.post("/strategy/research-run")
+    async def run_strategy_research_now(payload: Optional[Dict[str, Any]] = Body(None)):
+        """
+        手动触发策略研发流水线（walk-forward + 门控），不受「有持仓则跳过」限制。
+        可选 JSON：symbols, timeframe, lookback_days, timeout_seconds, max_symbols
+        """
+        payload = payload or {}
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        pipeline = getattr(main_controller, "strategy_research_pipeline", None)
+        if not pipeline:
+            return {"success": False, "message": "策略研究流水线未初始化"}
+
+        raw_syms = payload.get("symbols") or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+        if isinstance(raw_syms, str):
+            symbols = [raw_syms]
+        elif isinstance(raw_syms, list):
+            symbols = [str(s) for s in raw_syms if s]
+        else:
+            symbols = ["BTC/USDT", "ETH/USDT"]
+
+        timeframe = str(payload.get("timeframe") or "1h")
+        lookback_days = max(7, int(payload.get("lookback_days") or 28))
+        timeout_sec = max(60, int(payload.get("timeout_seconds") or 900))
+        max_symbols = max(1, int(payload.get("max_symbols") or min(6, len(symbols))))
+        sym_slice = symbols[:max_symbols]
+
+        try:
+            result = await asyncio.wait_for(
+                pipeline.run_cycle(symbols=sym_slice, timeframe=timeframe, lookback_days=lookback_days),
+                timeout=timeout_sec,
+            )
+            return {
+                "success": True,
+                "symbols_used": sym_slice,
+                "timeframe": timeframe,
+                "lookback_days": lookback_days,
+                "result": result,
+                "timestamp": datetime.now().isoformat(),
+            }
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "message": f"策略研发执行超时（>{timeout_sec}s），可增大 timeout_seconds 后重试",
+                "symbols_used": sym_slice,
+            }
+        except Exception as e:
+            logger.exception("手动策略研发失败")
+            return {"success": False, "message": str(e), "symbols_used": sym_slice}
 
     s1_router = APIRouter(prefix="/api/v1/s1", tags=["s1"])
 

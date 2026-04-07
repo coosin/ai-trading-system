@@ -875,124 +875,189 @@ class APIServer:
                 "timestamp": datetime.now().isoformat(),
             }
 
-        # 策略管理路由 - 支持 /api/v1/strategies
+        def _strategy_manager_payload_list() -> List[Dict[str, Any]]:
+            mc = self.main_controller
+            if not mc or not getattr(mc, "strategy_manager", None):
+                return []
+            sm = mc.strategy_manager
+            configs = getattr(sm, "strategy_configs", None) or {}
+            metrics = getattr(sm, "performance_metrics", None) or {}
+            out: List[Dict[str, Any]] = []
+            for sid, cfg in configs.items():
+                d = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
+                item: Dict[str, Any] = {
+                    "id": d.get("strategy_id", sid),
+                    "strategy_id": d.get("strategy_id", sid),
+                    "name": d.get("name", sid),
+                    "description": d.get("description", ""),
+                    "strategy_type": d.get("strategy_type"),
+                    "status": "active" if d.get("enabled", True) else "inactive",
+                    "enabled": d.get("enabled", True),
+                    "symbols": d.get("symbols", []),
+                    "timeframe": d.get("timeframe", "1h"),
+                    "parameters": d.get("parameters", {}),
+                    "metadata": d.get("metadata", {}),
+                    "returns": "-",
+                    "max_drawdown": "-",
+                    "sharpe_ratio": "-",
+                }
+                perf = metrics.get(sid)
+                if perf:
+                    item["total_trades"] = int(getattr(perf, "total_trades", 0) or 0)
+                    item["win_rate"] = round(100.0 * float(getattr(perf, "win_rate", 0.0) or 0.0), 2)
+                    item["max_drawdown"] = str(round(float(getattr(perf, "max_drawdown", 0.0) or 0.0) * 100.0, 2))
+                    item["sharpe_ratio"] = str(round(float(getattr(perf, "sharpe_ratio", 0.0) or 0.0), 3))
+                    item["returns"] = str(round(float(getattr(perf, "total_pnl", 0.0) or 0.0), 4))
+                out.append(item)
+            return out
+
+        # 策略管理路由 - 支持 /api/v1/strategies（真实 StrategyManager）
         @api_v1_router.get("/strategies", tags=["strategies"])
         async def get_strategies():
-            """获取所有策略"""
-            # 这里应该从策略管理器获取策略列表
-            # 为简化，返回模拟数据
-            return [
-                {
-                    "id": "1",
-                    "name": "移动平均趋势跟踪",
-                    "status": "active",
-                    "returns": "15.2",
-                    "max_drawdown": "8.3",
-                    "sharpe_ratio": "1.2"
-                },
-                {
-                    "id": "2",
-                    "name": "布林带均值回归",
-                    "status": "inactive",
-                    "returns": "10.5",
-                    "max_drawdown": "6.7",
-                    "sharpe_ratio": "0.9"
-                },
-                {
-                    "id": "3",
-                    "name": "机器学习策略",
-                    "status": "active",
-                    "returns": "22.8",
-                    "max_drawdown": "12.1",
-                    "sharpe_ratio": "1.5"
-                }
-            ]
+            """获取所有策略（来自 StrategyManager）"""
+            return _strategy_manager_payload_list()
 
         @api_v1_router.get("/strategies/{id}", tags=["strategies"])
         async def get_strategy(id: str):
-            """获取单个策略"""
-            # 这里应该从策略管理器获取策略详情
-            # 为简化，返回模拟数据
-            return {
+            """获取单个策略详情"""
+            mc = self.main_controller
+            if not mc or not getattr(mc, "strategy_manager", None):
+                raise HTTPException(status_code=503, detail="策略管理器未初始化")
+            sm = mc.strategy_manager
+            if id not in sm.strategy_configs:
+                raise HTTPException(status_code=404, detail="策略不存在")
+            cfg = sm.strategy_configs[id]
+            d = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
+            metrics = getattr(sm, "performance_metrics", None) or {}
+            perf = metrics.get(id)
+            body: Dict[str, Any] = {
                 "id": id,
-                "name": "移动平均趋势跟踪",
-                "status": "active",
-                "returns": "15.2",
-                "max_drawdown": "8.3",
-                "sharpe_ratio": "1.2",
-                "parameters": {
-                    "fast_ma_period": 10,
-                    "slow_ma_period": 30,
-                    "stop_loss_pct": 0.05,
-                    "take_profit_pct": 0.1
-                },
-                "symbols": ["BTC/USDT", "ETH/USDT"],
-                "timeframe": "1h"
+                "strategy_id": d.get("strategy_id", id),
+                "name": d.get("name", id),
+                "status": "active" if d.get("enabled", True) else "inactive",
+                "parameters": d.get("parameters", {}),
+                "symbols": d.get("symbols", []),
+                "timeframe": d.get("timeframe", "1h"),
+                "metadata": d.get("metadata", {}),
+                "strategy_type": d.get("strategy_type"),
+                "description": d.get("description", ""),
             }
+            if perf:
+                body["returns"] = str(round(float(getattr(perf, "total_pnl", 0.0) or 0.0), 4))
+                body["max_drawdown"] = str(round(float(getattr(perf, "max_drawdown", 0.0) or 0.0) * 100.0, 2))
+                body["sharpe_ratio"] = str(round(float(getattr(perf, "sharpe_ratio", 0.0) or 0.0), 3))
+            else:
+                body.setdefault("returns", "0")
+                body.setdefault("max_drawdown", "0")
+                body.setdefault("sharpe_ratio", "0")
+            return body
 
         @api_v1_router.post("/strategies", tags=["strategies"])
         async def create_strategy(strategy_data: Dict[str, Any]):
-            """创建策略"""
-            # 这里应该创建新策略
-            # 为简化，返回模拟数据
+            """创建策略（加载到 StrategyManager）"""
+            mc = self.main_controller
+            if not mc or not getattr(mc, "strategy_manager", None):
+                raise HTTPException(status_code=503, detail="策略管理器未初始化")
+            sm = mc.strategy_manager
+            if not strategy_data.get("strategy_id"):
+                strategy_data = {**strategy_data, "strategy_id": f"api_{datetime.now().strftime('%Y%m%d%H%M%S')}"}
+            cfg = await sm.load_strategy_config(strategy_data)
+            if not cfg:
+                raise HTTPException(status_code=400, detail="策略配置无效：需含 name、strategy_type")
             return {
-                "id": "4",
-                "name": strategy_data.get("name", "新策略"),
-                "status": "inactive",
-                "returns": "0.0",
-                "max_drawdown": "0.0",
-                "sharpe_ratio": "0.0"
+                "id": cfg.strategy_id,
+                "name": cfg.name,
+                "status": "inactive" if not cfg.enabled else "active",
+                "message": "策略已加载",
             }
 
         @api_v1_router.put("/strategies/{id}", tags=["strategies"])
         async def update_strategy(id: str, strategy_data: Dict[str, Any]):
-            """更新策略"""
-            # 这里应该更新策略
-            # 为简化，返回模拟数据
-            return {
-                "id": id,
-                "name": strategy_data.get("name", "策略"),
-                "status": "inactive",
-                "returns": "0.0",
-                "max_drawdown": "0.0",
-                "sharpe_ratio": "0.0"
-            }
+            """更新策略（内存中的配置）"""
+            mc = self.main_controller
+            if not mc or not getattr(mc, "strategy_manager", None):
+                raise HTTPException(status_code=503, detail="策略管理器未初始化")
+            sm = mc.strategy_manager
+            if id not in sm.strategy_configs:
+                raise HTTPException(status_code=404, detail="策略不存在")
+            cfg = sm.strategy_configs[id]
+            if "name" in strategy_data:
+                cfg.name = str(strategy_data["name"])
+            if "description" in strategy_data:
+                cfg.description = str(strategy_data["description"])
+            if "enabled" in strategy_data:
+                cfg.enabled = bool(strategy_data["enabled"])
+            if "parameters" in strategy_data and isinstance(strategy_data["parameters"], dict):
+                cfg.parameters = {**cfg.parameters, **strategy_data["parameters"]}
+            if "symbols" in strategy_data and isinstance(strategy_data["symbols"], list):
+                cfg.symbols = list(strategy_data["symbols"])
+            cfg.updated_at = datetime.now()
+            return {"id": id, "name": cfg.name, "status": "active" if cfg.enabled else "inactive"}
 
         @api_v1_router.delete("/strategies/{id}", tags=["strategies"])
         async def delete_strategy(id: str):
-            """删除策略"""
-            # 这里应该删除策略
-            # 为简化，返回成功消息
+            """从策略池移除"""
+            mc = self.main_controller
+            if not mc or not getattr(mc, "strategy_manager", None):
+                raise HTTPException(status_code=503, detail="策略管理器未初始化")
+            sm = mc.strategy_manager
+            async with sm._lock:
+                sm.strategy_configs.pop(id, None)
+                sm.performance_metrics.pop(id, None)
             return {"status": "success", "message": "策略已删除"}
 
         @api_v1_router.post("/strategies/{id}/activate", tags=["strategies"])
         async def activate_strategy(id: str):
             """激活策略"""
-            # 这里应该激活策略
-            # 为简化，返回成功消息
+            mc = self.main_controller
+            if not mc or not getattr(mc, "strategy_manager", None):
+                raise HTTPException(status_code=503, detail="策略管理器未初始化")
+            sm = mc.strategy_manager
+            if id not in sm.strategy_configs:
+                raise HTTPException(status_code=404, detail="策略不存在")
+            sm.strategy_configs[id].enabled = True
             return {"status": "success", "message": "策略已激活"}
 
         @api_v1_router.post("/strategies/{id}/deactivate", tags=["strategies"])
         async def deactivate_strategy(id: str):
             """停用策略"""
-            # 这里应该停用策略
-            # 为简化，返回成功消息
+            mc = self.main_controller
+            if not mc or not getattr(mc, "strategy_manager", None):
+                raise HTTPException(status_code=503, detail="策略管理器未初始化")
+            sm = mc.strategy_manager
+            if id not in sm.strategy_configs:
+                raise HTTPException(status_code=404, detail="策略不存在")
+            sm.strategy_configs[id].enabled = False
             return {"status": "success", "message": "策略已停用"}
 
         @api_v1_router.get("/strategies/{id}/performance", tags=["strategies"])
         async def get_strategy_performance(id: str):
-            """获取策略性能"""
-            # 这里应该获取策略性能
-            # 为简化，返回模拟数据
+            """获取策略性能指标"""
+            mc = self.main_controller
+            if not mc or not getattr(mc, "strategy_manager", None):
+                raise HTTPException(status_code=503, detail="策略管理器未初始化")
+            sm = mc.strategy_manager
+            perf = (getattr(sm, "performance_metrics", None) or {}).get(id)
+            if not perf:
+                return {
+                    "strategy_id": id,
+                    "total_return": "0",
+                    "max_drawdown": "0",
+                    "sharpe_ratio": "0",
+                    "win_rate": "0",
+                    "profit_factor": "0",
+                    "total_trades": "0",
+                    "average_trade": "0",
+                }
             return {
                 "strategy_id": id,
-                "total_return": "15.2",
-                "max_drawdown": "8.3",
-                "sharpe_ratio": "1.2",
-                "win_rate": "65.3",
-                "profit_factor": "1.8",
-                "total_trades": "124",
-                "average_trade": "0.12"
+                "total_return": str(round(float(perf.total_pnl or 0.0), 4)),
+                "max_drawdown": str(round(float(perf.max_drawdown or 0.0) * 100.0, 2)),
+                "sharpe_ratio": str(round(float(perf.sharpe_ratio or 0.0), 3)),
+                "win_rate": str(round(100.0 * float(perf.win_rate or 0.0), 2)),
+                "profit_factor": str(round(float(perf.profit_factor or 0.0), 3)),
+                "total_trades": str(int(perf.total_trades or 0)),
+                "average_trade": str(round(float(perf.avg_trade_pnl or 0.0), 6)),
             }
 
         # 市场数据路由 - 支持 /api/v1/market/data

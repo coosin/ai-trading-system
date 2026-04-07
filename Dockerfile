@@ -6,6 +6,7 @@ WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
+COPY docs ./docs
 RUN npm run build
 
 # ---- backend runtime stage ----
