@@ -4302,6 +4302,11 @@ class MainController:
                 logger.warning("⚠️ OKX交易所未设置，止损监控将无法获取价格")
             await self.stop_loss_manager.start()
             logger.info("✅ 止盈止损监控已启动")
+            try:
+                sync_res = await self.stop_loss_manager.sync_open_positions_from_exchange()
+                logger.info(f"📌 交易所持仓已同步至止盈止损跟踪: {sync_res}")
+            except Exception as e:
+                logger.warning(f"⚠️ 交易所持仓同步至止盈止损失败（不影响启动）: {e}")
         else:
             logger.warning("⚠️ 止损管理器未初始化，跳过启动")
     

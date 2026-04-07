@@ -131,7 +131,8 @@ class StopLossTakeProfitOrder:
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "triggered_at": self.triggered_at.isoformat() if self.triggered_at else None,
-            "trigger_reason": self.trigger_reason
+            "trigger_reason": self.trigger_reason,
+            "metadata": self.metadata,
         }
 
 
@@ -149,6 +150,7 @@ class StopLossTakeProfitConfig:
     check_interval: int = 5
     max_orders: int = 100
     persist_file: str = "data/stop_loss_orders.json"
+    sync_exchange_positions_on_startup: bool = True
 
 
 class StopLossTakeProfitManager:
@@ -232,6 +234,81 @@ class StopLossTakeProfitManager:
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info("✅ 止盈止损监控已启动")
+
+    async def sync_open_positions_from_exchange(self) -> Dict[str, Any]:
+        """
+        将交易所当前净持仓登记到本地止盈止损跟踪（解决「仓位在交易所但本模块未建单」的问题）。
+        每个持仓使用 index_key = symbol|side，与合约多空方向区分。
+        """
+        if not self.config.sync_exchange_positions_on_startup:
+            return {"synced": 0, "skipped": 0, "disabled": True}
+        if not self._exchange:
+            logger.warning("sync_open_positions: 交易所未连接，跳过持仓同步")
+            return {"synced": 0, "skipped": 0, "error": "no_exchange"}
+        if not hasattr(self._exchange, "get_positions"):
+            return {"synced": 0, "skipped": 0, "error": "no_get_positions"}
+
+        try:
+            positions = await self._exchange.get_positions()
+        except Exception as e:
+            logger.error(f"sync_open_positions: 拉取持仓失败: {e}")
+            return {"synced": 0, "skipped": 0, "error": str(e)}
+
+        synced = 0
+        skipped = 0
+
+        for p in positions or []:
+            try:
+                sz = float(p.get("size", 0) or 0)
+                if abs(sz) < 1e-12:
+                    continue
+                sym = str(p.get("symbol", "") or "").strip()
+                if not sym:
+                    continue
+                side = str(p.get("side", "long") or "long").lower()
+                if side not in ("long", "short"):
+                    side = "long"
+                entry = float(p.get("entry_price", 0) or 0)
+                index_key = f"{sym}|{side}"
+
+                oid = self.order_index.get(index_key)
+                if oid:
+                    existing = self.orders.get(oid)
+                    if existing and existing.status == StopLossTakeProfitStatus.ACTIVE:
+                        skipped += 1
+                        continue
+
+                if entry <= 0:
+                    try:
+                        t = await self._exchange.get_ticker(sym)
+                        if t and float(t.get("last", 0) or 0) > 0:
+                            entry = float(t["last"])
+                    except Exception:
+                        pass
+                if entry <= 0:
+                    logger.warning(f"sync_open_positions: 跳过 {index_key}（无有效入场价）")
+                    continue
+
+                if len(self.orders) >= self.config.max_orders:
+                    logger.warning("sync_open_positions: 已达 max_orders，停止同步")
+                    break
+
+                await self.create_order(
+                    sym,
+                    side,
+                    entry,
+                    abs(sz),
+                    metadata={
+                        "index_key": index_key,
+                        "source": "exchange_sync",
+                    },
+                )
+                synced += 1
+            except Exception as e:
+                logger.warning(f"sync_open_positions: 处理单条持仓失败: {e}")
+
+        logger.info(f"📌 交易所持仓→止盈止损跟踪: 新建 {synced}，已存在跳过 {skipped}")
+        return {"synced": synced, "skipped": skipped}
     
     async def stop(self) -> None:
         """停止监控"""
@@ -272,7 +349,10 @@ class StopLossTakeProfitManager:
         Returns:
             止盈止损订单
         """
-        order_id = self._generate_order_id(symbol)
+        meta = dict(metadata or {})
+        index_key = meta.get("index_key") or symbol
+
+        order_id = self._generate_order_id(index_key)
         
         sl_config = stop_loss_config or StopLossConfig()
         tp_config = take_profit_config or TakeProfitConfig()
@@ -306,11 +386,11 @@ class StopLossTakeProfitManager:
             highest_price=entry_price if side == "long" else 0,
             lowest_price=entry_price if side == "short" else float('inf'),
             time_limit=time_limit,
-            metadata=metadata or {}
+            metadata=meta
         )
         
         self.orders[order_id] = order
-        self.order_index[symbol] = order_id
+        self.order_index[index_key] = order_id
         self._stats["total_orders"] += 1
         
         await self._save_orders()
@@ -379,18 +459,25 @@ class StopLossTakeProfitManager:
         
         return entry_price * 1.06 if side == "long" else entry_price * 0.94
     
-    async def update_price(self, symbol: str, current_price: float) -> Optional[StopLossTakeProfitOrder]:
+    async def update_price(
+        self,
+        symbol: str,
+        current_price: float,
+        index_key: Optional[str] = None,
+    ) -> Optional[StopLossTakeProfitOrder]:
         """
         更新价格并检查止盈止损
         
         Args:
             symbol: 交易对
             current_price: 当前价格
+            index_key: 订单索引键（同交易对多方向时用 symbol|side），默认与 symbol 相同
         
         Returns:
             如果触发止盈止损，返回订单；否则返回None
         """
-        order_id = self.order_index.get(symbol)
+        key = index_key or symbol
+        order_id = self.order_index.get(key)
         if not order_id:
             return None
         
@@ -731,7 +818,8 @@ class StopLossTakeProfitManager:
                         if ticker:
                             current_price = ticker.get("last", 0)
                             if current_price > 0:
-                                await self.update_price(order.symbol, current_price)
+                                idx = (order.metadata or {}).get("index_key") or order.symbol
+                                await self.update_price(order.symbol, current_price, index_key=idx)
                     except Exception as e:
                         logger.error(f"更新 {order.symbol} 价格失败: {e}")
                 
@@ -807,11 +895,13 @@ class StopLossTakeProfitManager:
                     status=StopLossTakeProfitStatus(order_data.get("status", "active")),
                     created_at=datetime.fromisoformat(order_data["created_at"]) if order_data.get("created_at") else datetime.now(),
                     triggered_at=datetime.fromisoformat(order_data["triggered_at"]) if order_data.get("triggered_at") else None,
-                    trigger_reason=order_data.get("trigger_reason")
+                    trigger_reason=order_data.get("trigger_reason"),
+                    metadata=order_data.get("metadata") or {},
                 )
                 
                 self.orders[oid] = order
-                self.order_index[order.symbol] = oid
+                idx_key = (order.metadata or {}).get("index_key") or order.symbol
+                self.order_index[idx_key] = oid
             
             self._stats.update(data.get("stats", {}))
             
