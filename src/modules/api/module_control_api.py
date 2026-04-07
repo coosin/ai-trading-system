@@ -432,8 +432,27 @@ def init_module_control_api(app, main_controller):
         if main_controller:
             if hasattr(main_controller, 'ai_memory_manager') and main_controller.ai_memory_manager:
                 mem = main_controller.ai_memory_manager
-                stats["short_term_count"] = len(mem.short_term_memory)
-                stats["long_term_count"] = len(mem.long_term_memory)
+                # 兼容旧版内存管理器(list字段)与新版网关(get_stats接口)
+                if hasattr(mem, "get_stats"):
+                    try:
+                        raw = mem.get_stats() or {}
+                        if isinstance(raw, dict):
+                            stats["short_term_count"] = int(raw.get("short_term_count", raw.get("short_term", 0)) or 0)
+                            stats["long_term_count"] = int(raw.get("long_term_count", raw.get("long_term", 0)) or 0)
+                            stats["trade_records"] = int(raw.get("trade_records", raw.get("trades", 0)) or 0)
+                            stats["risk_events"] = int(raw.get("risk_events", raw.get("risks", 0)) or 0)
+                    except Exception:
+                        pass
+                if stats["short_term_count"] == 0 and hasattr(mem, "short_term_memory"):
+                    try:
+                        stats["short_term_count"] = len(getattr(mem, "short_term_memory") or [])
+                    except Exception:
+                        pass
+                if stats["long_term_count"] == 0 and hasattr(mem, "long_term_memory"):
+                    try:
+                        stats["long_term_count"] = len(getattr(mem, "long_term_memory") or [])
+                    except Exception:
+                        pass
         
         return stats
 
@@ -495,6 +514,51 @@ def init_module_control_api(app, main_controller):
             health["total_count"] = total
         
         return health
+
+    @router.get("/strategy/optimization-status")
+    async def get_strategy_optimization_status():
+        """
+        预留给前端的策略优化状态接口：
+        - 策略池总量/上限
+        - 每日优化进度与结果
+        - 最近一次策略池清理时间
+        """
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        try:
+            sm = main_controller.strategy_manager
+            if hasattr(sm, "get_optimization_status"):
+                data = sm.get_optimization_status()
+            else:
+                data = {
+                    "pool_limit": 30,
+                    "total_strategies": len(getattr(sm, "strategy_configs", {}) or {}),
+                    "daily_optimization": {},
+                    "last_daily_optimization_date": None,
+                    "last_pool_prune_at": None,
+                }
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": f"读取策略优化状态失败: {e}"}
+
+    @router.post("/strategy/optimization-config")
+    async def update_strategy_optimization_config(config: Dict[str, Any]):
+        """热更新策略优化运行参数（前端可直接调用）。"""
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        try:
+            sm = main_controller.strategy_manager
+            if not hasattr(sm, "update_optimization_runtime_config"):
+                return {"success": False, "message": "当前策略管理器不支持热更新优化参数"}
+            applied = sm.update_optimization_runtime_config(config or {})
+            return {
+                "success": True,
+                "message": "策略优化参数已更新",
+                "applied": applied,
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": f"更新策略优化参数失败: {e}"}
 
     s1_router = APIRouter(prefix="/api/v1/s1", tags=["s1"])
 

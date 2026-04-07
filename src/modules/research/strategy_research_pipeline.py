@@ -215,7 +215,66 @@ class StrategyResearchPipeline:
                     "metadata": {"generator": "grid"},
                 }
             )
+        # volatility breakout variants
+        for window in (14, 20):
+            for atr_mult in (1.2, 1.5):
+                candidates.append(
+                    {
+                        **base,
+                        "name": f"VolBreak{window}x{atr_mult}",
+                        "version": "1.0.0",
+                        "entry": [{"type": "volatility_breakout", "params": {"window": window, "atr_mult": atr_mult}}],
+                        "filters": [],
+                        "exit": [{"type": "bollinger_reversion", "params": {"window": 20, "std": 2.0}}],
+                        "tags": ["dsl", "volatility", "walkforward"],
+                        "metadata": {"generator": "grid", "kind": "volatility"},
+                    }
+                )
+        # scalping variants (short-term mean reversion)
+        for window in (7, 9, 12):
+            for z in (1.0, 1.2, 1.5):
+                candidates.append(
+                    {
+                        **base,
+                        "name": f"ScalpMR{window}z{z}",
+                        "version": "1.0.0",
+                        "entry": [{"type": "scalp_reversion", "params": {"window": window, "zscore": z}}],
+                        "filters": [],
+                        "exit": [{"type": "bollinger_reversion", "params": {"window": max(14, window * 2), "std": 1.8}}],
+                        "tags": ["dsl", "scalping", "walkforward"],
+                        "metadata": {"generator": "grid", "kind": "scalping"},
+                    }
+                )
+        # pin-catch variants (wick reversal)
+        for body_ratio in (0.25, 0.35):
+            for wick_ratio in (2.0, 2.5):
+                candidates.append(
+                    {
+                        **base,
+                        "name": f"PinCatch{int(body_ratio*100)}x{wick_ratio}",
+                        "version": "1.0.0",
+                        "entry": [
+                            {"type": "pinbar_reversal", "params": {"body_ratio_max": body_ratio, "wick_ratio_min": wick_ratio}}
+                        ],
+                        "filters": [],
+                        "exit": [{"type": "bollinger_reversion", "params": {"window": 20, "std": 2.0}}],
+                        "tags": ["dsl", "pinbar", "walkforward"],
+                        "metadata": {"generator": "grid", "kind": "pin_catch"},
+                    }
+                )
         return candidates
+
+    @staticmethod
+    def _map_strategy_type(dsl: Dict[str, Any]) -> str:
+        tags = set((dsl.get("tags") or []))
+        kind = str((dsl.get("metadata") or {}).get("kind", "")).lower()
+        if "scalping" in tags or kind == "scalping":
+            return "grid_trading"
+        if "volatility" in tags or kind == "volatility":
+            return "market_making"
+        if "ma" in tags or "breakout" in tags:
+            return "trend_following"
+        return "ai_generated"
 
     async def _optimize_candidate(self, dsl: Dict[str, Any], train_df: pd.DataFrame) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         # For MA candidates, optimize fast/slow around the initial values.
@@ -280,6 +339,18 @@ class StrategyResearchPipeline:
             and metrics.get("total_trades", 0) >= self.gates.min_trades
         )
 
+    @staticmethod
+    def _research_score(test_metrics: Dict[str, Any]) -> float:
+        """
+        统一研究评分（用于后续策略池清理/排序）：
+        高 sharpe、正 pnl、低回撤、有交易样本 => 高分。
+        """
+        sharpe = float(test_metrics.get("sharpe_ratio", 0.0) or 0.0)
+        pnl = float(test_metrics.get("total_pnl", 0.0) or 0.0)
+        dd = float(test_metrics.get("max_drawdown", 1.0) or 1.0)
+        trades = float(test_metrics.get("total_trades", 0.0) or 0.0)
+        return sharpe * 0.6 + (pnl / 1000.0) * 0.25 - dd * 0.1 + min(trades, 100.0) * 0.0005
+
     async def _publish(self, dsl: Dict[str, Any], test_metrics: Dict[str, Any], train_metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not self.main_controller or not getattr(self.main_controller, "strategy_manager", None):
             return None
@@ -294,7 +365,7 @@ class StrategyResearchPipeline:
             "strategy_id": strategy_id,
             "name": dsl["name"],
             "description": f"DSL strategy auto-researched. gates={self.gates}",
-            "strategy_type": "ai_driven",
+            "strategy_type": self._map_strategy_type(dsl),
             "enabled": True,
             "version": version,
             "parameters": {"dsl": dsl},
@@ -308,6 +379,7 @@ class StrategyResearchPipeline:
                     "test": test_metrics,
                     "gates": self.gates.__dict__,
                     "published_at": datetime.now().isoformat(),
+                    "score": self._research_score(test_metrics),
                 },
             },
         }

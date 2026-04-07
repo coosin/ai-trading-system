@@ -141,6 +141,12 @@ class AICoreDecisionEngine:
             "risk_check_interval": 30,
             "auto_reduce_on_high_risk": True,
             "emergency_close_on_critical": True,
+            # 策略研究任务限流（避免挤占交易/API主路径）
+            "research_enabled": True,
+            "research_cooldown_seconds": 21600,
+            "research_max_symbols": 2,
+            "research_lookback_days": 20,
+            "research_timeout_seconds": 240,
         }
         
         # 状态
@@ -170,6 +176,7 @@ class AICoreDecisionEngine:
         self._last_global_tune_at: Optional[datetime] = None
         self._sltp_group_adaptive: Dict[str, Dict[str, float]] = {}
         self._last_sltp_tune_at: Dict[str, datetime] = {}
+        self._last_research_at: Optional[datetime] = None
         
         logger.info("🧠 AI核心决策引擎初始化（完整控制权版本）")
     
@@ -746,11 +753,41 @@ class AICoreDecisionEngine:
             pipeline = self.main_controller.strategy_research_pipeline
         if not pipeline or not self.authorization.get("auto_strategy"):
             return
+        if not bool(self.config.get("research_enabled", True)):
+            return
         try:
+            now = datetime.utcnow()
+            cooldown = int(self.config.get("research_cooldown_seconds", 21600) or 21600)
+            if self._last_research_at and cooldown > 0:
+                elapsed = (now - self._last_research_at).total_seconds()
+                if elapsed < cooldown:
+                    logger.debug("跳过策略研究：冷却中（剩余 %.0fs）", cooldown - elapsed)
+                    return
+
             symbols = self.config.get("symbols", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"])
-            result = await pipeline.run_cycle(symbols=symbols[:4], timeframe="1h", lookback_days=30)
+            max_symbols = max(1, int(self.config.get("research_max_symbols", 2) or 2))
+            lookback_days = max(7, int(self.config.get("research_lookback_days", 20) or 20))
+            timeout_sec = max(60, int(self.config.get("research_timeout_seconds", 240) or 240))
+
+            # 优先在非繁忙状态运行研究任务，降低对实盘执行链路的干扰。
+            busy = bool(getattr(self, "_monitoring", False)) and len(getattr(self, "_active_positions", {}) or {}) > 0
+            if busy:
+                logger.info("跳过策略研究：当前有活动持仓，优先保障执行链路")
+                return
+
+            result = await asyncio.wait_for(
+                pipeline.run_cycle(
+                    symbols=symbols[:max_symbols],
+                    timeframe="1h",
+                    lookback_days=lookback_days,
+                ),
+                timeout=timeout_sec,
+            )
+            self._last_research_at = now
             if result.get("published"):
                 logger.info(f"✅ 策略研究发布 {len(result['published'])} 个策略")
+        except asyncio.TimeoutError:
+            logger.warning("策略研究流水线超时，已跳过本轮以保障主服务稳定")
         except Exception as e:
             logger.warning(f"策略研究流水线执行失败: {e}")
     

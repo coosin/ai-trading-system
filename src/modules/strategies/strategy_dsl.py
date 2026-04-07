@@ -17,6 +17,9 @@ PrimitiveType = Literal[
     "ma_crossover",
     "bollinger_reversion",
     "breakout_channel",
+    "volatility_breakout",
+    "scalp_reversion",
+    "pinbar_reversal",
 ]
 
 
@@ -82,7 +85,14 @@ def validate_dsl(dsl: Dict[str, Any]) -> None:
         for op in ops:
             if not isinstance(op, dict):
                 raise StrategyDSLValidationError(f"dsl.{section} items must be dicts")
-            if op.get("type") not in {"ma_crossover", "bollinger_reversion", "breakout_channel"}:
+            if op.get("type") not in {
+                "ma_crossover",
+                "bollinger_reversion",
+                "breakout_channel",
+                "volatility_breakout",
+                "scalp_reversion",
+                "pinbar_reversal",
+            }:
                 raise StrategyDSLValidationError(f"unsupported primitive type: {op.get('type')}")
             params = op.get("params", {})
             if params is not None and not isinstance(params, dict):

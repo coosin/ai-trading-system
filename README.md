@@ -209,6 +209,14 @@ docker exec -it openclaw-trading bash
 - ✅ **Telegram 巡检推送闭环**：新增 `probe_report_to_tg.py`，支持“一条命令”完成巡检 + 报告生成 + TG 推送。
 - ✅ **止盈止损统计接口**：新增 `/api/v1/modules/stop-loss/stats`，供巡检、可视化面板与告警系统统一读取。
 - ✅ **代理订阅更新运维脚本**：新增 `update_clash_subscriptions.sh`，支持订阅更新后自动 reload Clash，便于定时任务托管。
+- ✅ **多类型策略研发放宽**：DSL 与研究候选扩展为趋势/波动/剥头皮/抓针（`volatility_breakout`、`scalp_reversion`、`pinbar_reversal`），支持并行筛选高分策略。
+- ✅ **研究发布类型修复**：修复研究发布 `strategy_type` 映射，避免无效类型导致策略无法正确入池。
+- ✅ **策略池治理上线**：低分淘汰 + 总量上限（当前 30）+ 每小时清理窗口，防止策略无限累积。
+- ✅ **每日固定优化 + 回撤优化**：全策略每日执行参数与回撤联合优化，持续写入 `metadata.daily_optimization`。
+- ✅ **回撤任务资源保护**：每日优化改为“分批 + 时间预算 + 让出事件循环”，降低 CPU 峰值与主链路抖动。
+- ✅ **前端对接接口预留**：
+  - `GET /api/v1/modules/strategy/optimization-status`（查询策略池与每日优化状态）
+  - `POST /api/v1/modules/strategy/optimization-config`（热更新批处理/周期/上限参数，无需重启）
 
 ---
 

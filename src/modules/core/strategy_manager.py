@@ -571,6 +571,26 @@ class StrategyManager:
         self._lock = asyncio.Lock()
         self._initialized = False
         self._running = False
+        self._last_pool_prune_at: Optional[datetime] = None
+        self._last_daily_optimization_date: Optional[str] = None
+        self._daily_optimization_cursor: int = 0
+        self._daily_optimization_status: Dict[str, Any] = {
+            "date": None,
+            "completed": False,
+            "processed": 0,
+            "total": 0,
+            "drawdown_optimized": 0,
+            "started_at": None,
+            "finished_at": None,
+            "last_batch_ms": 0.0,
+        }
+        self._optimization_runtime_config: Dict[str, Any] = {
+            "pool_limit": 30,
+            "prune_interval_seconds": 3600,
+            "daily_batch_size": 6,
+            "daily_batch_time_budget_sec": 1.5,
+            "daily_opt_cycle_seconds": 300,
+        }
 
         logger.info("策略管理器初始化完成")
 
@@ -1821,6 +1841,9 @@ class StrategyManager:
                 # 更新性能指标
                 await self._update_performance_metrics()
 
+                # 定期策略池瘦身：限制总量并淘汰低分策略
+                await self._prune_low_score_strategies()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1835,10 +1858,14 @@ class StrategyManager:
 
         while self._initialized:
             try:
-                await asyncio.sleep(300)  # 每5分钟计算一次
+                cycle = int(self._optimization_runtime_config.get("daily_opt_cycle_seconds", 300) or 300)
+                await asyncio.sleep(max(60, cycle))
 
                 # 计算所有策略的性能指标
                 await self._calculate_all_performance()
+
+                # 每日执行一次：按策略类型做固定优化 + 回撤优化
+                await self._run_daily_strategy_optimization()
 
             except asyncio.CancelledError:
                 break
@@ -1867,6 +1894,270 @@ class StrategyManager:
         """更新性能指标"""
         # 这里可以添加实时性能指标更新逻辑
         pass
+
+    def _calc_strategy_pool_score(self, strategy_id: str, config: StrategyConfig) -> float:
+        """计算策略池评分，优先使用研究回测分，回退到运行表现分。"""
+        md = config.metadata if isinstance(config.metadata, dict) else {}
+        research = md.get("research", {}) if isinstance(md.get("research", {}), dict) else {}
+        test = research.get("test", {}) if isinstance(research.get("test", {}), dict) else {}
+
+        # 研究评分优先
+        if "score" in research:
+            try:
+                return float(research.get("score", 0.0) or 0.0)
+            except Exception:
+                pass
+
+        sharpe = float(test.get("sharpe_ratio", 0.0) or 0.0)
+        pnl = float(test.get("total_pnl", 0.0) or 0.0)
+        drawdown = float(test.get("max_drawdown", 1.0) or 1.0)
+        trades = float(test.get("total_trades", 0.0) or 0.0)
+        score = sharpe * 0.6 + (pnl / 1000.0) * 0.25 - drawdown * 0.1 + min(trades, 100.0) * 0.0005
+
+        # 叠加在线表现（若已有）
+        perf = self.performance_metrics.get(strategy_id)
+        if perf:
+            score += float(perf.sharpe_ratio or 0.0) * 0.2 + float(perf.total_pnl or 0.0) / 5000.0
+        return float(score)
+
+    async def _prune_low_score_strategies(self) -> None:
+        """
+        定期清理低分策略，防止策略数量无限累积。
+        仅清理研究/AI生成策略，默认基础策略不删除。
+        """
+        now = datetime.now()
+        interval_seconds = int(self._optimization_runtime_config.get("prune_interval_seconds", 3600) or 3600)
+        max_total = int(self._optimization_runtime_config.get("pool_limit", 30) or 30)
+        min_keep = 8
+        protect_prefixes = ("default_", "combined_")
+        candidate_prefixes = ("dsl_", "ai_strategy_", "ai_")
+
+        if self._last_pool_prune_at and (now - self._last_pool_prune_at).total_seconds() < interval_seconds:
+            return
+        self._last_pool_prune_at = now
+
+        async with self._lock:
+            total = len(self.strategy_configs)
+            if total <= max_total:
+                return
+
+            candidates: List[tuple[str, float]] = []
+            for strategy_id, cfg in self.strategy_configs.items():
+                if strategy_id.startswith(protect_prefixes):
+                    continue
+                if not strategy_id.startswith(candidate_prefixes):
+                    continue
+                score = self._calc_strategy_pool_score(strategy_id, cfg)
+                candidates.append((strategy_id, score))
+
+            if not candidates:
+                return
+
+            # 从低分到高分淘汰
+            candidates.sort(key=lambda x: x[1])
+            removable = max(0, total - max_total)
+            # 保底保留一定数量，防止过度清理
+            removable = min(removable, max(0, len(candidates) - max(0, min_keep - (total - len(candidates)))))
+            if removable <= 0:
+                return
+
+            to_remove = [sid for sid, _ in candidates[:removable]]
+
+            # 先停止并删除相关实例
+            remove_instance_ids = [
+                iid for iid, inst in self.strategy_instances.items() if inst.config.strategy_id in to_remove
+            ]
+            for iid in remove_instance_ids:
+                self.strategy_instances.pop(iid, None)
+                self.strategy_weights.pop(iid, None)
+
+            # 删除策略配置与性能记录
+            for sid in to_remove:
+                self.strategy_configs.pop(sid, None)
+                self.performance_metrics.pop(sid, None)
+
+            # 归一化剩余权重
+            tw = sum(self.strategy_weights.values())
+            if tw > 0:
+                for iid in list(self.strategy_weights.keys()):
+                    self.strategy_weights[iid] = float(self.strategy_weights[iid]) / float(tw)
+
+            logger.info(
+                "🧹 策略池清理完成: 删除 %s 个低分策略，当前总数 %s（上限 %s）",
+                len(to_remove),
+                len(self.strategy_configs),
+                max_total,
+            )
+
+    async def _run_daily_strategy_optimization(self) -> None:
+        """
+        每日策略优化例程：
+        1) 按策略类型做固定参数微调（长期稳定性）
+        2) 按回撤做风控参数收敛（回撤优化）
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        batch_size = int(self._optimization_runtime_config.get("daily_batch_size", 6) or 6)
+        batch_time_budget_sec = float(self._optimization_runtime_config.get("daily_batch_time_budget_sec", 1.5) or 1.5)
+        started = datetime.now()
+
+        async with self._lock:
+            # 新的一天，重置游标/状态（分批跑，避免单次占用过高）
+            if self._daily_optimization_status.get("date") != today:
+                self._daily_optimization_cursor = 0
+                self._daily_optimization_status = {
+                    "date": today,
+                    "completed": False,
+                    "processed": 0,
+                    "total": len(self.strategy_configs),
+                    "drawdown_optimized": 0,
+                    "started_at": datetime.now().isoformat(),
+                    "finished_at": None,
+                    "last_batch_ms": 0.0,
+                }
+
+            if self._daily_optimization_status.get("completed"):
+                self._last_daily_optimization_date = today
+                return
+
+            items = list(self.strategy_configs.items())
+            total = len(items)
+            if total == 0:
+                self._daily_optimization_status["completed"] = True
+                self._daily_optimization_status["finished_at"] = datetime.now().isoformat()
+                self._last_daily_optimization_date = today
+                return
+
+            idx = int(self._daily_optimization_cursor)
+            end_idx = min(total, idx + batch_size)
+            batch = items[idx:end_idx]
+
+            optimized = 0
+            dd_optimized = 0
+            for sid, cfg in batch:
+                md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+                if not isinstance(md, dict):
+                    md = {}
+
+                params = cfg.parameters if isinstance(cfg.parameters, dict) else {}
+                # ---- 固定优化：按类型做轻微参数收敛 ----
+                st = cfg.strategy_type.value if hasattr(cfg.strategy_type, "value") else str(cfg.strategy_type)
+                if st == "trend_following":
+                    params.setdefault("fast_ma_period", 12)
+                    params.setdefault("slow_ma_period", 36)
+                elif st in {"grid_trading", "mean_reversion"}:
+                    params.setdefault("bb_period", 20)
+                    params.setdefault("bb_std", 2.0)
+                elif st in {"market_making", "ai_generated"}:
+                    params.setdefault("vol_window", 20)
+                    params.setdefault("atr_mult", 1.4)
+
+                # ---- 回撤优化：依据历史回测/运行回撤收紧风险参数 ----
+                dd = 0.0
+                research = md.get("research", {}) if isinstance(md.get("research", {}), dict) else {}
+                test = research.get("test", {}) if isinstance(research.get("test", {}), dict) else {}
+                try:
+                    dd = max(dd, float(test.get("max_drawdown", 0.0) or 0.0))
+                except Exception:
+                    pass
+                perf = self.performance_metrics.get(sid)
+                if perf:
+                    dd = max(dd, float(perf.max_drawdown or 0.0))
+
+                stop_loss = float(params.get("stop_loss_pct", 0.03) or 0.03)
+                take_profit = float(params.get("take_profit_pct", 0.06) or 0.06)
+                if dd >= 0.25:
+                    stop_loss = max(0.008, stop_loss * 0.88)
+                    take_profit = max(0.015, take_profit * 0.92)
+                    dd_optimized += 1
+                elif dd <= 0.10:
+                    # 低回撤时仅小步放宽，避免过拟合
+                    stop_loss = min(0.06, stop_loss * 1.03)
+                    take_profit = min(0.15, take_profit * 1.03)
+                    dd_optimized += 1
+
+                params["stop_loss_pct"] = float(round(stop_loss, 4))
+                params["take_profit_pct"] = float(round(take_profit, 4))
+                cfg.parameters = params
+                cfg.updated_at = datetime.now()
+                md["daily_optimization"] = {
+                    "date": today,
+                    "strategy_type": st,
+                    "max_drawdown_used": float(round(dd, 4)),
+                    "stop_loss_pct": cfg.parameters.get("stop_loss_pct"),
+                    "take_profit_pct": cfg.parameters.get("take_profit_pct"),
+                }
+                cfg.metadata = md
+                optimized += 1
+                # 让出事件循环，避免长时间占用主线程
+                await asyncio.sleep(0)
+                if (datetime.now() - started).total_seconds() >= batch_time_budget_sec:
+                    break
+
+            processed_now = optimized
+            self._daily_optimization_cursor = min(total, idx + processed_now)
+            self._daily_optimization_status["processed"] = int(self._daily_optimization_status.get("processed", 0) or 0) + processed_now
+            self._daily_optimization_status["drawdown_optimized"] = int(
+                self._daily_optimization_status.get("drawdown_optimized", 0) or 0
+            ) + dd_optimized
+            self._daily_optimization_status["total"] = total
+            self._daily_optimization_status["last_batch_ms"] = round(
+                (datetime.now() - started).total_seconds() * 1000.0, 2
+            )
+
+            if self._daily_optimization_cursor >= total:
+                self._daily_optimization_status["completed"] = True
+                self._daily_optimization_status["finished_at"] = datetime.now().isoformat()
+                self._last_daily_optimization_date = today
+                logger.info(
+                    "🛠️ 每日策略优化完成: 总计 %s, 回撤优化 %s, 日期 %s",
+                    self._daily_optimization_status.get("processed", 0),
+                    self._daily_optimization_status.get("drawdown_optimized", 0),
+                    today,
+                )
+            else:
+                logger.info(
+                    "🧩 每日策略优化分批进行: %s/%s（本批%d）",
+                    self._daily_optimization_status.get("processed", 0),
+                    total,
+                    processed_now,
+                )
+
+    def get_optimization_status(self) -> Dict[str, Any]:
+        """给 API/UI 查询策略池与每日优化状态。"""
+        return {
+            "pool_limit": int(self._optimization_runtime_config.get("pool_limit", 30) or 30),
+            "total_strategies": len(self.strategy_configs),
+            "runtime_config": dict(self._optimization_runtime_config),
+            "daily_optimization": dict(self._daily_optimization_status),
+            "last_daily_optimization_date": self._last_daily_optimization_date,
+            "last_pool_prune_at": self._last_pool_prune_at.isoformat() if self._last_pool_prune_at else None,
+        }
+
+    def update_optimization_runtime_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """运行期热更新优化参数（无需重启）。"""
+        allowed = {
+            "pool_limit": (int, 8, 200),
+            "prune_interval_seconds": (int, 300, 86400),
+            "daily_batch_size": (int, 1, 50),
+            "daily_batch_time_budget_sec": (float, 0.2, 10.0),
+            "daily_opt_cycle_seconds": (int, 60, 3600),
+        }
+        applied: Dict[str, Any] = {}
+        for k, v in (updates or {}).items():
+            if k not in allowed or v is None:
+                continue
+            typ, lo, hi = allowed[k]
+            try:
+                val = typ(v)
+                if val < lo:
+                    val = lo
+                if val > hi:
+                    val = hi
+                self._optimization_runtime_config[k] = val
+                applied[k] = val
+            except Exception:
+                continue
+        return applied
 
     async def _calculate_all_performance(self) -> None:
         """计算所有策略性能"""
