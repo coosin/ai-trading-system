@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../services/api';
 import { useMarketData, useTechnicalIndicators, useOrderBook, useTrades, useAIMarketAnalysis, useAITradingSignal } from '../hooks/useRealTimeData';
+import { toCnSignal, translateReasoning } from '../utils/cnFormatter';
 
 function RealTimeMarket() {
   const [selectedSymbol, setSelectedSymbol] = useState('BTC/USDT');
@@ -296,7 +297,12 @@ function RealTimeMarket() {
               )}
               {aiSignal.reasoning && (
                 <p style={{ margin: '5px 0', fontSize: '13px' }}>
-                  <strong>分析依据:</strong> {aiSignal.reasoning}
+                  <strong>分析依据:</strong> {translateReasoning(aiSignal.reasoning)}
+                </p>
+              )}
+              {aiSignal.signal && (
+                <p style={{ margin: '5px 0', fontSize: '13px' }}>
+                  <strong>信号释义:</strong> {toCnSignal(aiSignal.signal)}
                 </p>
               )}
             </div>

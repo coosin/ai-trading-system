@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { toCnFieldKey, toCnSignal, toCnRiskLevel, toCnStrategy, translateReasoning } from '../utils/cnFormatter';
 
 function Notifications() {
   const [notifications, setNotifications] = useState([]);
@@ -341,8 +342,16 @@ function Notifications() {
                   <div style={{ marginTop: '10px', padding: '10px', backgroundColor: '#f1f3f4', borderRadius: '4px', fontSize: '14px' }}>
                     {Object.entries(notification.details).map(([key, value]) => (
                       <div key={key}>
-                        <strong>{key.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase())}：</strong>
-                        {value}
+                        <strong>{toCnFieldKey(key)}：</strong>
+                        {key === 'side'
+                          ? toCnSignal(value)
+                          : key === 'strategy' || key === 'strategy_name'
+                            ? toCnStrategy(value)
+                            : key === 'risk_level'
+                              ? toCnRiskLevel(value)
+                              : key === 'reason' || key === 'reasoning'
+                                ? translateReasoning(value)
+                                : value}
                       </div>
                     ))}
                   </div>

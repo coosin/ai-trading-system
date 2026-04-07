@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../services/api';
+import { toCnFieldKey, toCnRiskLevel, toCnStrategy, translateReasoning } from '../utils/cnFormatter';
 
 function AIMarketAnalysis() {
   const [selectedSymbol, setSelectedSymbol] = useState('BTC/USDT');
@@ -452,17 +453,25 @@ function AIMarketAnalysis() {
                           color: signalResult.signal === 'buy' ? '#27ae60' : 
                                  signalResult.signal === 'sell' ? '#e74c3c' : '#f39c12'
                         }}>
-                          {signalResult.signal === 'buy' ? '🟢 买入 (BUY)' : 
-                           signalResult.signal === 'sell' ? '🔴 卖出 (SELL)' : 
-                           '⚪ 观望 (HOLD)'}
+                          {signalResult.signal === 'buy' ? '🟢 买入' :
+                           signalResult.signal === 'sell' ? '🔴 卖出' :
+                           '⚪ 观望'}
                         </span>
                       </div>
                     )}
                     {Object.entries(signalResult).filter(([key]) => key !== 'signal').map(([key, value]) => (
                       <div key={key} style={{ marginBottom: '10px' }}>
-                        <strong style={{ color: '#f39c12' }}>{key}:</strong>
+                        <strong style={{ color: '#f39c12' }}>{toCnFieldKey(key)}:</strong>
                         <span style={{ marginLeft: '10px' }}>
-                          {typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}
+                          {typeof value === 'object'
+                            ? JSON.stringify(value, null, 2)
+                            : key === 'reasoning' || key === 'reason' || key === 'decision_reason'
+                              ? translateReasoning(value)
+                              : key === 'strategy' || key === 'strategy_name'
+                                ? toCnStrategy(value)
+                                : key === 'risk_level'
+                                  ? toCnRiskLevel(value)
+                                  : String(value)}
                         </span>
                       </div>
                     ))}
