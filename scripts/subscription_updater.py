@@ -10,12 +10,14 @@ import yaml
 import logging
 import os
 import re
+from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class SubscriptionUpdater:
@@ -86,7 +88,7 @@ class SubscriptionUpdater:
                 continue
             
             logger.info(f"更新订阅: {name}")
-            logger.info(f"URL: {url}")
+            logger.info(f"URL: {self._mask_url(url)}")
             
             content = await self.fetch_subscription(url)
             if content:
@@ -100,6 +102,15 @@ class SubscriptionUpdater:
                     logger.warning(f"订阅 {name} 没有有效的代理节点")
         
         return total_proxies
+
+    @staticmethod
+    def _mask_url(url: str) -> str:
+        try:
+            p = urlparse(url or "")
+            host = p.netloc or "unknown-host"
+            return f"{p.scheme}://{host}/***"
+        except Exception:
+            return "***"
     
     def generate_clash_config(self) -> Dict[str, Any]:
         existing_config = {}

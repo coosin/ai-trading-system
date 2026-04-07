@@ -1,0 +1,7 @@
+{
+  "max_rr_rejected_per_interval": 20,
+  "max_spread_rejected_per_interval": 20,
+  "max_depth_imbalance_rejected_per_interval": 20,
+  "max_data_quality_holds_per_interval": 30,
+  "max_dynamic_adjustments_per_interval": 80
+}

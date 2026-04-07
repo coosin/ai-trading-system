@@ -436,6 +436,20 @@ def init_module_control_api(app, main_controller):
                 stats["long_term_count"] = len(mem.long_term_memory)
         
         return stats
+
+    @router.get("/stop-loss/stats")
+    async def get_stop_loss_stats():
+        """获取止盈止损跟踪统计"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        try:
+            slm = getattr(main_controller, "stop_loss_manager", None)
+            if not slm:
+                return {"success": False, "message": "止盈止损管理器未初始化"}
+            data = slm.get_stats() if hasattr(slm, "get_stats") else {}
+            return {"success": True, "stats": data or {}}
+        except Exception as e:
+            return {"success": False, "message": f"读取止盈止损统计失败: {e}"}
     
     @router.get("/system/health")
     async def get_system_health():

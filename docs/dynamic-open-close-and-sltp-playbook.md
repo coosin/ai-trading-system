@@ -158,6 +158,29 @@
 
 ---
 
+## 24小时连续巡检
+
+新增脚本：`scripts/continuous_system_probe.py`  
+阈值样例：`docs/system-monitor-thresholds.example.json`
+
+示例（24小时，每5分钟一轮）：
+
+`python3 scripts/continuous_system_probe.py --base-url http://localhost:8000 --interval-sec 300 --hours 24 --thresholds docs/system-monitor-thresholds.example.json --output logs/system_probe_report.jsonl`
+
+快速冒烟（只跑1轮）：
+
+`python3 scripts/continuous_system_probe.py --base-url http://localhost:8000 --iterations 1`
+
+生成中文日报（基于巡检 JSONL）：
+
+`python3 scripts/system_probe_daily_summary.py --input logs/system_probe_report.jsonl --output logs/system_probe_daily_summary.md`
+
+巡检 + 日报 + TG 推送（一条命令）：
+
+`python3 scripts/probe_report_to_tg.py --base-url http://localhost:8000 --iterations 1 --interval-sec 5 --probe-output logs/system_probe_report.jsonl --summary-output logs/system_probe_daily_summary.md`
+
+---
+
 ## 观测与排障
 
 - 关注日志关键词：

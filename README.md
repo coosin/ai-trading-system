@@ -205,6 +205,10 @@ docker exec -it openclaw-trading bash
 - ✅ **开仓时机与仓位跟踪联动优化**：`ai_core` 开仓成功后，自动将自适应门控（分组/时段阈值、实时盘口）映射为该仓位的 SL/TP 跟踪配置，确保“开仓判断”与“后续风控执行”一致。
 - ✅ **止盈止损实时动态调整**：`StopLossTakeProfitManager` 增加基于实时订单簿的动态调整（价差/深度失衡），在浮盈阶段可自动收紧止损或小幅延展止盈，减少震荡回吐并跟随趋势延续。
 - ✅ **策略开发与执行流程文档化**：将“门控阈值 -> 开仓 -> 跟踪 -> 动态SL/TP -> 触发平仓”链路纳入统一执行说明，便于后续策略迭代直接复用。
+- ✅ **巡检与日报自动化**：新增 `continuous_system_probe.py` 与 `system_probe_daily_summary.py`，支持关键接口巡检、峰值统计与中文日报输出。
+- ✅ **Telegram 巡检推送闭环**：新增 `probe_report_to_tg.py`，支持“一条命令”完成巡检 + 报告生成 + TG 推送。
+- ✅ **止盈止损统计接口**：新增 `/api/v1/modules/stop-loss/stats`，供巡检、可视化面板与告警系统统一读取。
+- ✅ **代理订阅更新运维脚本**：新增 `update_clash_subscriptions.sh`，支持订阅更新后自动 reload Clash，便于定时任务托管。
 
 ---
 
