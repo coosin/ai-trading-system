@@ -415,7 +415,10 @@ class MainController:
     async def process_user_command(self, command: str, source: str = "system") -> Dict[str, Any]:
         """
         Unified communication entrypoint.
-        Route user command to primary AI brain first.
+
+        重要：必须先走「指令执行器」再回退核心大脑。
+        若先走 ai_core.process_user_command，其内部多为纯 LLM 闲聊，会永远 return，
+        导致策略/交易/分析等真实执行链路（AICommandExecutor）从未被调用。
         """
         # Always capture the incoming message as conversation memory (scope by channel).
         if getattr(self, "memory_gateway", None):
@@ -443,43 +446,59 @@ class MainController:
             except Exception:
                 command_with_context = command
 
+        async def _store_assistant_reply(result_dict: Dict[str, Any]) -> None:
+            if not getattr(self, "memory_gateway", None) or not isinstance(result_dict, dict):
+                return
+            try:
+                resp_text = result_dict.get("response") or result_dict.get("message") or ""
+                if not resp_text:
+                    return
+                src = str(result_dict.get("source") or "assistant")
+                await self.memory_gateway.add_memory(
+                    memory_type="conversation",
+                    content=f"[assistant@{src}] {resp_text}",
+                    metadata={"scope": f"channel:{source}", "role": "assistant"},
+                    source_module="main_controller",
+                    importance=0.35,
+                    tags=["conversation"],
+                )
+            except Exception:
+                pass
+
+        # 1) 优先：意图解析 + 可执行动作（交易/策略/行情/持仓等）
+        if getattr(self, "ai_command_executor", None):
+            try:
+                result = await self.ai_command_executor.process_input(command)
+                if isinstance(result, dict):
+                    result.setdefault("source", "ai_command_executor")
+                    await _store_assistant_reply(result)
+                    return result
+                return {"success": True, "response": str(result), "source": "ai_command_executor"}
+            except Exception as e:
+                logger.error(f"指令执行器处理失败(source={source}): {e}")
+
+        # 2) 回退：核心大脑（纯对话/状态拼装，易「只说不做」——仅作补充）
         brain = await self.get_primary_ai_brain()
         if brain and hasattr(brain, "process_user_command"):
             try:
                 result = await brain.process_user_command(command_with_context)
                 if isinstance(result, dict):
                     result.setdefault("source", getattr(brain, "__class__", type(brain)).__name__)
-                    # capture assistant response if present
-                    if getattr(self, "memory_gateway", None):
-                        try:
-                            resp_text = result.get("response") or result.get("message") or ""
-                            if resp_text:
-                                await self.memory_gateway.add_memory(
-                                    memory_type="conversation",
-                                    content=f"[assistant@{result.get('source')}] {resp_text}",
-                                    metadata={"scope": f"channel:{source}", "role": "assistant"},
-                                    source_module="main_controller",
-                                    importance=0.35,
-                                    tags=["conversation"],
-                                )
-                        except Exception:
-                            pass
-                return result if isinstance(result, dict) else {"success": True, "response": str(result)}
+                    await _store_assistant_reply(result)
+                    return result
+                return {"success": True, "response": str(result)}
             except Exception as e:
                 logger.error(f"核心大脑处理失败(source={source}): {e}")
-
-        if getattr(self, "ai_command_executor", None):
-            result = await self.ai_command_executor.process_input(command)
-            if isinstance(result, dict):
-                result.setdefault("source", "ai_command_executor")
-            return result if isinstance(result, dict) else {"success": True, "response": str(result)}
 
         if getattr(self, "natural_language_interface", None):
             result = await self.natural_language_interface.process_and_respond(command, {"source": source})
             if isinstance(result, dict):
                 result.setdefault("source", "natural_language_interface")
+                await _store_assistant_reply(result)
                 return result
-            return {"success": True, "response": str(result), "source": "natural_language_interface"}
+            out = {"success": True, "response": str(result), "source": "natural_language_interface"}
+            await _store_assistant_reply(out)
+            return out
 
         return {"success": False, "response": "核心大脑未就绪", "source": "none"}
 
