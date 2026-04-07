@@ -382,6 +382,10 @@ def init_module_control_api(app, main_controller):
             "auto_tune_cooldown_seconds",
             "auto_tune_min_rr_delta",
             "auto_tune_min_spread_delta_bps",
+            "auto_tune_sltp_params",
+            "auto_tune_sltp_cooldown_seconds",
+            "auto_tune_sltp_step_tighten",
+            "auto_tune_sltp_step_extend",
         }
         applied: Dict[str, Any] = {}
         for k, v in (config or {}).items():
@@ -393,6 +397,7 @@ def init_module_control_api(app, main_controller):
                         "auto_tune_by_symbol_group",
                         "auto_tune_by_session",
                         "auto_tune_global_enabled",
+                        "auto_tune_sltp_params",
                     ):
                         ai_core.config[k] = bool(v)
                         applied[k] = bool(v)

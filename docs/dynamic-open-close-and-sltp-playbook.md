@@ -75,6 +75,21 @@
 - `dynamic_tighten_ratio`（默认 0.15）
 - `dynamic_tp_extend_ratio`（默认 0.10）
 
+### 动态 SL/TP 在线学习
+
+- `auto_tune_sltp_params`：是否启用 SL/TP 动态参数学习
+- `auto_tune_sltp_cooldown_seconds`：同一分组/时段再次学习的最小间隔
+- `auto_tune_sltp_step_tighten`：每次学习对 `dynamic_tighten_ratio` 的调整步长
+- `auto_tune_sltp_step_extend`：每次学习对 `dynamic_tp_extend_ratio` 的调整步长
+- `auto_tune_sltp_tighten_bounds`：`dynamic_tighten_ratio` 上下界
+- `auto_tune_sltp_extend_bounds`：`dynamic_tp_extend_ratio` 上下界
+
+学习分组与执行门控一致：
+
+1. 优先 `symbol@session`（如 `BTC@US`）
+2. 其次 `symbol`（如 `BTC`）
+3. 最后回退全局默认（`StopLossTakeProfitConfig`）
+
 ---
 
 ## 策略开发建议（落地规范）
@@ -84,6 +99,62 @@
 3. 开仓成功后必须创建对应 `index_key=symbol|side` 的跟踪单；
 4. 持仓跟踪参数修改必须通过 `StopLossTakeProfitManager`，保持审计一致；
 5. 触发平仓统一走 `ExecutionGateway`，避免多出口并发写单。
+
+---
+
+## 推荐初始值（实盘小资金）
+
+- `auto_tune_sltp_params=true`
+- `auto_tune_sltp_cooldown_seconds=21600`（6小时）
+- `auto_tune_sltp_step_tighten=0.02`
+- `auto_tune_sltp_step_extend=0.02`
+- `auto_tune_sltp_tighten_bounds=[0.08, 0.30]`
+- `auto_tune_sltp_extend_bounds=[0.02, 0.25]`
+
+说明：
+
+- tighten 越大：不利盘口时止损收紧越快，回撤更小但可能更早离场；
+- extend 越大：有利盘口时止盈延展更积极，收益上限更高但回吐风险也更高。
+
+---
+
+## 回滚方案（快速止血）
+
+### 方案 A：只关 SLTP 在线学习
+
+- 设置 `auto_tune_sltp_params=false`
+- 系统继续保留固定动态规则（不再自动学习新参数）
+
+### 方案 B：恢复最保守默认
+
+- `dynamic_tighten_ratio=0.15`
+- `dynamic_tp_extend_ratio=0.10`
+- 可同时把 `enable_dynamic_market_adjustment=false` 作为紧急兜底
+
+### 方案 C：仅保留开仓门控
+
+- 保持执行门控学习开启
+- 关闭 `enable_dynamic_market_adjustment`
+- 适用于需要先稳定“开仓质量”，再逐步恢复持仓内动态调节的场景
+
+---
+
+## 观测指标与告警建议
+
+- 执行门控：
+  - `execution_guards.stats`
+  - `execution_guards.adaptive_profile`
+- SLTP 学习：
+  - `execution_guards.sltp_group_adaptive`
+  - `execution_guards.sltp_last_tuned_at`
+- 持仓跟踪质量：
+  - `stop_loss_manager.dynamic_adjustments`
+  - 日志关键词：`动态调整SL/TP`、`止盈止损实盘平仓已提交`
+
+建议阈值（可按账户规模调整）：
+
+- 若 `dynamic_adjustments` 突增且触发止损比例升高，先降低 `auto_tune_sltp_step_extend`；
+- 若趋势行情下盈利单过早离场，适度降低 `auto_tune_sltp_step_tighten` 或提高上限冷却时间。
 
 ---
 

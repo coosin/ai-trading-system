@@ -641,8 +641,8 @@ class StopLossTakeProfitManager:
                     pass
 
             pnl = self._calculate_pnl_percent(order, current_price)
-            tighten_ratio = float(self.config.dynamic_tighten_ratio)
-            tp_extend_ratio = float(self.config.dynamic_tp_extend_ratio)
+            tighten_ratio = float(meta.get("dynamic_tighten_ratio", self.config.dynamic_tighten_ratio) or self.config.dynamic_tighten_ratio)
+            tp_extend_ratio = float(meta.get("dynamic_tp_extend_ratio", self.config.dynamic_tp_extend_ratio) or self.config.dynamic_tp_extend_ratio)
             changed = False
 
             # 仅在浮盈阶段做主动动态调整，降低频繁噪音修改。

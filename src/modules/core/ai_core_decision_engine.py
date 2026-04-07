@@ -129,6 +129,12 @@ class AICoreDecisionEngine:
             "auto_tune_min_spread_delta_bps": 0.5,
             "auto_tune_rr_bounds": [1.0, 2.0],
             "auto_tune_spread_bounds": [12.0, 80.0],
+            "auto_tune_sltp_params": True,
+            "auto_tune_sltp_cooldown_seconds": 21600,
+            "auto_tune_sltp_step_tighten": 0.02,
+            "auto_tune_sltp_step_extend": 0.02,
+            "auto_tune_sltp_tighten_bounds": [0.08, 0.30],
+            "auto_tune_sltp_extend_bounds": [0.02, 0.25],
             "max_loss_per_position": 0.05,
             "daily_loss_limit": 0.10,
             "max_drawdown_limit": 0.15,
@@ -162,6 +168,8 @@ class AICoreDecisionEngine:
         self._symbol_group_guard_overrides: Dict[str, Dict[str, float]] = {}
         self._last_group_tune_at: Dict[str, datetime] = {}
         self._last_global_tune_at: Optional[datetime] = None
+        self._sltp_group_adaptive: Dict[str, Dict[str, float]] = {}
+        self._last_sltp_tune_at: Dict[str, datetime] = {}
         
         logger.info("🧠 AI核心决策引擎初始化（完整控制权版本）")
     
@@ -662,6 +670,39 @@ class AICoreDecisionEngine:
                         "🧩 分组调参[%s]: win_rate=%.2f avg_pnl=%.4f RR %.2f->%.2f spread %.1f->%.1f",
                         g, gwr, gavg, old_g_rr, g_rr, old_g_sp, g_sp
                     )
+
+                    # 同步学习动态 SL/TP 参数（按同一分组/时段）
+                    if bool(self.config.get("auto_tune_sltp_params", True)):
+                        sltp_cooldown = int(self.config.get("auto_tune_sltp_cooldown_seconds", 21600) or 21600)
+                        last_sltp = self._last_sltp_tune_at.get(g)
+                        if (not last_sltp) or sltp_cooldown <= 0 or (datetime.utcnow() - last_sltp).total_seconds() >= sltp_cooldown:
+                            stp = float(self.config.get("auto_tune_sltp_step_tighten", 0.02) or 0.02)
+                            sep = float(self.config.get("auto_tune_sltp_step_extend", 0.02) or 0.02)
+                            tmin, tmax = self.config.get("auto_tune_sltp_tighten_bounds", [0.08, 0.30])
+                            emin, emax = self.config.get("auto_tune_sltp_extend_bounds", [0.02, 0.25])
+                            curp = self._sltp_group_adaptive.get(g, {})
+                            cur_tighten = float(curp.get("dynamic_tighten_ratio", 0.15) or 0.15)
+                            cur_extend = float(curp.get("dynamic_tp_extend_ratio", 0.10) or 0.10)
+                            old_tighten, old_extend = cur_tighten, cur_extend
+                            # 低胜率或负收益：更保守（更快锁盈，减少延展）
+                            if gwr < 0.45 or gavg < 0:
+                                cur_tighten = min(float(tmax), cur_tighten + stp)
+                                cur_extend = max(float(emin), cur_extend - sep)
+                            # 高胜率且正收益：更进攻（略放缓锁盈，增加延展）
+                            elif gwr > 0.60 and gavg > 0:
+                                cur_tighten = max(float(tmin), cur_tighten - stp)
+                                cur_extend = min(float(emax), cur_extend + sep)
+                            if abs(cur_tighten - old_tighten) >= 0.005 or abs(cur_extend - old_extend) >= 0.005:
+                                self._sltp_group_adaptive[g] = {
+                                    "dynamic_tighten_ratio": float(cur_tighten),
+                                    "dynamic_tp_extend_ratio": float(cur_extend),
+                                    "sample_size": float(len(gpnl)),
+                                }
+                                self._last_sltp_tune_at[g] = datetime.utcnow()
+                                logger.info(
+                                    "🧠 分组SLTP调参[%s]: tighten %.3f->%.3f extend %.3f->%.3f",
+                                    g, old_tighten, cur_tighten, old_extend, cur_extend
+                                )
         except Exception as e:
             logger.debug(f"自动调参(执行门控)失败: {e}")
 
@@ -2809,6 +2850,12 @@ class AICoreDecisionEngine:
                 trailing_offset = max(0.006, trailing_offset * 0.85)
 
         idx_key = f"{decision.symbol}|{decision.side}"
+        symbol_group = self._symbol_group_key(decision.symbol)
+        session_group = self._market_session_key(datetime.utcnow())
+        composite_group = f"{symbol_group}@{session_group}"
+        sltp_prof = self._sltp_group_adaptive.get(composite_group) or self._sltp_group_adaptive.get(symbol_group) or {}
+        dyn_tighten = float(sltp_prof.get("dynamic_tighten_ratio", 0.15) or 0.15)
+        dyn_extend = float(sltp_prof.get("dynamic_tp_extend_ratio", 0.10) or 0.10)
         await self.main_controller.create_stop_loss_order(
             symbol=decision.symbol,
             side=decision.side,
@@ -2824,6 +2871,9 @@ class AICoreDecisionEngine:
                 "effective_min_rr": float(min_rr),
                 "spread_bps_on_open": float(spread_bps) if spread_bps is not None else None,
                 "depth_imbalance_on_open": float(depth_imbalance) if depth_imbalance is not None else None,
+                "dynamic_tighten_ratio": float(dyn_tighten),
+                "dynamic_tp_extend_ratio": float(dyn_extend),
+                "sltp_adaptive_group": composite_group if composite_group in self._sltp_group_adaptive else symbol_group,
             },
         )
     
@@ -2947,11 +2997,19 @@ class AICoreDecisionEngine:
                     "auto_tune_cooldown_seconds": self.config.get("auto_tune_cooldown_seconds"),
                     "auto_tune_min_rr_delta": self.config.get("auto_tune_min_rr_delta"),
                     "auto_tune_min_spread_delta_bps": self.config.get("auto_tune_min_spread_delta_bps"),
+                    "auto_tune_sltp_params": self.config.get("auto_tune_sltp_params"),
+                    "auto_tune_sltp_cooldown_seconds": self.config.get("auto_tune_sltp_cooldown_seconds"),
+                    "auto_tune_sltp_step_tighten": self.config.get("auto_tune_sltp_step_tighten"),
+                    "auto_tune_sltp_step_extend": self.config.get("auto_tune_sltp_step_extend"),
                 },
                 "adaptive_profile": dict(self._adaptive_guard_profile),
                 "group_overrides": dict(self._symbol_group_guard_overrides),
+                "sltp_group_adaptive": dict(self._sltp_group_adaptive),
                 "group_last_tuned_at": {
                     k: v.isoformat() for k, v in self._last_group_tune_at.items()
+                },
+                "sltp_last_tuned_at": {
+                    k: v.isoformat() for k, v in self._last_sltp_tune_at.items()
                 },
                 "global_last_tuned_at": (
                     self._last_global_tune_at.isoformat() if self._last_global_tune_at else None
@@ -2989,6 +3047,10 @@ class AICoreDecisionEngine:
                 "auto_tune_cooldown_seconds",
                 "auto_tune_min_rr_delta",
                 "auto_tune_min_spread_delta_bps",
+                "auto_tune_sltp_params",
+                "auto_tune_sltp_cooldown_seconds",
+                "auto_tune_sltp_step_tighten",
+                "auto_tune_sltp_step_extend",
             )
             for k in keys:
                 if k in overrides and overrides[k] is not None:
@@ -2998,6 +3060,7 @@ class AICoreDecisionEngine:
                         "auto_tune_by_symbol_group",
                         "auto_tune_by_session",
                         "auto_tune_global_enabled",
+                        "auto_tune_sltp_params",
                     ):
                         self.config[k] = bool(overrides[k])
                     elif k in ("auto_tune_group_step_rr", "auto_tune_group_step_spread_bps"):

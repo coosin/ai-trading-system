@@ -1053,6 +1053,11 @@ class AICommandExecutor:
                             f"最小RR变动: {gcfg.get('auto_tune_min_rr_delta', 'N/A')} | "
                             f"最小价差变动(bps): {gcfg.get('auto_tune_min_spread_delta_bps', 'N/A')}\n"
                         )
+                        response += (
+                            f"SLTP学习: {'开启' if gcfg.get('auto_tune_sltp_params', True) else '关闭'} | "
+                            f"SLTP冷却(s): {gcfg.get('auto_tune_sltp_cooldown_seconds', 'N/A')} | "
+                            f"tighten/extend步长: {gcfg.get('auto_tune_sltp_step_tighten', 'N/A')}/{gcfg.get('auto_tune_sltp_step_extend', 'N/A')}\n"
+                        )
                     if gprof:
                         response += (
                             f"当前档位: {gprof.get('profile', 'normal')} | "
