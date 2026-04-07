@@ -62,6 +62,7 @@ class MultiSourceDataFusion:
         self._sources: Dict[str, Any] = {}
         self._cache: Dict[str, FusedData] = {}
         self._cache_ttl = self.config.get("cache_ttl", 60)
+        self._last_source_health: Dict[str, Dict[str, Any]] = {}
         
         self._fusion_weights = {
             "exchange": 0.4,
@@ -82,7 +83,32 @@ class MultiSourceDataFusion:
             "source": source,
             "type": source_type
         }
+        self._last_source_health.setdefault(name, {
+            "status": "unknown",
+            "last_ok_at": None,
+            "last_error": "",
+            "fail_count": 0,
+            "quality_score": 0.0,
+        })
         logger.info(f"注册数据源: {name} ({source_type.value})")
+
+    def _mark_source_ok(self, name: str) -> None:
+        stat = self._last_source_health.setdefault(name, {})
+        stat["status"] = "ok"
+        stat["last_ok_at"] = datetime.now().isoformat()
+        stat["last_error"] = ""
+        stat["fail_count"] = 0
+        stat["quality_score"] = 1.0
+
+    def _mark_source_fail(self, name: str, error: str) -> None:
+        stat = self._last_source_health.setdefault(name, {})
+        prev_fail = int(stat.get("fail_count", 0) or 0)
+        fail_count = prev_fail + 1
+        stat["status"] = "degraded"
+        stat["last_error"] = str(error)
+        stat["fail_count"] = fail_count
+        # 连续失败指数衰减质量分，最低到 0.05，避免直接归零导致全盘无信号。
+        stat["quality_score"] = max(0.05, 1.0 / (1.0 + fail_count))
     
     def register_data_source(self, name: str, source: Any, source_type: Optional[str] = None):
         """注册数据源（兼容接口）"""
@@ -110,6 +136,7 @@ class MultiSourceDataFusion:
                 if hasattr(source, 'get_market_data'):
                     data = await source.get_market_data(symbol)
                     if data:
+                        self._mark_source_ok(name)
                         data_points.append(DataPoint(
                             source=name,
                             source_type=source_info["type"],
@@ -117,7 +144,60 @@ class MultiSourceDataFusion:
                             symbol=symbol,
                             value=data
                         ))
+                    else:
+                        self._mark_source_fail(name, "empty_data")
+
+                # 可选增强：若数据源支持订单簿/衍生品数据，则并行纳入融合输入
+                if hasattr(source, "get_order_book"):
+                    try:
+                        ob = await source.get_order_book(symbol, depth=10)
+                        if ob and getattr(ob, "bids", None) and getattr(ob, "asks", None):
+                            best_bid = float(ob.bids[0][0])
+                            best_ask = float(ob.asks[0][0])
+                            bid_vol = sum(float(x[1]) for x in ob.bids[:5])
+                            ask_vol = sum(float(x[1]) for x in ob.asks[:5])
+                            spread_bps = ((best_ask - best_bid) / max(1e-9, best_bid)) * 10000.0
+                            depth_imbalance = (bid_vol - ask_vol) / max(1e-9, bid_vol + ask_vol)
+                            data_points.append(DataPoint(
+                                source=f"{name}:orderbook",
+                                source_type=source_info["type"],
+                                timestamp=datetime.now(),
+                                symbol=symbol,
+                                value={
+                                    "spread_bps": spread_bps,
+                                    "depth_imbalance": depth_imbalance,
+                                    "bid_volume_top5": bid_vol,
+                                    "ask_volume_top5": ask_vol,
+                                },
+                                metadata={"kind": "orderbook"},
+                            ))
+                    except Exception as e:
+                        logger.debug(f"从 {name} 获取订单簿失败: {e}")
+
+                if hasattr(source, "get_open_interest") or hasattr(source, "get_funding_rate"):
+                    try:
+                        derivatives: Dict[str, Any] = {}
+                        if hasattr(source, "get_open_interest"):
+                            oi = await source.get_open_interest(symbol)
+                            if isinstance(oi, dict):
+                                derivatives.update(oi)
+                        if hasattr(source, "get_funding_rate"):
+                            fr = await source.get_funding_rate(symbol)
+                            if fr is not None:
+                                derivatives["funding_rate"] = float(fr)
+                        if derivatives:
+                            data_points.append(DataPoint(
+                                source=f"{name}:derivatives",
+                                source_type=source_info["type"],
+                                timestamp=datetime.now(),
+                                symbol=symbol,
+                                value=derivatives,
+                                metadata={"kind": "derivatives"},
+                            ))
+                    except Exception as e:
+                        logger.debug(f"从 {name} 获取衍生品数据失败: {e}")
             except Exception as e:
+                self._mark_source_fail(name, str(e))
                 logger.warning(f"从 {name} 获取数据失败: {e}")
         
         return data_points
@@ -141,6 +221,20 @@ class MultiSourceDataFusion:
                 # 1) dict（期望包含 price/volume/sentiment）
                 # 2) MarketData dataclass（price/volume/change_24h）
                 if isinstance(dp.value, dict):
+                    if dp.metadata.get("kind") == "orderbook":
+                        if "spread_bps" in dp.value:
+                            fused.technical_indicators["spread_bps"] = float(dp.value.get("spread_bps") or 0.0)
+                        if "depth_imbalance" in dp.value:
+                            fused.technical_indicators["depth_imbalance"] = float(dp.value.get("depth_imbalance") or 0.0)
+                        continue
+                    if dp.metadata.get("kind") == "derivatives":
+                        if "open_interest" in dp.value:
+                            fused.onchain_metrics["open_interest"] = float(dp.value.get("open_interest") or 0.0)
+                        if "volume_24h" in dp.value:
+                            fused.onchain_metrics["oi_volume_24h"] = float(dp.value.get("volume_24h") or 0.0)
+                        if "funding_rate" in dp.value:
+                            fused.onchain_metrics["funding_rate"] = float(dp.value.get("funding_rate") or 0.0)
+                        continue
                     if "price" in dp.value:
                         prices.append(dp.value["price"])
                     if "volume" in dp.value:
@@ -214,13 +308,17 @@ class MultiSourceDataFusion:
     
     def get_source_status(self) -> Dict[str, Dict[str, Any]]:
         """获取数据源状态"""
-        return {
+        status = {
             name: {
                 "type": info["type"].value,
                 "status": "active"
             }
             for name, info in self._sources.items()
         }
+        for name, health in self._last_source_health.items():
+            if name in status:
+                status[name]["health"] = dict(health)
+        return status
     
     async def analyze_market(self, symbol: str) -> Dict[str, Any]:
         """
@@ -241,7 +339,10 @@ class MultiSourceDataFusion:
             "trend": "unknown",
             "volatility": 0.0,
             "confidence": 0.0,
-            "sources": []
+            "sources": [],
+            "quality_score": 0.0,
+            "degraded_sources": [],
+            "source_health": {},
         }
         
         try:
@@ -252,6 +353,18 @@ class MultiSourceDataFusion:
                 result["sentiment"] = fused_data.sentiment
                 result["confidence"] = fused_data.confidence
                 result["sources"] = fused_data.sources
+                result["source_health"] = self.get_source_status()
+                degraded_sources = [
+                    n for n, s in result["source_health"].items()
+                    if isinstance(s, dict) and isinstance(s.get("health"), dict) and s["health"].get("status") == "degraded"
+                ]
+                result["degraded_sources"] = degraded_sources
+                source_quality = []
+                for n in result["sources"]:
+                    health = (result["source_health"].get(n) or {}).get("health", {})
+                    source_quality.append(float(health.get("quality_score", 1.0) or 1.0))
+                quality_score = (sum(source_quality) / len(source_quality)) if source_quality else 0.0
+                result["quality_score"] = max(0.0, min(1.0, quality_score))
                 
                 # 技术指标可能不存在（目前 fuse_data 未生成）
                 if fused_data.technical_indicators:
@@ -263,6 +376,13 @@ class MultiSourceDataFusion:
                     else:
                         result["trend"] = "neutral"
                     result["volatility"] = fused_data.technical_indicators.get("atr", 0)
+                    if "spread_bps" in fused_data.technical_indicators:
+                        result["spread_bps"] = fused_data.technical_indicators.get("spread_bps", 0)
+                    if "depth_imbalance" in fused_data.technical_indicators:
+                        result["depth_imbalance"] = fused_data.technical_indicators.get("depth_imbalance", 0)
+                if fused_data.onchain_metrics:
+                    result["open_interest"] = fused_data.onchain_metrics.get("open_interest")
+                    result["funding_rate"] = fused_data.onchain_metrics.get("funding_rate")
         except Exception as e:
             logger.warning(f"市场分析失败: {e}")
         

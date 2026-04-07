@@ -1016,6 +1016,60 @@ class AICommandExecutor:
                     response += f"运行状态: {'运行中' if status.get('running') else '已停止'}\n"
                     connected = [k for k, v in modules_status.items() if v]
                     response += f"已连接模块: {', '.join(connected) if connected else '无'}\n"
+                    guards = status.get("execution_guards", {})
+                    gcfg = guards.get("config", {})
+                    gprof = guards.get("adaptive_profile", {})
+                    gmap = guards.get("group_overrides", {})
+                    g_global_at = guards.get("global_last_tuned_at")
+                    gstats = guards.get("stats", {})
+                    if gcfg:
+                        response += "\n【执行门控】\n"
+                        response += (
+                            f"数据质量阈值: {gcfg.get('min_data_quality_to_trade', 'N/A')} | "
+                            f"最小RR: {gcfg.get('min_rr_to_trade', 'N/A')} | "
+                            f"最大价差(bps): {gcfg.get('max_spread_bps_to_trade', 'N/A')}\n"
+                        )
+                        response += f"自适应门控: {'开启' if gcfg.get('auto_adaptive_guards', True) else '关闭'}\n"
+                        response += (
+                            f"自动学习: {'开启' if gcfg.get('auto_tune_guards', True) else '关闭'} | "
+                            f"分组学习: {'开启' if gcfg.get('auto_tune_by_symbol_group', True) else '关闭'} | "
+                            f"时段学习: {'开启' if gcfg.get('auto_tune_by_session', True) else '关闭'}\n"
+                        )
+                        response += (
+                            f"全局基准慢调: {'开启' if gcfg.get('auto_tune_global_enabled', True) else '关闭'} | "
+                            f"全局冷却(s): {gcfg.get('auto_tune_global_cooldown_seconds', 'N/A')} | "
+                            f"上次全局调参: {g_global_at or '无'}\n"
+                        )
+                        response += (
+                            f"全局步长 RR/价差: {gcfg.get('auto_tune_global_step_rr', 'N/A')} / "
+                            f"{gcfg.get('auto_tune_global_step_spread_bps', 'N/A')}\n"
+                        )
+                        response += (
+                            f"分组步长 RR/价差: {gcfg.get('auto_tune_group_step_rr') or gcfg.get('auto_tune_step_rr', 'N/A')} / "
+                            f"{gcfg.get('auto_tune_group_step_spread_bps') or gcfg.get('auto_tune_step_spread_bps', 'N/A')}\n"
+                        )
+                        response += (
+                            f"分组冷却(s): {gcfg.get('auto_tune_cooldown_seconds', 'N/A')} | "
+                            f"最小RR变动: {gcfg.get('auto_tune_min_rr_delta', 'N/A')} | "
+                            f"最小价差变动(bps): {gcfg.get('auto_tune_min_spread_delta_bps', 'N/A')}\n"
+                        )
+                    if gprof:
+                        response += (
+                            f"当前档位: {gprof.get('profile', 'normal')} | "
+                            f"分组: {gprof.get('symbol_group', 'DEFAULT')} | "
+                            f"时段: {gprof.get('session_group', 'N/A')} | "
+                            f"ATR占比(1H): {float(gprof.get('atr_pct_1h', 0) or 0):.3%} | "
+                            f"生效RR: {gprof.get('effective_min_rr', 'N/A')}\n"
+                        )
+                    if gmap:
+                        response += f"分组学习覆盖: {len(gmap)} 组\n"
+                    if gstats:
+                        response += (
+                            f"门控统计: 质量拦截={gstats.get('data_quality_guard_hold', 0)}, "
+                            f"RR拒绝={gstats.get('rr_rejected', 0)}, "
+                            f"价差拒绝={gstats.get('spread_rejected', 0)}, "
+                            f"失衡拒绝={gstats.get('depth_imbalance_rejected', 0)}\n"
+                        )
                 
                 response += f"\n【用户规则】"
                 response += f"\n黑名单: {self.blacklist if self.blacklist else '无'}"
@@ -1031,7 +1085,8 @@ class AICommandExecutor:
                                 symbol = pos.get('instId', pos.get('symbol', 'Unknown'))
                                 side = pos.get('posSide', pos.get('side', 'unknown'))
                                 size = pos.get('pos', pos.get('size', 0))
-                                response += f"\n  {symbol}: {side} {size}"
+                                side_zh = {"long": "做多", "short": "做空"}.get(str(side).lower(), str(side))
+                                response += f"\n  {symbol}: {side_zh} {size}"
                     except Exception as e:
                         logger.debug(f"查询持仓信息失败: {e}")
                 

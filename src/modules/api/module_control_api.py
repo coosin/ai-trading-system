@@ -334,6 +334,85 @@ def init_module_control_api(app, main_controller):
                 return {"success": True, "message": "风险计数器已重置"}
         
         return {"success": True, "message": "风险计数器已重置"}
+
+    @router.get("/ai/guards")
+    async def get_ai_execution_guards():
+        """获取 AI 执行门控配置与触发统计"""
+        if not main_controller or not hasattr(main_controller, "ai_core") or not main_controller.ai_core:
+            return {"success": False, "message": "AI核心决策引擎未初始化"}
+        try:
+            st = main_controller.ai_core.get_status() if hasattr(main_controller.ai_core, "get_status") else {}
+            guards = (st or {}).get("execution_guards", {})
+            return {
+                "success": True,
+                "config": guards.get("config", {}),
+                "adaptive_profile": guards.get("adaptive_profile", {}),
+                "group_overrides": guards.get("group_overrides", {}),
+                "group_last_tuned_at": guards.get("group_last_tuned_at", {}),
+                "global_last_tuned_at": guards.get("global_last_tuned_at"),
+                "stats": guards.get("stats", {}),
+            }
+        except Exception as e:
+            return {"success": False, "message": f"读取执行门控失败: {e}"}
+
+    @router.post("/ai/guards")
+    async def update_ai_execution_guards(config: Dict[str, Any]):
+        """更新 AI 执行门控阈值（运行期生效）"""
+        if not main_controller or not hasattr(main_controller, "ai_core") or not main_controller.ai_core:
+            return {"success": False, "message": "AI核心决策引擎未初始化"}
+        ai_core = main_controller.ai_core
+        allowed = {
+            "min_data_quality_to_trade",
+            "min_rr_to_trade",
+            "max_spread_bps_to_trade",
+            "max_abs_depth_imbalance_to_trade",
+            "degraded_data_quantity_factor",
+            "auto_adaptive_guards",
+            "auto_tune_guards",
+            "auto_tune_by_symbol_group",
+            "auto_tune_by_session",
+            "auto_tune_global_enabled",
+            "auto_tune_global_cooldown_seconds",
+            "auto_tune_global_step_rr",
+            "auto_tune_global_step_spread_bps",
+            "auto_tune_step_rr",
+            "auto_tune_step_spread_bps",
+            "auto_tune_group_step_rr",
+            "auto_tune_group_step_spread_bps",
+            "auto_tune_cooldown_seconds",
+            "auto_tune_min_rr_delta",
+            "auto_tune_min_spread_delta_bps",
+        }
+        applied: Dict[str, Any] = {}
+        for k, v in (config or {}).items():
+            if k in allowed and v is not None:
+                try:
+                    if k in (
+                        "auto_adaptive_guards",
+                        "auto_tune_guards",
+                        "auto_tune_by_symbol_group",
+                        "auto_tune_by_session",
+                        "auto_tune_global_enabled",
+                    ):
+                        ai_core.config[k] = bool(v)
+                        applied[k] = bool(v)
+                    elif k in ("auto_tune_group_step_rr", "auto_tune_group_step_spread_bps"):
+                        if isinstance(v, str) and v.strip().lower() in ("", "null", "none"):
+                            ai_core.config[k] = None
+                            applied[k] = None
+                        else:
+                            ai_core.config[k] = float(v)
+                            applied[k] = float(ai_core.config[k])
+                    else:
+                        ai_core.config[k] = float(v)
+                        applied[k] = float(v)
+                except Exception:
+                    continue
+        return {
+            "success": True,
+            "message": "执行门控配置已更新",
+            "applied": applied,
+        }
     
     @router.get("/memory/stats")
     async def get_memory_stats():

@@ -4221,7 +4221,8 @@ class MainController:
         stop_loss_percent: float = 0.03,
         take_profit_percent: float = 0.06,
         enable_trailing: bool = True,
-        trailing_offset: float = 0.02
+        trailing_offset: float = 0.02,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[StopLossTakeProfitOrder]:
         """
         创建止盈止损订单
@@ -4260,7 +4261,8 @@ class MainController:
             entry_price=entry_price,
             quantity=quantity,
             stop_loss_config=sl_config,
-            take_profit_config=tp_config
+            take_profit_config=tp_config,
+            metadata=metadata,
         )
         
         logger.info(f"✅ 创建止盈止损订单: {symbol} {side} 止损={stop_loss_percent*100:.1f}% 止盈={take_profit_percent*100:.1f}%")

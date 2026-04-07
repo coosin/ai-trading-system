@@ -1236,9 +1236,10 @@ class OKXExchange(ExchangeBase):
         
         try:
             data = await self._make_request("GET", endpoint, params)
-            if data:
-                oi = float(data.get("oi", 0))
-                vol24h = float(data.get("vol24h", 0))
+            item = data[0] if isinstance(data, list) and data else (data or {})
+            if item:
+                oi = float(item.get("oi", 0) or 0)
+                vol24h = float(item.get("vol24h", 0) or 0)
                 return {
                     "open_interest": oi,
                     "volume_24h": vol24h
@@ -1256,8 +1257,9 @@ class OKXExchange(ExchangeBase):
         
         try:
             data = await self._make_request("GET", endpoint, params)
-            if data:
-                return float(data.get("fundingRate", 0))
+            item = data[0] if isinstance(data, list) and data else (data or {})
+            if item:
+                return float(item.get("fundingRate", 0) or 0)
             return None
         except Exception as e:
             logger.error(f"获取资金费率失败: {e}")

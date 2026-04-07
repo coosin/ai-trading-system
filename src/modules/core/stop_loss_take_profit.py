@@ -153,6 +153,11 @@ class StopLossTakeProfitConfig:
     sync_exchange_positions_on_startup: bool = True
     # 触发 SL/TP/时间止损时是否调用交易所真实平仓（经 ExecutionGateway）
     execute_exchange_on_trigger: bool = True
+    # 动态跟踪：根据实时盘口/波动微调止盈止损
+    enable_dynamic_market_adjustment: bool = True
+    dynamic_update_min_interval_sec: int = 20
+    dynamic_tighten_ratio: float = 0.15
+    dynamic_tp_extend_ratio: float = 0.10
 
 
 class StopLossTakeProfitManager:
@@ -196,7 +201,8 @@ class StopLossTakeProfitManager:
             "trailing_updates": 0,
             "breakeven_activated": 0,
             "partial_tp_executed": 0,
-            "time_stop_triggered": 0
+            "time_stop_triggered": 0,
+            "dynamic_adjustments": 0,
         }
         
         self._persist_path = Path(self.config.persist_file)
@@ -582,6 +588,9 @@ class StopLossTakeProfitManager:
             return None
         
         order.updated_at = datetime.now()
+
+        # 先做一次基于实时盘口/价格行为的动态参数微调，再执行触发判断。
+        await self._dynamic_market_adjust(order, current_price)
         
         if order.side == "long":
             if current_price > order.highest_price:
@@ -599,6 +608,100 @@ class StopLossTakeProfitManager:
         await self._check_time_stop(order)
         
         return triggered
+
+    async def _dynamic_market_adjust(self, order: StopLossTakeProfitOrder, current_price: float) -> None:
+        """根据实时行情动态微调止盈止损。"""
+        if not self.config.enable_dynamic_market_adjustment:
+            return
+        try:
+            now = datetime.now()
+            meta = order.metadata or {}
+            last_adjust_at = meta.get("last_dynamic_adjust_at")
+            if last_adjust_at:
+                try:
+                    last_dt = datetime.fromisoformat(str(last_adjust_at))
+                    if (now - last_dt).total_seconds() < int(self.config.dynamic_update_min_interval_sec):
+                        return
+                except Exception:
+                    pass
+
+            spread_bps = None
+            depth_imb = None
+            if self._exchange and hasattr(self._exchange, "get_order_book"):
+                try:
+                    ob = await self._exchange.get_order_book(order.symbol, depth=10)
+                    if ob and getattr(ob, "bids", None) and getattr(ob, "asks", None):
+                        best_bid = float(ob.bids[0][0])
+                        best_ask = float(ob.asks[0][0])
+                        bid_vol = sum(float(x[1]) for x in ob.bids[:5])
+                        ask_vol = sum(float(x[1]) for x in ob.asks[:5])
+                        spread_bps = ((best_ask - best_bid) / max(1e-9, best_bid)) * 10000.0
+                        depth_imb = (bid_vol - ask_vol) / max(1e-9, bid_vol + ask_vol)
+                except Exception:
+                    pass
+
+            pnl = self._calculate_pnl_percent(order, current_price)
+            tighten_ratio = float(self.config.dynamic_tighten_ratio)
+            tp_extend_ratio = float(self.config.dynamic_tp_extend_ratio)
+            changed = False
+
+            # 仅在浮盈阶段做主动动态调整，降低频繁噪音修改。
+            if pnl > 0:
+                adverse = False
+                favorable = False
+                if depth_imb is not None:
+                    adverse = (order.side == "long" and depth_imb < -0.35) or (order.side == "short" and depth_imb > 0.35)
+                    favorable = (order.side == "long" and depth_imb > 0.25) or (order.side == "short" and depth_imb < -0.25)
+                spread_guard = float((meta.get("guard_profile") or {}).get("effective_max_spread_bps", 40.0) or 40.0)
+                if spread_bps is not None and spread_bps > max(25.0, spread_guard):
+                    adverse = True
+
+                sl = float(order.stop_loss_price or 0)
+                tp = float(order.take_profit_price or 0)
+                if order.side == "long":
+                    if adverse and sl > 0:
+                        # 向现价上移止损，锁定部分利润
+                        target_sl = sl + (current_price - sl) * tighten_ratio
+                        if target_sl > sl:
+                            order.stop_loss_price = target_sl
+                            changed = True
+                    elif favorable and tp > 0:
+                        # 顺风单略微放宽止盈目标，争取趋势延续利润
+                        ext = (tp - current_price) * tp_extend_ratio
+                        if ext > 0:
+                            order.take_profit_price = tp + ext
+                            changed = True
+                else:
+                    if adverse and sl > 0:
+                        target_sl = sl - (sl - current_price) * tighten_ratio
+                        if target_sl < sl:
+                            order.stop_loss_price = target_sl
+                            changed = True
+                    elif favorable and tp > 0:
+                        ext = (current_price - tp) * tp_extend_ratio
+                        if ext > 0:
+                            order.take_profit_price = tp - ext
+                            changed = True
+
+            if changed:
+                self._stats["dynamic_adjustments"] += 1
+                order.updated_at = now
+                meta["last_dynamic_adjust_at"] = now.isoformat()
+                meta["last_market_spread_bps"] = float(spread_bps) if spread_bps is not None else None
+                meta["last_market_depth_imbalance"] = float(depth_imb) if depth_imb is not None else None
+                order.metadata = meta
+                logger.info(
+                    "🧭 动态调整SL/TP: %s side=%s pnl=%.2f%% sl=%.4f tp=%.4f spread=%s imb=%s",
+                    order.symbol,
+                    order.side,
+                    pnl * 100.0,
+                    float(order.stop_loss_price or 0),
+                    float(order.take_profit_price or 0),
+                    f"{spread_bps:.2f}" if spread_bps is not None else "N/A",
+                    f"{depth_imb:.3f}" if depth_imb is not None else "N/A",
+                )
+        except Exception as e:
+            logger.debug(f"动态调整止盈止损失败: {e}")
     
     async def _update_trailing_stop(self, order: StopLossTakeProfitOrder, current_price: float):
         """更新移动止损"""

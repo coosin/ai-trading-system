@@ -107,6 +107,28 @@ class AICoreDecisionEngine:
             "aggressive_mode": False,
             "auto_create_strategy": True,
             "min_confidence_to_trade": 0.75,
+            "min_data_quality_to_trade": 0.55,
+            "min_rr_to_trade": 1.20,
+            "max_spread_bps_to_trade": 35.0,
+            "max_abs_depth_imbalance_to_trade": 0.92,
+            "degraded_data_quantity_factor": 0.60,
+            "auto_adaptive_guards": True,
+            "auto_tune_guards": True,
+            "auto_tune_by_symbol_group": True,
+            "auto_tune_by_session": True,
+            "auto_tune_step_rr": 0.05,
+            "auto_tune_step_spread_bps": 2.0,
+            "auto_tune_global_enabled": True,
+            "auto_tune_global_cooldown_seconds": 86400,
+            "auto_tune_global_step_rr": 0.02,
+            "auto_tune_global_step_spread_bps": 1.0,
+            "auto_tune_group_step_rr": None,
+            "auto_tune_group_step_spread_bps": None,
+            "auto_tune_cooldown_seconds": 10800,
+            "auto_tune_min_rr_delta": 0.01,
+            "auto_tune_min_spread_delta_bps": 0.5,
+            "auto_tune_rr_bounds": [1.0, 2.0],
+            "auto_tune_spread_bounds": [12.0, 80.0],
             "max_loss_per_position": 0.05,
             "daily_loss_limit": 0.10,
             "max_drawdown_limit": 0.15,
@@ -122,6 +144,24 @@ class AICoreDecisionEngine:
         self._pending_decisions: List[TradeDecision] = []
         self._active_strategies: Dict[str, Any] = {}
         self._strategy_performance: Dict[str, Dict] = {}
+        self._execution_guards_stats: Dict[str, int] = {
+            "data_quality_guard_hold": 0,
+            "degraded_quantity_reduced": 0,
+            "rr_rejected": 0,
+            "spread_rejected": 0,
+            "depth_imbalance_rejected": 0,
+        }
+        self._adaptive_guard_profile: Dict[str, Any] = {
+            "profile": "normal",
+            "symbol_group": "DEFAULT",
+            "atr_pct_1h": 0.0,
+            "effective_min_rr": self.config.get("min_rr_to_trade", 1.2),
+            "effective_max_spread_bps": self.config.get("max_spread_bps_to_trade", 35.0),
+            "effective_max_abs_depth_imbalance": self.config.get("max_abs_depth_imbalance_to_trade", 0.92),
+        }
+        self._symbol_group_guard_overrides: Dict[str, Dict[str, float]] = {}
+        self._last_group_tune_at: Dict[str, datetime] = {}
+        self._last_global_tune_at: Optional[datetime] = None
         
         logger.info("🧠 AI核心决策引擎初始化（完整控制权版本）")
     
@@ -457,10 +497,207 @@ class AICoreDecisionEngine:
 
                 # 自动研究并发布候选策略（walk-forward 门控）
                 await self._run_research_pipeline()
+
+                # 根据近期交易表现自动微调执行门控阈值（小步、带边界）
+                await self._auto_tune_guard_thresholds()
                 
             except Exception as e:
                 logger.error(f"策略管理循环错误: {e}")
                 await asyncio.sleep(SLEEP_5MIN)
+
+    async def _auto_tune_guard_thresholds(self) -> None:
+        """基于近期交易结果自动微调 RR 与最大价差阈值。"""
+        if not bool(self.config.get("auto_tune_guards", True)):
+            return
+        try:
+            records: List[Dict[str, Any]] = []
+            wins = 0
+            losses = 0
+            pnls: List[float] = []
+
+            # 优先使用交易历史（若可用）
+            for rec in list(getattr(self, "_trade_history", []) or [])[-40:]:
+                d = rec.get("decision", {}) if isinstance(rec, dict) else {}
+                pnl = d.get("pnl")
+                sym = str(d.get("symbol", "") or rec.get("symbol", "") if isinstance(rec, dict) else "")
+                try:
+                    pnl_f = float(pnl)
+                    ts = d.get("timestamp") or (rec.get("timestamp") if isinstance(rec, dict) else None)
+                    records.append({"symbol": sym, "pnl": pnl_f, "timestamp": ts})
+                    pnls.append(pnl_f)
+                    if pnl_f > 0:
+                        wins += 1
+                    elif pnl_f < 0:
+                        losses += 1
+                except Exception:
+                    continue
+
+            # 回退使用策略表现里的交易复盘
+            if len(pnls) < 8:
+                for perf in (self._strategy_performance or {}).values():
+                    for tr in list(perf.get("trades", []) or [])[-40:]:
+                        res = tr.get("result", {}) if isinstance(tr, dict) else {}
+                        pnl = None
+                        sym = str(tr.get("symbol", "") if isinstance(tr, dict) else "")
+                        if isinstance(res, dict):
+                            pnl = res.get("pnl")
+                        if pnl is None and isinstance(tr, dict):
+                            pnl = tr.get("pnl")
+                        try:
+                            pnl_f = float(pnl)
+                            ts = tr.get("timestamp") if isinstance(tr, dict) else None
+                            records.append({"symbol": sym, "pnl": pnl_f, "timestamp": ts})
+                            pnls.append(pnl_f)
+                            if pnl_f > 0:
+                                wins += 1
+                            elif pnl_f < 0:
+                                losses += 1
+                        except Exception:
+                            continue
+
+            total = wins + losses
+            if total < 8:
+                return
+
+            win_rate = wins / total if total > 0 else 0.0
+            avg_pnl = (sum(pnls) / len(pnls)) if pnls else 0.0
+
+            rr_min, rr_max = self.config.get("auto_tune_rr_bounds", [1.0, 2.0])
+            sp_min, sp_max = self.config.get("auto_tune_spread_bounds", [12.0, 80.0])
+            min_rr_delta = float(self.config.get("auto_tune_min_rr_delta", 0.01) or 0.01)
+            min_sp_delta = float(self.config.get("auto_tune_min_spread_delta_bps", 0.5) or 0.5)
+
+            # ---------- 全局基准：慢速漂移（可与分组解耦；冷却更长、步长更小） ----------
+            if bool(self.config.get("auto_tune_global_enabled", True)):
+                g_rr_step = float(self.config.get("auto_tune_global_step_rr", 0.02) or 0.02)
+                g_sp_step = float(self.config.get("auto_tune_global_step_spread_bps", 1.0) or 1.0)
+                gcool = int(self.config.get("auto_tune_global_cooldown_seconds", 86400) or 86400)
+                now_utc = datetime.utcnow()
+                can_global = True
+                if self._last_global_tune_at and gcool > 0:
+                    if (now_utc - self._last_global_tune_at).total_seconds() < gcool:
+                        can_global = False
+
+                if can_global:
+                    rr = float(self.config.get("min_rr_to_trade", 1.2) or 1.2)
+                    spread = float(self.config.get("max_spread_bps_to_trade", 35.0) or 35.0)
+                    old_rr = rr
+                    old_sp = spread
+                    changed = False
+                    if win_rate < 0.45 or avg_pnl < 0:
+                        rr = min(float(rr_max), rr + g_rr_step)
+                        spread = max(float(sp_min), spread - g_sp_step)
+                        changed = True
+                    elif win_rate > 0.60 and avg_pnl > 0:
+                        rr = max(float(rr_min), rr - g_rr_step)
+                        spread = min(float(sp_max), spread + g_sp_step)
+                        changed = True
+                    if changed:
+                        if abs(rr - old_rr) >= min_rr_delta or abs(spread - old_sp) >= min_sp_delta:
+                            self.config["min_rr_to_trade"] = float(rr)
+                            self.config["max_spread_bps_to_trade"] = float(spread)
+                            self._last_global_tune_at = now_utc
+                            logger.info(
+                                "🛠️ 自动调参(全局基准): win_rate=%.2f avg_pnl=%.4f RR %.2f->%.2f spread %.1f->%.1f",
+                                win_rate, avg_pnl, old_rr, rr, old_sp, spread,
+                            )
+
+            # ---------- 分组/时段：较快响应（独立步长与冷却） ----------
+            # 可选：按交易对分组独立学习，避免不同币种波动相互污染
+            if bool(self.config.get("auto_tune_by_symbol_group", True)):
+                rr_step = self.config.get("auto_tune_group_step_rr")
+                sp_step = self.config.get("auto_tune_group_step_spread_bps")
+                if rr_step is None:
+                    rr_step = float(self.config.get("auto_tune_step_rr", 0.05) or 0.05)
+                else:
+                    rr_step = float(rr_step or 0.05)
+                if sp_step is None:
+                    sp_step = float(self.config.get("auto_tune_step_spread_bps", 2.0) or 2.0)
+                else:
+                    sp_step = float(sp_step or 2.0)
+                grouped: Dict[str, List[float]] = {}
+                tune_by_session = bool(self.config.get("auto_tune_by_session", True))
+                for r in records:
+                    g = self._symbol_group_key(r.get("symbol", ""))
+                    if tune_by_session:
+                        g = f"{g}@{self._market_session_key(r.get('timestamp'))}"
+                    grouped.setdefault(g, []).append(float(r.get("pnl", 0.0)))
+                for g, gpnl in grouped.items():
+                    if len(gpnl) < 6:
+                        continue
+                    cooldown_seconds = int(self.config.get("auto_tune_cooldown_seconds", 10800) or 10800)
+                    last_tune = self._last_group_tune_at.get(g)
+                    if last_tune and cooldown_seconds > 0:
+                        if (datetime.utcnow() - last_tune).total_seconds() < cooldown_seconds:
+                            continue
+                    gw = sum(1 for x in gpnl if x > 0)
+                    gl = sum(1 for x in gpnl if x < 0)
+                    gtotal = gw + gl
+                    if gtotal < 6:
+                        continue
+                    gwr = gw / gtotal
+                    gavg = sum(gpnl) / len(gpnl)
+                    cur = self._symbol_group_guard_overrides.get(g, {})
+                    g_rr = float(cur.get("min_rr_to_trade", self.config.get("min_rr_to_trade", 1.2)) or 1.2)
+                    g_sp = float(cur.get("max_spread_bps_to_trade", self.config.get("max_spread_bps_to_trade", 35.0)) or 35.0)
+                    old_g_rr, old_g_sp = g_rr, g_sp
+                    if gwr < 0.45 or gavg < 0:
+                        g_rr = min(float(rr_max), g_rr + rr_step)
+                        g_sp = max(float(sp_min), g_sp - sp_step)
+                    elif gwr > 0.60 and gavg > 0:
+                        g_rr = max(float(rr_min), g_rr - rr_step)
+                        g_sp = min(float(sp_max), g_sp + sp_step)
+                    else:
+                        continue
+                    # 防抖：变动太小则不更新，避免阈值来回抖动
+                    if abs(g_rr - old_g_rr) < min_rr_delta and abs(g_sp - old_g_sp) < min_sp_delta:
+                        continue
+                    self._symbol_group_guard_overrides[g] = {
+                        "min_rr_to_trade": float(g_rr),
+                        "max_spread_bps_to_trade": float(g_sp),
+                        "sample_size": float(len(gpnl)),
+                    }
+                    self._last_group_tune_at[g] = datetime.utcnow()
+                    logger.info(
+                        "🧩 分组调参[%s]: win_rate=%.2f avg_pnl=%.4f RR %.2f->%.2f spread %.1f->%.1f",
+                        g, gwr, gavg, old_g_rr, g_rr, old_g_sp, g_sp
+                    )
+        except Exception as e:
+            logger.debug(f"自动调参(执行门控)失败: {e}")
+
+    @staticmethod
+    def _symbol_group_key(symbol: str) -> str:
+        s = str(symbol or "").upper()
+        if "BTC" in s:
+            return "BTC"
+        if "ETH" in s:
+            return "ETH"
+        if "SOL" in s:
+            return "SOL"
+        if "BNB" in s:
+            return "BNB"
+        return "ALT"
+
+    @staticmethod
+    def _market_session_key(ts: Any = None) -> str:
+        """将时间映射到交易时段（按 UTC 小时简化分桶）。"""
+        try:
+            if isinstance(ts, datetime):
+                hour = int(ts.hour)
+            else:
+                s = str(ts or "").strip()
+                if s.endswith("Z"):
+                    s = s.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(s) if s else datetime.utcnow()
+                hour = int(dt.hour)
+        except Exception:
+            hour = int(datetime.utcnow().hour)
+
+        if 0 <= hour < 8:
+            return "ASIA"
+        if 8 <= hour < 16:
+            return "EU"
+        return "US"
 
     async def _run_research_pipeline(self) -> None:
         pipeline = None
@@ -1359,6 +1596,7 @@ class AICoreDecisionEngine:
             return None
         
         try:
+            await self._refresh_runtime_guard_config()
             # 1. 获取市场数据 - 实时
             market_data = await self._get_market_data(symbol)
             logger.info(f"   ✅ 市场数据: 价格={market_data.get('price', 0)}")
@@ -1398,6 +1636,35 @@ class AICoreDecisionEngine:
             # 10. 获取AI交易引擎分析 - 实时
             ai_engine_analysis = await self._get_ai_engine_analysis(symbol)
             logger.info(f"   ✅ AI引擎分析: {ai_engine_analysis.get('trend', 'unknown')}")
+
+            # 10.5 数据质量门控：当多源数据明显退化且第三方不可用时，避免做出激进决策。
+            quality_score = float(multi_source_analysis.get("quality_score", 0) or 0)
+            degraded_count = int(multi_source_analysis.get("degraded_count", 0) or 0)
+            third_party_available = bool(third_party_data.get("available", False))
+            min_quality = float(self.config.get("min_data_quality_to_trade", 0.55) or 0.55)
+            if quality_score < min_quality and (degraded_count > 0 or not third_party_available):
+                self._execution_guards_stats["data_quality_guard_hold"] += 1
+                logger.warning(
+                    "⚠️ 数据质量门控触发: symbol=%s quality=%.2f degraded=%s third_party=%s",
+                    symbol,
+                    quality_score,
+                    degraded_count,
+                    third_party_available,
+                )
+                return TradeDecision(
+                    symbol=symbol,
+                    action="hold",
+                    side="long",
+                    quantity=0,
+                    leverage=int(self.config.get("default_leverage", 1) or 1),
+                    entry_price=float(market_data.get("price", 0) or 0),
+                    stop_loss=0.0,
+                    take_profit=0.0,
+                    confidence=0.0,
+                    reasoning=f"data_quality_guard: quality={quality_score:.2f} degraded={degraded_count} third_party={third_party_available}",
+                    strategy_used="data_quality_guard",
+                    risk_level=risk_assessment.get("level", "high"),
+                )
             
             # 构建完整的决策prompt
             prompt = self._build_decision_prompt(
@@ -1516,6 +1783,9 @@ class AICoreDecisionEngine:
                                 "recommendation": analysis.get("recommendation", "neutral"),
                                 "confidence": analysis.get("confidence", 0),
                                 "trend": analysis.get("trend", "unknown"),
+                                "quality_score": analysis.get("quality_score", 0),
+                                "degraded_sources": analysis.get("degraded_sources", []),
+                                "degraded_count": len(analysis.get("degraded_sources", []) or []),
                             }
                         else:
                             result = {
@@ -1550,6 +1820,9 @@ class AICoreDecisionEngine:
                             "recommendation": analysis.get("recommendation", "neutral"),
                             "confidence": analysis.get("confidence", 0),
                             "trend": analysis.get("trend", "unknown"),
+                            "quality_score": analysis.get("quality_score", 0),
+                            "degraded_sources": analysis.get("degraded_sources", []),
+                            "degraded_count": len(analysis.get("degraded_sources", []) or []),
                         }
                     else:
                         result = {
@@ -2262,12 +2535,117 @@ class AICoreDecisionEngine:
                 decision.stop_loss = current_price + 2 * atr
                 decision.take_profit = current_price - 3 * atr
             
+            # 3.2 数据退化时自动降仓（避免单点数据故障造成激进下单）
+            if "data_quality_guard" in str(decision.reasoning or ""):
+                logger.warning("⚠️ 数据质量保护触发，跳过执行")
+                return True
+            if "degraded=" in str(decision.reasoning or ""):
+                try:
+                    q_factor = float(self.config.get("degraded_data_quantity_factor", 0.6) or 0.6)
+                    new_qty = max(1, int(float(decision.quantity) * q_factor))
+                    if new_qty < decision.quantity:
+                        self._execution_guards_stats["degraded_quantity_reduced"] += 1
+                        logger.info("📉 数据退化降仓: %s -> %s", decision.quantity, new_qty)
+                        decision.quantity = new_qty
+                except Exception:
+                    pass
+
+            # 3.3 执行前二次确认门：最小盈亏比 + 盘口价差 + 深度失衡
+            rr = 0.0
+            try:
+                risk = abs(float(decision.entry_price) - float(decision.stop_loss))
+                reward = abs(float(decision.take_profit) - float(decision.entry_price))
+                rr = reward / max(1e-9, risk)
+            except Exception:
+                rr = 0.0
+            symbol_group = self._symbol_group_key(decision.symbol)
+            session_group = self._market_session_key(datetime.utcnow())
+            composite_group = f"{symbol_group}@{session_group}"
+            gcfg = self._symbol_group_guard_overrides.get(composite_group) or self._symbol_group_guard_overrides.get(symbol_group, {})
+            min_rr = float(gcfg.get("min_rr_to_trade", self.config.get("min_rr_to_trade", 1.2)) or 1.2)
+            max_spread_bps = float(gcfg.get("max_spread_bps_to_trade", self.config.get("max_spread_bps_to_trade", 35.0)) or 35.0)
+            max_abs_imb = float(self.config.get("max_abs_depth_imbalance_to_trade", 0.92) or 0.92)
+
+            # 3.3.1 自适应门控阈值：波动低 -> 收紧；波动高 -> 适度放宽。
+            if bool(self.config.get("auto_adaptive_guards", True)):
+                try:
+                    tech = await self._get_technical_indicators(decision.symbol)
+                    price_ref = float(tech.get("price", decision.entry_price) or decision.entry_price or 0)
+                    ma5 = float(tech.get("ma5_1h", 0) or 0)
+                    ma20 = float(tech.get("ma20_1h", 0) or 0)
+                    atr_proxy = abs(ma5 - ma20)
+                    atr_pct = (atr_proxy / max(1e-9, price_ref)) if price_ref > 0 else 0.0
+                    profile = "normal"
+                    if atr_pct >= 0.02:
+                        profile = "high_vol"
+                        min_rr = min_rr * 0.90
+                        max_spread_bps = max_spread_bps * 1.25
+                        max_abs_imb = min(0.98, max_abs_imb * 1.05)
+                    elif atr_pct <= 0.005:
+                        profile = "low_vol"
+                        min_rr = min_rr * 1.10
+                        max_spread_bps = max(5.0, max_spread_bps * 0.80)
+                        max_abs_imb = max(0.80, max_abs_imb * 0.95)
+                    self._adaptive_guard_profile = {
+                        "profile": profile,
+                        "symbol_group": symbol_group,
+                        "session_group": session_group,
+                        "composite_group": composite_group,
+                        "atr_pct_1h": float(atr_pct),
+                        "effective_min_rr": float(min_rr),
+                        "effective_max_spread_bps": float(max_spread_bps),
+                        "effective_max_abs_depth_imbalance": float(max_abs_imb),
+                    }
+                except Exception as e:
+                    logger.debug(f"自适应门控计算失败: {e}")
+
+            if rr < min_rr:
+                self._execution_guards_stats["rr_rejected"] += 1
+                logger.warning("⚠️ 执行门控拒绝: RR过低 rr=%.2f < %.2f symbol=%s", rr, min_rr, decision.symbol)
+                return False
+
+            spread_bps = None
+            depth_imbalance = None
+            try:
+                if hasattr(self.exchange, "get_order_book"):
+                    ob = await self.exchange.get_order_book(decision.symbol, depth=10)
+                    if ob and getattr(ob, "bids", None) and getattr(ob, "asks", None):
+                        best_bid = float(ob.bids[0][0])
+                        best_ask = float(ob.asks[0][0])
+                        bid_vol = sum(float(x[1]) for x in ob.bids[:5])
+                        ask_vol = sum(float(x[1]) for x in ob.asks[:5])
+                        spread_bps = ((best_ask - best_bid) / max(1e-9, best_bid)) * 10000.0
+                        depth_imbalance = (bid_vol - ask_vol) / max(1e-9, bid_vol + ask_vol)
+            except Exception as e:
+                logger.debug(f"执行前订单簿检查失败: {e}")
+
+            if spread_bps is not None and spread_bps > max_spread_bps:
+                self._execution_guards_stats["spread_rejected"] += 1
+                logger.warning(
+                    "⚠️ 执行门控拒绝: 盘口价差过大 spread=%.2fbps > %.2f symbol=%s",
+                    spread_bps, max_spread_bps, decision.symbol
+                )
+                return False
+            if depth_imbalance is not None and abs(depth_imbalance) > max_abs_imb:
+                self._execution_guards_stats["depth_imbalance_rejected"] += 1
+                logger.warning(
+                    "⚠️ 执行门控拒绝: 深度失衡过大 imbalance=%.3f > %.3f symbol=%s",
+                    abs(depth_imbalance), max_abs_imb, decision.symbol
+                )
+                return False
+
             logger.info(f"🎯 执行AI决策: {decision.symbol} {decision.action} {decision.side}")
             logger.info(f"   入场价: {decision.entry_price}")
             logger.info(f"   数量: {decision.quantity}张")
             logger.info(f"   杠杆: {decision.leverage}x")
             logger.info(f"   止损: {decision.stop_loss}")
             logger.info(f"   止盈: {decision.take_profit}")
+            logger.info(f"   RR: {rr:.2f}")
+            logger.info(f"   门控档位: {self._adaptive_guard_profile.get('profile', 'normal')}")
+            if spread_bps is not None:
+                logger.info(f"   盘口价差: {spread_bps:.2f} bps")
+            if depth_imbalance is not None:
+                logger.info(f"   深度失衡: {depth_imbalance:.3f}")
             logger.info(f"   理由: {decision.reasoning}")
             logger.info(f"   策略: {decision.strategy_used}")
             
@@ -2367,6 +2745,18 @@ class AICoreDecisionEngine:
             
             if order and order.get('success'):
                 logger.info(f"✅ AI决策执行成功: {order.get('orderId')}")
+
+                # 开仓成功后，立即同步创建/更新仓位跟踪止盈止损单（使用当前动态门控信息）
+                if decision.action != "close":
+                    try:
+                        await self._sync_dynamic_sltp_after_open(
+                            decision=decision,
+                            min_rr=min_rr if 'min_rr' in locals() else float(self.config.get("min_rr_to_trade", 1.2) or 1.2),
+                            spread_bps=spread_bps if 'spread_bps' in locals() else None,
+                            depth_imbalance=depth_imbalance if 'depth_imbalance' in locals() else None,
+                        )
+                    except Exception as e:
+                        logger.warning(f"同步止盈止损跟踪失败（不影响开仓成功）: {e}")
                 
                 await self._save_decision_to_memory(decision, order)
                 
@@ -2382,6 +2772,60 @@ class AICoreDecisionEngine:
         except Exception as e:
             logger.error(f"执行AI决策失败: {e}")
             return False
+
+    async def _sync_dynamic_sltp_after_open(
+        self,
+        decision: TradeDecision,
+        min_rr: float,
+        spread_bps: Optional[float],
+        depth_imbalance: Optional[float],
+    ) -> None:
+        """开仓成功后将自适应门控结果应用到仓位跟踪止盈止损。"""
+        if not self.main_controller or not hasattr(self.main_controller, "create_stop_loss_order"):
+            return
+        entry = float(decision.entry_price or 0)
+        if entry <= 0:
+            return
+
+        risk_pct = abs(float(decision.stop_loss or 0) - entry) / max(1e-9, entry)
+        tp_pct = abs(float(decision.take_profit or 0) - entry) / max(1e-9, entry)
+        # 兜底范围，避免极端值
+        risk_pct = min(0.08, max(0.006, risk_pct))
+        tp_pct = min(0.20, max(0.010, tp_pct))
+
+        # 若当前 RR 低于目标门槛，按门槛抬高止盈距离，保证与执行门控一致。
+        rr_now = tp_pct / max(1e-9, risk_pct)
+        if rr_now < float(min_rr):
+            tp_pct = min(0.20, risk_pct * float(min_rr))
+
+        trailing_offset = float(self._adaptive_guard_profile.get("effective_max_spread_bps", 35.0) or 35.0) / 10000.0
+        trailing_offset = min(0.03, max(0.008, trailing_offset * 2.0))
+
+        # 盘口极端时先更保守：减小 trailing offset（更快锁盈）
+        if spread_bps is not None and spread_bps > 45:
+            trailing_offset = max(0.006, trailing_offset * 0.8)
+        if depth_imbalance is not None:
+            if (decision.side == "long" and depth_imbalance < -0.40) or (decision.side == "short" and depth_imbalance > 0.40):
+                trailing_offset = max(0.006, trailing_offset * 0.85)
+
+        idx_key = f"{decision.symbol}|{decision.side}"
+        await self.main_controller.create_stop_loss_order(
+            symbol=decision.symbol,
+            side=decision.side,
+            entry_price=entry,
+            quantity=float(decision.quantity),
+            stop_loss_percent=float(risk_pct),
+            take_profit_percent=float(tp_pct),
+            enable_trailing=True,
+            trailing_offset=float(trailing_offset),
+            metadata={
+                "index_key": idx_key,
+                "guard_profile": dict(self._adaptive_guard_profile),
+                "effective_min_rr": float(min_rr),
+                "spread_bps_on_open": float(spread_bps) if spread_bps is not None else None,
+                "depth_imbalance_on_open": float(depth_imbalance) if depth_imbalance is not None else None,
+            },
+        )
     
     async def _save_decision_to_memory(self, decision: TradeDecision, order: Dict) -> None:
         """保存AI决策到记忆"""
@@ -2419,12 +2863,15 @@ class AICoreDecisionEngine:
     
     async def _report_decision(self, decision: TradeDecision) -> None:
         """向用户报告AI决策"""
+        action_zh = {"buy": "买入", "sell": "卖出", "hold": "观望", "close": "平仓"}.get(str(decision.action).lower(), str(decision.action))
+        side_zh = {"long": "做多", "short": "做空"}.get(str(decision.side).lower(), str(decision.side))
+        risk_zh = {"low": "低", "medium": "中", "high": "高", "critical": "严重"}.get(str(decision.risk_level).lower(), str(decision.risk_level))
         message = f"""
 🎯 AI交易决策报告
 
 交易对: {decision.symbol}
-操作: {decision.action.upper()}
-方向: {decision.side.upper()}
+操作: {action_zh}
+方向: {side_zh}
 价格: {decision.entry_price}
 数量: {decision.quantity}张
 杠杆: {decision.leverage}x
@@ -2434,7 +2881,7 @@ class AICoreDecisionEngine:
 决策理由: {decision.reasoning}
 使用策略: {decision.strategy_used}
 置信度: {decision.confidence:.0%}
-风险等级: {decision.risk_level}
+风险等级: {risk_zh}
 
 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
@@ -2478,7 +2925,88 @@ class AICoreDecisionEngine:
             "active_positions": len(self._current_positions) if hasattr(self, '_current_positions') else 0,
             "positions": self._current_positions if hasattr(self, '_current_positions') else {},
             "total_trades": len(self._trade_history) if hasattr(self, '_trade_history') else 0,
+            "execution_guards": {
+                "config": {
+                    "min_data_quality_to_trade": self.config.get("min_data_quality_to_trade"),
+                    "min_rr_to_trade": self.config.get("min_rr_to_trade"),
+                    "max_spread_bps_to_trade": self.config.get("max_spread_bps_to_trade"),
+                    "max_abs_depth_imbalance_to_trade": self.config.get("max_abs_depth_imbalance_to_trade"),
+                    "degraded_data_quantity_factor": self.config.get("degraded_data_quantity_factor"),
+                    "auto_adaptive_guards": self.config.get("auto_adaptive_guards"),
+                    "auto_tune_guards": self.config.get("auto_tune_guards"),
+                    "auto_tune_by_symbol_group": self.config.get("auto_tune_by_symbol_group"),
+                    "auto_tune_by_session": self.config.get("auto_tune_by_session"),
+                    "auto_tune_global_enabled": self.config.get("auto_tune_global_enabled"),
+                    "auto_tune_global_cooldown_seconds": self.config.get("auto_tune_global_cooldown_seconds"),
+                    "auto_tune_global_step_rr": self.config.get("auto_tune_global_step_rr"),
+                    "auto_tune_global_step_spread_bps": self.config.get("auto_tune_global_step_spread_bps"),
+                    "auto_tune_step_rr": self.config.get("auto_tune_step_rr"),
+                    "auto_tune_step_spread_bps": self.config.get("auto_tune_step_spread_bps"),
+                    "auto_tune_group_step_rr": self.config.get("auto_tune_group_step_rr"),
+                    "auto_tune_group_step_spread_bps": self.config.get("auto_tune_group_step_spread_bps"),
+                    "auto_tune_cooldown_seconds": self.config.get("auto_tune_cooldown_seconds"),
+                    "auto_tune_min_rr_delta": self.config.get("auto_tune_min_rr_delta"),
+                    "auto_tune_min_spread_delta_bps": self.config.get("auto_tune_min_spread_delta_bps"),
+                },
+                "adaptive_profile": dict(self._adaptive_guard_profile),
+                "group_overrides": dict(self._symbol_group_guard_overrides),
+                "group_last_tuned_at": {
+                    k: v.isoformat() for k, v in self._last_group_tune_at.items()
+                },
+                "global_last_tuned_at": (
+                    self._last_global_tune_at.isoformat() if self._last_global_tune_at else None
+                ),
+                "stats": dict(self._execution_guards_stats),
+            },
         }
+
+    async def _refresh_runtime_guard_config(self) -> None:
+        """支持运行期热更新执行门控阈值（由 ai_managed_config 驱动）。"""
+        if not self.main_controller or not hasattr(self.main_controller, "get_ai_managed_config"):
+            return
+        try:
+            overrides = await self.main_controller.get_ai_managed_config("ai_core_runtime", {})
+            if not isinstance(overrides, dict) or not overrides:
+                return
+            keys = (
+                "min_data_quality_to_trade",
+                "min_rr_to_trade",
+                "max_spread_bps_to_trade",
+                "max_abs_depth_imbalance_to_trade",
+                "degraded_data_quantity_factor",
+                "auto_adaptive_guards",
+                "auto_tune_guards",
+                "auto_tune_by_symbol_group",
+                "auto_tune_by_session",
+                "auto_tune_global_enabled",
+                "auto_tune_global_cooldown_seconds",
+                "auto_tune_global_step_rr",
+                "auto_tune_global_step_spread_bps",
+                "auto_tune_step_rr",
+                "auto_tune_step_spread_bps",
+                "auto_tune_group_step_rr",
+                "auto_tune_group_step_spread_bps",
+                "auto_tune_cooldown_seconds",
+                "auto_tune_min_rr_delta",
+                "auto_tune_min_spread_delta_bps",
+            )
+            for k in keys:
+                if k in overrides and overrides[k] is not None:
+                    if k in (
+                        "auto_adaptive_guards",
+                        "auto_tune_guards",
+                        "auto_tune_by_symbol_group",
+                        "auto_tune_by_session",
+                        "auto_tune_global_enabled",
+                    ):
+                        self.config[k] = bool(overrides[k])
+                    elif k in ("auto_tune_group_step_rr", "auto_tune_group_step_spread_bps"):
+                        v = overrides[k]
+                        self.config[k] = None if v == "" or v == "null" else float(v)
+                    else:
+                        self.config[k] = float(overrides[k])
+        except Exception as e:
+            logger.debug(f"刷新运行期门控配置失败: {e}")
     
     async def process_user_command(self, command: str) -> Dict[str, Any]:
         """处理用户命令 - 纯自然语言交流，AI直接理解并执行"""

@@ -115,6 +115,40 @@ class ProactiveMarketScanner:
             "actions_taken": 0,
             "insights_generated": 0,
         }
+
+    @staticmethod
+    def _zh_direction(v: str) -> str:
+        m = {"long": "做多", "short": "做空", "neutral": "中性"}
+        return m.get(str(v or "").lower(), str(v))
+
+    @staticmethod
+    def _zh_trend(v: str) -> str:
+        m = {"bullish": "看涨", "bearish": "看跌", "sideways": "震荡", "mixed": "混合", "unknown": "未知"}
+        return m.get(str(v or "").lower(), str(v))
+
+    @staticmethod
+    def _zh_sentiment(v: str) -> str:
+        m = {"bullish": "乐观", "bearish": "悲观", "neutral": "中性", "fear": "恐惧", "greed": "贪婪"}
+        return m.get(str(v or "").lower(), str(v))
+
+    @staticmethod
+    def _zh_volatility(v: str) -> str:
+        m = {"low": "低", "normal": "正常", "high": "高", "extreme": "极高"}
+        return m.get(str(v or "").lower(), str(v))
+
+    @staticmethod
+    def _zh_opp_type(v: str) -> str:
+        m = {
+            "breakout": "突破",
+            "trend_reversal": "趋势反转",
+            "mean_reversion": "均值回归",
+            "news_driven": "新闻驱动",
+            "sentiment_shift": "情绪转折",
+            "arbitrage": "套利",
+            "volatility_spike": "波动率飙升",
+            "liquidity_event": "流动性事件",
+        }
+        return m.get(str(v or "").lower(), str(v))
     
     async def initialize(self) -> bool:
         """初始化"""
@@ -520,8 +554,13 @@ class ProactiveMarketScanner:
     
     async def _notify_opportunity(self, opportunity: MarketOpportunity) -> None:
         """通知发现的机会"""
-        logger.info(f"🎯 发现交易机会: {opportunity.symbol} {opportunity.direction} "
-                   f"(置信度: {opportunity.confidence:.0%}, 类型: {opportunity.opportunity_type.value})")
+        logger.info(
+            "🎯 发现交易机会: %s %s (置信度: %.0f%%, 类型: %s)",
+            opportunity.symbol,
+            self._zh_direction(opportunity.direction),
+            opportunity.confidence * 100,
+            self._zh_opp_type(opportunity.opportunity_type.value),
+        )
         
         for callback in self._alert_callbacks:
             try:
@@ -534,7 +573,7 @@ class ProactiveMarketScanner:
     
     async def _evaluate_and_execute(self, opportunity: MarketOpportunity) -> bool:
         """评估并执行机会"""
-        logger.info(f"⚡ 评估机会: {opportunity.symbol} {opportunity.direction}")
+        logger.info(f"⚡ 评估机会: {opportunity.symbol} {self._zh_direction(opportunity.direction)}")
         
         insight = self._insights.get(opportunity.symbol)
         
@@ -576,7 +615,7 @@ class ProactiveMarketScanner:
         report_lines = [
             "📊 市场分析报告",
             f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"市场状态: {self._market_state['trend']} | 波动率: {self._market_state['volatility_regime']} | 情绪: {self._market_state['risk_sentiment']}",
+            f"市场状态: {self._zh_trend(self._market_state['trend'])} | 波动率: {self._zh_volatility(self._market_state['volatility_regime'])} | 情绪: {self._zh_sentiment(self._market_state['risk_sentiment'])}",
             "",
             "主要洞察:"
         ]
@@ -590,8 +629,8 @@ class ProactiveMarketScanner:
         for symbol, insight in sorted_insights:
             trend_emoji = "📈" if insight.trend == "bullish" else "📉" if insight.trend == "bearish" else "➡️"
             report_lines.append(
-                f"  {trend_emoji} {symbol}: {insight.trend} (强度: {insight.trend_strength:.1%}) | "
-                f"波动率: {insight.volatility:.2%} | 情绪: {insight.sentiment}"
+                f"  {trend_emoji} {symbol}: {self._zh_trend(insight.trend)} (强度: {insight.trend_strength:.1%}) | "
+                f"波动率: {insight.volatility:.2%} | 情绪: {self._zh_sentiment(insight.sentiment)}"
             )
         
         if self._opportunities:
@@ -599,7 +638,7 @@ class ProactiveMarketScanner:
             report_lines.append(f"🎯 发现 {len(self._opportunities)} 个交易机会:")
             for opp in sorted(self._opportunities, key=lambda o: o.priority, reverse=True)[:3]:
                 report_lines.append(
-                    f"  • {opp.symbol}: {opp.direction} ({opp.opportunity_type.value}) - 置信度 {opp.confidence:.0%}"
+                    f"  • {opp.symbol}: {self._zh_direction(opp.direction)}（{self._zh_opp_type(opp.opportunity_type.value)}）- 置信度 {opp.confidence:.0%}"
                 )
         
         report = "\n".join(report_lines)
@@ -1186,10 +1225,10 @@ class ProactiveAIOrchestrator:
                 'direction': str(getattr(opportunity, "direction", "")),
                 'cooldown_key': f"opportunity:{opportunity.symbol}:{opportunity.direction}",
                 'message': (
-                    f"🎯 发现机会: {opportunity.symbol} {opportunity.direction}\n"
+                    f"🎯 发现机会: {opportunity.symbol} {self.market_scanner._zh_direction(opportunity.direction)}\n"
                     f"置信度: {float(getattr(opportunity, 'confidence', 0.0) or 0.0):.0%} | "
                     f"优先级: {int(getattr(opportunity, 'priority', 0) or 0)} | "
-                    f"盈亏比: {rr:.2f} | 趋势: {trend}/{trend_strength:.2%}\n\n"
+                    f"盈亏比: {rr:.2f} | 趋势: {self.market_scanner._zh_trend(trend)}/{trend_strength:.2%}\n\n"
                     f"{opportunity.reasoning}"
                 ),
             })
