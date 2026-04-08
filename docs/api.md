@@ -164,6 +164,52 @@ X-API-Secret: <your_api_secret>
 }
 ```
 
+---
+
+### 2.x 司令部（Commander）统一控制接口（modules）
+
+司令部接口用于统一前端与消息通道（如 TG）的控制入口与状态快照。
+
+#### 2.x.1 获取司令部快照
+
+**GET** `/modules/commander/snapshot`
+
+查询参数：
+- `symbol`：默认 `BTC/USDT`
+- `mode`：`fast|full`（默认 `fast`）
+
+说明：
+- `fast` 用于高频刷新，优先返回核心状态，避免重聚合阻塞。
+- `full` 返回更完整但可能更慢的快照。
+
+#### 2.x.2 触发司令部日常任务
+
+**POST** `/modules/commander/chores`
+
+请求体示例：
+```json
+{
+  "symbol": "BTC/USDT",
+  "trigger_optimize": false
+}
+```
+
+#### 2.x.3 司令部统一指令入口
+
+**POST** `/modules/commander/dispatch`
+
+请求体示例：
+```json
+{
+  "message": "执行系统巡检并汇总告警",
+  "source": "telegram"
+}
+```
+
+#### 2.x.4 司令部全链路审查
+
+**GET** `/modules/commander/audit`
+
 #### 2.3 获取系统指标
 
 **GET** `/metrics`

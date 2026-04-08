@@ -116,6 +116,17 @@ TELEGRAM_BOT_TOKEN=your-token
 TELEGRAM_CHAT_ID=your-chat-id
 ```
 
+### 代理配置（可选，默认不启用）
+
+为避免容器被宿主机 `HTTP_PROXY/HTTPS_PROXY` 等环境变量“误伤”导致网络不稳定，容器内默认不启用系统代理变量。  
+如需代理，请显式配置：
+
+```bash
+# 仅在确实需要代理时设置
+OPENCLAW_HTTP_PROXY=http://host.docker.internal:7890
+OPENCLAW_HTTPS_PROXY=http://host.docker.internal:7890
+```
+
 ### 交易配置
 
 ```yaml
@@ -217,6 +228,17 @@ docker exec -it openclaw-trading bash
 - ✅ **前端对接接口预留**：
   - `GET /api/v1/modules/strategy/optimization-status`（查询策略池与每日优化状态）
   - `POST /api/v1/modules/strategy/optimization-config`（热更新批处理/周期/上限参数，无需重启）
+
+---
+
+## 2026-04-08/09 最新状态（交付前最终审查）
+
+- ✅ **重启接管**：系统启动后会强制同步 **钱包余额 + 持仓**，并接管 SL/TP 跟踪与仓位管理建议输出。
+- ✅ **司令部快照增强**：`GET /api/v1/modules/commander/snapshot?mode=fast` 将返回：
+  - `account.balance / account.positions / account.synced_at`
+  - `risk.sltp` 与 `risk.position_recommendations`
+- ✅ **OKX 稳定性增强**：修复 GET 签名未包含 query string、以及 instId/`-SWAP-SWAP` 混用导致的错误噪音。
+- ✅ **代理策略调整**：默认不启用系统代理变量；使用 `OPENCLAW_HTTP_PROXY/OPENCLAW_HTTPS_PROXY` 显式开启，降低不稳定因素。
 
 ---
 

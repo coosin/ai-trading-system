@@ -799,4 +799,29 @@ A:
 
 ---
 
+## 2026-04-09 交付前最终审查收敛（接管/代理/OKX稳定性）
+
+### 交付前审查（运行态）
+
+- 容器健康检查通过：
+  - `openclaw-trading` / `openclaw-redis` health 均为 `healthy`
+  - `GET /health` 返回 200
+- 司令部快照核验通过：
+  - `GET /api/v1/modules/commander/snapshot?mode=fast` 返回 `account.balance / account.positions / account.synced_at`
+  - 同时返回 `risk.sltp` 与 `risk.position_recommendations`
+
+### 不稳定因素与修复
+
+- 代理污染导致外部网络不稳定：
+  - 问题：容器中意外启用 `HTTP_PROXY=http://127.0.0.1:7890`（宿主机变量/默认注入），造成 Binance/CoinGecko/LLM 外部请求失败。
+  - 修复：默认清空容器内 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`（含大小写），改用 `OPENCLAW_HTTP_PROXY/OPENCLAW_HTTPS_PROXY` 显式启用。
+- OKX 错误噪音（`Invalid Sign` / `Instrument ID does not exist.`）：
+  - 修复：GET 签名 requestPath 纳入 query string；instId 归一（避免 `-SWAP-SWAP`），并提升对 `BTC-USDT-SWAP` 这类 instId 输入的兼容性。
+
+### 仓库洁净性
+
+- `workspace/memory/` 为运行态记忆与归档产物，已整体加入忽略，避免交付提交被污染。
+
+---
+
 **Happy Coding! 🚀**

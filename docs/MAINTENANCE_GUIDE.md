@@ -12,14 +12,13 @@
 - ✅ **7x24小时监控** - 确保系统稳定运行
 
 **关键依赖说明**:
-- 🔌 **代理服务**：交易系统关键依赖，影响所有API连接
-- 📡 **必须确保代理稳定**：代理故障会导致交易中断
-- 🛡️ **代理监控优先级高**：与交易系统进程同等重要
+- 🔌 **代理服务（可选）**：只有当你显式启用了 `OPENCLAW_HTTP_PROXY/OPENCLAW_HTTPS_PROXY` 时，代理才会影响外部 API 连接。
+- 🛡️ **默认策略**：为避免宿主机代理变量污染容器导致不稳定，容器内默认不启用系统 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`。
 
 **系统端口说明**:
 - **后端API服务端口**: 8000
 - **前端开发服务器端口**: 5173  
-- **代理服务端口**: 7890 (关键依赖，影响API连接)
+- **代理服务端口**: 7890 (可选；仅在启用 OPENCLAW_* 代理时影响API连接)
 - **监控检查端口**: 8000 (健康检查、API访问)
 
 ---
@@ -53,7 +52,7 @@
 # 检查进程状态
 ps aux | grep -E "python.*src.main" | grep -v grep
 
-# 检查代理服务状态（关键依赖）
+# 检查代理服务状态（仅在你启用了 OPENCLAW_* 代理时才需要）
 curl --proxy http://127.0.0.1:7890 https://www.okx.com -I 2>/dev/null | head -1
 # 或检查代理进程
 ps aux | grep -E "(clash|v2ray|proxy)" | grep -v grep
@@ -74,7 +73,7 @@ tail -100 /home/cool/.openclaw-trading/logs/app.log | grep -E "(ERROR|CRITICAL)"
 # 运行后端健康检查（端口8000）
 curl -s http://localhost:8000/health
 
-# 检查代理服务连通性（关键依赖）
+# 检查代理服务连通性（仅在你启用了 OPENCLAW_* 代理时才需要）
 curl --proxy http://127.0.0.1:7890 https://www.okx.com -o /dev/null -w "代理状态: %{http_code}, 耗时: %{time_total}s\\n" 2>/dev/null || echo "❌ 代理连接失败"
 
 # 检查前端开发服务器（端口5173）

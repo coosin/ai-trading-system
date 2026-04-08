@@ -536,7 +536,8 @@ volumes:
 
 ### 7.2 网络配置
 
-- **代理**: Docker容器通过 `host.docker.internal:7890` 访问宿主机代理
+- **代理（默认不启用）**：为避免“宿主机代理变量污染容器”导致网络不稳定，容器内默认 **不读取** `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`。
+  - 如需代理，请显式设置 `OPENCLAW_HTTP_PROXY` / `OPENCLAW_HTTPS_PROXY`（例如 `http://host.docker.internal:7890`），并确保宿主机代理端口可达。
 - **Redis**: 容器内部通信
 - **API**: 端口8000对外暴露
 
@@ -563,9 +564,10 @@ OKX_PASSPHRASE=xxx
 TELEGRAM_BOT_TOKEN=xxx
 TELEGRAM_CHAT_ID=xxx
 
-# 代理配置
-HTTP_PROXY=http://host.docker.internal:7890
-HTTPS_PROXY=http://host.docker.internal:7890
+# 代理配置（可选，默认不启用）
+# 为避免容器被宿主机 HTTP_PROXY 误伤，系统使用 OPENCLAW_* 显式变量。
+OPENCLAW_HTTP_PROXY=http://host.docker.internal:7890
+OPENCLAW_HTTPS_PROXY=http://host.docker.internal:7890
 ```
 
 ### 8.2 系统配置 (data/config/default.yml)
