@@ -263,6 +263,38 @@ class NaturalLanguageInterface:
         elif isinstance(response, str):
             return response
         return str(response)
+
+    def _parse_json_loose(self, raw: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """尽量从LLM文本中提取JSON（支持```json代码块/前后缀文本）。"""
+        text = str(raw or "").strip()
+        if not text:
+            return default or {}
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else (default or {})
+        except json.JSONDecodeError:
+            pass
+
+        fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+        if fence:
+            candidate = fence.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                return parsed if isinstance(parsed, dict) else (default or {})
+            except json.JSONDecodeError:
+                pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                parsed = json.loads(candidate)
+                return parsed if isinstance(parsed, dict) else (default or {})
+            except json.JSONDecodeError:
+                pass
+
+        return default or {}
     
     def get_available_skills(self) -> List[str]:
         if self.skill_manager:
@@ -300,11 +332,21 @@ class NaturalLanguageInterface:
             if context is None:
                 context = {}
             self._turn_counter += 1
+            q_text = str(query or "")
+            q_lower = q_text.lower()
 
             # Direct intent: user explicitly teaches what should not be stored in memory.
             memory_filter_result = await self._try_handle_memory_filter_learning(query)
             if memory_filter_result is not None:
                 return memory_filter_result
+
+            # 直连执行验证查询，避免LLM命令识别不稳定导致“unknown”
+            if self.main_controller and (
+                "最近执行" in q_text
+                or ("执行" in q_text and ("记录" in q_text or "历史" in q_text))
+                or "failed execution" in q_lower
+            ):
+                return await self.main_controller.query_execution_status(q_text)
 
             self._session_history.append({"role": "user", "content": str(query)})
             if len(self._session_history) > 20:
@@ -468,9 +510,8 @@ class NaturalLanguageInterface:
         response = await self.llm_integration.generate(prompt)
         content = self._get_response_content(response)
         
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError:
+        result = self._parse_json_loose(content)
+        if not result:
             result = {
                 "success": False,
                 "data": None,
@@ -603,10 +644,7 @@ class NaturalLanguageInterface:
         response = await self.llm_integration.generate(prompt)
         content = self._get_response_content(response)
         
-        try:
-            params = json.loads(content)
-        except json.JSONDecodeError:
-            params = {}
+        params = self._parse_json_loose(content, default={})
         
         return params
 
@@ -749,9 +787,8 @@ class NaturalLanguageInterface:
         response = await self.llm_integration.generate(prompt)
         content = self._get_response_content(response)
         
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError:
+        result = self._parse_json_loose(content)
+        if not result:
             result = {
                 "answer": content,
                 "confidence": 0.8,

@@ -81,6 +81,10 @@ class TelegramBot:
         if not self.enabled:
             logger.info("Telegram机器人未启用")
             return
+        if not self.bot_token:
+            logger.warning("Telegram机器人未配置 BOT TOKEN，跳过初始化")
+            self.enabled = False
+            return
         
         self.proxy = self.config.get("proxy") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "http://host.docker.internal:7890"
         self.proxy = self._normalize_proxy_for_runtime(self.proxy)
@@ -92,7 +96,7 @@ class TelegramBot:
         if me:
             logger.info(f"✅ Telegram机器人已连接: @{me.get('username', 'unknown')}")
         else:
-            logger.warning("⚠️ Telegram机器人连接失败")
+            logger.warning("⚠️ Telegram机器人连接失败（已尝试代理与直连）")
 
     def _normalize_proxy_for_runtime(self, proxy_url: Optional[str]) -> Optional[str]:
         """In Docker, rewrite loopback proxy URL to host gateway."""
@@ -138,15 +142,16 @@ class TelegramBot:
 
     async def _get_me(self) -> Optional[Dict]:
         """获取机器人信息"""
-        try:
-            url = f"{self.base_url}/getMe"
-            async with self.session.get(url, proxy=self.proxy) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("ok"):
-                        return data.get("result")
-        except Exception as e:
-            logger.error(f"获取机器人信息失败: {e}")
+        url = f"{self.base_url}/getMe"
+        for proxy in (self.proxy, None):
+            try:
+                async with self.session.get(url, proxy=proxy) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("ok"):
+                            return data.get("result")
+            except Exception as e:
+                logger.debug(f"获取机器人信息失败(proxy={proxy}): {e}")
         return None
 
     async def _polling_loop(self):

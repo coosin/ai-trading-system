@@ -877,11 +877,26 @@ class DatabaseManager:
             try:
                 db_path.parent.mkdir(parents=True, exist_ok=True)
             except PermissionError:
-                fallback_path = Path("/tmp/openclaw_data")
-                fallback_path.mkdir(parents=True, exist_ok=True)
-                self.config.database = str(fallback_path / "trading_system.db")
-                connection_string = self.config.get_connection_string()
-                logger.warning(f"数据库路径权限不足，使用备用路径: {self.config.database}")
+                # 容器内优先改写到 /app/data，尽量避免 /tmp 回退
+                if Path("/.dockerenv").exists():
+                    try:
+                        app_data = Path("/app/data")
+                        app_data.mkdir(parents=True, exist_ok=True)
+                        self.config.database = str(app_data / "trading_system.db")
+                        connection_string = self.config.get_connection_string()
+                        logger.warning(f"数据库路径权限不足，改用容器数据目录: {self.config.database}")
+                    except Exception:
+                        fallback_path = Path("/tmp/openclaw_data")
+                        fallback_path.mkdir(parents=True, exist_ok=True)
+                        self.config.database = str(fallback_path / "trading_system.db")
+                        connection_string = self.config.get_connection_string()
+                        logger.warning(f"数据库路径权限不足，使用备用路径: {self.config.database}")
+                else:
+                    fallback_path = Path("/tmp/openclaw_data")
+                    fallback_path.mkdir(parents=True, exist_ok=True)
+                    self.config.database = str(fallback_path / "trading_system.db")
+                    connection_string = self.config.get_connection_string()
+                    logger.warning(f"数据库路径权限不足，使用备用路径: {self.config.database}")
 
         engine_kwargs = {
             "pool_size": self.config.pool_size,

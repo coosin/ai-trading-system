@@ -214,7 +214,10 @@ class OptimizedMemorySystem:
         
         self.config = config or {}
         
-        if storage_path:
+        if os.path.exists("/.dockerenv"):
+            # 容器环境固定到可持久化挂载目录，避免配置漂移到不可写路径
+            self.storage_path = Path("/app/data/memory")
+        elif storage_path:
             self.storage_path = Path(storage_path)
         elif config_manager:
             data_path = config_manager.get_path_sync("data_path", None)
@@ -222,8 +225,6 @@ class OptimizedMemorySystem:
                 self.storage_path = Path(data_path) / "memory"
             else:
                 self.storage_path = None
-        elif os.path.exists("/.dockerenv"):
-            self.storage_path = Path("/app/data/memory")
         else:
             self.storage_path = Path(workspace_path or "workspace") / "memory"
         
@@ -264,26 +265,40 @@ class OptimizedMemorySystem:
         logger.info(f"优化版记忆系统初始化，存储路径: {self.storage_path}")
     
     def _ensure_storage_path(self):
-        """确保存储路径存在"""
-        try:
-            self.storage_path.mkdir(parents=True, exist_ok=True)
-            
-            subdirs = ["core", "working", "experience", "history", "trades", "sessions"]
-            for subdir in subdirs:
-                (self.storage_path / subdir).mkdir(exist_ok=True)
-            # 权限探针：目录存在但不可写时尽早切换 fallback
-            probe = self.storage_path / "working" / ".write_probe"
-            with open(probe, "w", encoding="utf-8") as f:
-                f.write("")
-            probe.unlink(missing_ok=True)
-                
-        except PermissionError:
-            fallback = Path("/tmp/openclaw_memory")
-            fallback.mkdir(parents=True, exist_ok=True)
-            for subdir in ["core", "working", "experience", "history", "trades", "sessions"]:
-                (fallback / subdir).mkdir(exist_ok=True)
-            self.storage_path = fallback
-            logger.warning(f"权限不足，使用备用路径: {fallback}")
+        """确保存储路径存在并可写。"""
+        subdirs = ["core", "working", "experience", "history", "trades", "sessions"]
+
+        def _prepare(path: Path) -> bool:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                for subdir in subdirs:
+                    (path / subdir).mkdir(parents=True, exist_ok=True)
+                probe = path / "working" / ".write_probe"
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("")
+                probe.unlink(missing_ok=True)
+                return True
+            except OSError:
+                return False
+
+        if _prepare(self.storage_path):
+            return
+
+        candidates: List[Path] = []
+        if os.path.exists("/.dockerenv"):
+            candidates.extend([Path("/app/data/memory"), Path("/app/workspace/memory")])
+        candidates.append(Path("/tmp/openclaw_memory"))
+
+        for candidate in candidates:
+            if candidate == self.storage_path:
+                continue
+            if _prepare(candidate):
+                self.storage_path = candidate
+                if str(candidate).startswith("/tmp/"):
+                    logger.warning(f"权限不足，使用备用路径: {candidate}")
+                else:
+                    logger.warning(f"权限不足，改用容器数据目录: {candidate}")
+                return
     
     async def initialize(self) -> bool:
         """异步初始化"""

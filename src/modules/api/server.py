@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from src.modules.api.strategy_api import router as strategy_router
@@ -711,6 +712,8 @@ class APIServer:
         # 创建API路由前缀
         api_router = APIRouter(prefix="/api", tags=["api"])
         api_v1_router = APIRouter(prefix="/v1", tags=["api-v1"])
+        # 供闭包路由统一使用，避免局部函数中 NameError
+        main_controller = self.main_controller
 
         # 根路由 - 仅在静态文件服务不存在时生效
         # 注意：静态文件服务会处理根路径的请求
@@ -740,23 +743,29 @@ class APIServer:
         @api_v1_router.get("/system/status", tags=["system"])
         async def get_status():
             """获取系统状态"""
-            return {
+            base = {
                 "system_status": "running",
                 "status": "running",
                 "uptime": 0,
-                "module_count": 7,
-                "running_modules": 7,
+                "module_count": 0,
+                "running_modules": 0,
                 "timestamp": datetime.now().isoformat(),
-                "module_statuses": {
-                    "主控制器": {"status": "running", "health": "healthy", "uptime": 0, "error_count": 0},
-                    "API服务器": {"status": "running", "health": "healthy", "uptime": 0, "error_count": 0},
-                    "数据库管理器": {"status": "running", "health": "healthy", "uptime": 0, "error_count": 0},
-                    "事件系统": {"status": "running", "health": "healthy", "uptime": 0, "error_count": 0},
-                    "策略管理器": {"status": "running", "health": "healthy", "uptime": 0, "error_count": 0},
-                    "风险管理": {"status": "running", "health": "healthy", "uptime": 0, "error_count": 0},
-                    "市场数据": {"status": "running", "health": "healthy", "uptime": 0, "error_count": 0},
-                }
+                "module_statuses": {},
             }
+            if not main_controller:
+                return base
+            try:
+                mc_status = await main_controller.get_system_status()
+                if isinstance(mc_status, dict):
+                    base.update(mc_status)
+                    # 向后兼容历史字段
+                    base["status"] = base.get("system_status", base.get("status", "unknown"))
+                    base["timestamp"] = datetime.now().isoformat()
+            except Exception as e:
+                base["status"] = "degraded"
+                base["system_status"] = "degraded"
+                base["error"] = str(e)
+            return base
 
         # 健康检查 - 支持 /api/v1/health
         @api_v1_router.get("/health", tags=["health"])
@@ -768,24 +777,59 @@ class APIServer:
                 "uptime": self._get_uptime(),
             }
 
+        @api_v1_router.get("/system/health", tags=["health"])
+        async def system_health_v1():
+            """系统健康检查（兼容前端 system.health 调用）"""
+            return {
+                "status": "healthy",
+                "overall": "healthy",
+                "timestamp": datetime.now().isoformat(),
+                "uptime": self._get_uptime(),
+            }
+
         # 指标端点 - 支持 /api/v1/metrics
         @api_v1_router.get("/metrics", tags=["metrics"])
         async def get_metrics_v1():
             """获取指标 v1"""
-            # 这里应该从系统获取真实的指标数据
-            # 为简化，返回模拟数据，与前端期望的格式一致
-            return {
-                "total_events": 1234,
-                "total_errors": 5,
-                "module_starts": 7,
-                "event_processing_time_ms": 1.23,
-                "running_modules": 7,
-                "module_count": 7,
-                "websocket_active_connections": 0,
-                "rate_limits": {},
-                "uptime": "0 days, 0:00:00",
-                "timestamp": datetime.now().isoformat()
+            api_stats = await self.get_api_stats()
+            out: Dict[str, Any] = {
+                "total_events": 0,
+                "total_errors": 0,
+                "module_starts": 0,
+                "event_processing_time_ms": 0.0,
+                "running_modules": 0,
+                "module_count": 0,
+                "websocket_active_connections": api_stats.get("websocket_active_connections", 0),
+                "rate_limits": api_stats.get("rate_limits", {}),
+                "uptime": self._get_uptime(),
+                "timestamp": datetime.now().isoformat(),
+                "api": api_stats,
             }
+            if main_controller:
+                try:
+                    mc_status = await main_controller.get_system_status()
+                    metrics = mc_status.get("metrics", {}) if isinstance(mc_status, dict) else {}
+                    out["total_events"] = int(metrics.get("total_events", 0) or 0)
+                    out["total_errors"] = int(metrics.get("total_errors", 0) or 0)
+                    out["module_starts"] = int(metrics.get("module_starts", 0) or 0)
+                    out["event_processing_time_ms"] = float(metrics.get("event_processing_time_ms", 0.0) or 0.0)
+                    out["running_modules"] = int(mc_status.get("running_modules", 0) or 0)
+                    out["module_count"] = int(mc_status.get("module_count", 0) or 0)
+                except Exception as e:
+                    out["status"] = "degraded"
+                    out["error"] = str(e)
+            return out
+
+        @api_v1_router.get("/executions", tags=["executions"])
+        async def get_executions(limit: int = 20):
+            """获取最近执行记录（兼容 README/前端约定）"""
+            safe_limit = max(1, min(int(limit), 200))
+            if not main_controller:
+                return []
+            try:
+                return await main_controller.get_recent_executions(safe_limit)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"获取执行记录失败: {e}")
 
         # 认证路由 - 同时支持 /auth/login 和 /api/v1/auth/login
         @self.app.post("/auth/login", tags=["auth"])
@@ -1335,6 +1379,7 @@ class APIServer:
             - offset: 分页偏移
             """
             try:
+                mc = self.main_controller
                 # 解析时间范围
                 now = datetime.now()
                 if range == "24h":
@@ -1350,8 +1395,8 @@ class APIServer:
                 
                 # 尝试从主控制器获取交易历史服务
                 trade_service = None
-                if main_controller and hasattr(main_controller, 'trade_history_service'):
-                    trade_service = main_controller.trade_history_service
+                if mc and hasattr(mc, 'trade_history_service'):
+                    trade_service = mc.trade_history_service
                 
                 if trade_service:
                     # 使用真实的交易历史服务查询
@@ -1433,6 +1478,29 @@ class APIServer:
                     "suggestion": "请联系管理员检查系统状态"
                 }
 
+        @api_v1_router.get("/trading/history", tags=["trades"])
+        async def get_trading_history_compat(
+            range: str = "7d",
+            symbol: Optional[str] = None,
+            side: Optional[str] = None,
+            limit: int = 100,
+            offset: int = 0
+        ):
+            """兼容旧前端：/api/v1/trading/history -> /api/v1/trades"""
+            result = await get_trades(range=range, symbol=symbol, side=side, limit=limit, offset=offset)
+            trades = []
+            if isinstance(result, dict):
+                trades = result.get("trades", []) if isinstance(result.get("trades"), list) else []
+            elif isinstance(result, list):
+                trades = result
+            return {
+                "success": True,
+                "data": trades,
+                "total": len(trades),
+                "source": "compat:/trading/history",
+                "query_time": datetime.now().isoformat(),
+            }
+
         @api_v1_router.get("/trades/statistics", tags=["trades"])
         async def get_trade_statistics(days: int = 30):
             """
@@ -1441,9 +1509,10 @@ class APIServer:
             返回详细的交易统计信息，包括胜率、盈亏、风险指标等
             """
             try:
+                mc = self.main_controller
                 trade_service = None
-                if main_controller and hasattr(main_controller, 'trade_history_service'):
-                    trade_service = main_controller.trade_history_service
+                if mc and hasattr(mc, 'trade_history_service'):
+                    trade_service = mc.trade_history_service
                 
                 if trade_service:
                     stats = await trade_service.get_statistics(days=days)
@@ -1474,9 +1543,10 @@ class APIServer:
             生成包含统计分析、趋势、建议的完整复盘报告
             """
             try:
+                mc = self.main_controller
                 trade_service = None
-                if main_controller and hasattr(main_controller, 'trade_history_service'):
-                    trade_service = main_controller.trade_history_service
+                if mc and hasattr(mc, 'trade_history_service'):
+                    trade_service = mc.trade_history_service
                 
                 if trade_service:
                     review = await trade_service.generate_trade_review(days=days)
@@ -1498,6 +1568,165 @@ class APIServer:
                     "error": "生成交易复盘失败",
                     "details": str(e)
                 }
+
+        @api_v1_router.get("/monitoring/logs", tags=["monitoring"])
+        async def get_monitoring_logs(limit: int = 20):
+            """监控日志（统一总控中心使用）"""
+            records: List[Dict[str, Any]] = []
+            try:
+                log_dir = Path("logs")
+                if not log_dir.exists():
+                    return {"success": True, "data": records, "source": "filesystem:missing"}
+
+                candidates = sorted(
+                    [p for p in log_dir.glob("*.log") if p.is_file()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )[:3]
+                for file_path in candidates:
+                    try:
+                        content = file_path.read_text(encoding="utf-8", errors="ignore")
+                        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+                        for line in lines[-max(limit, 1):]:
+                            records.append(
+                                {
+                                    "source": file_path.name,
+                                    "message": line[:500],
+                                    "level": "info",
+                                    "timestamp": datetime.now().isoformat(),
+                                }
+                            )
+                    except Exception:
+                        continue
+                return {"success": True, "data": records[-limit:], "source": "filesystem"}
+            except Exception as e:
+                logger.warning(f"读取监控日志失败: {e}")
+                return {"success": False, "data": [], "error": str(e)}
+
+        @api_v1_router.get("/control-center/state", tags=["control-center"])
+        async def get_control_center_state(limit: int = 20):
+            """单模块总控中心聚合状态接口"""
+            status_payload = await get_status()
+            health_payload = await system_health_v1()
+            s1_payload: Dict[str, Any] = {}
+            guards_payload: Dict[str, Any] = {}
+            sltp_payload: Dict[str, Any] = {}
+            strategy_opt_payload: Dict[str, Any] = {}
+            strategies_payload: List[Dict[str, Any]] = []
+            monitoring_summary: Dict[str, Any] = {}
+            market_data_payload: Dict[str, Any] = {}
+            proactive_status_payload: Dict[str, Any] = {}
+            proactive_opportunities_payload: List[Dict[str, Any]] = []
+            proactive_insights_payload: Dict[str, Any] = {}
+            risk_payload: Dict[str, Any] = {}
+            strategy_perf_payload: Dict[str, Any] = {}
+            anomalies_payload: List[Dict[str, Any]] = []
+            alerts_payload: List[Dict[str, Any]] = []
+            alerts_history_payload: List[Dict[str, Any]] = []
+            trade_statistics_payload: Dict[str, Any] = {}
+            trade_review_payload: Dict[str, Any] = {}
+            trade_history_payload = await get_trading_history_compat(limit=limit)
+            logs_payload = await get_monitoring_logs(limit=limit)
+
+            mc = self.main_controller
+            if mc:
+                try:
+                    from src.modules.api.module_control_api import (
+                        get_module_health,
+                        get_s1_verification,
+                        get_ai_guard_status,
+                        get_stop_loss_stats,
+                        get_strategy_optimization_status,
+                    )
+                    s1_payload = await get_s1_verification()
+                    guards_payload = await get_ai_guard_status()
+                    sltp_payload = await get_stop_loss_stats()
+                    strategy_opt_payload = await get_strategy_optimization_status()
+                    health_res = await get_module_health()
+                    if isinstance(health_res, dict):
+                        health_payload = {**health_payload, **health_res}
+                except Exception as e:
+                    logger.debug(f"总控聚合: module_control_api 获取失败: {e}")
+
+                try:
+                    if hasattr(mc, "strategy_manager") and mc.strategy_manager:
+                        configs = getattr(mc.strategy_manager, "strategy_configs", {}) or {}
+                        for sid, cfg in configs.items():
+                            strategies_payload.append(
+                                {
+                                    "strategy_id": getattr(cfg, "strategy_id", sid),
+                                    "name": getattr(cfg, "name", sid),
+                                    "strategy_type": str(getattr(cfg, "strategy_type", "")),
+                                    "enabled": bool(getattr(cfg, "enabled", True)),
+                                }
+                            )
+                except Exception as e:
+                    logger.debug(f"总控聚合: strategy_manager 获取失败: {e}")
+
+            try:
+                from src.modules.api.monitoring_api import (
+                    get_monitoring_summary,
+                    get_market_data_status,
+                    get_proactive_ai_status,
+                    get_proactive_opportunities,
+                    get_proactive_insights,
+                    get_risk_metrics,
+                    get_strategy_performance,
+                    get_anomaly_events,
+                    get_active_alerts,
+                    get_alert_history,
+                )
+                monitoring_summary = await get_monitoring_summary()
+                market_data_payload = await get_market_data_status()
+                proactive_status_payload = await get_proactive_ai_status()
+                proactive_opportunities_payload = await get_proactive_opportunities()
+                proactive_insights_payload = await get_proactive_insights()
+                risk_payload = await get_risk_metrics()
+                strategy_perf_payload = await get_strategy_performance()
+                anomalies_payload = await get_anomaly_events(limit=limit)
+                alerts_payload = await get_active_alerts()
+                alerts_history_payload = await get_alert_history(limit=limit)
+            except Exception as e:
+                logger.debug(f"总控聚合: monitoring_api 获取失败: {e}")
+
+            try:
+                trade_statistics_payload = await get_trade_statistics(days=30)
+                trade_review_payload = await get_trade_review(days=7)
+            except Exception as e:
+                logger.debug(f"总控聚合: trade review/stat 获取失败: {e}")
+
+            return {
+                "success": True,
+                "timestamp": datetime.now().isoformat(),
+                "system": {"status": status_payload, "health": health_payload},
+                "ai": {
+                    "s1": s1_payload,
+                    "guards": guards_payload,
+                    "proactive_status": proactive_status_payload,
+                    "opportunities": proactive_opportunities_payload,
+                    "insights": proactive_insights_payload,
+                },
+                "market": {
+                    "monitoring_summary": monitoring_summary,
+                    "market_data": market_data_payload,
+                    "risk": risk_payload,
+                },
+                "trading": {
+                    "trade_history": trade_history_payload.get("data", []),
+                    "sltp_stats": sltp_payload,
+                    "strategies": strategies_payload,
+                    "strategy_optimization": strategy_opt_payload.get("data", strategy_opt_payload),
+                    "strategy_performance": strategy_perf_payload,
+                    "trade_statistics": trade_statistics_payload,
+                    "trade_review": trade_review_payload,
+                },
+                "observability": {
+                    "logs": logs_payload.get("data", []),
+                    "alerts": alerts_payload,
+                    "alerts_history": alerts_history_payload,
+                    "anomalies": anomalies_payload,
+                },
+            }
 
         # 设置管理路由 - 支持 /api/v1/settings
         @api_v1_router.get("/settings", tags=["settings"])
@@ -1966,6 +2195,14 @@ class APIServer:
                 
                 # 使用自然语言接口处理查询
                 result = await self.main_controller.process_natural_language_query(query, context)
+                # 回退：若NLI返回“解析失败”，直接走执行验证器语义查询，确保接口可用
+                if (
+                    isinstance(result, dict)
+                    and result.get("success") is False
+                    and "无法解析命令执行结果" in str(result.get("details", ""))
+                    and hasattr(self.main_controller, "query_execution_status")
+                ):
+                    result = await self.main_controller.query_execution_status(query)
                 
                 return {
                     "status": "success",

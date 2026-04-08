@@ -388,8 +388,25 @@ class EnhancedLLMIntegration:
         if is_user_input:
             if self.enhanced_memory:
                 try:
-                    memory_context = self.enhanced_memory.build_memory_context(prompt)
-                    self.enhanced_memory.add_message("user", prompt)
+                    if hasattr(self.enhanced_memory, "build_memory_context"):
+                        memory_context = self.enhanced_memory.build_memory_context(prompt)
+                    elif hasattr(self.enhanced_memory, "retrieve_memories"):
+                        items = await self.enhanced_memory.retrieve_memories(query=prompt, limit=5)
+                        if isinstance(items, list):
+                            memory_context = "\n".join(
+                                [str((m or {}).get("content", m)) for m in items[:5]]
+                            )
+
+                    if hasattr(self.enhanced_memory, "add_message"):
+                        self.enhanced_memory.add_message("user", prompt)
+                    elif hasattr(self.enhanced_memory, "add_memory"):
+                        await self.enhanced_memory.add_memory(
+                            memory_type="conversation",
+                            content=f"用户: {prompt}",
+                            importance=0.7,
+                            tags=["conversation"],
+                            source_module="llm_integration",
+                        )
                 except Exception as e:
                     logger.warning(f"增强记忆注入失败: {e}")
             elif self.memory_manager:
@@ -428,7 +445,16 @@ class EnhancedLLMIntegration:
             if is_user_input:
                 if self.enhanced_memory:
                     try:
-                        self.enhanced_memory.add_message("assistant", response.content)
+                        if hasattr(self.enhanced_memory, "add_message"):
+                            self.enhanced_memory.add_message("assistant", response.content)
+                        elif hasattr(self.enhanced_memory, "add_memory"):
+                            await self.enhanced_memory.add_memory(
+                                memory_type="conversation",
+                                content=f"AI: {response.content[:500]}...",
+                                importance=0.8,
+                                tags=["conversation"],
+                                source_module="llm_integration",
+                            )
                     except Exception as e:
                         logger.warning(f"增强记忆记录AI回复失败: {e}")
                 elif self.memory_manager:

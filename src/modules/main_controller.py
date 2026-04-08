@@ -2295,6 +2295,32 @@ class MainController:
                     "stop_time": info.stop_time.isoformat() if info.stop_time else None,
                 }
 
+            # 兼容：若 self.modules 未注册完整，回退到按关键属性统计真实模块连接状态
+            fallback_module_names = [
+                "event_system", "data_quality_system", "fault_tolerance", "enhanced_llm_manager",
+                "llm_integration", "ai_trading_engine", "ai_core",
+                "hierarchical_memory", "skill_manager", "smart_notification",
+                "trading_monitor", "strategy_manager", "risk_monitor",
+                "data_storage", "backup_manager", "database_manager",
+                "telegram_bot", "natural_language_interface",
+                "emergency_stop", "intelligent_monitoring", "security_manager", "fund_manager",
+                "unified_info_collector",
+                "dynamic_position_manager", "correlation_monitor", "strategy_hot_loader",
+                "audit_logger", "enhanced_monitoring", "stop_loss_manager",
+            ]
+            fallback_connected = [n for n in fallback_module_names if getattr(self, n, None) is not None]
+            fallback_statuses = {
+                n: {"status": "connected", "health": "unknown", "uptime": 0, "error_count": 0}
+                for n in fallback_connected
+            }
+
+            module_count = len(self.modules) if len(self.modules) > 0 else len(fallback_module_names)
+            running_modules = (
+                len([m for m in self.modules.values() if m.status == ModuleStatus.RUNNING])
+                if len(self.modules) > 0
+                else len(fallback_connected)
+            )
+
             out: Dict[str, Any] = {
                 "system_status": self.system_status.value,
                 "start_time": self.start_time.isoformat() if self.start_time else None,
@@ -2304,11 +2330,9 @@ class MainController:
                     if self.start_time and self.system_status == ModuleStatus.RUNNING
                     else 0
                 ),
-                "module_count": len(self.modules),
-                "running_modules": len(
-                    [m for m in self.modules.values() if m.status == ModuleStatus.RUNNING]
-                ),
-                "module_statuses": module_statuses,
+                "module_count": module_count,
+                "running_modules": running_modules,
+                "module_statuses": module_statuses if module_statuses else fallback_statuses,
                 "metrics": self.metrics.copy(),
             }
             if getattr(self, "execution_gateway", None):

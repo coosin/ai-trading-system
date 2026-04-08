@@ -18,8 +18,8 @@ echo "2. 安装Python 3.11和相关工具..."
 sudo apt install -y python3.11 python3.11-dev python3.11-venv python3.11-distutils
 sudo apt install -y python3-pip python3-virtualenv python3-wheel
 
-# 3. 安装Docker和Docker Compose
-echo "3. 安装Docker和Docker Compose..."
+# 3. 安装Docker和Docker Compose v2
+echo "3. 安装Docker和Docker Compose v2..."
 
 # 安装Docker
 if ! command -v docker &> /dev/null; then
@@ -32,14 +32,13 @@ else
     echo "  Docker已安装"
 fi
 
-# 安装Docker Compose
-if ! command -v docker-compose &> /dev/null; then
-    echo "  安装Docker Compose..."
-    DOCKER_COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep tag_name | cut -d'"' -f4)
-    sudo curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    sudo chmod +x /usr/local/bin/docker-compose
+# 安装Docker Compose v2（docker compose）
+if ! docker compose version &> /dev/null; then
+    echo "  安装Docker Compose v2..."
+    sudo apt update
+    sudo apt install -y docker-compose-v2
 else
-    echo "  Docker Compose已安装"
+    echo "  Docker Compose v2已安装"
 fi
 
 # 4. 安装PostgreSQL和Redis客户端
@@ -78,7 +77,7 @@ echo "8. 验证安装..."
 echo -n "Python: " && python --version
 echo -n "pip: " && pip --version
 echo -n "Docker: " && docker --version
-echo -n "Docker Compose: " && docker-compose --version
+echo -n "Docker Compose: " && docker compose version
 echo -n "Git: " && git --version
 
 # 9. 初始化项目

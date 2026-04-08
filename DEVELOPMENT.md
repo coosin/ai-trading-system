@@ -578,4 +578,50 @@ A:
 
 ---
 
+## 2026-04-08 全量修复记录
+
+本次修复覆盖 API、主控状态统计、记忆存储路径、数据库路径和 Telegram 连通性，目标是恢复生产可用性并消除关键告警。
+
+### 已完成修复
+
+- `src/modules/intelligence/natural_language_interface.py`
+  - 增加宽松 JSON 解析（支持 ```json 包裹与前后缀文本）
+  - 针对“最近执行/执行历史”增加直连执行查询路径，避免 `unknown` 误判
+- `src/modules/api/server.py`
+  - `/api/v1/ai/query` 增加解析失败回退，保证接口可用
+- `src/modules/main_controller.py`
+  - `get_system_status()` 增加模块统计回退逻辑，避免 `module_count=0/running_modules=0`
+- `src/modules/core/database_manager.py`
+  - 容器内优先使用 `/app/data/trading_system.db`，减少回退 `/tmp` 场景
+- `src/modules/core/optimized_memory_system.py`
+  - 重构存储目录可写探测，容器内优先 `/app/data/memory`、次选 `/app/workspace/memory`
+- `src/modules/core/ai_memory.py`
+  - 增强可写探测，统一容器目录优先级，降低权限抖动导致的降级
+- `src/modules/core/llm_integration.py`
+  - 兼容 `MemoryGateway` 与旧记忆接口，消除方法缺失告警
+- `src/modules/notification/telegram_bot.py`
+  - 连接初始化增加“代理失败后直连”回退
+  - 未配置 token 时直接跳过，避免无意义报错
+
+### 回归结果
+
+- `GET /api/v1/status`：模块统计正常（`module_count=29`，`running_modules=29`）
+- `POST /api/v1/ai/query`：查询可正常返回执行记录
+- `GET /api/v1/s1/verify`：`all_passed=true`
+- Telegram：可连接并返回机器人身份（`getMe` 通过）
+- 最近启动日志中已不再出现：
+  - `无法解析命令执行结果`
+  - `module_count=0/running_modules=0`
+  - `权限不足，使用备用路径: /tmp/openclaw_*`
+
+### 运维建议
+
+- 使用 Docker Compose v2：
+  - 启动：`docker compose up -d`
+  - 重建：`docker compose up -d --build`
+  - 日志：`docker compose logs -f trading-system`
+- 避免覆盖 `.env` 中真实密钥，开发脚本应只在 `.env` 不存在时初始化模板。
+
+---
+
 **Happy Coding! 🚀**

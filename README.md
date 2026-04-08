@@ -44,8 +44,8 @@ nano .env
 ### 3. 启动服务
 
 ```bash
-# 使用Docker Compose启动
-docker-compose up -d
+# 使用Docker Compose启动（推荐 v2）
+docker compose up -d
 
 # 查看日志
 docker logs -f openclaw-trading
@@ -164,13 +164,13 @@ OPENCLAW__memory__retrieval__rerank__candidate_pool_size=12
 
 ```bash
 # 启动服务
-docker-compose up -d
+docker compose up -d
 
 # 停止服务
-docker-compose down
+docker compose down
 
 # 重启服务
-docker-compose restart
+docker compose restart
 
 # 查看日志
 docker logs -f openclaw-trading

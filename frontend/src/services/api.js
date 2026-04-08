@@ -70,7 +70,9 @@ export const api = {
     cancelOrder: (id) => request(`/trading/orders/${id}`, { method: 'DELETE' }),
     getHistory: (params = {}) => {
       const q = new URLSearchParams(params).toString();
-      return request(`/trading/history${q ? `?${q}` : ''}`);
+      return request(`/trading/history${q ? `?${q}` : ''}`).catch(() =>
+        request(`/trades${q ? `?${q}` : ''}`)
+      );
     },
   },
   market: {
@@ -108,6 +110,12 @@ export const api = {
     getLogs: (params = {}) => {
       const q = new URLSearchParams(params).toString();
       return request(`/monitoring/logs${q ? `?${q}` : ''}`);
+    },
+  },
+  controlCenter: {
+    getState: (params = {}) => {
+      const q = new URLSearchParams(params).toString();
+      return request(`/control-center/state${q ? `?${q}` : ''}`);
     },
   },
 };

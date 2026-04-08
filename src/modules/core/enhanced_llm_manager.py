@@ -159,6 +159,17 @@ class OpenAIProvider(BaseLLMProvider):
         max_retries = kwargs.get('max_retries', self.config.max_retries)
         last_error = None
         is_auth_failure = False
+        api_key = (self.config.api_key or "").strip()
+        if not api_key:
+            return LLMResponse(
+                content="",
+                model_id=self.config.model_id,
+                provider=self.config.provider,
+                latency_ms=(time.time() - start_time) * 1000,
+                success=False,
+                error_message="API key 缺失",
+                error_code="AUTH_FAILED"
+            )
         
         for retry in range(max_retries):
             try:
@@ -169,8 +180,6 @@ class OpenAIProvider(BaseLLMProvider):
                     url = f"{base_url}/chat/completions"
                 else:
                     url = f"{base_url}/chat/completions"
-                
-                api_key = self.config.api_key
                 
                 headers = {
                     "Authorization": f"Bearer {api_key}",
@@ -473,8 +482,8 @@ class EnhancedLLMManager:
         import os
         
         # 从环境变量读取API密钥
-        xunfei_api_key = os.getenv("XUNFEI_API_KEY", "")
-        qianfan_api_key = os.getenv("QIANFAN_API_KEY", "")
+        xunfei_api_key = os.getenv("XUNFEI_API_KEY", "").strip()
+        qianfan_api_key = os.getenv("QIANFAN_API_KEY", "").strip()
         
         predefined = [
             ModelConfig(
@@ -570,7 +579,7 @@ class EnhancedLLMManager:
                 provider=provider,
                 model_id=model_id,
                 display_name=model_config.get("display_name", model_id),
-                api_key=model_config.get("api_key", ""),
+                api_key=str(model_config.get("api_key", "") or "").strip(),
                 base_url=model_config.get("base_url", ""),
                 temperature=model_config.get("temperature", 0.7),
                 max_tokens=model_config.get("max_tokens", 2000),
@@ -598,6 +607,7 @@ class EnhancedLLMManager:
         
         model_config = self.models[model_id]
         
+        model_config.api_key = (model_config.api_key or "").strip()
         if not model_config.api_key and model_config.provider not in [ModelProvider.LOCAL]:
             logger.warning(f"模型 {model_id} 没有配置 API key，跳过初始化")
             model_config.enabled = False
@@ -812,7 +822,7 @@ class EnhancedLLMManager:
         if model_id not in self.models:
             return False
         
-        self.models[model_id].api_key = api_key
+        self.models[model_id].api_key = (api_key or "").strip()
         
         # 重新初始化提供者
         if model_id in self.providers:

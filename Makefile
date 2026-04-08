@@ -44,7 +44,12 @@ install:
 dev: install
 	@echo "$(BLUE)设置开发环境...$(NC)"
 	pre-commit install
-	cp .env.example .env
+	@if [ ! -f .env ]; then \
+		cp .env.example .env; \
+		echo "$(YELLOW).env 不存在，已从模板创建$(NC)"; \
+	else \
+		echo "$(GREEN).env 已存在，跳过覆盖$(NC)"; \
+	fi
 	@echo "$(GREEN)开发环境设置完成！$(NC)"
 	@echo "请编辑 .env 文件配置环境变量"
 
@@ -112,19 +117,19 @@ clean:
 # Docker命令
 docker-up:
 	@echo "$(BLUE)启动Docker服务...$(NC)"
-	docker-compose up -d
+	docker compose up -d
 
 docker-down:
 	@echo "$(BLUE)停止Docker服务...$(NC)"
-	docker-compose down
+	docker compose down
 
 docker-build:
 	@echo "$(BLUE)构建Docker镜像...$(NC)"
-	docker-compose build
+	docker compose build
 
 docker-logs:
 	@echo "$(BLUE)查看Docker日志...$(NC)"
-	docker-compose logs -f
+	docker compose logs -f
 
 # 数据库迁移
 migrate:

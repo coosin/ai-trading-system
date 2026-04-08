@@ -149,12 +149,25 @@ class SmartMemoryManager:
         
         try:
             self.storage_path.mkdir(parents=True, exist_ok=True)
-        except PermissionError:
+            probe = self.storage_path / ".write_probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+        except OSError:
             import os
-            fallback = Path("/tmp/openclaw_memory")
-            fallback.mkdir(parents=True, exist_ok=True)
-            self.storage_path = fallback
-            logger.warning(f"记忆存储路径权限不足，使用备用路径: {fallback}")
+            for candidate in (Path("/app/data/memory"), Path("/app/workspace/memory"), Path("/tmp/openclaw_memory")):
+                try:
+                    candidate.mkdir(parents=True, exist_ok=True)
+                    probe = candidate / ".write_probe"
+                    probe.write_text("", encoding="utf-8")
+                    probe.unlink(missing_ok=True)
+                    self.storage_path = candidate
+                    if str(candidate).startswith("/tmp/"):
+                        logger.warning(f"记忆存储路径权限不足，使用备用路径: {candidate}")
+                    else:
+                        logger.warning(f"记忆存储路径权限不足，改用容器数据目录: {candidate}")
+                    break
+                except OSError:
+                    continue
         
         self.workspace_path = Path(workspace_path) if workspace_path else Path("workspace")
         try:
