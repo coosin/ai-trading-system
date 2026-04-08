@@ -459,7 +459,20 @@ class AICommandExecutor:
             }
 
     def _guess_skill_action_from_text(self, user_input: str) -> Optional[str]:
-        text = str(user_input or "").lower()
+        # 注意：这里必须是“弱规则”且尽量减少误触发。
+        # 我们只在用户表达明确执行意图时才把 chat 映射成技能动作。
+        text_raw = str(user_input or "").strip()
+        text = text_raw.lower()
+
+        # 若是纯提问/质疑/闲聊，不做技能映射，交给 LLM 自由对话与澄清。
+        if any(q in text_raw for q in ["？", "?"]) or any(q in text for q in ["为什么", "怎么", "什么情况", "哪两项", "说清楚", "解释"]):
+            return None
+
+        intent_verbs = ("执行", "运行", "开始", "拉取", "获取", "同步", "查询", "看看", "帮我查", "帮我看")
+        has_exec_intent = any(v in text_raw for v in intent_verbs)
+        if not has_exec_intent:
+            return None
+
         mapping = [
             (["系统巡检", "健康检查", "巡检"], "system.inspection.run"),
             (["每日复盘", "日总结", "日报总结"], "memory.summary.daily"),
