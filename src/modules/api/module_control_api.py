@@ -907,6 +907,38 @@ def init_module_control_api(app, main_controller):
                         "metadata": getattr(r, "metadata", {}) if hasattr(r, "metadata") else {},
                     }
                 )
+            # 兜底：部分情况下召回模型可能漏召回，直接从内存后端筛选“每日复盘”类记录。
+            if not data:
+                backend = getattr(gateway, "memory_backend", None)
+                memories = getattr(backend, "_memories", {}) if backend else {}
+                fallback_rows: List[Dict[str, Any]] = []
+                for mid, entry in (memories or {}).items():
+                    try:
+                        content = str(getattr(entry, "content", "") or "")
+                        metadata = getattr(entry, "metadata", {}) or {}
+                        src = str(metadata.get("source_module") or "")
+                        if ("每日交易复盘" in content) or ("复盘" in content and src == "ai_command_executor"):
+                            fallback_rows.append(
+                                {
+                                    "id": mid,
+                                    "content": content,
+                                    "importance": float(getattr(entry, "importance", 0.0) or 0.0),
+                                    "timestamp": (
+                                        getattr(entry, "created_at", None).isoformat()
+                                        if getattr(entry, "created_at", None) is not None
+                                        else None
+                                    ),
+                                    "metadata": metadata,
+                                }
+                            )
+                    except Exception:
+                        continue
+                fallback_rows = sorted(
+                    fallback_rows,
+                    key=lambda x: str(x.get("timestamp") or ""),
+                    reverse=True,
+                )[:safe_limit]
+                data = fallback_rows
             return {"success": True, "data": data, "count": len(data), "timestamp": datetime.now().isoformat()}
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
@@ -931,15 +963,119 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
+    async def _build_commander_fast_snapshot(symbol: str = "BTC/USDT") -> Dict[str, Any]:
+        """快速快照：优先返回核心状态，避免重聚合阻塞。"""
+        out: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "mode": "fast",
+            "system": {},
+            "strategy": {},
+            "execution": {},
+            "risk": {},
+            "account": {},
+            "data_hub": {"symbol": symbol},
+            "alerts": [],
+        }
+        mc = main_controller
+        if not mc:
+            return out
+        try:
+            st = await mc.get_system_status()
+            out["system"] = {
+                "system_status": st.get("system_status"),
+                "module_count": st.get("module_count"),
+                "running_modules": st.get("running_modules"),
+            }
+        except Exception as e:
+            out["alerts"].append(f"系统状态读取失败: {e}")
+
+        try:
+            sm = getattr(mc, "strategy_manager", None)
+            if sm and hasattr(sm, "get_optimization_status"):
+                s = sm.get_optimization_status()
+                out["strategy"] = {
+                    "total_strategies": s.get("total_strategies"),
+                    "pool_limit": s.get("pool_limit"),
+                    "daily_optimization": s.get("daily_optimization"),
+                    "deployment_stage_counts": s.get("deployment_stage_counts"),
+                }
+        except Exception as e:
+            out["alerts"].append(f"策略状态读取失败: {e}")
+
+        try:
+            gw = getattr(mc, "execution_gateway", None)
+            if gw and hasattr(gw, "get_snapshot"):
+                out["execution"] = await gw.get_snapshot()
+        except Exception as e:
+            out["alerts"].append(f"执行网关快照失败: {e}")
+
+        try:
+            slm = getattr(mc, "stop_loss_manager", None)
+            if slm and hasattr(slm, "get_stats"):
+                out["risk"]["sltp"] = slm.get_stats()
+        except Exception as e:
+            out["alerts"].append(f"SLTP统计读取失败: {e}")
+
+        # 账户/持仓：优先取启动接管缓存；若没有则做一次轻量强制同步（不阻塞失败）。
+        try:
+            st = getattr(mc, "_latest_account_state", None)
+            if not st and hasattr(mc, "force_sync_account_state"):
+                try:
+                    st = await mc.force_sync_account_state(reason="snapshot_fast")
+                except Exception:
+                    st = None
+            st = st or {}
+            out["account"] = {
+                "balance": st.get("balance"),
+                "positions": st.get("positions"),
+                "synced_at": st.get("timestamp"),
+            }
+        except Exception:
+            pass
+
+        # 仓位管理建议（快速版：仅在能得到可用余额时生成）
+        try:
+            bal = out.get("account", {}).get("balance") or {}
+            usdt = bal.get("USDT", bal.get("usdt", 0)) if isinstance(bal, dict) else 0
+            if isinstance(usdt, dict):
+                available = usdt.get("free", usdt.get("available", 0))
+            else:
+                available = usdt
+            positions = out.get("account", {}).get("positions") or []
+            pos_map: Dict[str, Any] = {}
+            if isinstance(positions, list):
+                for p in positions:
+                    if isinstance(p, dict):
+                        sym = p.get("symbol") or p.get("instId") or p.get("instrument_id")
+                        if sym:
+                            try:
+                                v = float(p.get("notional") or p.get("value") or 0)
+                            except Exception:
+                                v = 0.0
+                            pos_map[str(sym)] = {"value": v, **p}
+            if available and hasattr(mc, "get_position_recommendations"):
+                out["risk"]["position_recommendations"] = await mc.get_position_recommendations(
+                    account_balance=float(available),
+                    current_positions=pos_map,
+                )
+        except Exception:
+            pass
+        return out
+
     @router.get("/commander/snapshot")
-    async def commander_snapshot(symbol: str = "BTC/USDT"):
+    async def commander_snapshot(symbol: str = "BTC/USDT", mode: str = "fast"):
         """司令部统一快照：前端/TG/运维可共享。"""
         if not main_controller:
             return {"success": False, "message": "主控制器未初始化"}
         if not hasattr(main_controller, "build_ai_commander_snapshot"):
             return {"success": False, "message": "司令部快照能力不可用"}
         try:
-            data = await main_controller.build_ai_commander_snapshot(symbol=symbol)
+            mode_l = str(mode or "fast").strip().lower()
+            if mode_l == "full":
+                data = await main_controller.build_ai_commander_snapshot(symbol=symbol)
+                data["mode"] = "full"
+            else:
+                data = await _build_commander_fast_snapshot(symbol=symbol)
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}

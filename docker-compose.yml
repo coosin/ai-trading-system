@@ -22,8 +22,15 @@ services:
     environment:
       - MODE=${MODE:-simulation}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - HTTP_PROXY=http://host.docker.internal:7890
-      - HTTPS_PROXY=http://host.docker.internal:7890
+      # 避免宿主机 HTTP(S)_PROXY 意外污染容器；如需代理请用 OPENCLAW_HTTP_PROXY/OPENCLAW_HTTPS_PROXY
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - OPENCLAW_HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-}
+      - OPENCLAW_HTTPS_PROXY=${OPENCLAW_HTTPS_PROXY:-}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     networks:

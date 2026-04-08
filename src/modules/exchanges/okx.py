@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from functools import wraps
+from urllib.parse import urlencode
 
 import aiohttp
 
@@ -132,6 +133,44 @@ class OKXExchange(ExchangeBase):
             "Content-Type": "application/json"
         }
         return headers
+
+    def _build_request_path(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> str:
+        """
+        OKX 签名的 requestPath 对 GET 需要包含 query string。
+        这里使用排序后的 urlencode，确保签名稳定一致。
+        """
+        if not params:
+            return endpoint
+        items: List[Tuple[str, str]] = []
+        for k in sorted(params.keys()):
+            v = params.get(k)
+            if v is None:
+                continue
+            items.append((str(k), str(v)))
+        if not items:
+            return endpoint
+        return endpoint + "?" + urlencode(items)
+
+    def _to_okx_inst_id(self, symbol: str, default_type: str = "SPOT") -> str:
+        """
+        将系统内 symbol 统一转换为 OKX instId。
+        - BTC/USDT/SWAP -> BTC-USDT-SWAP
+        - BTC/USDT      -> BTC-USDT （默认 SPOT）
+        """
+        s = str(symbol or "").strip()
+        s_up = s.upper()
+        # 已经是 OKX instId（例如 BTC-USDT-SWAP / BTC-USDT）则直接返回
+        if "-" in s and "/" not in s:
+            return s
+        if "/SWAP" in s_up or s_up.endswith("SWAP"):
+            okx_symbol = s.replace("/SWAP", "").replace("/swap", "").replace("/", "-")
+            if not okx_symbol.upper().endswith("-SWAP"):
+                okx_symbol = okx_symbol + "-SWAP"
+            return okx_symbol
+        okx_symbol = s.replace("/", "-")
+        if default_type.upper() == "SWAP" and not okx_symbol.upper().endswith("-SWAP"):
+            okx_symbol = okx_symbol + "-SWAP"
+        return okx_symbol
     
     async def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None, body: Dict[str, Any] = None) -> Any:
         """发送请求到OKX API - 带重试和限流机制"""
@@ -145,8 +184,9 @@ class OKXExchange(ExchangeBase):
             
             url = self.api_url + endpoint
             body_str = json.dumps(body, separators=(',', ':')) if body else ""
-            
-            headers = self._get_headers(method, endpoint, body_str)
+
+            request_path = self._build_request_path(endpoint, params if str(method).upper() == "GET" else None)
+            headers = self._get_headers(method, request_path, body_str)
             
             logger.debug(f"📤 OKX请求: {method} {endpoint}")
             logger.debug(f"📤 Body: {body_str}")
@@ -495,13 +535,9 @@ class OKXExchange(ExchangeBase):
     async def get_order_book(self, symbol: str, depth: int = 10) -> OrderBook:
         """获取订单簿"""
         endpoint = "/api/v5/market/books"
-        
-        if "/SWAP" in symbol or symbol.endswith("SWAP"):
-            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
-            if not okx_symbol.endswith("-SWAP"):
-                okx_symbol = okx_symbol + "-SWAP"
-        else:
-            okx_symbol = symbol.replace("/", "-") + "-SWAP"
+
+        # 行情订单簿：若 symbol 未明确 SWAP，则按现货 instId 请求，避免 “Instrument ID does not exist” 噪音。
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SPOT")
         
         params = {
             "instId": okx_symbol,
@@ -661,8 +697,7 @@ class OKXExchange(ExchangeBase):
         
         params = {"instType": "SPOT"}
         if symbol:
-            okx_symbol = symbol.replace("/", "-")
-            params["instId"] = okx_symbol
+            params["instId"] = self._to_okx_inst_id(symbol, default_type="SPOT")
         
         try:
             data = await self._make_request("GET", endpoint, params)
@@ -1231,7 +1266,7 @@ class OKXExchange(ExchangeBase):
     async def get_open_interest(self, symbol: str) -> Optional[Dict[str, float]]:
         """获取持仓量"""
         endpoint = "/api/v5/public/open-interest"
-        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         params = {"instId": okx_symbol}
         
         try:
@@ -1252,7 +1287,7 @@ class OKXExchange(ExchangeBase):
     async def get_funding_rate(self, symbol: str) -> Optional[float]:
         """获取资金费率"""
         endpoint = "/api/v5/public/funding-rate"
-        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         params = {"instId": okx_symbol}
         
         try:
@@ -1268,8 +1303,8 @@ class OKXExchange(ExchangeBase):
     async def get_long_short_ratio(self, symbol: str) -> Optional[Dict[str, float]]:
         """获取多空比 - 使用订单簿数据计算"""
         try:
-            okx_symbol = symbol.replace("/", "-") + "-SWAP"
-            order_book = await self.get_order_book(okx_symbol, depth=20)
+            okx_inst_id = self._to_okx_inst_id(symbol, default_type="SWAP")
+            order_book = await self.get_order_book(okx_inst_id, depth=20)
             
             if not order_book:
                 return None

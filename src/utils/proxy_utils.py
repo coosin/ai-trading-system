@@ -78,9 +78,16 @@ class UnifiedProxyManager:
     
     async def _detect_from_env(self):
         """从环境变量检测代理"""
-        http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-        https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-        all_proxy = os.getenv("ALL_PROXY") or os.getenv("all_proxy")
+        # 优先读取应用专用变量，避免宿主机的 HTTP_PROXY 意外污染容器运行（常导致 127.0.0.1:7890 不可达）
+        http_proxy = os.getenv("OPENCLAW_HTTP_PROXY") or ""
+        https_proxy = os.getenv("OPENCLAW_HTTPS_PROXY") or ""
+        all_proxy = os.getenv("OPENCLAW_ALL_PROXY") or ""
+
+        if not (http_proxy or https_proxy or all_proxy):
+            # 兼容：如用户确实希望使用系统变量，可直接设置 OPENCLAW_* 或把系统变量注入容器
+            http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy") or ""
+            https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or ""
+            all_proxy = os.getenv("ALL_PROXY") or os.getenv("all_proxy") or ""
         
         if http_proxy or https_proxy or all_proxy:
             self.settings.enabled = True

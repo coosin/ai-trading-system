@@ -606,6 +606,18 @@ class StopLossTakeProfitManager:
 
         # 先做一次基于实时盘口/价格行为的动态参数微调，再执行触发判断。
         await self._dynamic_market_adjust(order, current_price)
+
+        # 修正边界：极端情况下（重启后加载/同步），最高/最低价可能是 0/inf，先用当前价接管初始化。
+        try:
+            if order.side == "long":
+                if not isinstance(order.highest_price, (int, float)) or order.highest_price <= 0:
+                    order.highest_price = float(current_price)
+            else:
+                lp = float(order.lowest_price) if order.lowest_price is not None else float("inf")
+                if (not math.isfinite(lp)) or lp <= 0:
+                    order.lowest_price = float(current_price)
+        except Exception:
+            pass
         
         if order.side == "long":
             if current_price > order.highest_price:

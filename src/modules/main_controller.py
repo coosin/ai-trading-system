@@ -1683,6 +1683,12 @@ class MainController:
                     # 启动AI核心控制器（单脑仲裁，避免双控制器并行下单）
                     await self._start_ai_brain_controllers()
                     await self._start_ai_autonomous_supervision()
+
+                    # 重启动后的强制接管：同步余额/持仓，并把持仓接入 SLTP 跟踪与仓位管理。
+                    try:
+                        await self.force_sync_account_state(reason="startup")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 启动同步余额/持仓失败（不阻塞启动）: {e}")
                     
                     # 启动主动性AI系统 - 让AI主动工作
                     if self.proactive_ai:
@@ -1750,6 +1756,62 @@ class MainController:
             logger.error(f"系统启动异常: {e}")
             traceback.print_exc()
             return False
+
+    async def force_sync_account_state(self, reason: str = "manual") -> Dict[str, Any]:
+        """
+        强制同步并接管交易现场数据：
+        - 钱包余额（USDT 等）
+        - 持仓（用于司令部快照、SLTP 跟踪、动态仓位管理）
+        """
+        out: Dict[str, Any] = {"reason": reason, "timestamp": datetime.now().isoformat(), "balance": None, "positions": None}
+        ex = self.get_exchange() if hasattr(self, "get_exchange") else None
+        ex = ex or getattr(self, "okx_exchange", None)
+        if not ex:
+            out["error"] = "exchange_missing"
+            return out
+
+        # 1) balance
+        try:
+            bal = await ex.get_balance()
+            out["balance"] = bal
+        except Exception as e:
+            out["balance_error"] = str(e)
+
+        # 2) positions
+        try:
+            pos = await ex.get_positions()
+            out["positions"] = pos
+        except Exception as e:
+            out["positions_error"] = str(e)
+
+        # 缓存到控制器，供快照/指挥台复用
+        self._latest_account_state = out
+
+        # 3) 写入记忆，便于 AI 复盘与持续接管
+        gw = getattr(self, "memory_gateway", None)
+        if gw and hasattr(gw, "add_memory"):
+            try:
+                await gw.add_memory(
+                    memory_type="trade_record",
+                    content=f"重启/同步接管({reason})：余额与持仓已同步。",
+                    summary="系统重启后强制同步余额/持仓",
+                    metadata={"reason": reason, "balance": out.get("balance"), "positions": out.get("positions")},
+                    source_module="main_controller",
+                    importance=0.75,
+                )
+            except Exception:
+                pass
+
+        # 4) SLTP 接管：把交易所持仓同步到 SLTP 跟踪
+        try:
+            if getattr(self, "stop_loss_manager", None):
+                if getattr(self, "okx_exchange", None):
+                    self.stop_loss_manager.set_exchange(self.okx_exchange)
+                await self.stop_loss_manager.sync_open_positions_from_exchange()
+        except Exception as e:
+            out["sltp_sync_error"] = str(e)
+
+        return out
 
     async def stop_system(self) -> bool:
         """
@@ -3940,6 +4002,7 @@ class MainController:
             "strategy": {},
             "execution": {},
             "risk": {},
+            "account": {},
             "alerts": [],
         }
         try:
@@ -3995,6 +4058,44 @@ class MainController:
                 out["risk"]["sltp"] = slm.get_stats()
             except Exception as e:
                 out["alerts"].append(f"SLTP统计读取失败: {e}")
+
+        # 账户/持仓接管快照（重启后强制同步的结果）
+        try:
+            st = getattr(self, "_latest_account_state", None) or {}
+            out["account"] = {
+                "balance": st.get("balance"),
+                "positions": st.get("positions"),
+                "synced_at": st.get("timestamp"),
+            }
+        except Exception:
+            pass
+
+        # 动态仓位管理建议（若可用）
+        try:
+            bal = out.get("account", {}).get("balance") or {}
+            usdt = bal.get("USDT", bal.get("usdt", 0)) if isinstance(bal, dict) else 0
+            if isinstance(usdt, dict):
+                available = usdt.get("free", usdt.get("available", 0))
+            else:
+                available = usdt
+            positions = out.get("account", {}).get("positions") or []
+            # normalize positions to dict with value
+            pos_map: Dict[str, Any] = {}
+            if isinstance(positions, list):
+                for p in positions:
+                    if isinstance(p, dict):
+                        sym = p.get("symbol") or p.get("instId") or p.get("instrument_id")
+                        if sym:
+                            try:
+                                v = float(p.get("notional") or p.get("value") or 0)
+                            except Exception:
+                                v = 0.0
+                            pos_map[str(sym)] = {"value": v, **p}
+            if available and hasattr(self, "get_position_recommendations"):
+                reco = await self.get_position_recommendations(account_balance=float(available), current_positions=pos_map)
+                out["risk"]["position_recommendations"] = reco
+        except Exception:
+            pass
         return out
 
     async def run_ai_commander_chores(self, symbol: str = "BTC/USDT", trigger_optimize: bool = False) -> Dict[str, Any]:

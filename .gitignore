@@ -90,7 +90,7 @@ Thumbs.db
 Desktop.ini
 
 # Project Specific
-workspace/memory/*.json
+workspace/memory/
 workspace/USER.md
 data/historical/*.csv
 data/historical/*.json

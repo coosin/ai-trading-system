@@ -119,8 +119,12 @@ export const api = {
       request(`/modules/memory/daily-summary?limit=${Number(limit) || 6}`),
     runMemoryDailySummary: () =>
       request('/modules/memory/daily-summary/run', { method: 'POST' }),
-    getCommanderSnapshot: (symbol = 'BTC/USDT') =>
-      request(`/modules/commander/snapshot?symbol=${encodeURIComponent(symbol)}`),
+    getCommanderSnapshot: (symbol = 'BTC/USDT', mode = 'fast') =>
+      request(`/modules/commander/snapshot?symbol=${encodeURIComponent(symbol)}&mode=${encodeURIComponent(mode)}`),
+    getCommanderSnapshotFast: (symbol = 'BTC/USDT') =>
+      request(`/modules/commander/snapshot?symbol=${encodeURIComponent(symbol)}&mode=fast`),
+    getCommanderSnapshotFull: (symbol = 'BTC/USDT') =>
+      request(`/modules/commander/snapshot?symbol=${encodeURIComponent(symbol)}&mode=full`),
     runCommanderChores: (body = {}) =>
       request('/modules/commander/chores', { method: 'POST', body: JSON.stringify(body || {}) }),
     dispatchCommanderMessage: (message, source = 'control_hub') =>

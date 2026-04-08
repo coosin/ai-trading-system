@@ -54,6 +54,7 @@ function ControlHubModule() {
   const [dailyMemorySummary, setDailyMemorySummary] = useState([]);
   const [commanderSnapshot, setCommanderSnapshot] = useState(null);
   const [commanderAudit, setCommanderAudit] = useState(null);
+  const [commanderSnapshotMode, setCommanderSnapshotMode] = useState('fast');
   const [commanderInput, setCommanderInput] = useState('执行系统巡检');
   const [commanderReply, setCommanderReply] = useState('');
 
@@ -117,7 +118,7 @@ function ControlHubModule() {
         api.modules.getStrategyResearchJobs(20).catch(() => ({ jobs: [] })),
         api.modules.getExecutionProductionAudit().catch(() => null),
         api.modules.getMemoryDailySummary(6).catch(() => ({ data: [] })),
-        api.modules.getCommanderSnapshot(dataSymbol || 'BTC/USDT').catch(() => null),
+        api.modules.getCommanderSnapshotFast(dataSymbol || 'BTC/USDT').catch(() => null),
         api.modules.getCommanderAudit().catch(() => null),
       ]);
       setStrategies(Array.isArray(list) ? list : []);
@@ -126,6 +127,7 @@ function ControlHubModule() {
       setProductionAudit(auditRes || null);
       setDailyMemorySummary(Array.isArray(memSummaryRes?.data) ? memSummaryRes.data : []);
       setCommanderSnapshot(commanderRes?.data || commanderRes || null);
+      setCommanderSnapshotMode((commanderRes?.data || commanderRes || null)?.mode || 'fast');
       setCommanderAudit(commanderAuditRes || null);
     } catch (e) {
       showNotice(`策略数据加载失败：${e.message || e}`, 'error');
@@ -388,6 +390,20 @@ function ControlHubModule() {
       await loadStrategyData();
     } catch (e) {
       showNotice(`司令部指令失败：${e.message || e}`, 'error');
+    } finally {
+      setManualBusy(false);
+    }
+  };
+
+  const refreshCommanderSnapshotFull = async () => {
+    setManualBusy(true);
+    try {
+      const res = await api.modules.getCommanderSnapshotFull(dataSymbol || 'BTC/USDT');
+      setCommanderSnapshot(res?.data || res || null);
+      setCommanderSnapshotMode((res?.data || res || null)?.mode || 'full');
+      showNotice('已刷新司令部完整快照');
+    } catch (e) {
+      showNotice(`刷新完整快照失败：${e.message || e}`, 'error');
     } finally {
       setManualBusy(false);
     }
@@ -742,6 +758,12 @@ function ControlHubModule() {
               {JSON.stringify(commanderAudit || {}, null, 2)}
             </pre>
             <div style={{ marginTop: 12, fontWeight: 600 }}>司令部统一快照</div>
+            <div style={{ marginTop: 6, marginBottom: 6, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>当前模式: {commanderSnapshotMode}</span>
+              <button type="button" className="btn btn-sm btn-outline" disabled={manualBusy} onClick={refreshCommanderSnapshotFull}>
+                拉取完整快照(full)
+              </button>
+            </div>
             <pre style={{ maxHeight: 220, overflow: 'auto', fontSize: 11, padding: 10, background: 'var(--bg-secondary)', borderRadius: 8, whiteSpace: 'pre-wrap', marginTop: 8 }}>
               {JSON.stringify(commanderSnapshot || {}, null, 2)}
             </pre>
