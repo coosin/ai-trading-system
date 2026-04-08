@@ -1033,6 +1033,10 @@ class StrategyManager:
         all_signals = []
 
         try:
+            # Pull unified snapshot once per symbol/tick and share across all running strategies.
+            unified_snapshot = await self._get_unified_snapshot(symbol)
+            quality_score = self._extract_quality_score(unified_snapshot)
+
             # 检测市场状态
             await self._detect_market_regime(data)
             
@@ -1062,10 +1066,28 @@ class StrategyManager:
                             signal.signal_id = f"signal_{uuid.uuid4().hex[:8]}"
                             stage = self._get_deployment_stage(instance.config)
                             mult = self._deployment_cap_multiplier(stage)
-                            signal.confidence = max(0.0, min(1.0, float(signal.confidence or 0.0) * mult))
+                            base_conf = max(0.0, min(1.0, float(signal.confidence or 0.0) * mult))
+                            # Soft quality weighting: never hard-drop signals, only smooth confidence.
+                            if quality_score is not None:
+                                q_weight = max(0.75, min(1.05, 0.75 + 0.30 * float(quality_score)))
+                                signal.confidence = max(0.0, min(1.0, base_conf * q_weight))
+                            else:
+                                signal.confidence = base_conf
                             signal.metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
                             signal.metadata["deployment_stage"] = stage
                             signal.metadata["cap_multiplier"] = mult
+                            if unified_snapshot:
+                                signal.metadata["unified_quality_score"] = quality_score
+                                signal.metadata["data_provenance"] = (
+                                    (unified_snapshot.get("数据来源状态") or {}).get("provenance")
+                                    if isinstance(unified_snapshot, dict)
+                                    else None
+                                )
+                                signal.metadata["ai_data_analysis"] = (
+                                    (unified_snapshot.get("AI智能分析") or {})
+                                    if isinstance(unified_snapshot, dict)
+                                    else {}
+                                )
                             out.append(signal)
                         return out
                     except Exception as e:
@@ -1095,6 +1117,31 @@ class StrategyManager:
             logger.error(f"处理市场数据失败: {e}")
 
         return all_signals
+
+    async def _get_unified_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Best-effort unified data snapshot accessor."""
+        te = self.trade_engine
+        mc = getattr(te, "main_controller", None) if te else None
+        hub = getattr(mc, "data_source_hub", None) if mc else None
+        if not hub or not hasattr(hub, "get_unified_snapshot"):
+            return None
+        try:
+            snap = await hub.get_unified_snapshot(symbol)
+            return snap if isinstance(snap, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_quality_score(snapshot: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not isinstance(snapshot, dict):
+            return None
+        q = snapshot.get("数据质量评估", {})
+        if not isinstance(q, dict):
+            return None
+        try:
+            return float(q.get("score")) if q.get("score") is not None else None
+        except Exception:
+            return None
 
     async def get_signals(
         self,

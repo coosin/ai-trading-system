@@ -644,6 +644,8 @@ class StopLossTakeProfitManager:
             depth_imb = None
             unified_quality = None
             whale_risk = False
+            ai_bias = None
+            ai_confidence = None
             if self._exchange and hasattr(self._exchange, "get_order_book"):
                 try:
                     ob = await self._exchange.get_order_book(order.symbol, depth=10)
@@ -666,6 +668,12 @@ class StopLossTakeProfitManager:
                     q = ((snap.get("数据质量评估") or {}).get("score")) if isinstance(snap, dict) else None
                     if q is not None:
                         unified_quality = float(q)
+                    ai_blk = (snap.get("AI智能分析") or {}) if isinstance(snap, dict) else {}
+                    ai_bias = str(ai_blk.get("action_bias") or "").lower() or None
+                    try:
+                        ai_confidence = float(ai_blk.get("confidence")) if ai_blk.get("confidence") is not None else None
+                    except Exception:
+                        ai_confidence = None
                     whale_blk = (snap.get("大资金与大户监控") or {}) if isinstance(snap, dict) else {}
                     whale_count = int(whale_blk.get("链上大户活跃条数") or 0)
                     high_risk_positions = int(
@@ -715,6 +723,16 @@ class StopLossTakeProfitManager:
                     adverse = True
                 if unified_quality is not None and unified_quality < 0.5:
                     adverse = True
+                # AI 分析参与：高置信度反向倾向时优先保护；同向时适度放宽止盈空间。
+                if ai_confidence is not None and ai_confidence >= 0.65 and ai_bias:
+                    if order.side == "long" and ai_bias in {"sell", "short"}:
+                        adverse = True
+                    elif order.side == "short" and ai_bias in {"buy", "long"}:
+                        adverse = True
+                    elif order.side == "long" and ai_bias in {"buy", "long"}:
+                        favorable = True
+                    elif order.side == "short" and ai_bias in {"sell", "short"}:
+                        favorable = True
 
                 trend_thr = float(self.config.trend_extend_threshold)
                 if order.side == "long" and trend >= trend_thr:
@@ -770,6 +788,8 @@ class StopLossTakeProfitManager:
                 meta["last_market_volatility"] = float(volatility)
                 meta["last_unified_quality_score"] = float(unified_quality) if unified_quality is not None else None
                 meta["last_whale_risk"] = bool(whale_risk)
+                meta["last_ai_bias"] = ai_bias
+                meta["last_ai_confidence"] = ai_confidence
                 meta["last_trailing_offset"] = float(order.trailing_stop_offset)
                 order.metadata = meta
                 logger.info(

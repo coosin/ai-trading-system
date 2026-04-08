@@ -1057,13 +1057,18 @@ class AITradingEngine:
             decision_prompt = self._build_decision_prompt(symbol, context, current_position)
             
             # 调用AI生成决策
+            snap = context.metadata.get("unified_snapshot", {}) if isinstance(context.metadata, dict) else {}
+            ai_data_analysis = (snap.get("AI智能分析") or {}) if isinstance(snap, dict) else {}
+            data_quality = (snap.get("数据质量评估") or {}) if isinstance(snap, dict) else {}
             ai_decision = await self.llm_integration.generate_trading_signal(
                 {
                     "symbol": symbol,
                     "price": context.price,
                     "trend": context.trend,
                     "sentiment": context.sentiment,
-                    "volatility": context.volatility
+                    "volatility": context.volatility,
+                    "unified_data_quality": data_quality,
+                    "unified_ai_analysis": ai_data_analysis,
                 }
             )
             
