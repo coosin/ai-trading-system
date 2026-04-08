@@ -87,9 +87,17 @@ class TelegramBot:
             self.enabled = False
             return
         
-        self.proxy = self.config.get("proxy") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "http://host.docker.internal:7890"
-        self.proxy = self._normalize_proxy_for_runtime(self.proxy)
-        logger.info(f"📱 Telegram使用代理: {self.proxy}")
+        # 代理策略：默认不强制代理，避免把 TG 通道绑死在不可用代理上。
+        # 优先使用 OPENCLAW_* 显式变量，其次才兼容系统 HTTP(S)_PROXY。
+        self.proxy = (
+            self.config.get("proxy")
+            or os.getenv("OPENCLAW_HTTPS_PROXY")
+            or os.getenv("OPENCLAW_HTTP_PROXY")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("HTTP_PROXY")
+        )
+        self.proxy = self._normalize_proxy_for_runtime(self.proxy) if self.proxy else None
+        logger.info(f"📱 Telegram代理: {self.proxy or 'disabled (direct)'}")
         
         self.session = aiohttp.ClientSession()
         
@@ -175,16 +183,23 @@ class TelegramBot:
                 "offset": self._last_update_id + 1,
                 "timeout": 30
             }
-            
-            async with self.session.get(url, params=params, proxy=self.proxy) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("ok"):
-                        updates = data.get("result", [])
-                        for update in updates:
-                            self._last_update_id = update.get("update_id", 0)
-                            if "message" in update:
-                                await self._process_message(update["message"])
+
+            # 先用代理（若配置），失败则降级直连，避免 TG 通道“卡死”
+            for proxy in (self.proxy, None):
+                try:
+                    async with self.session.get(url, params=params, proxy=proxy) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+                        if data.get("ok"):
+                            updates = data.get("result", [])
+                            for update in updates:
+                                self._last_update_id = update.get("update_id", 0)
+                                if "message" in update:
+                                    await self._process_message(update["message"])
+                            return
+                except Exception as e:
+                    logger.debug(f"轮询更新失败(proxy={proxy}): {e}")
         except Exception as e:
             logger.error(f"轮询更新失败: {e}")
 
@@ -234,7 +249,19 @@ class TelegramBot:
                     enriched_text,
                     source="telegram",
                 )
-                response_text = (result or {}).get("response", "处理完成")
+                # 兼容不同模块返回口径：response/message/text
+                response_text = (
+                    (result or {}).get("response")
+                    or (result or {}).get("message")
+                    or (result or {}).get("text")
+                    or ""
+                )
+                if not response_text:
+                    # 最后兜底：把结构化结果压缩输出，避免 TG 永远只回“处理完成”
+                    try:
+                        response_text = json.dumps(result or {}, ensure_ascii=False, indent=2)[:3500]
+                    except Exception:
+                        response_text = "处理完成"
                 success = (result or {}).get("success", False)
                 # AI优先：仅在失败时使用快捷规则兜底，避免把AI变成关键词机器人。
                 if not success:
