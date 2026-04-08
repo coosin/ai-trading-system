@@ -1436,9 +1436,67 @@ class AICommandExecutor:
         try:
             if hasattr(mc, "skill_manager") and mc.skill_manager:
                 report = await mc.skill_manager.run_health_check({"source": "ai_command_executor"})
+                # 生成“摘要 + 明细”，避免消息通道只收到一句话。
+                def _is_benign_failure_dict(r: Dict[str, Any]) -> bool:
+                    msg = str((r or {}).get("message") or "")
+                    lower_msg = msg.lower()
+                    benign_markers = (
+                        "缺少编辑请求",
+                        "缺少开发请求",
+                        "缺少审查请求",
+                        "missing request",
+                        "no request",
+                    )
+                    return any(m in msg for m in benign_markers) or any(m in lower_msg for m in benign_markers)
+
+                results = report.get("results") if isinstance(report, dict) else None
+                results = results if isinstance(results, list) else []
+                actionable = [
+                    r
+                    for r in results
+                    if isinstance(r, dict)
+                    and str(r.get("status") or "").lower() == "failed"
+                    and not _is_benign_failure_dict(r)
+                ]
+                warnings = [
+                    r
+                    for r in results
+                    if isinstance(r, dict)
+                    and str(r.get("status") or "").lower() == "success"
+                    and str(r.get("priority") or "").lower() in {"high"}
+                    and isinstance(r.get("recommendations"), list)
+                    and len(r.get("recommendations") or []) > 0
+                ]
+
+                lines = [
+                    f"系统巡检完成：{report.get('status')}，可执行失败 {report.get('actionable_failures', len(actionable))} 项",
+                ]
+                if actionable:
+                    lines.append("")
+                    lines.append("失败明细（可执行）：")
+                    for i, r in enumerate(actionable[:6], start=1):
+                        name = str(r.get("skill_name") or "unknown")
+                        msg = str(r.get("message") or "").strip()
+                        recs = r.get("recommendations") or []
+                        rec_line = f"；建议：{recs[0]}" if isinstance(recs, list) and recs else ""
+                        # 控制长度，避免 TG 过长导致截断
+                        if len(msg) > 180:
+                            msg = msg[:180] + "…"
+                        lines.append(f"{i}) {name}: {msg}{rec_line}")
+                    if len(actionable) > 6:
+                        lines.append(f"... 还有 {len(actionable) - 6} 项（可在UI/司令部快照查看完整结果）")
+                if warnings:
+                    lines.append("")
+                    lines.append("告警/建议：")
+                    for i, r in enumerate(warnings[:4], start=1):
+                        name = str(r.get("skill_name") or "unknown")
+                        recs = r.get("recommendations") or []
+                        if isinstance(recs, list) and recs:
+                            lines.append(f"- {name}: {str(recs[0])[:180]}")
+
                 return {
                     "success": True,
-                    "response": f"系统巡检完成：{report.get('status')}，可执行失败 {report.get('actionable_failures', 0)} 项",
+                    "response": "\n".join(lines).strip(),
                     "data": report,
                     "timestamp": datetime.now().isoformat(),
                 }

@@ -240,6 +240,17 @@ class TelegramBot:
         try:
             logger.info(f"📩 收到消息 [{message.from_user}]: {message.text[:100] if len(message.text) > 100 else message.text}")
             text = (message.text or "").strip()
+
+            # 轻量问候：避免把“你好/在吗”误触发为巡检/任务并回一句固定摘要。
+            greeting = text.lower().strip()
+            if greeting in {"你好", "在吗", "hi", "hello", "hey"}:
+                await self._send_message(TelegramResponse(
+                    chat_id=message.chat_id,
+                    text="我在。你想查看什么？\n\n例如：\n- 拉取司令部快照\n- 同步持仓和余额\n- 执行系统巡检并列出失败项\n- 查询SL/TP状态",
+                    reply_to_message_id=message.message_id
+                ))
+                return
+
             profile = self._load_ai_commander_profile()
             enriched_text = self._build_enriched_user_message(text, profile)
 
