@@ -154,7 +154,10 @@ class AICoreDecisionEngine:
         self._last_decision_time: Dict[str, datetime] = {}
         self._last_strategy_check: Optional[datetime] = None
         self._pending_decisions: List[TradeDecision] = []
+        # 与 StrategyManager 中已启用策略同步的镜像；用于状态与提示词排序
         self._active_strategies: Dict[str, Any] = {}
+        # 简化回测打分后的优先策略 ID（决策提示词优先推荐）
+        self._preferred_strategy_id: Optional[str] = None
         self._strategy_performance: Dict[str, Dict] = {}
         self._execution_guards_stats: Dict[str, int] = {
             "data_quality_guard_hold": 0,
@@ -309,7 +312,8 @@ class AICoreDecisionEngine:
         asyncio.create_task(self._main_decision_loop())
         asyncio.create_task(self._strategy_management_loop())
         asyncio.create_task(self._risk_monitoring_loop())
-        
+        asyncio.create_task(self._startup_strategy_sync_and_backtest())
+
         logger.info("✅ AI核心决策引擎已启动 - AI拥有完整控制权")
     
     async def _sync_positions_on_startup(self) -> None:
@@ -494,6 +498,78 @@ class AICoreDecisionEngine:
             logger.error(f"AI选择币种失败: {e}")
         
         return available_symbols[:5]
+
+    async def _sync_active_strategies_from_manager(self) -> None:
+        """将 StrategyManager 中已启用策略同步到 _active_strategies（与「仅 AI 自建」脱钩）。"""
+        if not self.strategy_manager:
+            return
+        configs = getattr(self.strategy_manager, "strategy_configs", None) or {}
+        n = 0
+        for sid, cfg in configs.items():
+            if hasattr(cfg, "enabled") and not getattr(cfg, "enabled", True):
+                continue
+            st = getattr(cfg, "strategy_type", "unknown")
+            stv = st.value if hasattr(st, "value") else str(st)
+            self._active_strategies[sid] = {
+                "strategy_id": sid,
+                "name": getattr(cfg, "name", sid),
+                "description": getattr(cfg, "description", ""),
+                "strategy_type": stv,
+                "parameters": dict(getattr(cfg, "parameters", {}) or {}),
+                "symbols": list(getattr(cfg, "symbols", []) or []),
+                "timeframe": getattr(cfg, "timeframe", "1h"),
+                "initial_capital": float(getattr(cfg, "initial_capital", 10000.0) or 10000.0),
+                "enabled": True,
+            }
+            n += 1
+        logger.info("✅ 已从策略管理器同步 %s 个启用策略到 AI 核心", n)
+
+    @staticmethod
+    def _score_backtest_perf(perf: Dict[str, Any]) -> float:
+        """综合打分：夏普、回撤惩罚、收益、成交次数（用于择优）。"""
+        if not perf:
+            return -1e9
+        try:
+            sh = float(perf.get("sharpe_ratio", 0) or 0)
+            dd = float(perf.get("max_drawdown", 0.5) or 0)
+            tr = float(perf.get("total_return", 0) or 0)
+            tc = int(perf.get("trade_count", 0) or 0)
+            if tc < 2:
+                return -1e8 + tr
+            dd_pen = max(0.0, min(abs(dd), 0.99))
+            return sh * (1.0 - dd_pen * 0.5) + 0.25 * tr + 0.01 * float(tc)
+        except Exception:
+            return -1e9
+
+    async def _rank_strategies_after_backtest(self) -> None:
+        """根据 _strategy_performance 中的简化回测结果选出优先策略。"""
+        best_id: Optional[str] = None
+        best_score = -1e18
+        for sid, perf in (self._strategy_performance or {}).items():
+            if not isinstance(perf, dict):
+                continue
+            sc = self._score_backtest_perf(perf)
+            if sc > best_score:
+                best_score = sc
+                best_id = sid
+        if best_id:
+            self._preferred_strategy_id = best_id
+            logger.info("📌 回测择优：优先策略 %s (score=%.4f)", best_id, best_score)
+        else:
+            self._preferred_strategy_id = None
+
+    async def _startup_strategy_sync_and_backtest(self) -> None:
+        """启动后异步：同步策略池 → 自动回测 → 自动优化 → 择优（全权模式无需用户点「激活」）。"""
+        try:
+            await asyncio.sleep(5)
+            await self._sync_active_strategies_from_manager()
+            if self.authorization.get("auto_backtest"):
+                await self._auto_backtest_strategies()
+            if self.authorization.get("auto_optimize"):
+                await self._auto_optimize_strategies()
+            await self._rank_strategies_after_backtest()
+        except Exception as e:
+            logger.warning("启动时策略同步/回测/择优失败: %s", e)
     
     async def _strategy_management_loop(self) -> None:
         """AI策略管理循环 - 等待交易事件触发"""
@@ -2151,10 +2227,15 @@ class AICoreDecisionEngine:
                     })
                     if len(advice_list) >= 3:
                         break
-            
+
+            pref = getattr(self, "_preferred_strategy_id", None)
+            if pref and advice_list:
+                advice_list.sort(key=lambda x: (0 if x.get("id") == pref else 1, str(x.get("name", ""))))
+
             return {
                 "strategies": advice_list,
                 "count": len(advice_list),
+                "preferred_strategy_id": pref,
             }
         except Exception as e:
             logger.error(f"获取策略建议失败: {symbol} - {e}")
@@ -2985,6 +3066,13 @@ class AICoreDecisionEngine:
     
     def get_status(self) -> Dict:
         """获取状态"""
+        sm_enabled = 0
+        sm_ids: List[str] = []
+        if self.strategy_manager:
+            for sid, cfg in (getattr(self.strategy_manager, "strategy_configs", {}) or {}).items():
+                if getattr(cfg, "enabled", True):
+                    sm_enabled += 1
+                    sm_ids.append(sid)
         return {
             "running": self._running,
             "blacklist": list(self.blacklist),
@@ -3001,7 +3089,10 @@ class AICoreDecisionEngine:
                 "plugin_manager": self.plugin_manager is not None,
             },
             "strategies": {
-                "active": len(self._active_strategies),
+                "active": sm_enabled,
+                "enabled_strategy_ids": sm_ids[:32],
+                "ai_core_registered": len(self._active_strategies),
+                "preferred_strategy_id": self._preferred_strategy_id,
                 "performance_tracked": len(self._strategy_performance),
             },
             "last_decisions": {

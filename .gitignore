@@ -44,6 +44,12 @@ logs/
 *.log
 *.log.*
 
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/node_modules/.vite/
+
 # Data (root level only)
 /data/
 *.db
@@ -71,6 +77,7 @@ htmlcov/
 *.bak
 *.backup
 *.old
+backups/
 
 # Temporary
 *.tmp
