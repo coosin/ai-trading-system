@@ -29,6 +29,21 @@ function ControlHubModule() {
   const [monitorLogs, setMonitorLogs] = useState([]);
   const [marketData, setMarketData] = useState({});
   const [monitoringSummary, setMonitoringSummary] = useState(null);
+  const [dataSymbol, setDataSymbol] = useState('BTC/USDT');
+  const [dataModuleBusy, setDataModuleBusy] = useState(false);
+  const [dataModuleStatus, setDataModuleStatus] = useState({
+    symbols: [],
+    ticker: null,
+    trends: null,
+    signals: null,
+    fusion: null,
+    lastUpdatedAt: null,
+    source: 'idle',
+  });
+  const [dataHubSnapshot, setDataHubSnapshot] = useState(null);
+  const [dataHubStatus, setDataHubStatus] = useState(null);
+  const [qualityAdvice, setQualityAdvice] = useState(null);
+  const [aiDataAnalysis, setAiDataAnalysis] = useState(null);
   const [proactiveStatus, setProactiveStatus] = useState(null);
   const [riskMetrics, setRiskMetrics] = useState(null);
   const [opportunities, setOpportunities] = useState([]);
@@ -41,6 +56,17 @@ function ControlHubModule() {
   const [strategyOpt, setStrategyOpt] = useState(null);
   const [researchBusy, setResearchBusy] = useState(false);
   const [researchLog, setResearchLog] = useState('');
+  const [researchJobs, setResearchJobs] = useState([]);
+  const [productionAudit, setProductionAudit] = useState(null);
+  const [manualBusy, setManualBusy] = useState(false);
+  const [feedbackForm, setFeedbackForm] = useState({
+    strategy_id: 'default_trend_following_ma',
+    pnl: -5,
+    win_rate: 45,
+    max_drawdown: 0.2,
+    total_trades: 20,
+    force_optimize: true,
+  });
 
   const [docQuery, setDocQuery] = useState('');
   const [selectedDocId, setSelectedDocId] = useState('control-hub-user-manual');
@@ -80,12 +106,16 @@ function ControlHubModule() {
 
   const loadStrategyData = useCallback(async () => {
     try {
-      const [list, optRes] = await Promise.all([
+      const [list, optRes, jobsRes, auditRes] = await Promise.all([
         api.strategies.getAll().catch(() => []),
         api.modules.getStrategyOptimizationStatus().catch(() => null),
+        api.modules.getStrategyResearchJobs(20).catch(() => ({ jobs: [] })),
+        api.modules.getExecutionProductionAudit().catch(() => null),
       ]);
       setStrategies(Array.isArray(list) ? list : []);
       setStrategyOpt(optRes?.data ?? null);
+      setResearchJobs(Array.isArray(jobsRes?.jobs) ? jobsRes.jobs : []);
+      setProductionAudit(auditRes || null);
     } catch (e) {
       showNotice(`策略数据加载失败：${e.message || e}`, 'error');
     }
@@ -177,9 +207,64 @@ function ControlHubModule() {
     }
   };
 
+  const refreshDataModule = useCallback(async (symbol = dataSymbol) => {
+    const targetSymbol = String(symbol || 'BTC/USDT');
+    setDataModuleBusy(true);
+    try {
+      const [symbolsRes, tickerRes, trendsRes, signalsRes, fusionRes, hubStatusRes, hubSnapshotRes, adviceRes, aiRes] = await Promise.all([
+        api.market.getSymbols().catch(() => []),
+        api.market.getTicker(targetSymbol).catch(() => null),
+        api.externalData.analyzeTrends(targetSymbol).catch(() => null),
+        api.externalData.getSignals(targetSymbol).catch(() => null),
+        api.dataFusion.analyzeMarket(targetSymbol).catch(() => null),
+        api.dataHub.getStatus().catch(() => null),
+        api.dataHub.getUnifiedSnapshot(targetSymbol).catch(() => null),
+        api.dataHub.getQualityAdvice(targetSymbol).catch(() => null),
+        api.dataHub.getAiAnalysis(targetSymbol).catch(() => null),
+      ]);
+
+      const symbols = Array.isArray(symbolsRes?.data)
+        ? symbolsRes.data
+        : Array.isArray(symbolsRes)
+          ? symbolsRes
+          : [];
+
+      setDataModuleStatus({
+        symbols,
+        ticker: tickerRes?.data || tickerRes || null,
+        trends: trendsRes?.data || trendsRes || null,
+        signals: signalsRes?.data || signalsRes || null,
+        fusion: fusionRes?.data || fusionRes || null,
+        lastUpdatedAt: new Date().toISOString(),
+        source: 'api-live',
+      });
+      setDataHubStatus(hubStatusRes?.data || hubStatusRes || null);
+      setDataHubSnapshot(hubSnapshotRes?.data || hubSnapshotRes || null);
+      setQualityAdvice(adviceRes?.data || adviceRes || null);
+      setAiDataAnalysis(aiRes?.data || aiRes || null);
+    } catch (e) {
+      setDataModuleStatus((prev) => ({
+        ...prev,
+        lastUpdatedAt: new Date().toISOString(),
+        source: 'api-fallback',
+      }));
+      showNotice(`数据模块刷新失败：${e.message || e}`, 'error');
+    } finally {
+      setDataModuleBusy(false);
+    }
+  }, [dataSymbol]);
+
   useEffect(() => {
     refresh();
+    refreshDataModule('BTC/USDT');
   }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      refreshDataModule();
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [refreshDataModule]);
 
   const runResearch = async () => {
     setResearchBusy(true);
@@ -192,10 +277,22 @@ function ControlHubModule() {
         symbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'ADA/USDT'],
       });
       if (res.success) {
-        const pub = res.result?.published?.length ?? 0;
-        const rej = res.result?.rejected?.length ?? 0;
-        showNotice(`策略研发完成：发布 ${pub} 个，拒绝 ${rej} 个`);
-        setResearchLog(JSON.stringify(res.result || res, null, 2));
+        showNotice(`策略研发任务已提交：${res.job_id || '-'}`);
+        setResearchLog(JSON.stringify(res, null, 2));
+        const jobId = res.job_id;
+        if (jobId) {
+          let tries = 0;
+          while (tries < 30) {
+            tries += 1;
+            await new Promise((r) => setTimeout(r, 2000));
+            const jobRes = await api.modules.getStrategyResearchJob(jobId).catch(() => null);
+            const st = jobRes?.job?.status;
+            if (st === 'completed' || st === 'failed') {
+              setResearchLog(JSON.stringify(jobRes.job || jobRes, null, 2));
+              break;
+            }
+          }
+        }
         await loadStrategyData();
       } else {
         showNotice(res.message || '策略研发失败', 'error');
@@ -206,6 +303,39 @@ function ControlHubModule() {
       setResearchLog(String(e.message || e));
     } finally {
       setResearchBusy(false);
+    }
+  };
+
+  const runOptimizeNow = async () => {
+    setManualBusy(true);
+    try {
+      const res = await api.modules.triggerStrategyOptimizeNow();
+      showNotice(res?.message || '已触发优化批次');
+      await loadStrategyData();
+    } catch (e) {
+      showNotice(`触发优化失败：${e.message || e}`, 'error');
+    } finally {
+      setManualBusy(false);
+    }
+  };
+
+  const submitTradeFeedback = async () => {
+    setManualBusy(true);
+    try {
+      const payload = {
+        ...feedbackForm,
+        pnl: Number(feedbackForm.pnl),
+        win_rate: Number(feedbackForm.win_rate),
+        max_drawdown: Number(feedbackForm.max_drawdown),
+        total_trades: Number(feedbackForm.total_trades),
+      };
+      const res = await api.modules.submitStrategyTradeFeedback(payload);
+      showNotice(res?.data?.success ? '交易反馈已提交并触发优化链路' : '交易反馈已提交');
+      await loadStrategyData();
+    } catch (e) {
+      showNotice(`提交交易反馈失败：${e.message || e}`, 'error');
+    } finally {
+      setManualBusy(false);
     }
   };
 
@@ -325,6 +455,77 @@ function ControlHubModule() {
             <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 10 }}>
               数据质量概览：{monitoringSummary?.status || 'unknown'} · 交易记录 {monitoringSummary?.total_trades ?? '-'} · 活跃告警{' '}
               {monitoringSummary?.active_alerts ?? '-'}
+            </div>
+            <div style={{ border: '1px solid var(--border-light)', borderRadius: 8, padding: 10, marginBottom: 10 }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
+                <div style={{ fontWeight: 600 }}>数据模块联动</div>
+                <input
+                  className="form-input"
+                  value={dataSymbol}
+                  onChange={(e) => setDataSymbol(e.target.value)}
+                  style={{ maxWidth: 200 }}
+                  placeholder="BTC/USDT"
+                />
+                <button type="button" className="btn btn-sm btn-outline" onClick={() => refreshDataModule(dataSymbol)} disabled={dataModuleBusy}>
+                  {dataModuleBusy ? '拉取中…' : '刷新数据模块'}
+                </button>
+                <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+                  源: {dataModuleStatus.source} · 更新时间: {dataModuleStatus.lastUpdatedAt || '-'}
+                </span>
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+                可用交易对 {dataModuleStatus.symbols?.length || 0} · 行情 {dataModuleStatus.ticker ? 'ok' : 'n/a'} · 趋势{' '}
+                {dataModuleStatus.trends ? 'ok' : 'n/a'} · 信号 {dataModuleStatus.signals ? 'ok' : 'n/a'} · 融合分析{' '}
+                {dataModuleStatus.fusion ? 'ok' : 'n/a'}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
+                统一数据源中心：{dataHubStatus?.模块 || '统一数据源中心'} · 健康 {String(dataHubStatus?.健康 ?? '-') } · 提供者 {dataHubStatus?.提供者 || '-'}
+              </div>
+              <pre style={{ maxHeight: 180, overflow: 'auto', fontSize: 11, marginTop: 8, background: 'var(--bg-secondary)', padding: 8, borderRadius: 6, whiteSpace: 'pre-wrap' }}>
+                {JSON.stringify(
+                  {
+                    symbol: dataSymbol,
+                    ticker: dataModuleStatus.ticker,
+                    trends: dataModuleStatus.trends,
+                    signals: dataModuleStatus.signals,
+                    fusion: dataModuleStatus.fusion,
+                  },
+                  null,
+                  2
+                )}
+              </pre>
+              {dataHubSnapshot ? (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>统一双渠道快照（中文）</div>
+                  <pre style={{ maxHeight: 220, overflow: 'auto', fontSize: 11, marginTop: 6, background: 'var(--bg-secondary)', padding: 8, borderRadius: 6, whiteSpace: 'pre-wrap' }}>
+                    {JSON.stringify(dataHubSnapshot, null, 2)}
+                  </pre>
+                </div>
+              ) : null}
+              {qualityAdvice ? (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>
+                    数据质量与作用评分：{qualityAdvice.grade || '-'} · 置信度 {qualityAdvice.confidence ?? '-'}
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
+                    质量分 {qualityAdvice.quality_score ?? '-'} · 作用分 {qualityAdvice.effectiveness_score ?? '-'} · 稳定性{' '}
+                    {qualityAdvice.stability_score ?? '-'}
+                  </div>
+                  <div style={{ marginTop: 4, fontSize: 12 }}>
+                    建议：{Array.isArray(qualityAdvice.suggestions) ? qualityAdvice.suggestions.join('；') : '-'}
+                  </div>
+                </div>
+              ) : null}
+              {aiDataAnalysis ? (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>AI智能分析：{aiDataAnalysis.action_bias || '-'}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
+                    趋势 {aiDataAnalysis.trend || '-'} · 情绪 {aiDataAnalysis.sentiment || '-'} · 风险 {aiDataAnalysis.risk_level || '-'} ·
+                    置信度 {aiDataAnalysis.confidence ?? '-'}
+                  </div>
+                  <div style={{ marginTop: 4, fontSize: 12 }}>{aiDataAnalysis.summary || '-'}</div>
+                </div>
+              ) : null}
             </div>
             <div style={{ maxHeight: 360, overflow: 'auto', border: '1px solid var(--border-light)', borderRadius: 8 }}>
               {marketRows.map((m) => (
@@ -513,6 +714,61 @@ function ControlHubModule() {
                 {strategyOpt.daily_optimization.processed}/{strategyOpt.daily_optimization.total}
               </div>
             )}
+            {strategyOpt?.deployment_stage_counts && (
+              <div style={{ fontSize: 13, marginBottom: 12, color: 'var(--text-secondary)' }}>
+                分层发布：paper {strategyOpt.deployment_stage_counts.paper || 0} · shadow {strategyOpt.deployment_stage_counts.shadow || 0} ·
+                small {strategyOpt.deployment_stage_counts.small || 0} · full {strategyOpt.deployment_stage_counts.full || 0}
+              </div>
+            )}
+            <div style={{ marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button type="button" className="btn btn-sm btn-outline" onClick={runOptimizeNow} disabled={manualBusy}>
+                {manualBusy ? '执行中…' : '手动触发每日优化批次'}
+              </button>
+              <button type="button" className="btn btn-sm btn-outline" onClick={loadStrategyData} disabled={manualBusy}>
+                刷新研究任务与生产审计
+              </button>
+            </div>
+
+            <div style={{ marginBottom: 12, border: '1px solid var(--border-light)', borderRadius: 8, padding: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>手动交易反馈（触发自适应优化）</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(120px,1fr))', gap: 8 }}>
+                <input className="form-input" value={feedbackForm.strategy_id} onChange={(e) => setFeedbackForm((p) => ({ ...p, strategy_id: e.target.value }))} placeholder="strategy_id" />
+                <input className="form-input" type="number" value={feedbackForm.pnl} onChange={(e) => setFeedbackForm((p) => ({ ...p, pnl: e.target.value }))} placeholder="pnl" />
+                <input className="form-input" type="number" value={feedbackForm.win_rate} onChange={(e) => setFeedbackForm((p) => ({ ...p, win_rate: e.target.value }))} placeholder="win_rate(%)" />
+                <input className="form-input" type="number" step="0.01" value={feedbackForm.max_drawdown} onChange={(e) => setFeedbackForm((p) => ({ ...p, max_drawdown: e.target.value }))} placeholder="max_drawdown" />
+                <input className="form-input" type="number" value={feedbackForm.total_trades} onChange={(e) => setFeedbackForm((p) => ({ ...p, total_trades: e.target.value }))} placeholder="total_trades" />
+                <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <input type="checkbox" checked={!!feedbackForm.force_optimize} onChange={(e) => setFeedbackForm((p) => ({ ...p, force_optimize: e.target.checked }))} />
+                  force_optimize
+                </label>
+              </div>
+              <div style={{ marginTop: 8 }}>
+                <button type="button" className="btn btn-sm btn-primary" onClick={submitTradeFeedback} disabled={manualBusy}>
+                  提交交易反馈
+                </button>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>研究任务队列（最近）</div>
+              <div style={{ maxHeight: 180, overflow: 'auto', border: '1px solid var(--border-light)', borderRadius: 8 }}>
+                {(researchJobs || []).slice(0, 10).map((j) => (
+                  <div key={j.job_id} style={{ padding: '8px 10px', borderBottom: '1px solid var(--border-light)', fontSize: 12 }}>
+                    {j.job_id} · {j.status} · {j.created_at}
+                  </div>
+                ))}
+                {!researchJobs?.length && <div style={{ padding: 10, color: 'var(--text-tertiary)' }}>暂无研究任务记录</div>}
+              </div>
+            </div>
+
+            {productionAudit ? (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>生产执行审计</div>
+                <pre style={{ maxHeight: 220, overflow: 'auto', fontSize: 11, padding: 10, background: 'var(--bg-secondary)', borderRadius: 8, whiteSpace: 'pre-wrap' }}>
+                  {JSON.stringify(productionAudit, null, 2)}
+                </pre>
+              </div>
+            ) : null}
             <div style={{ fontWeight: 600, marginBottom: 8 }}>当前策略 ({strategies.length})</div>
             <div style={{ maxHeight: 280, overflow: 'auto', border: '1px solid var(--border-light)', borderRadius: 8 }}>
               {(strategies || []).map((s) => (

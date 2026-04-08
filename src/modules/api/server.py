@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from src.modules.api.strategy_api import router as strategy_router
 from src.modules.core.enhanced_llm_manager import TaskType
+from src.modules.data.data_source_hub import DataSourceHub
 
 try:
     from fastapi import (
@@ -714,6 +715,7 @@ class APIServer:
         api_v1_router = APIRouter(prefix="/v1", tags=["api-v1"])
         # 供闭包路由统一使用，避免局部函数中 NameError
         main_controller = self.main_controller
+        data_source_hub = DataSourceHub(main_controller)
 
         # 根路由 - 仅在静态文件服务不存在时生效
         # 注意：静态文件服务会处理根路径的请求
@@ -1132,207 +1134,40 @@ class APIServer:
         # 市场行情路由 - 支持 /api/v1/market/ticker/{symbol}
         @api_v1_router.get("/market/ticker/{symbol}", tags=["market"])
         async def get_market_ticker(symbol: str):
-            """获取市场行情 - 从OKX公开API获取真实数据（带重试机制和代理支持）"""
-            import aiohttp
-            formatted_symbol = symbol.replace("-", "-")
-            
-            proxy_url = None
-            try:
-                from src.modules.core.proxy_manager import get_proxy_manager
-                proxy_manager = await get_proxy_manager()
-                proxy = await proxy_manager.get_proxy("www.okx.com")
-                if proxy:
-                    proxy_url = proxy.url
-                    logger.debug(f"使用代理: {proxy_url}")
-            except Exception as e:
-                logger.debug(f"获取代理配置失败: {e}")
-            
-            max_retries = 3
-            for retry in range(max_retries):
-                try:
-                    timeout = aiohttp.ClientTimeout(total=30, connect=10)
-                    connector = aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)
-                    
-                    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                        url = f"https://www.okx.com/api/v5/market/ticker?instId={formatted_symbol}"
-                        async with session.get(url, proxy=proxy_url) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if data.get("code") == "0" and data.get("data"):
-                                    ticker = data["data"][0]
-                                    last_price = float(ticker.get("last", 0))
-                                    if last_price > 0:
-                                        return {
-                                            "symbol": symbol,
-                                            "last": last_price,
-                                            "price": last_price,
-                                            "bid": float(ticker.get("bidPx", 0)),
-                                            "ask": float(ticker.get("askPx", 0)),
-                                            "high": float(ticker.get("high24h", 0)),
-                                            "low": float(ticker.get("low24h", 0)),
-                                            "volume": float(ticker.get("vol24h", 0)),
-                                            "change": float(ticker.get("change24h", 0)),
-                                            "timestamp": datetime.now().isoformat()
-                                        }
-                except asyncio.TimeoutError:
-                    logger.warning(f"OKX API超时 (重试 {retry + 1}/{max_retries}): {symbol}")
-                    if retry < max_retries - 1:
-                        await asyncio.sleep(0.5)
-                        continue
-                except aiohttp.ClientError as e:
-                    logger.warning(f"OKX API连接错误 (重试 {retry + 1}/{max_retries}): {e}")
-                    if retry < max_retries - 1:
-                        await asyncio.sleep(0.5)
-                        continue
-                except Exception as e:
-                    logger.error(f"获取OKX真实行情失败: {e}")
-                    break
-            
-            # 备用数据源
-            import random
-            base_price = 68000 if "BTC" in symbol else 2100 if "ETH" in symbol else 85 if "SOL" in symbol else 620 if "BNB" in symbol else 100
-            price = base_price + random.uniform(-500, 500)
-            return {
-                "symbol": symbol,
-                "price": round(price, 2),
-                "last": round(price, 2),
-                "bid": round(price - random.uniform(1, 10), 2),
-                "ask": round(price + random.uniform(1, 10), 2),
-                "high": round(price + random.uniform(50, 100), 2),
-                "low": round(price - random.uniform(50, 100), 2),
-                "volume": round(random.uniform(1000, 5000), 2),
-                "change": round(random.uniform(-5, 5), 2),
-                "timestamp": datetime.now().isoformat()
-            }
+            """获取市场行情（统一数据源模块）"""
+            return await data_source_hub.get_ticker(symbol)
+
+        @api_v1_router.get("/market/ticker", tags=["market"])
+        async def get_market_ticker_q(symbol: str):
+            """兼容 query 参数形式：/market/ticker?symbol=BTC/USDT"""
+            return await data_source_hub.get_ticker(symbol)
 
         # K线路由 - 支持 /api/v1/market/klines/{symbol}
         @api_v1_router.get("/market/klines/{symbol}", tags=["market"])
         async def get_market_klines(symbol: str, interval: str = "1H", limit: int = 100):
-            """获取K线数据 - 从OKX公开API获取真实数据（带重试机制和代理支持）"""
-            import aiohttp
-            formatted_symbol = symbol.replace("-", "-")
-            
-            okx_bar_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
-            okx_bar = okx_bar_map.get(interval.lower(), "1H")
-            
-            proxy_url = None
-            try:
-                from src.modules.core.proxy_manager import get_proxy_manager
-                proxy_manager = await get_proxy_manager()
-                proxy = await proxy_manager.get_proxy("www.okx.com")
-                if proxy:
-                    proxy_url = proxy.url
-            except Exception as e:
-                logger.debug(f"获取代理配置失败: {e}")
-            
-            max_retries = 3
-            for retry in range(max_retries):
-                try:
-                    timeout = aiohttp.ClientTimeout(total=30, connect=10)
-                    connector = aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)
-                    
-                    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                        url = f"https://www.okx.com/api/v5/market/candles?instId={formatted_symbol}&bar={okx_bar}&limit={limit}"
-                        async with session.get(url, proxy=proxy_url) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if data.get("code") == "0" and data.get("data"):
-                                    klines = []
-                                    for k in reversed(data["data"]):
-                                        klines.append({
-                                            "timestamp": k[0],
-                                            "open": float(k[1]),
-                                            "high": float(k[2]),
-                                            "low": float(k[3]),
-                                            "close": float(k[4]),
-                                            "volume": float(k[5])
-                                        })
-                                    return klines
-                except asyncio.TimeoutError:
-                    logger.warning(f"OKX K线API超时 (重试 {retry + 1}/{max_retries}): {symbol}")
-                    if retry < max_retries - 1:
-                        await asyncio.sleep(0.5)
-                        continue
-                except Exception as e:
-                    logger.error(f"获取OKX真实K线失败: {e}")
-                    break
-            
-            import random
-            from datetime import timedelta
-            data = []
-            now = datetime.now()
-            base_price = 68000 if "BTC" in symbol else 2100 if "ETH" in symbol else 85 if "SOL" in symbol else 620
-            for i in range(limit):
-                timestamp = (now - timedelta(hours=i)).isoformat()
-                price = base_price + random.uniform(-500, 500)
-                data.append({
-                    "timestamp": timestamp,
-                    "open": price - random.uniform(100, 200),
-                    "high": price + random.uniform(50, 100),
-                    "low": price - random.uniform(50, 100),
-                    "close": price,
-                    "volume": random.uniform(1000, 5000)
-                })
-            data.reverse()
-            return data
+            """获取K线数据（统一数据源模块）"""
+            return await data_source_hub.get_klines(symbol, interval=interval, limit=limit)
+
+        @api_v1_router.get("/market/klines", tags=["market"])
+        async def get_market_klines_q(symbol: str, interval: str = "1H", limit: int = 100):
+            """兼容 query 参数形式：/market/klines?symbol=BTC/USDT"""
+            return await data_source_hub.get_klines(symbol, interval=interval, limit=limit)
 
         # 订单簿路由 - 支持 /api/v1/market/orderbook/{symbol}
         @api_v1_router.get("/market/orderbook/{symbol}", tags=["market"])
         async def get_market_orderbook(symbol: str, depth: int = 20):
-            """获取订单簿 - 从OKX公开API获取真实数据（带重试机制和代理支持）"""
-            import aiohttp
-            formatted_symbol = symbol.replace("-", "-")
-            
-            proxy_url = None
-            try:
-                from src.modules.core.proxy_manager import get_proxy_manager
-                proxy_manager = await get_proxy_manager()
-                proxy = await proxy_manager.get_proxy("www.okx.com")
-                if proxy:
-                    proxy_url = proxy.url
-            except Exception as e:
-                logger.debug(f"获取代理配置失败: {e}")
-            
-            max_retries = 3
-            for retry in range(max_retries):
-                try:
-                    timeout = aiohttp.ClientTimeout(total=30, connect=10)
-                    connector = aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)
-                    
-                    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                        url = f"https://www.okx.com/api/v5/market/books?instId={formatted_symbol}&sz={depth}"
-                        async with session.get(url, proxy=proxy_url) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if data.get("code") == "0" and data.get("data"):
-                                    book = data["data"][0]
-                                    bids = [[float(b[0]), float(b[1])] for b in book.get("bids", [])]
-                                    asks = [[float(a[0]), float(a[1])] for a in book.get("asks", [])]
-                                    return {
-                                        "symbol": symbol,
-                                        "bids": bids,
-                                        "asks": asks,
-                                        "timestamp": datetime.now().isoformat()
-                                    }
-                except asyncio.TimeoutError:
-                    logger.warning(f"OKX订单簿API超时 (重试 {retry + 1}/{max_retries}): {symbol}")
-                    if retry < max_retries - 1:
-                        await asyncio.sleep(0.5)
-                        continue
-                except Exception as e:
-                    logger.error(f"获取OKX真实订单簿失败: {e}")
-                    break
-            
-            import random
-            base_price = 68000 if "BTC" in symbol else 2100 if "ETH" in symbol else 85
-            bids = [[base_price - i * 10, random.uniform(0.1, 2)] for i in range(depth)]
-            asks = [[base_price + i * 10, random.uniform(0.1, 2)] for i in range(depth)]
-            return {
-                "symbol": symbol,
-                "bids": bids,
-                "asks": asks,
-                "timestamp": datetime.now().isoformat()
-            }
+            """获取订单簿（统一数据源模块）"""
+            return await data_source_hub.get_order_book(symbol, depth=depth)
+
+        @api_v1_router.get("/market/orderbook", tags=["market"])
+        async def get_market_orderbook_q(symbol: str, depth: int = 20):
+            """兼容 query 参数形式：/market/orderbook?symbol=BTC/USDT"""
+            return await data_source_hub.get_order_book(symbol, depth=depth)
+
+        @api_v1_router.get("/market/symbols", tags=["market"])
+        async def get_market_symbols():
+            """获取可用交易对（统一数据源模块）"""
+            return {"status": "success", "data": await data_source_hub.get_symbols(), "timestamp": datetime.now().isoformat()}
 
         # 风险指标路由 - 支持 /api/v1/risk/metrics
         @api_v1_router.get("/risk/metrics", tags=["risk"])
@@ -2559,75 +2394,8 @@ class APIServer:
         async def analyze_market(symbol: str):
             """多源数据融合市场分析"""
             try:
-                # 从主控制器获取多源数据融合分析器
-                if hasattr(self.main_controller, 'data_fusion_analyzer'):
-                    data_fusion = self.main_controller.data_fusion_analyzer
-                    result = await data_fusion.analyze_market(symbol)
-                    
-                    return {
-                        "status": "success",
-                        "data": result,
-                        "timestamp": datetime.now().isoformat()
-                    }
-                else:
-                    # 模拟数据
-                    import random
-                    sentiments = ['extreme_greed', 'greed', 'neutral', 'fear', 'extreme_fear']
-                    recommendations = ['bullish', 'bearish', 'neutral']
-                    
-                    mock_data = {
-                        "overall_sentiment": sentiments[random.randint(0, 4)],
-                        "overall_sentiment_score": round(random.uniform(-1, 1), 2),
-                        "signal_strength": random.randint(1, 5),
-                        "technical_analysis": {
-                            "trend": round(random.uniform(-1, 1), 2),
-                            "rsi": round(random.uniform(30, 70), 2),
-                            "volatility": round(random.uniform(0.01, 0.1), 3)
-                        },
-                        "sentiment_analysis": {
-                            "price_change_7d": round(random.uniform(-10, 10), 2),
-                            "positive_days": random.randint(1, 7),
-                            "negative_days": 7 - random.randint(0, 6)
-                        },
-                        "on_chain_analysis": {
-                            "tx_count": random.randint(100, 600),
-                            "large_tx_count": random.randint(5, 55)
-                        },
-                        "news_analysis": {
-                            "article_count": random.randint(10, 60),
-                            "positive_mentions": random.randint(5, 25),
-                            "negative_mentions": random.randint(0, 10)
-                        },
-                        "social_media_analysis": {
-                            "tweet_count": random.randint(100, 600),
-                            "engagement": random.randint(1000, 6000)
-                        },
-                        "key_insights": [
-                            "技术面显示上升趋势明显",
-                            "市场情绪偏多，投资者信心增强",
-                            "链上活跃度较高，大额交易频繁",
-                            "新闻报道正面，社交媒体讨论积极"
-                        ],
-                        "risk_factors": [
-                            "短期超买，可能出现回调",
-                            "市场波动较大，风险增加"
-                        ],
-                        "opportunity_signals": [
-                            "突破阻力位，可能继续上涨",
-                            "成交量放大，动能增强"
-                        ],
-                        "recommendation": recommendations[random.randint(0, 2)],
-                        "confidence": round(random.uniform(0.7, 1.0), 2),
-                        "data_sources_used": ["technical", "market_sentiment", "news", "social_media"],
-                        "data_sources_missing": ["on_chain"],
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    
-                    return {
-                        "status": "success",
-                        "data": mock_data,
-                        "timestamp": datetime.now().isoformat()
-                    }
+                result = await data_source_hub.analyze_market(symbol)
+                return {"status": "success", "data": result, "timestamp": datetime.now().isoformat()}
             except Exception as e:
                 logger.error(f"多源数据分析失败: {e}")
                 return {
@@ -2635,6 +2403,67 @@ class APIServer:
                     "message": f"多源数据分析失败: {str(e)}",
                     "timestamp": datetime.now().isoformat()
                 }
+
+        @api_v1_router.get("/data-fusion/analyze", tags=["data-fusion"])
+        async def analyze_market_q(symbol: str):
+            """兼容 query 参数形式：/data-fusion/analyze?symbol=BTC/USDT"""
+            result = await data_source_hub.analyze_market(symbol)
+            return {"status": "success", "data": result, "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.get("/external/analyze-trends", tags=["external"])
+        async def external_analyze_trends(symbol: str):
+            """外部趋势分析统一入口（由 DataSourceHub 提供）。"""
+            data = await data_source_hub.analyze_trends(symbol)
+            return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.get("/external/signals", tags=["external"])
+        async def external_signals(symbol: str):
+            """外部信号统一入口（由 DataSourceHub 提供）。"""
+            data = await data_source_hub.get_signals(symbol)
+            return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.post("/external/indicators", tags=["external"])
+        async def external_indicators(payload: Dict[str, Any]):
+            """外部指标统一入口（由 DataSourceHub 提供）。"""
+            symbol = str(payload.get("symbol") or "BTC/USDT")
+            indicators = payload.get("indicators") if isinstance(payload.get("indicators"), list) else None
+            data = await data_source_hub.get_indicators(symbol, indicators=indicators)
+            return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.get("/data-hub/status", tags=["data-hub"])
+        async def data_hub_status():
+            """统一数据源中心状态（中文字段，便于前端展示）。"""
+            st = await data_source_hub.status()
+            return {
+                "status": "success",
+                "data": {
+                    "模块": "统一数据源中心",
+                    "健康": st.healthy,
+                    "提供者": st.provider,
+                    "时间": st.timestamp,
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        @api_v1_router.get("/data-hub/unified-snapshot", tags=["data-hub"])
+        async def data_hub_unified_snapshot(symbol: str = "BTC/USDT"):
+            """统一双渠道数据快照（中文模块化输出）。"""
+            data = await data_source_hub.get_unified_snapshot(symbol)
+            return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.get("/data-hub/quality-advice", tags=["data-hub"])
+        async def data_hub_quality_advice(symbol: str = "BTC/USDT"):
+            """数据质量与作用评分建议（插件化能力输出）。"""
+            data = await data_source_hub.get_unified_snapshot(symbol)
+            advice = data.get("数据质量与作用评分", {})
+            return {"status": "success", "data": advice, "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.get("/data-hub/ai-analysis", tags=["data-hub"])
+        async def data_hub_ai_analysis(symbol: str = "BTC/USDT"):
+            """统一数据快照的 AI 智能分析结果。"""
+            snapshot = await data_source_hub.get_unified_snapshot(symbol)
+            ai_out = snapshot.get("AI智能分析", {})
+            return {"status": "success", "data": ai_out, "timestamp": datetime.now().isoformat()}
 
         # 多源数据融合数据源API - 支持 /api/v1/data-fusion/sources
         @api_v1_router.get("/data-fusion/sources", tags=["data-fusion"])

@@ -67,6 +67,7 @@ class MarketContext:
     sentiment: str  # fear, neutral, greed
     support_levels: List[float] = field(default_factory=list)
     resistance_levels: List[float] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -166,6 +167,8 @@ class AITradingEngine:
             "max_loss_per_position": 0.05,
             "daily_loss_limit": 0.10,
             "max_drawdown_limit": 0.15,
+            "min_data_quality_for_open": 0.38,
+            "low_quality_confidence_penalty": 0.08,
         }
         
         # 运行状态
@@ -647,6 +650,15 @@ class AITradingEngine:
                     atr=technical_indicators.atr
                 ))
             
+            # 使用统一数据源中心快照（优先），将分散渠道结果统一给交易决策链。
+            unified_snapshot = None
+            try:
+                hub = getattr(self.main_controller, "data_source_hub", None) if self.main_controller else None
+                if hub and hasattr(hub, "get_unified_snapshot"):
+                    unified_snapshot = await hub.get_unified_snapshot(symbol)
+            except Exception as e:
+                logger.warning(f"统一数据源快照获取失败: {e}")
+
             # 使用多源数据融合分析（如果可用）
             fused_intelligence = None
             if hasattr(self, 'data_fusion') and self.data_fusion:
@@ -690,6 +702,8 @@ class AITradingEngine:
                 "technical_indicators": TechnicalIndicatorCalculator.indicators_to_dict(technical_indicators),
                 "multi_timeframe": self._summarize_multi_timeframe(market_data.get("multi_timeframe_klines", {}))
             }
+            if unified_snapshot:
+                analysis_data["unified_snapshot"] = unified_snapshot
             
             # 如果有多源数据，添加到分析中
             if fused_intelligence:
@@ -800,7 +814,8 @@ class AITradingEngine:
                         volume_24h=market_data["ticker"].get("volume", 0),
                         sentiment="greed" if fi_sentiment > 0.6 else "fear" if fi_sentiment < 0.4 else "neutral",
                         support_levels=ai_analysis.get("support_levels", []),
-                        resistance_levels=ai_analysis.get("resistance_levels", [])
+                        resistance_levels=ai_analysis.get("resistance_levels", []),
+                        metadata={"unified_snapshot": unified_snapshot or {}, "analysis_data": analysis_data},
                     )
                     logger.info(f"✅ AI增强分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}")
                 else:
@@ -816,7 +831,8 @@ class AITradingEngine:
                         volume_24h=market_data["ticker"].get("volume", 0),
                         sentiment=getattr(fi_sentiment, 'value', str(fi_sentiment)) if fi_sentiment else "neutral",
                         support_levels=ai_analysis.get("support_levels", []),
-                        resistance_levels=ai_analysis.get("resistance_levels", [])
+                        resistance_levels=ai_analysis.get("resistance_levels", []),
+                        metadata={"unified_snapshot": unified_snapshot or {}, "analysis_data": analysis_data},
                     )
                     logger.info(f"✅ AI增强分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}, "
                                f"信号强度={getattr(fi_signal, 'value', 'N/A') if fi_signal else 'N/A'}")
@@ -830,7 +846,8 @@ class AITradingEngine:
                     volume_24h=market_data["ticker"].get("volume", 0),
                     sentiment=ai_analysis.get("sentiment", "neutral"),
                     support_levels=ai_analysis.get("support_levels", []),
-                    resistance_levels=ai_analysis.get("resistance_levels", [])
+                    resistance_levels=ai_analysis.get("resistance_levels", []),
+                    metadata={"unified_snapshot": unified_snapshot or {}, "analysis_data": analysis_data},
                 )
                 
                 logger.info(f"✅ AI分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}")
@@ -1070,6 +1087,22 @@ class AITradingEngine:
             
             # 确定交易动作
             action = self._parse_action(signal, current_position)
+
+            # 数据质量软门控：保留 AI 决策自由，仅降低置信度并记录风险提示。
+            snap = context.metadata.get("unified_snapshot", {}) if isinstance(context.metadata, dict) else {}
+            quality = ((snap.get("数据质量评估") or {}).get("score")) if isinstance(snap, dict) else None
+            min_q = float(self.ai_config.get("min_data_quality_for_open", 0.38))
+            if action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
+                try:
+                    q = float(quality) if quality is not None else 0.0
+                except Exception:
+                    q = 0.0
+                if q < min_q:
+                    penalty = float(self.ai_config.get("low_quality_confidence_penalty", 0.08))
+                    confidence = max(0.05, float(confidence) - penalty)
+                    ai_decision["reasoning"] = (
+                        f"{ai_decision.get('reasoning', '')} | 数据质量偏低({q:.2f}<{min_q:.2f})，已降权但继续由AI自主决策"
+                    )
             
             if action == TradeAction.HOLD:
                 return AIDecision(

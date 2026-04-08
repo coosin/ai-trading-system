@@ -49,6 +49,7 @@ class StrategyResearchPipeline:
         self.per_symbol_time_budget_sec = 25.0
         self._bt_calls = 0
         self._symbol_semaphore = asyncio.Semaphore(self.max_parallel_symbols)
+        self.min_data_quality_for_research = 0.5
 
     async def run_cycle(self, symbols: List[str], timeframe: str = "1h", lookback_days: int = 30) -> Dict[str, Any]:
         # load config (best-effort)
@@ -75,6 +76,9 @@ class StrategyResearchPipeline:
                     self.max_candidates_per_symbol = max(4, int(limits.get("max_candidates_per_symbol", self.max_candidates_per_symbol) or self.max_candidates_per_symbol))
                     self.max_backtests_per_cycle = max(40, int(limits.get("max_backtests_per_cycle", self.max_backtests_per_cycle) or self.max_backtests_per_cycle))
                     self.per_symbol_time_budget_sec = max(5.0, float(limits.get("per_symbol_time_budget_sec", self.per_symbol_time_budget_sec) or self.per_symbol_time_budget_sec))
+                dq = cfg.get("data_quality", {})
+                if isinstance(dq, dict):
+                    self.min_data_quality_for_research = float(dq.get("min_quality_for_research", self.min_data_quality_for_research))
         except Exception:
             pass
 
@@ -108,6 +112,18 @@ class StrategyResearchPipeline:
 
     async def _research_symbol(self, symbol: str, timeframe: str, lookback_days: int) -> List[Dict[str, Any]]:
         started_at = datetime.now()
+        # Data quality gate: low-quality unified snapshot skips heavy research to avoid bad strategy fit.
+        snapshot = await self._get_unified_snapshot(symbol)
+        q_score = self._extract_quality_score(snapshot)
+        if q_score is not None and q_score < float(self.min_data_quality_for_research):
+            # Soft gate: do not block AI research; downgrade workload and keep exploratory capability.
+            logger.warning(
+                "low-quality research mode for %s: %.3f < %.3f",
+                symbol,
+                q_score,
+                float(self.min_data_quality_for_research),
+            )
+            self.max_candidates_per_symbol = max(4, int(self.max_candidates_per_symbol * 0.6))
         exchange = getattr(getattr(self.main_controller, "ai_trading_engine", None), "exchange", None)
         if not exchange:
             return []
@@ -149,6 +165,32 @@ class StrategyResearchPipeline:
                 if item:
                     published.append(item)
         return published
+
+    async def _get_unified_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
+        mc = self.main_controller
+        if not mc:
+            return None
+        hub = getattr(mc, "data_source_hub", None)
+        if not hub or not hasattr(hub, "get_unified_snapshot"):
+            return None
+        try:
+            snap = await hub.get_unified_snapshot(symbol)
+            return snap if isinstance(snap, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_quality_score(snapshot: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not isinstance(snapshot, dict):
+            return None
+        q = snapshot.get("数据质量评估", {})
+        if not isinstance(q, dict):
+            return None
+        val = q.get("score")
+        try:
+            return float(val) if val is not None else None
+        except Exception:
+            return None
 
     async def _load_klines_df(self, exchange, symbol: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
         tf = timeframe.lower().replace("h", "H").replace("m", "m")

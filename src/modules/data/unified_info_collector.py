@@ -160,13 +160,17 @@ class UnifiedInfoCollector:
             
             bpm = self.main_controller.business_process_manager if self.main_controller else None
             self.realtime_collector = RealTimeDataCollector(business_process_manager=bpm)
+            exchange = None
+            if self.main_controller and hasattr(self.main_controller, "ai_trading_engine"):
+                exchange = getattr(self.main_controller.ai_trading_engine, "exchange", None)
             
             # 配置数据源
             for symbol in self.config.symbols[:4]:  # 限制前4个
                 # add_data_source is synchronous and expects named args.
                 self.realtime_collector.add_data_source(
                     name=f"{symbol}_ws",
-                    source_type="websocket",
+                    source=exchange,
+                    source_type="exchange" if exchange else "websocket",
                     symbol=symbol,
                 )
             
@@ -335,11 +339,12 @@ class UnifiedInfoCollector:
             # 2. 获取市场分析
             if self.market_analyzer:
                 try:
-                    analysis = await self.market_analyzer.analyze_market_sentiment(symbol)
+                    analysis = await self.market_analyzer.analyze_symbol(symbol)
                     if analysis:
-                        market_info.sentiment_score = analysis.sentiment_score if hasattr(analysis, 'sentiment_score') else 0
-                        market_info.fear_greed_index = analysis.fear_greed_index if hasattr(analysis, 'fear_greed_index') else 50
-                        market_info.market_mood = analysis.sentiment if hasattr(analysis, 'sentiment') else "neutral"
+                        sentiment = analysis.get("sentiment", {}) if isinstance(analysis, dict) else {}
+                        market_info.sentiment_score = float(sentiment.get("strength", 0.0) or 0.0)
+                        market_info.fear_greed_index = float(sentiment.get("fear_greed_index", 50.0) or 50.0)
+                        market_info.market_mood = str(sentiment.get("sentiment", "neutral") or "neutral")
                 except Exception as e:
                     logger.debug(f"分析 {symbol} 市场情绪失败: {e}")
             
@@ -354,13 +359,29 @@ class UnifiedInfoCollector:
                     logger.debug(f"获取 {symbol} 情感分析失败: {e}")
             
             # 4. 计算数据质量分数
-            market_info.sources_count = sum([
-                1 if self.realtime_collector else 0,
-                1 if self.market_analyzer else 0,
-                1 if self.sentiment_analyzer else 0,
-                1 if self.onchain_integrator else 0
-            ])
-            market_info.data_quality_score = min(market_info.sources_count / 4.0, 1.0)
+            source_scores = []
+            if self.realtime_collector:
+                rt_score = 0.5 if market_info.current_price > 0 else 0.0
+                try:
+                    rt_status = await self.realtime_collector.get_collector_status()
+                    ds = rt_status.get("data_sources", {}) if isinstance(rt_status, dict) else {}
+                    total = max(1, len(ds))
+                    connected = len([v for v in ds.values() if v.get("status") == "connected"])
+                    rt_score = min(1.0, rt_score + 0.5 * (connected / total))
+                except Exception:
+                    pass
+                source_scores.append(rt_score)
+            if self.market_analyzer:
+                source_scores.append(1.0 if market_info.market_mood in {"bullish", "bearish", "neutral"} else 0.2)
+            if self.sentiment_analyzer:
+                s_vals = [market_info.twitter_sentiment, market_info.reddit_sentiment, market_info.news_sentiment]
+                s_ok = sum(1 for x in s_vals if isinstance(x, (int, float)) and x != 0.0)
+                source_scores.append(min(1.0, s_ok / 3.0))
+            if self.onchain_integrator:
+                source_scores.append(0.6)
+
+            market_info.sources_count = len(source_scores)
+            market_info.data_quality_score = (sum(source_scores) / len(source_scores)) if source_scores else 0.0
             
             # 更新缓存
             self._market_info_cache[symbol] = market_info

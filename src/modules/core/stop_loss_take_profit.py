@@ -642,6 +642,8 @@ class StopLossTakeProfitManager:
 
             spread_bps = None
             depth_imb = None
+            unified_quality = None
+            whale_risk = False
             if self._exchange and hasattr(self._exchange, "get_order_book"):
                 try:
                     ob = await self._exchange.get_order_book(order.symbol, depth=10)
@@ -652,6 +654,24 @@ class StopLossTakeProfitManager:
                         ask_vol = sum(float(x[1]) for x in ob.asks[:5])
                         spread_bps = ((best_ask - best_bid) / max(1e-9, best_bid)) * 10000.0
                         depth_imb = (bid_vol - ask_vol) / max(1e-9, bid_vol + ask_vol)
+                except Exception:
+                    pass
+
+            # 接入统一数据源快照（链上大户/质量分），用于 SL/TP 动态微调。
+            mc = self._main_controller
+            hub = getattr(mc, "data_source_hub", None) if mc else None
+            if hub and hasattr(hub, "get_unified_snapshot"):
+                try:
+                    snap = await hub.get_unified_snapshot(order.symbol)
+                    q = ((snap.get("数据质量评估") or {}).get("score")) if isinstance(snap, dict) else None
+                    if q is not None:
+                        unified_quality = float(q)
+                    whale_blk = (snap.get("大资金与大户监控") or {}) if isinstance(snap, dict) else {}
+                    whale_count = int(whale_blk.get("链上大户活跃条数") or 0)
+                    high_risk_positions = int(
+                        ((snap.get("渠道A_交易所实时执行数据") or {}).get("liquidation_proxy") or {}).get("high_risk_positions") or 0
+                    )
+                    whale_risk = whale_count >= 6 or high_risk_positions >= 1
                 except Exception:
                     pass
 
@@ -690,6 +710,10 @@ class StopLossTakeProfitManager:
                 if spread_bps is not None and spread_bps > max(25.0, spread_guard):
                     adverse = True
                 if volatility >= float(self.config.volatility_tighten_threshold):
+                    adverse = True
+                if whale_risk:
+                    adverse = True
+                if unified_quality is not None and unified_quality < 0.5:
                     adverse = True
 
                 trend_thr = float(self.config.trend_extend_threshold)
@@ -744,6 +768,8 @@ class StopLossTakeProfitManager:
                 meta["last_market_depth_imbalance"] = float(depth_imb) if depth_imb is not None else None
                 meta["last_market_trend"] = float(trend)
                 meta["last_market_volatility"] = float(volatility)
+                meta["last_unified_quality_score"] = float(unified_quality) if unified_quality is not None else None
+                meta["last_whale_risk"] = bool(whale_risk)
                 meta["last_trailing_offset"] = float(order.trailing_stop_offset)
                 order.metadata = meta
                 logger.info(

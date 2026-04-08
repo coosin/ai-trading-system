@@ -20,6 +20,58 @@ def init_module_control_api(app, main_controller):
     research_jobs_lock = asyncio.Lock()
     research_semaphore = asyncio.Semaphore(1)
 
+    async def _check_unified_data_quality(
+        symbol: str = "BTC/USDT",
+        min_score: float = 0.5,
+    ) -> Dict[str, Any]:
+        mc = main_controller
+        if not mc:
+            return {"ok": False, "score": None, "message": "主控制器未初始化"}
+        hub = getattr(mc, "data_source_hub", None)
+        if not hub or not hasattr(hub, "get_unified_snapshot"):
+            return {"ok": True, "score": None, "message": "统一数据源中心不可用，跳过门控"}
+        try:
+            snap = await hub.get_unified_snapshot(symbol)
+            quality = (snap.get("数据质量评估") or {}) if isinstance(snap, dict) else {}
+            score = quality.get("score")
+            score_f = float(score) if score is not None else None
+            if score_f is None:
+                return {"ok": True, "score": None, "message": "未返回质量分，跳过门控"}
+            return {
+                "ok": score_f >= float(min_score),
+                "score": score_f,
+                "symbol": symbol,
+                "message": f"数据质量={score_f:.3f}, 阈值={float(min_score):.3f}",
+            }
+        except Exception as e:
+            return {"ok": True, "score": None, "message": f"质量门控检查失败，已降级放行: {e}"}
+
+    async def _notify_quality_warning(title: str, gate: Dict[str, Any]) -> None:
+        """将数据质量告警推送到统一通知通道（含 TG 等），不中断主流程。"""
+        try:
+            if not main_controller:
+                return
+            symbol = str(gate.get("symbol") or "BTC/USDT")
+            ai_line = ""
+            hub = getattr(main_controller, "data_source_hub", None)
+            if hub and hasattr(hub, "get_ai_analysis"):
+                try:
+                    ai = await hub.get_ai_analysis(symbol=symbol)
+                    ai_line = (
+                        f"\nAI分析: 趋势={ai.get('trend') or '-'} | 倾向={ai.get('action_bias') or '-'} | "
+                        f"置信度={ai.get('confidence') if ai.get('confidence') is not None else '-'}"
+                    )
+                    summary = str(ai.get("summary") or "").strip()
+                    if summary:
+                        ai_line += f"\n摘要: {summary[:180]}"
+                except Exception:
+                    pass
+            msg = f"{title}\n{gate.get('message', '')}{ai_line}"
+            if hasattr(main_controller, "_send_notification_handler"):
+                await main_controller._send_notification_handler("数据质量告警", msg, priority="medium")
+        except Exception:
+            pass
+
     async def _run_research_job(job_id: str, payload: Dict[str, Any]) -> None:
         """后台执行研究任务，避免阻塞 API worker。"""
         if not main_controller:
@@ -666,11 +718,17 @@ def init_module_control_api(app, main_controller):
         if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
             return {"success": False, "message": "策略管理器未初始化"}
         try:
+            gate = await _check_unified_data_quality(symbol="BTC/USDT", min_score=0.45)
+            if not gate.get("ok", True):
+                await _notify_quality_warning("优化任务低质量放行（AI自主判断）", gate)
             sm = main_controller.strategy_manager
             if hasattr(sm, "trigger_daily_optimization_now"):
-                return await sm.trigger_daily_optimization_now()
+                out = await sm.trigger_daily_optimization_now()
+                if isinstance(out, dict):
+                    out["quality_gate"] = gate
+                return out
             await sm._run_daily_strategy_optimization()  # type: ignore[attr-defined]
-            return {"success": True, "message": "已触发每日优化批次"}
+            return {"success": True, "message": "已触发每日优化批次", "quality_gate": gate}
         except Exception as e:
             return {"success": False, "message": f"触发每日优化失败: {e}"}
 
@@ -683,6 +741,9 @@ def init_module_control_api(app, main_controller):
         if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
             return {"success": False, "message": "策略管理器未初始化"}
         try:
+            gate = await _check_unified_data_quality(symbol=str(payload.get("symbol") or "BTC/USDT"), min_score=0.4)
+            if not gate.get("ok", True):
+                await _notify_quality_warning("交易反馈低质量放行（AI自主判断）", gate)
             sm = main_controller.strategy_manager
             strategy_id = str(payload.get("strategy_id") or "").strip()
             if not strategy_id:
@@ -701,7 +762,7 @@ def init_module_control_api(app, main_controller):
                     total_trades=total_trades,
                     force_optimize=force_optimize,
                 )
-                return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
+                return {"success": True, "data": out, "quality_gate": gate, "timestamp": datetime.now().isoformat()}
             return {"success": False, "message": "当前策略管理器不支持交易反馈优化"}
         except Exception as e:
             return {"success": False, "message": f"提交交易反馈失败: {e}"}
@@ -757,6 +818,19 @@ def init_module_control_api(app, main_controller):
         可选 JSON：symbols, timeframe, lookback_days, timeout_seconds, max_symbols
         """
         payload = payload or {}
+        raw_symbols = payload.get("symbols") or ["BTC/USDT"]
+        if isinstance(raw_symbols, str):
+            gate_symbol = raw_symbols
+        elif isinstance(raw_symbols, list) and raw_symbols:
+            gate_symbol = str(raw_symbols[0])
+        else:
+            gate_symbol = "BTC/USDT"
+        gate = await _check_unified_data_quality(
+            symbol=gate_symbol,
+            min_score=float(payload.get("min_data_quality", 0.5) or 0.5),
+        )
+        if not gate.get("ok", True):
+            await _notify_quality_warning("研究任务低质量放行（AI自主判断）", gate)
         job_id = f"research_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
         job = {
             "job_id": job_id,
@@ -784,6 +858,7 @@ def init_module_control_api(app, main_controller):
             "message": "策略研究任务已提交后台执行",
             "job_id": job_id,
             "status": "queued",
+            "quality_gate": gate,
             "timestamp": datetime.now().isoformat(),
         }
 

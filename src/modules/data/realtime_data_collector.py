@@ -100,6 +100,7 @@ class RealTimeDataCollector:
 
         # 数据源配置
         self.data_sources: Dict[str, DataSourceConfig] = {}
+        self.source_instances: Dict[str, Any] = {}
 
         # 连接管理
         self.connections: Dict[str, Any] = {}
@@ -117,6 +118,21 @@ class RealTimeDataCollector:
         self._lock = asyncio.Lock()
 
         logger.info("实时数据采集器初始化完成")
+
+    async def start(self) -> None:
+        """启动采集器并连接全部已注册数据源。"""
+        if self._running:
+            return
+        await self.initialize()
+        for source_name in list(self.data_sources.keys()):
+            try:
+                await self.connect_source(source_name)
+            except Exception as e:
+                logger.warning(f"启动阶段连接数据源失败 {source_name}: {e}")
+
+    async def stop(self) -> None:
+        """停止采集器（兼容旧接口）。"""
+        await self.shutdown()
 
     async def initialize(self) -> None:
         """初始化实时数据采集器"""
@@ -185,7 +201,10 @@ class RealTimeDataCollector:
             websocket_url=websocket_url,
             rest_api_url=rest_api_url
         )
-        return self.register_data_source(config)
+        ok = self.register_data_source(config)
+        if ok and source is not None:
+            self.source_instances[name] = source
+        return ok
 
     def unregister_data_source(self, source_name: str) -> bool:
         """
@@ -209,6 +228,8 @@ class RealTimeDataCollector:
             del self.connection_status[source_name]
         if source_name in self.data_buffers:
             del self.data_buffers[source_name]
+        if source_name in self.source_instances:
+            del self.source_instances[source_name]
 
         logger.info(f"注销数据源: {source_name}")
         return True
@@ -383,11 +404,12 @@ class RealTimeDataCollector:
         
         while self._running and source_name in self.data_sources:
             try:
-                # 模拟交易所数据获取
+                # 优先使用真实交易所对象；不可用时再降级模拟数据。
                 await asyncio.sleep(config.update_interval)
-                
-                mock_data = self._generate_mock_data(config.symbol)
-                await self._process_data(source_name, mock_data)
+                source = self.source_instances.get(source_name)
+                live_data = await self._fetch_live_exchange_data(source, config.symbol)
+                payload = live_data if live_data else self._generate_mock_data(config.symbol)
+                await self._process_data(source_name, payload)
                 
             except asyncio.CancelledError:
                 break
@@ -396,6 +418,35 @@ class RealTimeDataCollector:
                 await asyncio.sleep(config.reconnect_delay)
         
         logger.info(f"交易所工作任务停止: {source_name}")
+
+    async def _fetch_live_exchange_data(self, source: Any, symbol: str) -> Optional[Dict[str, Any]]:
+        """从真实交易所对象提取 OHLCV 快照。"""
+        if not source:
+            return None
+        try:
+            ticker = await source.get_ticker(symbol) if hasattr(source, "get_ticker") else None
+            if not ticker:
+                return None
+            price = float(ticker.get("last") or ticker.get("close") or 0.0)
+            if price <= 0:
+                return None
+            high = float(ticker.get("high") or price)
+            low = float(ticker.get("low") or price)
+            open_price = float(ticker.get("open") or price)
+            volume = float(ticker.get("quoteVolume") or ticker.get("volume") or 0.0)
+            return {
+                "symbol": symbol,
+                "timestamp": datetime.now(),
+                "open": open_price,
+                "high": max(high, low, price),
+                "low": min(high, low, price),
+                "close": price,
+                "volume": max(0.0, volume),
+                "is_live": True,
+            }
+        except Exception as e:
+            logger.debug(f"抓取实时交易所数据失败 {symbol}: {e}")
+            return None
 
     def _generate_mock_data(self, symbol: str) -> Dict[str, Any]:
         """生成模拟数据"""
@@ -411,7 +462,8 @@ class RealTimeDataCollector:
             "high": base_price + random.normalvariate(50, 100),
             "low": base_price - random.normalvariate(50, 100),
             "close": base_price + random.normalvariate(0, 100),
-            "volume": abs(random.normalvariate(1000, 200))
+            "volume": abs(random.normalvariate(1000, 200)),
+            "is_live": False,
         }
 
     async def _process_data(self, source_name: str, raw_data: Dict[str, Any]) -> None:

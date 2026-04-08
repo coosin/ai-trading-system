@@ -624,4 +624,133 @@ A:
 
 ---
 
+## 2026-04-08 阶段优化进度快照（总控闭环）
+
+本阶段目标：先打通“策略研究 -> 优化 -> 生产审计 -> 交易反馈再优化”的前后端闭环，再进入数据源模块专项优化。
+
+### 后端链路优化进度
+
+- 研究任务异步化：
+  - `POST /api/v1/modules/strategy/research-run` 改为异步任务提交，返回 `job_id`
+  - 新增 `GET /api/v1/modules/strategy/research-jobs` 与 `GET /api/v1/modules/strategy/research-jobs/{job_id}`
+- 优化与反馈接口：
+  - 新增 `POST /api/v1/modules/strategy/optimize-now`（手动触发每日优化）
+  - 新增 `POST /api/v1/modules/strategy/trade-feedback`（交易结果回灌触发自适应参数优化）
+- 生产闭环可观测性：
+  - 新增 `GET /api/v1/modules/execution/production-audit`
+  - 风险侧动态 SL/TP（含波动、趋势、点差、深度不平衡）已纳入调整逻辑
+
+### 前端总控优化进度
+
+- `frontend/src/services/api.js` 已补齐模块接口封装：
+  - `getStrategyResearchJobs`
+  - `getStrategyResearchJob`
+  - `triggerStrategyOptimizeNow`
+  - `submitStrategyTradeFeedback`
+  - `getExecutionProductionAudit`
+  - `getStrategyOptimizationConfig`
+- `frontend/src/modules/control-hub/ControlHubModule.jsx` 已补齐控制面板能力：
+  - 研究任务提交后按 `job_id` 轮询状态
+  - 手动触发每日优化批次
+  - 手动提交交易反馈（含 `force_optimize`）
+  - 展示研究任务队列与生产执行审计 JSON
+  - 展示部署分层统计（paper/shadow/small/full）
+
+### 当前缺口与下一阶段
+
+- 当前缺口：数据源模块尚未完成“专项优化 + 深度融合门控”
+- 下一阶段（立即执行）：
+  1. 完整梳理数据源链路（market/external/data-fusion）
+  2. 建立数据质量评分与可执行门控（研究/优化触发前置检查）
+  3. 打通异常降级与缓存回退策略，降低外部数据抖动影响
+
+---
+
+## 2026-04-08 数据源统一化升级（双渠道）
+
+### 目标
+
+- 将分散的数据获取统一收口到一个模块中心，支持降级容错并提供中文可读输出给前端。
+
+### 已实施
+
+- 新增 `src/modules/data/data_source_hub.py`：
+  - 统一交易所渠道（渠道A）：行情、K线、订单簿、持仓、挂单、未平仓量、资金费率、爆仓风险代理
+  - 统一外部情报渠道（渠道B）：链上、新闻、舆情情绪
+  - 提供 `get_unified_snapshot(symbol)`，输出：
+    - `渠道A_交易所实时执行数据`
+    - `渠道B_链上新闻舆情数据`
+    - `统一分析判断`
+    - `数据质量评估`
+    - `数据来源状态`
+- API 接口统一收口到 Hub：
+  - 已改造 `market/ticker|klines|orderbook|symbols`
+  - 已改造 `data-fusion/analyze`
+  - 新增 `data-hub/status`
+  - 新增 `data-hub/unified-snapshot`
+  - 新增/补齐 `external/analyze-trends|signals|indicators`
+  - 增加 query 参数兼容路由，避免前后端调用断裂
+- 前端中文模块化接入：
+  - `frontend/src/services/api.js` 新增 `dataHub` API
+  - `frontend/src/modules/control-hub/ControlHubModule.jsx` 增加“统一双渠道快照（中文）”展示
+
+### 降级策略
+
+- 任一来源失败时不阻断总链路，自动退化到可用来源并标记 `provenance`。
+- 数据质量分会反映通道退化原因（如订单簿缺失、链上退化、舆情退化）。
+- 输出中保留来源状态说明，供策略与前端做风险提示。
+
+---
+
+## 2026-04-08 市场分析模块并入交易链路
+
+### 已完成
+
+- 保留并升级 `src/modules/data/own_market_analyzer.py`（不删除重做）：
+  - 通过 `DataSourceHub` 纳入统一分析输出
+  - 结果进入 `统一分析判断` 与 `大资金与大户监控`
+- `DataSourceHub` 增强：
+  - 自动回退读取 `ai_trading_engine` 已初始化的 `third_party_data` / `onchain_data`
+  - 汇总链上大户活跃、交易所资金流样本、盘口大单监控
+- 交易引擎联动：
+  - `AITradingEngine._analyze_market` 引入 `get_unified_snapshot(symbol)` 作为统一分析输入
+  - `AITradingEngine._make_decision` 新增数据质量门控（低质量数据禁止新开仓）
+- 主控制器联动：
+  - `MainController` 初始化 `data_source_hub`
+  - 修正信息收集器初始化顺序后的分析器引用同步（`market_analyzer`/`onchain_integrator`）
+
+### 作用
+
+- 所有关键数据（交易所+链上+新闻舆情+市场分析）进入统一快照，再进入交易决策，减少分散取数导致的判断偏差。
+- 在数据源退化时自动降级到“观望优先”，降低误开仓风险。
+
+---
+
+## 2026-04-08 数据质量评分与优化建议插件
+
+### 已完成
+
+- 新增 `src/modules/data/data_quality_advisor.py`：
+  - 基于统一快照给出：
+    - `quality_score`（当前数据质量）
+    - `effectiveness_score`（对交易决策的作用）
+    - `stability_score`（历史窗口稳定性）
+    - `confidence/grade`
+    - `suggestions`（可执行优化建议）
+- `DataSourceHub` 已接入顾问模块：
+  - 在 `get_unified_snapshot(symbol)` 输出新增 `数据质量与作用评分`
+  - 支持短期历史表现评分（窗口化）
+- API 已开放：
+  - `GET /api/v1/data-hub/quality-advice?symbol=...`
+- 前端总控已展示：
+  - 评分等级、置信度、质量分、作用分、稳定性
+  - 中文建议列表
+
+### 说明
+
+- 该能力采用“插件化风格”，可继续接入 plugin manager 做热插拔版本管理。
+- 当前先以稳定接入为主，后续可扩展到“按策略维度评分”和“按执行结果回灌评分”。
+
+---
+
 **Happy Coding! 🚀**

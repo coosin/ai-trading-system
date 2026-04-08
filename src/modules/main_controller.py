@@ -351,6 +351,7 @@ class MainController:
         self.unified_trade_system = None         # 统一交易系统
         self.unified_risk_system = None          # 统一风险系统
         self.unified_info_collector = None       # 统一信息收集器
+        self.data_source_hub = None              # 统一数据源中心
         
         # 新增升级模块
         self.dynamic_position_manager = None     # 动态仓位管理器
@@ -1060,9 +1061,26 @@ class MainController:
             )
             await self.unified_info_collector.initialize()
             logger.info("✅ 统一信息收集分析管理器已初始化")
+
+            # 统一信息收集器初始化后，再同步关键分析引用（避免初始化顺序导致引用为空）
+            if hasattr(self.unified_info_collector, "market_analyzer"):
+                self.market_analyzer = self.unified_info_collector.market_analyzer
+                logger.info("✅ 市场分析器引用已同步")
+            if hasattr(self.unified_info_collector, "onchain_integrator"):
+                self.onchain_integrator = self.unified_info_collector.onchain_integrator
+                logger.info("✅ 链上数据集成器引用已同步")
         except Exception as e:
             logger.warning(f"⚠️ 统一信息收集分析管理器初始化失败: {e}")
             self.unified_info_collector = None
+
+        # 初始化统一数据源中心（双渠道）
+        try:
+            from src.modules.data.data_source_hub import DataSourceHub
+            self.data_source_hub = DataSourceHub(self)
+            logger.info("✅ 统一数据源中心已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 统一数据源中心初始化失败: {e}")
+            self.data_source_hub = None
         
         # 初始化缓存管理器
         try:

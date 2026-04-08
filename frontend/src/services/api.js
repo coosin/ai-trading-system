@@ -100,10 +100,21 @@ export const api = {
   },
   modules: {
     getStrategyOptimizationStatus: () => request('/modules/strategy/optimization-status'),
+    getStrategyOptimizationConfig: () => request('/modules/strategy/optimization-config'),
     updateStrategyOptimizationConfig: (data) =>
       request('/modules/strategy/optimization-config', { method: 'POST', body: JSON.stringify(data) }),
+    triggerStrategyOptimizeNow: () =>
+      request('/modules/strategy/optimize-now', { method: 'POST' }),
+    submitStrategyTradeFeedback: (data) =>
+      request('/modules/strategy/trade-feedback', { method: 'POST', body: JSON.stringify(data || {}) }),
     runStrategyResearch: (body) =>
       request('/modules/strategy/research-run', { method: 'POST', body: JSON.stringify(body || {}) }),
+    getStrategyResearchJobs: (limit = 20) =>
+      request(`/modules/strategy/research-jobs?limit=${Number(limit) || 20}`),
+    getStrategyResearchJob: (jobId) =>
+      request(`/modules/strategy/research-jobs/${encodeURIComponent(jobId)}`),
+    getExecutionProductionAudit: () =>
+      request('/modules/execution/production-audit'),
   },
   monitoring: {
     /** 若后端未实现则返回 404，总控会降级为空列表 */
@@ -117,6 +128,15 @@ export const api = {
       const q = new URLSearchParams(params).toString();
       return request(`/control-center/state${q ? `?${q}` : ''}`);
     },
+  },
+  dataHub: {
+    getStatus: () => request('/data-hub/status'),
+    getUnifiedSnapshot: (symbol = 'BTC/USDT') =>
+      request(`/data-hub/unified-snapshot?symbol=${encodeURIComponent(symbol)}`),
+    getQualityAdvice: (symbol = 'BTC/USDT') =>
+      request(`/data-hub/quality-advice?symbol=${encodeURIComponent(symbol)}`),
+    getAiAnalysis: (symbol = 'BTC/USDT') =>
+      request(`/data-hub/ai-analysis?symbol=${encodeURIComponent(symbol)}`),
   },
 };
 
