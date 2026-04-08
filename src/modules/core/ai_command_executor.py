@@ -1246,9 +1246,15 @@ class AICommandExecutor:
                 third_party_info.append("多源数据融合系统")
             
             # 检查第三方数据集成器
+            # 注意：项目现状主要使用 third_party_data_integrator（或 engine.third_party_data）
+            if hasattr(mc, 'third_party_data_integrator') and mc.third_party_data_integrator:
+                third_party_connected = True
+                third_party_info.append("第三方数据集成器(third_party_data_integrator)")
+
+            # 兼容旧字段名 third_party_integrator（历史遗留）
             if hasattr(mc, 'third_party_integrator') and mc.third_party_integrator:
                 third_party_connected = True
-                third_party_info.append("第三方数据集成器")
+                third_party_info.append("第三方数据集成器(third_party_integrator)")
             
             # 检查插件管理器
             if hasattr(mc, 'plugin_manager') and mc.plugin_manager:
@@ -1262,6 +1268,11 @@ class AICommandExecutor:
             if hasattr(mc, 'data_source_manager') and mc.data_source_manager:
                 third_party_connected = True
                 third_party_info.append("数据源管理器")
+
+            # 兼容：AI交易引擎内部第三方数据集成器
+            if hasattr(mc, 'ai_trading_engine') and mc.ai_trading_engine and hasattr(mc.ai_trading_engine, 'third_party_data') and mc.ai_trading_engine.third_party_data:
+                third_party_connected = True
+                third_party_info.append("AI交易引擎.third_party_data")
             
             if third_party_connected:
                 context_parts.append(f"\n🔌 第三方数据系统: ✅ 已连接")
