@@ -72,6 +72,8 @@ class TelegramBot:
         self._running = False
         self._polling_task = None
         self._last_update_id = 0
+        # 简易会话状态：用于追问时直接解释“上一条结果”，避免重复触发任务。
+        self._chat_state: Dict[int, Dict[str, Any]] = {}
         
         self.message_handlers: List[Callable] = []
         
@@ -251,6 +253,16 @@ class TelegramBot:
                 ))
                 return
 
+            # 追问理解：若用户在追问“哪几项失败/说清楚”，优先用上一条巡检结果直接解释。
+            follow_up = await self._maybe_answer_follow_up_from_context(message)
+            if follow_up:
+                await self._send_message(TelegramResponse(
+                    chat_id=message.chat_id,
+                    text=follow_up,
+                    reply_to_message_id=message.message_id
+                ))
+                return
+
             profile = self._load_ai_commander_profile()
             enriched_text = self._build_enriched_user_message(text, profile)
 
@@ -260,6 +272,15 @@ class TelegramBot:
                     enriched_text,
                     source="telegram",
                 )
+                # 保存最近一次结果，供后续追问解释
+                try:
+                    self._chat_state[message.chat_id] = {
+                        "last_result": result if isinstance(result, dict) else {"response": str(result)},
+                        "last_input": text,
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                except Exception:
+                    pass
                 # 兼容不同模块返回口径：response/message/text
                 response_text = (
                     (result or {}).get("response")
@@ -334,6 +355,58 @@ class TelegramBot:
                 chat_id=message.chat_id,
                 text=f"处理消息时出错: {str(e)}"
             ))
+
+    async def _maybe_answer_follow_up_from_context(self, message: TelegramMessage) -> Optional[str]:
+        """
+        对“失败项追问”做会话级回答，不重复触发巡检任务。
+        """
+        text = (message.text or "").strip()
+        if not text:
+            return None
+        low = text.lower()
+        ask_failure_detail = (
+            ("失败" in text and ("哪" in text or "什么" in text or "说清楚" in text or "详情" in text))
+            or ("which" in low and "fail" in low)
+        )
+        if not ask_failure_detail:
+            return None
+
+        state = self._chat_state.get(message.chat_id) or {}
+        last = state.get("last_result") if isinstance(state, dict) else None
+        if not isinstance(last, dict):
+            return None
+
+        data = last.get("data") if isinstance(last.get("data"), dict) else {}
+        results = data.get("results") if isinstance(data.get("results"), list) else []
+        if not results:
+            return None
+
+        def _is_benign(msg: str) -> bool:
+            m = (msg or "").lower()
+            markers = ("缺少编辑请求", "缺少开发请求", "缺少审查请求", "missing request", "no request")
+            return any(x in msg for x in markers) or any(x in m for x in markers)
+
+        actionable = [
+            r for r in results
+            if isinstance(r, dict)
+            and str(r.get("status") or "").lower() == "failed"
+            and not _is_benign(str(r.get("message") or ""))
+        ]
+        if not actionable:
+            return None
+
+        lines = [f"你问得对，上一条巡检里可执行失败共有 {len(actionable)} 项：", ""]
+        for i, r in enumerate(actionable[:8], start=1):
+            name = str(r.get("skill_name") or "unknown")
+            msg = str(r.get("message") or "").strip()
+            recs = r.get("recommendations") if isinstance(r.get("recommendations"), list) else []
+            rec = f"；建议：{recs[0]}" if recs else ""
+            if len(msg) > 180:
+                msg = msg[:180] + "…"
+            lines.append(f"{i}) {name}: {msg}{rec}")
+        lines.append("")
+        lines.append("如果你要，我可以现在重新执行一次巡检并对比变化。")
+        return "\n".join(lines)
 
     async def _try_commander_fallback(self, user_text: str) -> Optional[str]:
         """
