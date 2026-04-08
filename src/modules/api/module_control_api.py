@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,89 @@ def init_module_control_api(app, main_controller):
     from fastapi import APIRouter, Body
 
     router = APIRouter(prefix="/api/v1/modules", tags=["modules"])
+    research_jobs: Dict[str, Dict[str, Any]] = {}
+    research_jobs_lock = asyncio.Lock()
+    research_semaphore = asyncio.Semaphore(1)
+
+    async def _run_research_job(job_id: str, payload: Dict[str, Any]) -> None:
+        """后台执行研究任务，避免阻塞 API worker。"""
+        if not main_controller:
+            async with research_jobs_lock:
+                research_jobs[job_id]["status"] = "failed"
+                research_jobs[job_id]["message"] = "主控制器未初始化"
+                research_jobs[job_id]["finished_at"] = datetime.now().isoformat()
+            return
+
+        pipeline = getattr(main_controller, "strategy_research_pipeline", None)
+        if not pipeline:
+            async with research_jobs_lock:
+                research_jobs[job_id]["status"] = "failed"
+                research_jobs[job_id]["message"] = "策略研究流水线未初始化"
+                research_jobs[job_id]["finished_at"] = datetime.now().isoformat()
+            return
+
+        raw_syms = payload.get("symbols") or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+        if isinstance(raw_syms, str):
+            symbols = [raw_syms]
+        elif isinstance(raw_syms, list):
+            symbols = [str(s) for s in raw_syms if s]
+        else:
+            symbols = ["BTC/USDT", "ETH/USDT"]
+
+        timeframe = str(payload.get("timeframe") or "1h")
+        lookback_days = max(7, int(payload.get("lookback_days") or 28))
+        timeout_sec = max(120, int(payload.get("timeout_seconds") or 1800))
+        max_symbols = max(1, int(payload.get("max_symbols") or min(6, len(symbols))))
+        sym_slice = symbols[:max_symbols]
+
+        async with research_jobs_lock:
+            research_jobs[job_id].update(
+                {
+                    "status": "running",
+                    "symbols_used": sym_slice,
+                    "timeframe": timeframe,
+                    "lookback_days": lookback_days,
+                    "timeout_seconds": timeout_sec,
+                    "started_at": datetime.now().isoformat(),
+                }
+            )
+
+        def _run_cycle_in_thread() -> Dict[str, Any]:
+            # 在独立线程事件循环中执行重型研究流程，避免阻塞主 API loop。
+            return asyncio.run(
+                pipeline.run_cycle(symbols=sym_slice, timeframe=timeframe, lookback_days=lookback_days)
+            )
+
+        try:
+            async with research_semaphore:
+                result = await asyncio.wait_for(asyncio.to_thread(_run_cycle_in_thread), timeout=timeout_sec)
+            async with research_jobs_lock:
+                research_jobs[job_id].update(
+                    {
+                        "status": "completed",
+                        "result": result,
+                        "finished_at": datetime.now().isoformat(),
+                    }
+                )
+        except asyncio.TimeoutError:
+            async with research_jobs_lock:
+                research_jobs[job_id].update(
+                    {
+                        "status": "failed",
+                        "message": f"策略研发执行超时（>{timeout_sec}s）",
+                        "finished_at": datetime.now().isoformat(),
+                    }
+                )
+        except Exception as e:
+            logger.exception("手动策略研发失败")
+            async with research_jobs_lock:
+                research_jobs[job_id].update(
+                    {
+                        "status": "failed",
+                        "message": str(e),
+                        "finished_at": datetime.now().isoformat(),
+                    }
+                )
     
     @router.get("/list")
     async def get_all_modules():
@@ -560,6 +644,112 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             return {"success": False, "message": f"更新策略优化参数失败: {e}"}
 
+    @router.get("/strategy/optimization-config")
+    async def get_strategy_optimization_config():
+        """读取当前策略优化运行参数。"""
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        try:
+            sm = main_controller.strategy_manager
+            status = sm.get_optimization_status() if hasattr(sm, "get_optimization_status") else {}
+            return {
+                "success": True,
+                "config": (status.get("runtime_config", {}) if isinstance(status, dict) else {}),
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": f"读取策略优化参数失败: {e}"}
+
+    @router.post("/strategy/optimize-now")
+    async def trigger_strategy_optimization_now():
+        """手动触发一次每日优化批次（用于运维/验收）。"""
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        try:
+            sm = main_controller.strategy_manager
+            if hasattr(sm, "trigger_daily_optimization_now"):
+                return await sm.trigger_daily_optimization_now()
+            await sm._run_daily_strategy_optimization()  # type: ignore[attr-defined]
+            return {"success": True, "message": "已触发每日优化批次"}
+        except Exception as e:
+            return {"success": False, "message": f"触发每日优化失败: {e}"}
+
+    @router.post("/strategy/trade-feedback")
+    async def submit_strategy_trade_feedback(payload: Dict[str, Any]):
+        """
+        提交交易结果反馈，驱动策略参数自适应收敛并可联动优化批次。
+        body: strategy_id, pnl, win_rate?, max_drawdown?, total_trades?, force_optimize?
+        """
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        try:
+            sm = main_controller.strategy_manager
+            strategy_id = str(payload.get("strategy_id") or "").strip()
+            if not strategy_id:
+                return {"success": False, "message": "strategy_id 不能为空"}
+            pnl = float(payload.get("pnl", 0.0) or 0.0)
+            win_rate = payload.get("win_rate")
+            max_drawdown = payload.get("max_drawdown")
+            total_trades = payload.get("total_trades")
+            force_optimize = bool(payload.get("force_optimize", False))
+            if hasattr(sm, "apply_trade_feedback"):
+                out = await sm.apply_trade_feedback(
+                    strategy_id=strategy_id,
+                    pnl=pnl,
+                    win_rate=win_rate,
+                    max_drawdown=max_drawdown,
+                    total_trades=total_trades,
+                    force_optimize=force_optimize,
+                )
+                return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
+            return {"success": False, "message": "当前策略管理器不支持交易反馈优化"}
+        except Exception as e:
+            return {"success": False, "message": f"提交交易反馈失败: {e}"}
+
+    @router.get("/execution/production-audit")
+    async def get_production_execution_audit():
+        """
+        生产执行链路审查：
+        开仓、平仓、止盈、止损、跟踪止损、交易所连通、执行网关状态。
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        mc = main_controller
+        out: Dict[str, Any] = {
+            "success": True,
+            "timestamp": datetime.now().isoformat(),
+            "checks": {},
+        }
+        try:
+            gw = getattr(mc, "execution_gateway", None)
+            out["checks"]["execution_gateway"] = bool(gw is not None)
+            if gw:
+                out["execution_spine"] = await gw.get_snapshot()
+
+            ex = mc.get_exchange() if hasattr(mc, "get_exchange") else None
+            out["checks"]["exchange_connected"] = bool(ex is not None)
+
+            slm = getattr(mc, "stop_loss_manager", None)
+            out["checks"]["stop_loss_manager"] = bool(slm is not None)
+            if slm:
+                stats = slm.get_stats()
+                out["sltp_stats"] = stats
+                out["checks"]["dynamic_market_adjustment"] = bool(
+                    getattr(slm.config, "enable_dynamic_market_adjustment", False)
+                )
+                out["checks"]["trailing_stop_enabled"] = bool(
+                    getattr(slm.config, "enable_trailing_stop", False)
+                )
+                out["checks"]["execute_exchange_on_trigger"] = bool(
+                    getattr(slm.config, "execute_exchange_on_trigger", False)
+                )
+                active_orders = await slm.get_all_active_orders()
+                out["active_orders"] = [o.to_dict() for o in active_orders[:20]]
+
+            return out
+        except Exception as e:
+            return {"success": False, "message": f"生产执行审查失败: {e}", "timestamp": datetime.now().isoformat()}
+
     @router.post("/strategy/research-run")
     async def run_strategy_research_now(payload: Optional[Dict[str, Any]] = Body(None)):
         """
@@ -567,48 +757,56 @@ def init_module_control_api(app, main_controller):
         可选 JSON：symbols, timeframe, lookback_days, timeout_seconds, max_symbols
         """
         payload = payload or {}
-        if not main_controller:
-            return {"success": False, "message": "主控制器未初始化"}
-        pipeline = getattr(main_controller, "strategy_research_pipeline", None)
-        if not pipeline:
-            return {"success": False, "message": "策略研究流水线未初始化"}
+        job_id = f"research_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "created_at": datetime.now().isoformat(),
+            "payload": payload,
+            "result": None,
+            "message": "",
+            "started_at": None,
+            "finished_at": None,
+        }
+        async with research_jobs_lock:
+            research_jobs[job_id] = job
+            # 控制历史长度，避免内存无限增长
+            if len(research_jobs) > 50:
+                old_keys = sorted(
+                    research_jobs.keys(),
+                    key=lambda k: research_jobs[k].get("created_at", "")
+                )[:-50]
+                for k in old_keys:
+                    research_jobs.pop(k, None)
+        asyncio.create_task(_run_research_job(job_id, payload))
+        return {
+            "success": True,
+            "message": "策略研究任务已提交后台执行",
+            "job_id": job_id,
+            "status": "queued",
+            "timestamp": datetime.now().isoformat(),
+        }
 
-        raw_syms = payload.get("symbols") or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
-        if isinstance(raw_syms, str):
-            symbols = [raw_syms]
-        elif isinstance(raw_syms, list):
-            symbols = [str(s) for s in raw_syms if s]
-        else:
-            symbols = ["BTC/USDT", "ETH/USDT"]
+    @router.get("/strategy/research-jobs")
+    async def list_strategy_research_jobs(limit: int = 20):
+        """查询最近策略研究任务列表。"""
+        safe_limit = max(1, min(int(limit), 100))
+        async with research_jobs_lock:
+            jobs = sorted(
+                research_jobs.values(),
+                key=lambda x: x.get("created_at", ""),
+                reverse=True,
+            )[:safe_limit]
+        return {"success": True, "jobs": jobs, "timestamp": datetime.now().isoformat()}
 
-        timeframe = str(payload.get("timeframe") or "1h")
-        lookback_days = max(7, int(payload.get("lookback_days") or 28))
-        timeout_sec = max(60, int(payload.get("timeout_seconds") or 900))
-        max_symbols = max(1, int(payload.get("max_symbols") or min(6, len(symbols))))
-        sym_slice = symbols[:max_symbols]
-
-        try:
-            result = await asyncio.wait_for(
-                pipeline.run_cycle(symbols=sym_slice, timeframe=timeframe, lookback_days=lookback_days),
-                timeout=timeout_sec,
-            )
-            return {
-                "success": True,
-                "symbols_used": sym_slice,
-                "timeframe": timeframe,
-                "lookback_days": lookback_days,
-                "result": result,
-                "timestamp": datetime.now().isoformat(),
-            }
-        except asyncio.TimeoutError:
-            return {
-                "success": False,
-                "message": f"策略研发执行超时（>{timeout_sec}s），可增大 timeout_seconds 后重试",
-                "symbols_used": sym_slice,
-            }
-        except Exception as e:
-            logger.exception("手动策略研发失败")
-            return {"success": False, "message": str(e), "symbols_used": sym_slice}
+    @router.get("/strategy/research-jobs/{job_id}")
+    async def get_strategy_research_job(job_id: str):
+        """查询单个策略研究任务状态。"""
+        async with research_jobs_lock:
+            job = research_jobs.get(job_id)
+        if not job:
+            return {"success": False, "message": "任务不存在", "job_id": job_id}
+        return {"success": True, "job": job, "timestamp": datetime.now().isoformat()}
 
     s1_router = APIRouter(prefix="/api/v1/s1", tags=["s1"])
 

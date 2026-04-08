@@ -10,7 +10,9 @@ Strategy research pipeline:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,6 +42,13 @@ class StrategyResearchPipeline:
         self.slippage_rate = 0.0003
         self.fold_count = 3
         self.train_ratio = 0.7
+        # Resource guardrails: keep heavy research bounded.
+        self.max_parallel_symbols = 2
+        self.max_candidates_per_symbol = 12
+        self.max_backtests_per_cycle = 240
+        self.per_symbol_time_budget_sec = 25.0
+        self._bt_calls = 0
+        self._symbol_semaphore = asyncio.Semaphore(self.max_parallel_symbols)
 
     async def run_cycle(self, symbols: List[str], timeframe: str = "1h", lookback_days: int = 30) -> Dict[str, Any]:
         # load config (best-effort)
@@ -60,20 +69,45 @@ class StrategyResearchPipeline:
                 if isinstance(wf, dict):
                     self.fold_count = int(wf.get("folds", self.fold_count))
                     self.train_ratio = float(wf.get("train_ratio", self.train_ratio))
+                limits = cfg.get("resource_limits", {})
+                if isinstance(limits, dict):
+                    self.max_parallel_symbols = max(1, int(limits.get("max_parallel_symbols", self.max_parallel_symbols) or self.max_parallel_symbols))
+                    self.max_candidates_per_symbol = max(4, int(limits.get("max_candidates_per_symbol", self.max_candidates_per_symbol) or self.max_candidates_per_symbol))
+                    self.max_backtests_per_cycle = max(40, int(limits.get("max_backtests_per_cycle", self.max_backtests_per_cycle) or self.max_backtests_per_cycle))
+                    self.per_symbol_time_budget_sec = max(5.0, float(limits.get("per_symbol_time_budget_sec", self.per_symbol_time_budget_sec) or self.per_symbol_time_budget_sec))
         except Exception:
             pass
 
+        self._bt_calls = 0
+        self._symbol_semaphore = asyncio.Semaphore(self.max_parallel_symbols)
         results: Dict[str, Any] = {"published": [], "rejected": [], "errors": []}
-        for sym in symbols:
-            try:
-                published = await self._research_symbol(sym, timeframe=timeframe, lookback_days=lookback_days)
-                results["published"].extend(published)
-            except Exception as e:
-                logger.error(f"research cycle failed for {sym}: {e}")
-                results["errors"].append({"symbol": sym, "error": str(e)})
+        unique_symbols = []
+        seen = set()
+        for s in symbols:
+            x = str(s or "").strip()
+            if x and x not in seen:
+                unique_symbols.append(x)
+                seen.add(x)
+
+        async def _run_one(sym: str):
+            async with self._symbol_semaphore:
+                try:
+                    return {"symbol": sym, "published": await self._research_symbol(sym, timeframe=timeframe, lookback_days=lookback_days)}
+                except Exception as e:
+                    logger.error(f"research cycle failed for {sym}: {e}")
+                    return {"symbol": sym, "error": str(e)}
+
+        jobs = [asyncio.create_task(_run_one(sym)) for sym in unique_symbols]
+        for out in await asyncio.gather(*jobs, return_exceptions=False):
+            if isinstance(out, dict) and out.get("error"):
+                results["errors"].append({"symbol": out.get("symbol"), "error": out.get("error")})
+            else:
+                results["published"].extend(out.get("published", []))
+        results["backtest_calls"] = self._bt_calls
         return results
 
     async def _research_symbol(self, symbol: str, timeframe: str, lookback_days: int) -> List[Dict[str, Any]]:
+        started_at = datetime.now()
         exchange = getattr(getattr(self.main_controller, "ai_trading_engine", None), "exchange", None)
         if not exchange:
             return []
@@ -84,10 +118,18 @@ class StrategyResearchPipeline:
             return []
 
         folds = self._walk_forward_folds(df, folds=max(1, self.fold_count), train_ratio=self.train_ratio)
-        candidates = self._generate_candidates(symbol, timeframe)
+        market_ctx = await self._build_market_context(symbol)
+        candidates = self._generate_candidates(symbol, timeframe, market_ctx)
+        candidates = self._limit_candidates(candidates, market_ctx)
 
         published: List[Dict[str, Any]] = []
         for dsl in candidates:
+            if (datetime.now() - started_at).total_seconds() >= self.per_symbol_time_budget_sec:
+                logger.info("research time budget reached for %s; stop evaluating remaining candidates", symbol)
+                break
+            if self._bt_calls >= self.max_backtests_per_cycle:
+                logger.warning("research backtest budget reached (%s); stopping cycle", self.max_backtests_per_cycle)
+                break
             validate_dsl(dsl)
             # multi-fold walk-forward: optimize on each train window, score on test windows
             fold_scores: List[Dict[str, Any]] = []
@@ -98,6 +140,8 @@ class StrategyResearchPipeline:
                 test_metrics = await self._backtest(best_dsl, test_df)
                 fold_scores.append(test_metrics)
                 best_train = train_metrics
+                if self._bt_calls >= self.max_backtests_per_cycle:
+                    break
             test_metrics = self._aggregate_fold_metrics(fold_scores)
 
             if self._passes_gates(test_metrics):
@@ -177,8 +221,35 @@ class StrategyResearchPipeline:
             "folds": folds,
         }
 
-    def _generate_candidates(self, symbol: str, timeframe: str) -> List[Dict[str, Any]]:
+    async def _build_market_context(self, symbol: str) -> Dict[str, Any]:
+        """融合行情与第三方信息，指导候选策略生成。"""
+        out: Dict[str, Any] = {"volatility": None, "sentiment": "neutral", "market_mood": "neutral"}
+        mc = self.main_controller
+        try:
+            ui = getattr(mc, "unified_info_collector", None) if mc else None
+            if ui and hasattr(ui, "get_market_info"):
+                mi = ui.get_market_info(symbol)
+                if mi:
+                    out["volatility"] = getattr(mi, "volatility_24h", None)
+                    out["sentiment"] = getattr(mi, "market_mood", out["sentiment"])
+                    out["market_mood"] = getattr(mi, "market_mood", out["market_mood"])
+        except Exception:
+            pass
+        try:
+            eng = getattr(mc, "ai_trading_engine", None) if mc else None
+            if eng and hasattr(eng, "exchange") and eng.exchange and hasattr(eng.exchange, "get_market_data"):
+                md = await eng.exchange.get_market_data(symbol)
+                if isinstance(md, dict):
+                    vol = md.get("volatility") or md.get("volatility_24h")
+                    if isinstance(vol, (int, float)):
+                        out["volatility"] = float(vol)
+        except Exception:
+            pass
+        return out
+
+    def _generate_candidates(self, symbol: str, timeframe: str, market_ctx: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         symbol = normalize_symbol(symbol)
+        market_ctx = market_ctx or {}
         base = {
             "symbol": symbol,
             "timeframe": timeframe,
@@ -262,7 +333,43 @@ class StrategyResearchPipeline:
                         "metadata": {"generator": "grid", "kind": "pin_catch"},
                     }
                 )
+        vol = market_ctx.get("volatility")
+        mood = str(market_ctx.get("market_mood", "neutral") or "neutral").lower()
+        if isinstance(vol, (int, float)) and vol >= 0.05:
+            candidates.extend([c for c in candidates if "volatility" in (c.get("tags") or [])][:6])
+        if "bear" in mood or "fear" in mood:
+            candidates.extend([c for c in candidates if "breakout" in (c.get("tags") or [])][:4])
+        if "bull" in mood or "greed" in mood:
+            candidates.extend([c for c in candidates if "ma" in (c.get("tags") or [])][:4])
+        random.shuffle(candidates)
         return candidates
+
+    def _limit_candidates(self, candidates: List[Dict[str, Any]], market_ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """限制候选规模，按市场上下文偏好排序后截断。"""
+        mood = str(market_ctx.get("market_mood", "neutral") or "neutral").lower()
+        vol = market_ctx.get("volatility")
+
+        def score(c: Dict[str, Any]) -> float:
+            tags = set(c.get("tags") or [])
+            s = 0.0
+            if "ma" in tags:
+                s += 1.0
+            if "breakout" in tags:
+                s += 1.0
+            if "volatility" in tags:
+                s += 0.8
+            if "scalping" in tags:
+                s += 0.6
+            if isinstance(vol, (int, float)) and vol >= 0.05 and "volatility" in tags:
+                s += 1.2
+            if ("bull" in mood or "greed" in mood) and "ma" in tags:
+                s += 0.8
+            if ("bear" in mood or "fear" in mood) and "breakout" in tags:
+                s += 0.8
+            return s
+
+        ranked = sorted(candidates, key=score, reverse=True)
+        return ranked[: self.max_candidates_per_symbol]
 
     @staticmethod
     def _map_strategy_type(dsl: Dict[str, Any]) -> str:
@@ -303,6 +410,17 @@ class StrategyResearchPipeline:
         return best_dsl, best_metrics
 
     async def _backtest(self, dsl: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
+        if self._bt_calls >= self.max_backtests_per_cycle:
+            return {
+                "final_balance": 10000.0,
+                "total_pnl": -9999.0,
+                "win_rate": 0.0,
+                "max_drawdown": 1.0,
+                "sharpe_ratio": -9.0,
+                "total_trades": 0,
+                "estimated_cost": 0.0,
+            }
+        self._bt_calls += 1
         validate_dsl(dsl)
         config = BacktestConfig(
             symbol=dsl.get("symbol", "BTC/USDT"),
@@ -374,6 +492,11 @@ class StrategyResearchPipeline:
             "initial_capital": 10000.0,
             "metadata": {
                 "dsl": dsl,
+                "deployment": {
+                    "stage": "shadow",
+                    "cap_multiplier": 0.25,
+                    "policy": "auto_rollout",
+                },
                 "research": {
                     "train": train_metrics,
                     "test": test_metrics,

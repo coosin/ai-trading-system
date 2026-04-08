@@ -591,6 +591,16 @@ class StrategyManager:
             "daily_batch_time_budget_sec": 1.5,
             "daily_opt_cycle_seconds": 300,
         }
+        self._signal_runtime_config: Dict[str, Any] = {
+            "max_parallel_signal_tasks": 4,
+        }
+        self._deployment_runtime_config: Dict[str, Any] = {
+            "promote_min_score": 0.95,
+            "promote_min_trades": 20,
+            "demote_max_drawdown": 0.35,
+            "demote_min_score": 0.2,
+        }
+        self._last_trade_feedback_opt_at: Optional[datetime] = None
 
         logger.info("策略管理器初始化完成")
 
@@ -696,6 +706,14 @@ class StrategyManager:
                     logger.error(f"策略配置缺少必要字段: {field}")
                     return None
 
+            md = config_data.get("metadata", {}) if isinstance(config_data.get("metadata", {}), dict) else {}
+            if "deployment" not in md:
+                sid = str(config_data.get("strategy_id", ""))
+                if sid.startswith(("default_", "combined_")):
+                    md["deployment"] = {"stage": "full", "cap_multiplier": 1.0}
+                else:
+                    md["deployment"] = {"stage": "shadow", "cap_multiplier": 0.25}
+
             # 创建配置
             config = StrategyConfig(
                 strategy_id=config_data["strategy_id"],
@@ -709,7 +727,7 @@ class StrategyManager:
                 symbols=config_data.get("symbols", []),
                 timeframe=config_data.get("timeframe", "1h"),
                 initial_capital=config_data.get("initial_capital", 10000.0),
-                metadata=config_data.get("metadata", {}),
+                metadata=md,
             )
 
             # 保存配置
@@ -1026,41 +1044,49 @@ class StrategyManager:
             # 找到关注此交易对的运行中策略
             running_instances = await self.get_strategy_instances(status=StrategyStatus.RUNNING)
 
-            for instance in running_instances:
-                if symbol in instance.config.symbols:
+            max_parallel = max(1, int(self._signal_runtime_config.get("max_parallel_signal_tasks", 4) or 4))
+            sem = asyncio.Semaphore(max_parallel)
+            target_instances = [i for i in running_instances if symbol in i.config.symbols]
+
+            async def _run_instance(instance: StrategyInstance) -> List[TradingSignal]:
+                async with sem:
                     try:
-                        # 传递市场数据给策略
-                        if instance.instance:
-                            await instance.instance.on_market_data(symbol, data)
-
-                        # 生成信号
+                        if not instance.instance:
+                            return []
+                        await instance.instance.on_market_data(symbol, data)
                         signals = await instance.instance.generate_signals()
-
+                        out: List[TradingSignal] = []
                         for signal in signals:
-                            # 设置策略信息
                             signal.strategy_id = instance.config.strategy_id
                             signal.instance_id = instance.instance_id
-
-                            # 生成信号ID
                             signal.signal_id = f"signal_{uuid.uuid4().hex[:8]}"
-
-                            # 保存信号
-                            async with self._lock:
-                                self.signals[signal.signal_id] = signal
-                                self.signal_history.append(signal)
-
-                                # 限制历史记录长度
-                                if len(self.signal_history) > 10000:
-                                    self.signal_history = self.signal_history[-10000:]
-
-                            # 更新实例统计
-                            instance.last_signal_at = datetime.now()
-                            instance.total_signals += 1
-
-                            all_signals.append(signal)
-
+                            stage = self._get_deployment_stage(instance.config)
+                            mult = self._deployment_cap_multiplier(stage)
+                            signal.confidence = max(0.0, min(1.0, float(signal.confidence or 0.0) * mult))
+                            signal.metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+                            signal.metadata["deployment_stage"] = stage
+                            signal.metadata["cap_multiplier"] = mult
+                            out.append(signal)
+                        return out
                     except Exception as e:
                         logger.error(f"策略处理市场数据失败 {instance.instance_id}: {e}")
+                        return []
+
+            per_instance_signals = await asyncio.gather(
+                *[asyncio.create_task(_run_instance(inst)) for inst in target_instances],
+                return_exceptions=False,
+            )
+
+            for inst, signals in zip(target_instances, per_instance_signals):
+                for signal in signals:
+                    async with self._lock:
+                        self.signals[signal.signal_id] = signal
+                        self.signal_history.append(signal)
+                        if len(self.signal_history) > 10000:
+                            self.signal_history = self.signal_history[-10000:]
+                    inst.last_signal_at = datetime.now()
+                    inst.total_signals += 1
+                    all_signals.append(signal)
 
             if all_signals:
                 logger.debug(f"处理市场数据生成 {len(all_signals)} 个信号: {symbol}")
@@ -2121,9 +2147,75 @@ class StrategyManager:
                     total,
                     processed_now,
                 )
+            await self._auto_manage_deployment_stages()
+
+    def _get_deployment_stage(self, config: StrategyConfig) -> str:
+        md = config.metadata if isinstance(config.metadata, dict) else {}
+        dep = md.get("deployment", {}) if isinstance(md.get("deployment", {}), dict) else {}
+        stage = str(dep.get("stage", "full") or "full").lower()
+        if stage not in {"paper", "shadow", "small", "full"}:
+            stage = "full"
+        return stage
+
+    def _set_deployment_stage(self, config: StrategyConfig, stage: str, reason: str = "") -> None:
+        md = config.metadata if isinstance(config.metadata, dict) else {}
+        dep = md.get("deployment", {}) if isinstance(md.get("deployment", {}), dict) else {}
+        dep["stage"] = stage
+        dep["cap_multiplier"] = self._deployment_cap_multiplier(stage)
+        dep["updated_at"] = datetime.now().isoformat()
+        if reason:
+            dep["reason"] = reason
+        md["deployment"] = dep
+        config.metadata = md
+        config.updated_at = datetime.now()
+
+    @staticmethod
+    def _deployment_cap_multiplier(stage: str) -> float:
+        return {
+            "paper": 0.0,
+            "shadow": 0.25,
+            "small": 0.5,
+            "full": 1.0,
+        }.get(stage, 1.0)
+
+    async def _auto_manage_deployment_stages(self) -> None:
+        """自动分层发布：paper/shadow/small/full，按回测+实盘表现升降级。"""
+        promote_score = float(self._deployment_runtime_config.get("promote_min_score", 0.95) or 0.95)
+        promote_trades = int(self._deployment_runtime_config.get("promote_min_trades", 20) or 20)
+        demote_dd = float(self._deployment_runtime_config.get("demote_max_drawdown", 0.35) or 0.35)
+        demote_score = float(self._deployment_runtime_config.get("demote_min_score", 0.2) or 0.2)
+
+        for sid, cfg in self.strategy_configs.items():
+            if sid.startswith(("default_", "combined_")):
+                continue
+
+            stage = self._get_deployment_stage(cfg)
+            perf = self.performance_metrics.get(sid)
+            trades = int(getattr(perf, "total_trades", 0) or 0) if perf else 0
+            dd = float(getattr(perf, "max_drawdown", 0.0) or 0.0) if perf else 0.0
+            score = self._calc_strategy_pool_score(sid, cfg)
+
+            if dd >= demote_dd or score <= demote_score:
+                if stage in {"full", "small"}:
+                    self._set_deployment_stage(cfg, "shadow", reason=f"demote dd={dd:.3f} score={score:.3f}")
+                elif stage == "shadow":
+                    self._set_deployment_stage(cfg, "paper", reason=f"demote dd={dd:.3f} score={score:.3f}")
+                continue
+
+            if score >= promote_score and trades >= promote_trades:
+                if stage == "paper":
+                    self._set_deployment_stage(cfg, "shadow", reason=f"promote score={score:.3f}")
+                elif stage == "shadow":
+                    self._set_deployment_stage(cfg, "small", reason=f"promote score={score:.3f}")
+                elif stage == "small":
+                    self._set_deployment_stage(cfg, "full", reason=f"promote score={score:.3f}")
 
     def get_optimization_status(self) -> Dict[str, Any]:
         """给 API/UI 查询策略池与每日优化状态。"""
+        stage_counts = {"paper": 0, "shadow": 0, "small": 0, "full": 0}
+        for cfg in self.strategy_configs.values():
+            st = self._get_deployment_stage(cfg)
+            stage_counts[st] = stage_counts.get(st, 0) + 1
         return {
             "pool_limit": int(self._optimization_runtime_config.get("pool_limit", 30) or 30),
             "total_strategies": len(self.strategy_configs),
@@ -2131,6 +2223,7 @@ class StrategyManager:
             "daily_optimization": dict(self._daily_optimization_status),
             "last_daily_optimization_date": self._last_daily_optimization_date,
             "last_pool_prune_at": self._last_pool_prune_at.isoformat() if self._last_pool_prune_at else None,
+            "deployment_stage_counts": stage_counts,
         }
 
     def update_optimization_runtime_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -2141,6 +2234,10 @@ class StrategyManager:
             "daily_batch_size": (int, 1, 50),
             "daily_batch_time_budget_sec": (float, 0.2, 10.0),
             "daily_opt_cycle_seconds": (int, 60, 3600),
+            "promote_min_score": (float, 0.2, 5.0),
+            "promote_min_trades": (int, 5, 500),
+            "demote_max_drawdown": (float, 0.05, 0.95),
+            "demote_min_score": (float, -2.0, 2.0),
         }
         applied: Dict[str, Any] = {}
         for k, v in (updates or {}).items():
@@ -2153,11 +2250,114 @@ class StrategyManager:
                     val = lo
                 if val > hi:
                     val = hi
-                self._optimization_runtime_config[k] = val
+                if k in {"promote_min_score", "promote_min_trades", "demote_max_drawdown", "demote_min_score"}:
+                    self._deployment_runtime_config[k] = val
+                else:
+                    self._optimization_runtime_config[k] = val
                 applied[k] = val
             except Exception:
                 continue
         return applied
+
+    async def trigger_daily_optimization_now(self) -> Dict[str, Any]:
+        """外部触发一次每日优化批次（非阻塞循环外手动触发）。"""
+        started = datetime.now()
+        await self._run_daily_strategy_optimization()
+        status = self.get_optimization_status()
+        return {
+            "success": True,
+            "message": "已触发每日优化批次",
+            "status": status,
+            "elapsed_ms": round((datetime.now() - started).total_seconds() * 1000.0, 2),
+        }
+
+    async def apply_trade_feedback(
+        self,
+        strategy_id: str,
+        pnl: float,
+        win_rate: Optional[float] = None,
+        max_drawdown: Optional[float] = None,
+        total_trades: Optional[int] = None,
+        force_optimize: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        根据交易结果更新策略表现并做轻量自适应参数收敛。
+        目标：让生产结果持续反哺参数，并可定期触发增量优化。
+        """
+        if not strategy_id:
+            return {"success": False, "message": "strategy_id 不能为空"}
+
+        async with self._lock:
+            perf = self.performance_metrics.get(strategy_id)
+            if not perf:
+                perf = StrategyPerformance(strategy_id=strategy_id)
+                self.performance_metrics[strategy_id] = perf
+
+            perf.total_pnl = float(pnl)
+            if total_trades is not None:
+                perf.total_trades = max(0, int(total_trades))
+            if win_rate is not None:
+                try:
+                    wr = float(win_rate)
+                    perf.win_rate = wr if wr <= 1.0 else wr / 100.0
+                except Exception:
+                    pass
+            if max_drawdown is not None:
+                try:
+                    perf.max_drawdown = max(0.0, float(max_drawdown))
+                except Exception:
+                    pass
+            perf.last_updated = datetime.now()
+
+            cfg = self.strategy_configs.get(strategy_id)
+            if cfg:
+                params = cfg.parameters if isinstance(cfg.parameters, dict) else {}
+                stop_loss = float(params.get("stop_loss_pct", 0.03) or 0.03)
+                take_profit = float(params.get("take_profit_pct", 0.06) or 0.06)
+                dd = float(perf.max_drawdown or 0.0)
+
+                if dd >= 0.25 or pnl < 0:
+                    stop_loss = max(0.008, stop_loss * 0.93)
+                    take_profit = max(0.015, take_profit * 0.95)
+                elif dd <= 0.10 and pnl > 0:
+                    stop_loss = min(0.06, stop_loss * 1.02)
+                    take_profit = min(0.15, take_profit * 1.02)
+
+                params["stop_loss_pct"] = float(round(stop_loss, 4))
+                params["take_profit_pct"] = float(round(take_profit, 4))
+                cfg.parameters = params
+                md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+                md["trade_feedback"] = {
+                    "at": datetime.now().isoformat(),
+                    "pnl": float(round(pnl, 6)),
+                    "max_drawdown": float(round(dd, 6)),
+                    "stop_loss_pct": params["stop_loss_pct"],
+                    "take_profit_pct": params["take_profit_pct"],
+                }
+                cfg.metadata = md
+                cfg.updated_at = datetime.now()
+
+        should_opt = bool(force_optimize)
+        if not should_opt:
+            now = datetime.now()
+            if not self._last_trade_feedback_opt_at:
+                should_opt = True
+            else:
+                should_opt = (now - self._last_trade_feedback_opt_at).total_seconds() >= 3600
+            if should_opt:
+                self._last_trade_feedback_opt_at = now
+
+        if should_opt:
+            try:
+                await self._run_daily_strategy_optimization()
+            except Exception as e:
+                logger.warning(f"交易反馈触发每日优化失败: {e}")
+
+        return {
+            "success": True,
+            "strategy_id": strategy_id,
+            "triggered_daily_optimization": should_opt,
+        }
 
     async def _calculate_all_performance(self) -> None:
         """计算所有策略性能"""

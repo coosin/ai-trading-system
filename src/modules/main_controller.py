@@ -3727,6 +3727,19 @@ class MainController:
             
             self.trading_monitor.update_strategy_performance(strategy_name, performance)
 
+        # 生产结果反哺：把实时交易表现同步给策略管理器，触发自适应参数优化
+        if self.strategy_manager and hasattr(self.strategy_manager, "apply_trade_feedback"):
+            try:
+                await self.strategy_manager.apply_trade_feedback(
+                    strategy_id=strategy_name,
+                    pnl=float(total_pnl),
+                    win_rate=float(win_rate),
+                    max_drawdown=float(max_drawdown),
+                    total_trades=int(total_trades),
+                )
+            except Exception as e:
+                logger.warning(f"策略交易反馈优化失败({strategy_name}): {e}")
+
     # 私有方法
 
     async def _start_modules_in_order(self) -> bool:

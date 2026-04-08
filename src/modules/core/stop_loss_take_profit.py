@@ -113,20 +113,29 @@ class StopLossTakeProfitOrder:
     metadata: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
+        def _safe_num(v: Any) -> Optional[float]:
+            try:
+                x = float(v)
+            except Exception:
+                return None
+            if math.isfinite(x):
+                return x
+            return None
+
         return {
             "order_id": self.order_id,
             "symbol": self.symbol,
             "side": self.side,
-            "entry_price": self.entry_price,
-            "quantity": self.quantity,
-            "remaining_quantity": self.remaining_quantity,
-            "stop_loss_price": self.stop_loss_price,
+            "entry_price": _safe_num(self.entry_price),
+            "quantity": _safe_num(self.quantity),
+            "remaining_quantity": _safe_num(self.remaining_quantity),
+            "stop_loss_price": _safe_num(self.stop_loss_price),
             "stop_loss_type": self.stop_loss_type.value,
-            "take_profit_price": self.take_profit_price,
+            "take_profit_price": _safe_num(self.take_profit_price),
             "take_profit_type": self.take_profit_type.value,
             "trailing_stop_activated": self.trailing_stop_activated,
-            "highest_price": self.highest_price,
-            "lowest_price": self.lowest_price,
+            "highest_price": _safe_num(self.highest_price),
+            "lowest_price": _safe_num(self.lowest_price),
             "breakeven_activated": self.breakeven_activated,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
@@ -158,6 +167,12 @@ class StopLossTakeProfitConfig:
     dynamic_update_min_interval_sec: int = 20
     dynamic_tighten_ratio: float = 0.15
     dynamic_tp_extend_ratio: float = 0.10
+    # 市场跟踪窗口与阈值：用于动态调整止盈止损和追踪偏移
+    market_tracking_window: int = 20
+    volatility_tighten_threshold: float = 0.02
+    trend_extend_threshold: float = 0.005
+    min_trailing_offset: float = 0.006
+    max_trailing_offset: float = 0.03
 
 
 class StopLossTakeProfitManager:
@@ -640,6 +655,25 @@ class StopLossTakeProfitManager:
                 except Exception:
                     pass
 
+            # 维护短窗价格状态，提取趋势与波动率
+            ph = meta.get("price_history", [])
+            if not isinstance(ph, list):
+                ph = []
+            ph.append(float(current_price))
+            keep = max(5, int(self.config.market_tracking_window))
+            if len(ph) > keep:
+                ph = ph[-keep:]
+            meta["price_history"] = ph
+
+            trend = 0.0
+            volatility = 0.0
+            if len(ph) >= 5:
+                base = max(1e-9, float(ph[0]))
+                trend = (float(ph[-1]) - float(ph[0])) / base
+                mean = sum(ph) / len(ph)
+                variance = sum((x - mean) ** 2 for x in ph) / max(1, len(ph) - 1)
+                volatility = (variance ** 0.5) / max(1e-9, mean)
+
             pnl = self._calculate_pnl_percent(order, current_price)
             tighten_ratio = float(meta.get("dynamic_tighten_ratio", self.config.dynamic_tighten_ratio) or self.config.dynamic_tighten_ratio)
             tp_extend_ratio = float(meta.get("dynamic_tp_extend_ratio", self.config.dynamic_tp_extend_ratio) or self.config.dynamic_tp_extend_ratio)
@@ -655,9 +689,28 @@ class StopLossTakeProfitManager:
                 spread_guard = float((meta.get("guard_profile") or {}).get("effective_max_spread_bps", 40.0) or 40.0)
                 if spread_bps is not None and spread_bps > max(25.0, spread_guard):
                     adverse = True
+                if volatility >= float(self.config.volatility_tighten_threshold):
+                    adverse = True
+
+                trend_thr = float(self.config.trend_extend_threshold)
+                if order.side == "long" and trend >= trend_thr:
+                    favorable = True
+                if order.side == "short" and trend <= -trend_thr:
+                    favorable = True
 
                 sl = float(order.stop_loss_price or 0)
                 tp = float(order.take_profit_price or 0)
+                # 追踪偏移也动态化：高波动收紧，顺势平稳可小幅放宽
+                if volatility >= float(self.config.volatility_tighten_threshold):
+                    order.trailing_stop_offset = max(
+                        float(self.config.min_trailing_offset),
+                        float(order.trailing_stop_offset) * (1.0 - tighten_ratio * 0.5),
+                    )
+                elif favorable:
+                    order.trailing_stop_offset = min(
+                        float(self.config.max_trailing_offset),
+                        float(order.trailing_stop_offset) * (1.0 + tp_extend_ratio * 0.3),
+                    )
                 if order.side == "long":
                     if adverse and sl > 0:
                         # 向现价上移止损，锁定部分利润
@@ -689,16 +742,22 @@ class StopLossTakeProfitManager:
                 meta["last_dynamic_adjust_at"] = now.isoformat()
                 meta["last_market_spread_bps"] = float(spread_bps) if spread_bps is not None else None
                 meta["last_market_depth_imbalance"] = float(depth_imb) if depth_imb is not None else None
+                meta["last_market_trend"] = float(trend)
+                meta["last_market_volatility"] = float(volatility)
+                meta["last_trailing_offset"] = float(order.trailing_stop_offset)
                 order.metadata = meta
                 logger.info(
-                    "🧭 动态调整SL/TP: %s side=%s pnl=%.2f%% sl=%.4f tp=%.4f spread=%s imb=%s",
+                    "🧭 动态调整SL/TP: %s side=%s pnl=%.2f%% sl=%.4f tp=%.4f tr_off=%.4f spread=%s imb=%s trend=%.4f vol=%.4f",
                     order.symbol,
                     order.side,
                     pnl * 100.0,
                     float(order.stop_loss_price or 0),
                     float(order.take_profit_price or 0),
+                    float(order.trailing_stop_offset or 0.0),
                     f"{spread_bps:.2f}" if spread_bps is not None else "N/A",
                     f"{depth_imb:.3f}" if depth_imb is not None else "N/A",
+                    float(trend),
+                    float(volatility),
                 )
         except Exception as e:
             logger.debug(f"动态调整止盈止损失败: {e}")
