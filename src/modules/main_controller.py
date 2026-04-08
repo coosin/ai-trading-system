@@ -3929,6 +3929,93 @@ class MainController:
         except Exception as e:
             logger.error(f"通知处理失败: {e}")
 
+    async def build_ai_commander_snapshot(self, symbol: str = "BTC/USDT") -> Dict[str, Any]:
+        """
+        AI司令部快照：为TG/前端统一提供关键运行态与决策信息。
+        """
+        out: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "system": {},
+            "data_hub": {},
+            "strategy": {},
+            "execution": {},
+            "risk": {},
+            "alerts": [],
+        }
+        try:
+            status = await self.get_system_status()
+            out["system"] = {
+                "system_status": status.get("system_status"),
+                "module_count": status.get("module_count"),
+                "running_modules": status.get("running_modules"),
+            }
+        except Exception as e:
+            out["alerts"].append(f"系统状态读取失败: {e}")
+
+        hub = getattr(self, "data_source_hub", None)
+        if hub and hasattr(hub, "get_unified_snapshot"):
+            try:
+                snap = await hub.get_unified_snapshot(symbol)
+                out["data_hub"] = {
+                    "symbol": symbol,
+                    "quality": (snap.get("数据质量评估") or {}),
+                    "advisor": (snap.get("数据质量与作用评分") or {}),
+                    "ai_analysis": (snap.get("AI智能分析") or {}),
+                    "provenance": ((snap.get("数据来源状态") or {}).get("provenance")),
+                }
+                for a in (snap.get("监控告警") or []):
+                    if isinstance(a, dict):
+                        out["alerts"].append(str(a.get("标题") or "数据告警") + ": " + str(a.get("消息") or ""))
+            except Exception as e:
+                out["alerts"].append(f"数据中心快照失败: {e}")
+
+        sm = getattr(self, "strategy_manager", None)
+        if sm and hasattr(sm, "get_optimization_status"):
+            try:
+                st = sm.get_optimization_status()
+                out["strategy"] = {
+                    "total_strategies": st.get("total_strategies"),
+                    "pool_limit": st.get("pool_limit"),
+                    "daily_optimization": st.get("daily_optimization"),
+                    "deployment_stage_counts": st.get("deployment_stage_counts"),
+                }
+            except Exception as e:
+                out["alerts"].append(f"策略状态读取失败: {e}")
+
+        gw = getattr(self, "execution_gateway", None)
+        if gw and hasattr(gw, "get_snapshot"):
+            try:
+                out["execution"] = await gw.get_snapshot()
+            except Exception as e:
+                out["alerts"].append(f"执行网关快照失败: {e}")
+
+        slm = getattr(self, "stop_loss_manager", None)
+        if slm and hasattr(slm, "get_stats"):
+            try:
+                out["risk"]["sltp"] = slm.get_stats()
+            except Exception as e:
+                out["alerts"].append(f"SLTP统计读取失败: {e}")
+        return out
+
+    async def run_ai_commander_chores(self, symbol: str = "BTC/USDT", trigger_optimize: bool = False) -> Dict[str, Any]:
+        """
+        AI司令部日常任务（轻量、安全版）：
+        1) 拉取全局快照
+        2) 可选触发一次策略优化批次
+        """
+        report = await self.build_ai_commander_snapshot(symbol=symbol)
+        report["chores"] = {"trigger_optimize": bool(trigger_optimize), "optimize_result": None}
+        if trigger_optimize:
+            sm = getattr(self, "strategy_manager", None)
+            if sm and hasattr(sm, "trigger_daily_optimization_now"):
+                try:
+                    report["chores"]["optimize_result"] = await sm.trigger_daily_optimization_now()
+                except Exception as e:
+                    report["chores"]["optimize_result"] = {"success": False, "message": str(e)}
+            else:
+                report["chores"]["optimize_result"] = {"success": False, "message": "策略管理器不可用"}
+        return report
+
     def _register_default_handlers(self) -> None:
         """注册默认事件处理器"""
 

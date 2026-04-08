@@ -753,4 +753,50 @@ A:
 
 ---
 
+## 2026-04-08 司令部总对接收尾（前端/TG/后端统一）
+
+### 已完成
+
+- 司令部统一接口（`module_control_api`）：
+  - `GET /api/v1/modules/commander/snapshot`：统一状态快照
+  - `POST /api/v1/modules/commander/chores`：司令部日常任务（可带优化）
+  - `POST /api/v1/modules/commander/dispatch`：统一指令分发（前端/TG同入口）
+  - `GET /api/v1/modules/commander/audit`：全链路接入审查
+- 记忆复盘接口：
+  - `GET /api/v1/modules/memory/daily-summary`
+  - `POST /api/v1/modules/memory/daily-summary/run`
+- 前端总控（`ControlHubModule`）对接司令部：
+  - 指挥页新增：司令部任务按钮、司令部消息输入、审查结果、统一快照
+  - 策略页新增：每日复盘记忆卡片 + 手动触发每日复盘
+- TG/消息通道与司令部统一：
+  - Telegram 继续走 `main_controller.process_user_command`
+  - 前端 `dispatch` 同链路接入，形成统一中枢
+
+### AI自主与安全边界
+
+- AI执行器新增自然语言技能别名映射（chat 也可触发技能动作）：
+  - 巡检 / 复盘 / 策略研发 / 回测 / 优化 / 强制开平仓 / SLTP状态
+- 高风险动作确认模板：
+  - 强制开仓/强制平仓需“确认/立即执行/批准”后执行
+- 每日自动总结：
+  - 自主循环中每日写入交易复盘记忆（交易数、胜率、盈亏、回撤）
+  - 支持手动强制触发
+
+### 记忆库统一化与恢复
+
+- 已执行备份优先迁移：
+  - `scripts/memory_unify_migrate.py`
+  - `scripts/memory_restore_optimize.py`
+- 统一结构保留：
+  - `workspace/memory/{core,working,experience,history,trades,sessions,_archive}`
+- 旧库已移除，备份与归档保留，可回滚。
+
+### 审查结论（代码级）
+
+- 后端语法检查通过（`py_compile`）
+- 前端/后端 lints 无新增报错
+- 司令部接口、前端入口、消息通道、记忆复盘链路已完成统一对接
+
+---
+
 **Happy Coding! 🚀**

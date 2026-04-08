@@ -883,6 +883,130 @@ def init_module_control_api(app, main_controller):
             return {"success": False, "message": "任务不存在", "job_id": job_id}
         return {"success": True, "job": job, "timestamp": datetime.now().isoformat()}
 
+    @router.get("/memory/daily-summary")
+    async def get_memory_daily_summary(limit: int = 6):
+        """
+        获取每日复盘摘要（用于前端卡片与TG快速查看）。
+        """
+        safe_limit = max(1, min(int(limit), 20))
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        gateway = getattr(main_controller, "memory_gateway", None)
+        if not gateway:
+            return {"success": False, "message": "记忆网关不可用"}
+        try:
+            rows = await gateway.recall(query="每日交易复盘 自动总结", limit=safe_limit, min_importance=0.5)
+            data: List[Dict[str, Any]] = []
+            for r in rows:
+                data.append(
+                    {
+                        "id": getattr(r, "id", None),
+                        "content": getattr(r, "content", ""),
+                        "importance": getattr(r, "importance", None),
+                        "timestamp": getattr(r, "timestamp", None),
+                        "metadata": getattr(r, "metadata", {}) if hasattr(r, "metadata") else {},
+                    }
+                )
+            return {"success": True, "data": data, "count": len(data), "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/memory/daily-summary/run")
+    async def run_memory_daily_summary():
+        """
+        手动触发一次每日复盘写入（AI执行器路径）。
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        exe = getattr(main_controller, "ai_command_executor", None)
+        if not exe or not hasattr(exe, "_auto_daily_summary"):
+            return {"success": False, "message": "AI执行器不可用"}
+        try:
+            ok = await exe._auto_daily_summary(force=True)
+            return {
+                "success": bool(ok),
+                "message": "已触发每日复盘写入" if ok else "每日复盘写入失败",
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/snapshot")
+    async def commander_snapshot(symbol: str = "BTC/USDT"):
+        """司令部统一快照：前端/TG/运维可共享。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        if not hasattr(main_controller, "build_ai_commander_snapshot"):
+            return {"success": False, "message": "司令部快照能力不可用"}
+        try:
+            data = await main_controller.build_ai_commander_snapshot(symbol=symbol)
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/chores")
+    async def commander_chores(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """触发司令部日常任务。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        if not hasattr(main_controller, "run_ai_commander_chores"):
+            return {"success": False, "message": "司令部日常任务能力不可用"}
+        try:
+            symbol = str((payload or {}).get("symbol") or "BTC/USDT")
+            trigger_optimize = bool((payload or {}).get("trigger_optimize", False))
+            data = await main_controller.run_ai_commander_chores(symbol=symbol, trigger_optimize=trigger_optimize)
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/dispatch")
+    async def commander_dispatch(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """
+        司令部统一指令入口：把前端消息与TG消息统一到同一处理链路。
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        if not hasattr(main_controller, "process_user_command"):
+            return {"success": False, "message": "司令部指令入口不可用"}
+        text = str((payload or {}).get("message") or "").strip()
+        if not text:
+            return {"success": False, "message": "message 不能为空"}
+        source = str((payload or {}).get("source") or "control_hub")
+        try:
+            out = await main_controller.process_user_command(text, source=source)
+            return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/audit")
+    async def commander_audit():
+        """
+        司令部全链路审查：检查前端/消息通道/后端关键能力是否已接入。
+        """
+        checks: List[Dict[str, Any]] = []
+
+        def add(name: str, passed: bool, detail: str = "") -> None:
+            checks.append({"name": name, "passed": bool(passed), "detail": detail})
+
+        if not main_controller:
+            add("main_controller", False, "missing")
+            return {"success": False, "checks": checks, "all_passed": False, "timestamp": datetime.now().isoformat()}
+
+        mc = main_controller
+        add("commander.snapshot", hasattr(mc, "build_ai_commander_snapshot"), "build_ai_commander_snapshot")
+        add("commander.chores", hasattr(mc, "run_ai_commander_chores"), "run_ai_commander_chores")
+        add("commander.dispatch", hasattr(mc, "process_user_command"), "process_user_command")
+        add("message.telegram", bool(getattr(mc, "telegram_bot", None)), "telegram_bot")
+        add("notification.unified", hasattr(mc, "_send_notification_handler"), "_send_notification_handler")
+        add("memory.gateway", bool(getattr(mc, "memory_gateway", None)), "memory_gateway")
+        add("data.hub", bool(getattr(mc, "data_source_hub", None)), "data_source_hub")
+        add("strategy.manager", bool(getattr(mc, "strategy_manager", None)), "strategy_manager")
+        add("risk.sltp", bool(getattr(mc, "stop_loss_manager", None)), "stop_loss_manager")
+        add("execution.gateway", bool(getattr(mc, "execution_gateway", None)), "execution_gateway")
+        add("api.module_control", True, "routes_registered")
+        all_passed = all(c["passed"] for c in checks)
+        return {"success": True, "all_passed": all_passed, "checks": checks, "timestamp": datetime.now().isoformat()}
+
     s1_router = APIRouter(prefix="/api/v1/s1", tags=["s1"])
 
     @s1_router.get("/verify")

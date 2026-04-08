@@ -51,6 +51,11 @@ function ControlHubModule() {
   const [alertsHistory, setAlertsHistory] = useState([]);
   const [tradeStats, setTradeStats] = useState(null);
   const [tradeReview, setTradeReview] = useState(null);
+  const [dailyMemorySummary, setDailyMemorySummary] = useState([]);
+  const [commanderSnapshot, setCommanderSnapshot] = useState(null);
+  const [commanderAudit, setCommanderAudit] = useState(null);
+  const [commanderInput, setCommanderInput] = useState('执行系统巡检');
+  const [commanderReply, setCommanderReply] = useState('');
 
   const [strategies, setStrategies] = useState([]);
   const [strategyOpt, setStrategyOpt] = useState(null);
@@ -106,16 +111,22 @@ function ControlHubModule() {
 
   const loadStrategyData = useCallback(async () => {
     try {
-      const [list, optRes, jobsRes, auditRes] = await Promise.all([
+      const [list, optRes, jobsRes, auditRes, memSummaryRes, commanderRes, commanderAuditRes] = await Promise.all([
         api.strategies.getAll().catch(() => []),
         api.modules.getStrategyOptimizationStatus().catch(() => null),
         api.modules.getStrategyResearchJobs(20).catch(() => ({ jobs: [] })),
         api.modules.getExecutionProductionAudit().catch(() => null),
+        api.modules.getMemoryDailySummary(6).catch(() => ({ data: [] })),
+        api.modules.getCommanderSnapshot(dataSymbol || 'BTC/USDT').catch(() => null),
+        api.modules.getCommanderAudit().catch(() => null),
       ]);
       setStrategies(Array.isArray(list) ? list : []);
       setStrategyOpt(optRes?.data ?? null);
       setResearchJobs(Array.isArray(jobsRes?.jobs) ? jobsRes.jobs : []);
       setProductionAudit(auditRes || null);
+      setDailyMemorySummary(Array.isArray(memSummaryRes?.data) ? memSummaryRes.data : []);
+      setCommanderSnapshot(commanderRes?.data || commanderRes || null);
+      setCommanderAudit(commanderAuditRes || null);
     } catch (e) {
       showNotice(`策略数据加载失败：${e.message || e}`, 'error');
     }
@@ -334,6 +345,49 @@ function ControlHubModule() {
       await loadStrategyData();
     } catch (e) {
       showNotice(`提交交易反馈失败：${e.message || e}`, 'error');
+    } finally {
+      setManualBusy(false);
+    }
+  };
+
+  const runDailySummaryNow = async () => {
+    setManualBusy(true);
+    try {
+      const res = await api.modules.runMemoryDailySummary();
+      showNotice(res?.message || '已触发每日复盘写入');
+      await loadStrategyData();
+    } catch (e) {
+      showNotice(`触发每日复盘失败：${e.message || e}`, 'error');
+    } finally {
+      setManualBusy(false);
+    }
+  };
+
+  const runCommanderChores = async (triggerOptimize = false) => {
+    setManualBusy(true);
+    try {
+      const res = await api.modules.runCommanderChores({ symbol: dataSymbol || 'BTC/USDT', trigger_optimize: !!triggerOptimize });
+      showNotice(res?.success ? '司令部日常任务执行完成' : (res?.message || '司令部任务失败'), res?.success ? 'success' : 'error');
+      await loadStrategyData();
+    } catch (e) {
+      showNotice(`司令部任务失败：${e.message || e}`, 'error');
+    } finally {
+      setManualBusy(false);
+    }
+  };
+
+  const sendCommanderMessage = async () => {
+    const msg = String(commanderInput || '').trim();
+    if (!msg) return;
+    setManualBusy(true);
+    try {
+      const res = await api.modules.dispatchCommanderMessage(msg, 'control_hub');
+      const out = res?.data?.response || res?.data?.message || JSON.stringify(res?.data || res || {});
+      setCommanderReply(String(out || ''));
+      showNotice('司令部已处理指令');
+      await loadStrategyData();
+    } catch (e) {
+      showNotice(`司令部指令失败：${e.message || e}`, 'error');
     } finally {
       setManualBusy(false);
     }
@@ -656,10 +710,41 @@ function ControlHubModule() {
               <button type="button" className="btn btn-sm btn-primary" disabled={researchBusy} onClick={runResearch}>
                 {researchBusy ? '策略研发执行中…' : '一键触发策略研发'}
               </button>
+              <button type="button" className="btn btn-sm btn-outline" disabled={manualBusy} onClick={() => runCommanderChores(false)}>
+                执行司令部日常任务
+              </button>
+              <button type="button" className="btn btn-sm btn-outline" disabled={manualBusy} onClick={() => runCommanderChores(true)}>
+                司令部任务并优化
+              </button>
             </div>
+            <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                className="form-input"
+                value={commanderInput}
+                onChange={(e) => setCommanderInput(e.target.value)}
+                style={{ minWidth: 300 }}
+                placeholder="给司令部发送指令，如：执行系统巡检"
+              />
+              <button type="button" className="btn btn-sm btn-primary" disabled={manualBusy} onClick={sendCommanderMessage}>
+                发送司令部指令
+              </button>
+            </div>
+            {commanderReply ? (
+              <pre style={{ maxHeight: 120, overflow: 'auto', fontSize: 11, padding: 10, background: 'var(--bg-secondary)', borderRadius: 8, whiteSpace: 'pre-wrap', marginTop: 6 }}>
+                {commanderReply}
+              </pre>
+            ) : null}
             <div style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>
               指挥台聚合了系统状态、AI监督、策略研发与执行观测。后续会继续扩展到模块级启动/停用、风控预案切换、任务编排等统一指令。
             </div>
+            <div style={{ marginTop: 12, fontWeight: 600 }}>司令部对接审查</div>
+            <pre style={{ maxHeight: 180, overflow: 'auto', fontSize: 11, padding: 10, background: 'var(--bg-secondary)', borderRadius: 8, whiteSpace: 'pre-wrap', marginTop: 8 }}>
+              {JSON.stringify(commanderAudit || {}, null, 2)}
+            </pre>
+            <div style={{ marginTop: 12, fontWeight: 600 }}>司令部统一快照</div>
+            <pre style={{ maxHeight: 220, overflow: 'auto', fontSize: 11, padding: 10, background: 'var(--bg-secondary)', borderRadius: 8, whiteSpace: 'pre-wrap', marginTop: 8 }}>
+              {JSON.stringify(commanderSnapshot || {}, null, 2)}
+            </pre>
             <div style={{ marginTop: 12, fontWeight: 600 }}>交易统计（30天）</div>
             <pre
               style={{
@@ -724,9 +809,24 @@ function ControlHubModule() {
               <button type="button" className="btn btn-sm btn-outline" onClick={runOptimizeNow} disabled={manualBusy}>
                 {manualBusy ? '执行中…' : '手动触发每日优化批次'}
               </button>
+              <button type="button" className="btn btn-sm btn-outline" onClick={runDailySummaryNow} disabled={manualBusy}>
+                {manualBusy ? '执行中…' : '立即执行每日复盘'}
+              </button>
               <button type="button" className="btn btn-sm btn-outline" onClick={loadStrategyData} disabled={manualBusy}>
                 刷新研究任务与生产审计
               </button>
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>每日复盘记忆（AI总结）</div>
+              <div style={{ maxHeight: 160, overflow: 'auto', border: '1px solid var(--border-light)', borderRadius: 8 }}>
+                {(dailyMemorySummary || []).slice(0, 6).map((m) => (
+                  <div key={m.id || Math.random()} style={{ padding: '8px 10px', borderBottom: '1px solid var(--border-light)', fontSize: 12 }}>
+                    {String(m.content || '').slice(0, 220)}
+                  </div>
+                ))}
+                {!dailyMemorySummary?.length && <div style={{ padding: 10, color: 'var(--text-tertiary)' }}>暂无每日复盘记录</div>}
+              </div>
             </div>
 
             <div style={{ marginBottom: 12, border: '1px solid var(--border-light)', borderRadius: 8, padding: 10 }}>

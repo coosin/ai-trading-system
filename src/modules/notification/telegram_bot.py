@@ -12,6 +12,7 @@ import asyncio
 import logging
 import json
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable, Awaitable
@@ -223,15 +224,24 @@ class TelegramBot:
         """处理自然语言消息 - 直接调用AI核心决策引擎"""
         try:
             logger.info(f"📩 收到消息 [{message.from_user}]: {message.text[:100] if len(message.text) > 100 else message.text}")
+            text = (message.text or "").strip()
+            profile = self._load_ai_commander_profile()
+            enriched_text = self._build_enriched_user_message(text, profile)
 
             if self.main_controller and hasattr(self.main_controller, "process_user_command"):
-                logger.info(f"🤖 通过主控制器核心大脑路由处理: {message.text[:50]}")
+                logger.info(f"🤖 通过主控制器核心大脑路由处理: {text[:50]}")
                 result = await self.main_controller.process_user_command(
-                    message.text,
+                    enriched_text,
                     source="telegram",
                 )
                 response_text = (result or {}).get("response", "处理完成")
                 success = (result or {}).get("success", False)
+                # AI优先：仅在失败时使用快捷规则兜底，避免把AI变成关键词机器人。
+                if not success:
+                    fallback = await self._try_commander_fallback(text)
+                    if fallback:
+                        response_text = fallback
+                        success = True
                 logger.info(f"📤 AI响应: success={success}, response长度={len(response_text)}")
                 await self._send_message(TelegramResponse(
                     chat_id=message.chat_id,
@@ -286,6 +296,91 @@ class TelegramBot:
                 chat_id=message.chat_id,
                 text=f"处理消息时出错: {str(e)}"
             ))
+
+    async def _try_commander_fallback(self, user_text: str) -> Optional[str]:
+        """
+        当AI核心不可用时的轻量兜底。
+        注意：这里是 fallback，不是主流程，避免规则绑死 AI。
+        """
+        text = (user_text or "").strip()
+        commander_keywords = ["总控", "巡检", "全局状态", "司令部", "状态汇总", "健康检查"]
+        chore_keywords = ["执行日常", "自动维护", "一键维护", "运行维护任务"]
+        optimize_keywords = ["带优化", "触发优化", "并优化"]
+        if any(k in text for k in commander_keywords) and self.main_controller and hasattr(self.main_controller, "build_ai_commander_snapshot"):
+            snapshot = await self.main_controller.build_ai_commander_snapshot()
+            return self._format_commander_snapshot(snapshot)
+        if any(k in text for k in chore_keywords) and self.main_controller and hasattr(self.main_controller, "run_ai_commander_chores"):
+            trigger_opt = any(k in text for k in optimize_keywords)
+            report = await self.main_controller.run_ai_commander_chores(trigger_optimize=trigger_opt)
+            return self._format_commander_snapshot(report)
+        return None
+
+    def _load_ai_commander_profile(self) -> str:
+        """
+        读取“司令部人格/边界/任务”记忆：
+        - 优先: workspace/memory/core/AI_COMMANDER_PROFILE.md
+        - 其次: /app/data/memory/core/AI_COMMANDER_PROFILE.md
+        """
+        candidates = [
+            Path.cwd() / "workspace" / "memory" / "core" / "AI_COMMANDER_PROFILE.md",
+            Path("/app/data/memory/core/AI_COMMANDER_PROFILE.md"),
+            Path("/app/workspace/memory/core/AI_COMMANDER_PROFILE.md"),
+        ]
+        for p in candidates:
+            try:
+                if p.exists() and p.is_file():
+                    content = p.read_text(encoding="utf-8").strip()
+                    if content:
+                        return content[:6000]
+            except Exception:
+                continue
+        return ""
+
+    def _build_enriched_user_message(self, user_text: str, profile: str) -> str:
+        """
+        将人格与边界注入为“软约束记忆”，不替代AI自主判断。
+        """
+        if not profile:
+            return user_text
+        return (
+            f"{user_text}\n\n"
+            "[司令部记忆/人格与边界]\n"
+            f"{profile}\n\n"
+            "[执行原则]\n"
+            "- 优先自主分析与决策，不做僵硬关键词匹配。\n"
+            "- 在边界内尽量主动完成任务并清晰反馈。\n"
+            "- 高风险动作先说明依据与风险，再执行或请求确认。"
+        )
+
+    def _format_commander_snapshot(self, payload: Dict[str, Any]) -> str:
+        """把AI司令部快照转为Telegram友好文本。"""
+        try:
+            system = payload.get("system", {}) if isinstance(payload, dict) else {}
+            data_hub = payload.get("data_hub", {}) if isinstance(payload, dict) else {}
+            strategy = payload.get("strategy", {}) if isinstance(payload, dict) else {}
+            alerts = payload.get("alerts", []) if isinstance(payload, dict) else []
+            quality = data_hub.get("quality", {}) if isinstance(data_hub, dict) else {}
+            ai = data_hub.get("ai_analysis", {}) if isinstance(data_hub, dict) else {}
+            lines = [
+                "🧠 AI司令部总览",
+                f"时间: {payload.get('timestamp', datetime.now().isoformat())}",
+                f"系统: {system.get('system_status', '-')} | 模块: {system.get('running_modules', '-')}/{system.get('module_count', '-')}",
+                f"数据质量: {quality.get('score', '-')} ({quality.get('grade', '-')}) | 来源: {data_hub.get('provenance', '-')}",
+                f"AI判断: 趋势={ai.get('trend', '-')} 倾向={ai.get('action_bias', '-')} 置信度={ai.get('confidence', '-')}",
+                f"策略池: {strategy.get('total_strategies', '-')} / {strategy.get('pool_limit', '-')}",
+            ]
+            chores = payload.get("chores", {}) if isinstance(payload, dict) else {}
+            if chores:
+                opt = chores.get("optimize_result")
+                if isinstance(opt, dict):
+                    lines.append(f"维护任务: optimize={opt.get('success', '-')}, msg={opt.get('message', '-')}")
+            if alerts:
+                lines.append("告警:")
+                for a in alerts[:5]:
+                    lines.append(f"- {a}")
+            return "\n".join(lines)
+        except Exception:
+            return f"🧠 AI司令部总览\n{str(payload)[:2500]}"
 
     async def _get_system_context(self) -> str:
         """获取系统上下文 - 包含实时持仓信息"""

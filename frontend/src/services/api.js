@@ -115,6 +115,18 @@ export const api = {
       request(`/modules/strategy/research-jobs/${encodeURIComponent(jobId)}`),
     getExecutionProductionAudit: () =>
       request('/modules/execution/production-audit'),
+    getMemoryDailySummary: (limit = 6) =>
+      request(`/modules/memory/daily-summary?limit=${Number(limit) || 6}`),
+    runMemoryDailySummary: () =>
+      request('/modules/memory/daily-summary/run', { method: 'POST' }),
+    getCommanderSnapshot: (symbol = 'BTC/USDT') =>
+      request(`/modules/commander/snapshot?symbol=${encodeURIComponent(symbol)}`),
+    runCommanderChores: (body = {}) =>
+      request('/modules/commander/chores', { method: 'POST', body: JSON.stringify(body || {}) }),
+    dispatchCommanderMessage: (message, source = 'control_hub') =>
+      request('/modules/commander/dispatch', { method: 'POST', body: JSON.stringify({ message, source }) }),
+    getCommanderAudit: () =>
+      request('/modules/commander/audit'),
   },
   monitoring: {
     /** 若后端未实现则返回 404，总控会降级为空列表 */

@@ -11,6 +11,7 @@ import asyncio
 import logging
 import json
 import re
+from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -56,6 +57,7 @@ class AICommandExecutor:
         self.work_duties = []
         
         self._autonomous_running = False
+        self._last_daily_summary_date = None
         
         logger.info("AI指令执行器（智能增强版）初始化完成")
     
@@ -173,6 +175,19 @@ class AICommandExecutor:
                     metadata={"intent": intent.action, "params": intent.params},
                     source_module="ai_command_executor"
                 )
+                try:
+                    action_msg = str((result or {}).get("response") or "")[:500]
+                    if action_msg:
+                        await self.unified_memory.add_memory(
+                            memory_type="conversation",
+                            content=f"动作结果[{intent.action}] {action_msg}",
+                            summary=f"{intent.action} 执行结果摘要",
+                            metadata={"intent": intent.action, "success": bool((result or {}).get("success", False))},
+                            source_module="ai_command_executor",
+                            importance=0.55,
+                        )
+                except Exception:
+                    pass
             
             return result
             
@@ -283,8 +298,28 @@ class AICommandExecutor:
         context_parts.append("3. 工作职责是自动进行的，不是等待指令")
         context_parts.append("4. 回答用户问题时，要报告当前交易状态和持仓情况")
         context_parts.append("=" * 40 + "\n")
+        skill_pack = self._read_trading_skill_pack()
+        if skill_pack:
+            context_parts.append("【交易技能包】")
+            context_parts.append(skill_pack)
+            context_parts.append("")
         
         return "\n".join(context_parts)
+
+    def _read_trading_skill_pack(self) -> str:
+        candidates = [
+            Path.cwd() / "workspace" / "memory" / "core" / "SKILL_PACK_TRADING_OPS.md",
+            Path("/app/data/memory/core/SKILL_PACK_TRADING_OPS.md"),
+        ]
+        for p in candidates:
+            try:
+                if p.exists() and p.is_file():
+                    data = p.read_text(encoding="utf-8").strip()
+                    if data:
+                        return data[:6000]
+            except Exception:
+                continue
+        return ""
     
     def _get_memory_type_from_intent(self, action: str):
         """根据意图类型获取记忆类型"""
@@ -368,6 +403,11 @@ class AICommandExecutor:
         """执行意图 - 带用户规则检查"""
         action = intent.action
         params = intent.params
+        # 当意图解析成 chat 时，尝试用自然语言别名映射到技能动作。
+        if action == "chat":
+            guessed = self._guess_skill_action_from_text(user_input)
+            if guessed:
+                action = guessed
         
         if action in ["trade", "market_analysis"]:
             symbol = params.get('symbol', '')
@@ -417,6 +457,23 @@ class AICommandExecutor:
                 "response": f"执行 {action} 时遇到问题：{str(e)}",
                 "timestamp": datetime.now().isoformat()
             }
+
+    def _guess_skill_action_from_text(self, user_input: str) -> Optional[str]:
+        text = str(user_input or "").lower()
+        mapping = [
+            (["系统巡检", "健康检查", "巡检"], "system.inspection.run"),
+            (["每日复盘", "日总结", "日报总结"], "memory.summary.daily"),
+            (["策略研发", "研究策略", "生成策略"], "strategy.research.run"),
+            (["回测", "跑回测"], "strategy.backtest.run"),
+            (["策略优化", "优化策略", "立即优化"], "strategy.optimize.run"),
+            (["强制开仓", "立即开仓"], "execution.open.force"),
+            (["强制平仓", "立即平仓", "全部平仓"], "execution.close.force"),
+            (["止盈止损", "sltp", "风控状态"], "risk.sltp.adjust"),
+        ]
+        for kws, action in mapping:
+            if any(k in text for k in kws):
+                return action
+        return None
     
     async def _execute_backtest(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """执行策略回测"""
@@ -1283,6 +1340,9 @@ class AICommandExecutor:
     async def _ai_autonomous_action(self, action: str, params: Dict[str, Any], user_input: str, user_rules: str = "") -> Dict[str, Any]:
         """AI自主行动"""
         try:
+            routed = await self._route_skill_action(action=action, params=params, user_input=user_input, user_rules=user_rules)
+            if routed is not None:
+                return routed
             if self.llm_integration:
                 system_context = await self._get_system_context()
                 
@@ -1311,6 +1371,100 @@ class AICommandExecutor:
             
         except Exception as e:
             return {"success": False, "response": f"AI自主行动失败: {str(e)}"}
+
+    async def _route_skill_action(self, action: str, params: Dict[str, Any], user_input: str, user_rules: str = "") -> Optional[Dict[str, Any]]:
+        """
+        技能包动作映射：把“能力名”映射到可执行函数，避免只聊天不执行。
+        """
+        act = str(action or "").strip().lower()
+        alias = {
+            "strategy.research.run": "strategy_create",
+            "strategy.backtest.run": "backtest",
+            "strategy.optimize.run": "strategy_optimize",
+            "execution.open.force": "trade_force_open",
+            "execution.close.force": "trade_force_close",
+            "risk.sltp.adjust": "risk_sltp_status",
+            "system.inspection.run": "system_inspection",
+            "memory.summary.daily": "memory_daily_summary",
+        }.get(act, act)
+
+        if alias == "strategy_create":
+            return await self._create_strategy(params, user_input)
+        if alias == "backtest":
+            return await self._execute_backtest(params)
+        if alias == "strategy_optimize":
+            return await self._optimize_strategy(params, user_input)
+        if alias == "trade_force_open":
+            if not any(k in (user_input or "") for k in ["确认", "立即执行", "批准"]):
+                return {
+                    "success": True,
+                    "response": "检测到高风险动作【强制开仓】。请回复“确认 强制开仓”或“立即执行 强制开仓”后执行。",
+                    "needs_confirmation": True,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            p = dict(params or {})
+            p.setdefault("force", True)
+            return await self._execute_trade(p, user_input or "强制开仓", user_rules)
+        if alias == "trade_force_close":
+            if not any(k in (user_input or "") for k in ["确认", "立即执行", "批准"]):
+                return {
+                    "success": True,
+                    "response": "检测到高风险动作【强制平仓】。请回复“确认 强制平仓”或“立即执行 强制平仓”后执行。",
+                    "needs_confirmation": True,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            p = dict(params or {})
+            p.setdefault("force_close", True)
+            return await self._execute_trade(p, user_input or "强制平仓", user_rules)
+        if alias == "risk_sltp_status":
+            return await self._get_sltp_status()
+        if alias == "system_inspection":
+            return await self._run_system_inspection()
+        if alias == "memory_daily_summary":
+            ok = await self._auto_daily_summary(force=True)
+            return {
+                "success": bool(ok),
+                "response": "已执行每日复盘总结并写入记忆" if ok else "每日复盘总结执行失败",
+                "timestamp": datetime.now().isoformat(),
+            }
+        return None
+
+    async def _run_system_inspection(self) -> Dict[str, Any]:
+        mc = self.main_controller
+        if not mc:
+            return {"success": False, "response": "主控制器不可用"}
+        try:
+            if hasattr(mc, "skill_manager") and mc.skill_manager:
+                report = await mc.skill_manager.run_health_check({"source": "ai_command_executor"})
+                return {
+                    "success": True,
+                    "response": f"系统巡检完成：{report.get('status')}，可执行失败 {report.get('actionable_failures', 0)} 项",
+                    "data": report,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            return await self._get_system_status()
+        except Exception as e:
+            return {"success": False, "response": f"系统巡检失败: {e}"}
+
+    async def _get_sltp_status(self) -> Dict[str, Any]:
+        mc = self.main_controller
+        if not mc or not hasattr(mc, "stop_loss_manager") or not mc.stop_loss_manager:
+            return {"success": False, "response": "止盈止损管理器不可用"}
+        try:
+            stats = mc.stop_loss_manager.get_stats()
+            return {
+                "success": True,
+                "response": (
+                    f"SLTP状态：总订单={stats.get('total_orders', 0)}，"
+                    f"止损触发={stats.get('stop_loss_triggered', 0)}，"
+                    f"止盈触发={stats.get('take_profit_triggered', 0)}，"
+                    f"动态调整={stats.get('dynamic_adjustments', 0)}"
+                ),
+                "data": stats,
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "response": f"获取SLTP状态失败: {e}"}
     
     async def start_autonomous_work(self) -> None:
         """启动自主工作循环"""
@@ -1342,6 +1496,8 @@ class AICommandExecutor:
                 
                 await self._auto_market_scan()
                 
+                await self._auto_daily_summary()
+                
             except Exception as e:
                 logger.error(f"自主工作循环出错: {e}")
     
@@ -1372,3 +1528,36 @@ class AICommandExecutor:
                 await asyncio.sleep(SLEEP_5S)
             except Exception as e:
                 logger.error(f"扫描 {symbol} 失败: {e}")
+
+    async def _auto_daily_summary(self, force: bool = False) -> bool:
+        """
+        每日自动总结：写入经验/历史记忆，支持交易复盘与策略改进。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        if not force and self._last_daily_summary_date == today:
+            return True
+        mc = self.main_controller
+        if not mc:
+            return False
+        try:
+            ths = getattr(mc, "trade_history_service", None)
+            stats = await ths.get_statistics(days=1, force_refresh=True) if ths and hasattr(ths, "get_statistics") else {}
+            summary = (
+                f"每日交易复盘 {today}: 总交易={stats.get('total_trades', 0)}, "
+                f"胜率={stats.get('win_rate', 0)}%, 总盈亏={stats.get('total_pnl', 0)}, "
+                f"最大回撤={stats.get('max_drawdown', 0)}"
+            )
+            if self.unified_memory and hasattr(self.unified_memory, "add_memory"):
+                await self.unified_memory.add_memory(
+                    memory_type="lesson_learned",
+                    content=summary,
+                    summary="每日交易复盘自动总结",
+                    metadata={"date": today, "stats": stats},
+                    source_module="ai_command_executor",
+                    importance=0.72,
+                )
+            self._last_daily_summary_date = today
+            return True
+        except Exception as e:
+            logger.warning(f"每日自动总结失败: {e}")
+            return False
