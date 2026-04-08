@@ -1030,7 +1030,8 @@ class AICommandExecutor:
                     ) or (hasattr(mc, 'multi_source_data_fusion') and mc.multi_source_data_fusion),
                     # 兼容 third_party_integrator / third_party_data 两种挂载方式
                     "第三方数据集成": (
-                        (hasattr(mc, 'third_party_integrator') and mc.third_party_integrator is not None)
+                        (hasattr(mc, 'third_party_data_integrator') and mc.third_party_data_integrator is not None)
+                        or (hasattr(mc, 'third_party_integrator') and mc.third_party_integrator is not None)
                         or (hasattr(mc, 'ai_trading_engine') and mc.ai_trading_engine and hasattr(mc.ai_trading_engine, 'third_party_data') and mc.ai_trading_engine.third_party_data is not None)
                     ),
                     "AI核心决策引擎": hasattr(mc, 'ai_core') and mc.ai_core is not None,
@@ -1054,13 +1055,34 @@ class AICommandExecutor:
                             response += f"  • {name}\n"
                 
                 # 第三方数据详情
+                response += f"\n【第三方数据源】\n"
+                # 1) 插件体系（若存在）
                 if hasattr(mc, 'plugin_manager') and mc.plugin_manager:
                     pm = mc.plugin_manager
                     plugins_info = pm.get_all_plugin_info() if hasattr(pm, 'get_all_plugin_info') else {}
-                    response += f"\n【第三方数据源】\n"
                     response += f"已加载插件: {len(plugins_info)}个\n"
                     for plugin_name in list(plugins_info.keys())[:5]:
                         response += f"  • {plugin_name}\n"
+                # 2) 代码内置 ThirdPartyDataIntegrator（若存在）
+                try:
+                    tpi = getattr(mc, "third_party_data_integrator", None)
+                    if not tpi and hasattr(mc, "ai_trading_engine") and mc.ai_trading_engine:
+                        tpi = getattr(mc.ai_trading_engine, "third_party_data", None)
+                    if tpi:
+                        prov = getattr(tpi, "providers", {}) or {}
+                        disabled = list(getattr(tpi, "_disabled_providers", set()) or [])
+                        response += f"内置数据源: {len(prov)} 个（disabled={len(disabled)}）\n"
+                        if disabled:
+                            # DataSource Enum or str
+                            ds = []
+                            for x in disabled[:6]:
+                                try:
+                                    ds.append(getattr(x, "value", str(x)))
+                                except Exception:
+                                    ds.append(str(x))
+                            response += "已禁用源(常见原因403/401/限流): " + ", ".join(ds) + "\n"
+                except Exception:
+                    pass
 
                 # 外部数据源降级状态（如果系统挂载了 DataIntegration）
                 try:
