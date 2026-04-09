@@ -50,6 +50,10 @@ class StrategyResearchPipeline:
         self._bt_calls = 0
         self._symbol_semaphore = asyncio.Semaphore(self.max_parallel_symbols)
         self.min_data_quality_for_research = 0.5
+        self.publish_min_score = 0.55
+        self.promote_small_score = 1.10
+        self.redevelop_below_score = 0.35
+        self.discard_below_score = 0.10
 
     async def run_cycle(self, symbols: List[str], timeframe: str = "1h", lookback_days: int = 30) -> Dict[str, Any]:
         # load config (best-effort)
@@ -79,6 +83,12 @@ class StrategyResearchPipeline:
                 dq = cfg.get("data_quality", {})
                 if isinstance(dq, dict):
                     self.min_data_quality_for_research = float(dq.get("min_quality_for_research", self.min_data_quality_for_research))
+                gov = cfg.get("governance", {})
+                if isinstance(gov, dict):
+                    self.publish_min_score = float(gov.get("publish_min_score", self.publish_min_score))
+                    self.promote_small_score = float(gov.get("promote_small_score", self.promote_small_score))
+                    self.redevelop_below_score = float(gov.get("redevelop_below_score", self.redevelop_below_score))
+                    self.discard_below_score = float(gov.get("discard_below_score", self.discard_below_score))
         except Exception:
             pass
 
@@ -159,9 +169,12 @@ class StrategyResearchPipeline:
                 if self._bt_calls >= self.max_backtests_per_cycle:
                     break
             test_metrics = self._aggregate_fold_metrics(fold_scores)
+            score = self._research_score(test_metrics)
+            decision = self._governance_decision(score)
 
-            if self._passes_gates(test_metrics):
-                item = await self._publish(best_dsl, test_metrics, best_train)
+            # 最低规则：先过风险门，再过最低研究评分。
+            if self._passes_gates(test_metrics) and score >= self.publish_min_score:
+                item = await self._publish(best_dsl, test_metrics, best_train, score=score, decision=decision)
                 if item:
                     published.append(item)
         return published
@@ -511,7 +524,23 @@ class StrategyResearchPipeline:
         trades = float(test_metrics.get("total_trades", 0.0) or 0.0)
         return sharpe * 0.6 + (pnl / 1000.0) * 0.25 - dd * 0.1 + min(trades, 100.0) * 0.0005
 
-    async def _publish(self, dsl: Dict[str, Any], test_metrics: Dict[str, Any], train_metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _governance_decision(self, score: float) -> str:
+        if score < self.discard_below_score:
+            return "discard"
+        if score < self.redevelop_below_score:
+            return "redevelop"
+        if score >= self.promote_small_score:
+            return "production_small"
+        return "production_shadow"
+
+    async def _publish(
+        self,
+        dsl: Dict[str, Any],
+        test_metrics: Dict[str, Any],
+        train_metrics: Dict[str, Any],
+        score: Optional[float] = None,
+        decision: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         if not self.main_controller or not getattr(self.main_controller, "strategy_manager", None):
             return None
         strategy_manager = self.main_controller.strategy_manager
@@ -520,6 +549,10 @@ class StrategyResearchPipeline:
         strategy_id = f"dsl_{dsl['symbol'].replace('/','_')}_{dsl['name'].replace(' ','_')}"
         version = bump_version(dsl.get("version", "1.0.0"))
         dsl = {**dsl, "version": version}
+
+        research_score = float(score if score is not None else self._research_score(test_metrics))
+        gov_decision = decision or self._governance_decision(research_score)
+        deployment_stage = "small" if gov_decision == "production_small" else "shadow"
 
         config_data = {
             "strategy_id": strategy_id,
@@ -535,8 +568,8 @@ class StrategyResearchPipeline:
             "metadata": {
                 "dsl": dsl,
                 "deployment": {
-                    "stage": "shadow",
-                    "cap_multiplier": 0.25,
+                    "stage": deployment_stage,
+                    "cap_multiplier": 0.5 if deployment_stage == "small" else 0.25,
                     "policy": "auto_rollout",
                 },
                 "research": {
@@ -544,7 +577,8 @@ class StrategyResearchPipeline:
                     "test": test_metrics,
                     "gates": self.gates.__dict__,
                     "published_at": datetime.now().isoformat(),
-                    "score": self._research_score(test_metrics),
+                    "score": research_score,
+                    "decision": gov_decision,
                 },
             },
         }
@@ -606,5 +640,7 @@ class StrategyResearchPipeline:
             "test": test_metrics,
             "instance_id": instance_id,
             "activated": activated,
+            "score": research_score,
+            "decision": gov_decision,
         }
 

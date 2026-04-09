@@ -333,13 +333,23 @@ class ConfigManager:
             "enabled": True,
             "auto_run": True,
             "auto_interval_minutes": 360,
+            # 为兼容保留固定列表；开启 dynamic_scan_for_research 后优先动态选币。
             "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
+            "dynamic_scan_for_research": True,
+            "symbol_scan_limit": 12,
             "timeframe": "1h",
             "lookback_days": 30,
             "gates": {
                 "min_sharpe": 0.8,
                 "max_drawdown": 0.25,
                 "min_trades": 8,
+            },
+            # 最低治理规则：不过度严苛，但要求可解释、可筛选、可淘汰。
+            "governance": {
+                "publish_min_score": 0.55,
+                "promote_small_score": 1.10,
+                "redevelop_below_score": 0.35,
+                "discard_below_score": 0.10,
             },
             "cost_model": {
                 # applied in walk-forward scoring
@@ -351,6 +361,13 @@ class ConfigManager:
                 "folds": 3,
                 "train_ratio": 0.7,
             },
+        },
+        "ai_trading": {
+            # 允许 AI 使用动态币池，不再被固定币对长期束缚。
+            "dynamic_symbol_universe": True,
+            "dynamic_symbol_refresh_seconds": 300,
+            "max_dynamic_symbols": 12,
+            "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
         },
     }
 

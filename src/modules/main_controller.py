@@ -1370,6 +1370,7 @@ class MainController:
             # 设置交易所
             if hasattr(self, 'okx_exchange') and self.okx_exchange:
                 self.dynamic_symbol_selector.set_exchange(self.okx_exchange)
+            await self.dynamic_symbol_selector.start()
             
             logger.info("✅ 动态币种筛选器已初始化")
         except Exception as e:
@@ -1501,6 +1502,11 @@ class MainController:
 
         # 停止所有模块
         await self.stop_all_modules()
+        if getattr(self, "dynamic_symbol_selector", None):
+            try:
+                await self.dynamic_symbol_selector.stop()
+            except Exception:
+                pass
 
         # 取消所有任务
         for task in self._tasks:
@@ -4050,6 +4056,17 @@ class MainController:
                 symbols = cfg.get("symbols") or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
                 if isinstance(symbols, str):
                     symbols = [symbols]
+                if bool(cfg.get("dynamic_scan_for_research", True)):
+                    selector = getattr(self, "dynamic_symbol_selector", None)
+                    if selector and hasattr(selector, "get_trading_symbols"):
+                        try:
+                            dyn_symbols = await selector.get_trading_symbols()
+                            if dyn_symbols:
+                                symbols = dyn_symbols
+                        except Exception:
+                            pass
+                max_scan = int(cfg.get("symbol_scan_limit", 12) or 12)
+                symbols = [str(s) for s in symbols if s][:max(1, max_scan)]
                 timeframe = str(cfg.get("timeframe", "1h") or "1h")
                 lookback_days = int(cfg.get("lookback_days", 30) or 30)
 

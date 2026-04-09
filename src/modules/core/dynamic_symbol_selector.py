@@ -160,10 +160,10 @@ class DynamicSymbolSelector:
             logger.warning("交易所未连接，使用默认币种")
             return self.config.always_include
         
-        discovered = []
+        discovered: List[str] = []
         
         try:
-            markets = await self._exchange.fetch_markets()
+            markets = await self._fetch_markets_compat()
             
             for market in markets:
                 symbol = market.get("symbol", "")
@@ -178,7 +178,7 @@ class DynamicSymbolSelector:
                     continue
                 
                 try:
-                    ticker = await self._exchange.fetch_ticker(symbol)
+                    ticker = await self._fetch_ticker_compat(symbol)
                     
                     volume_24h = ticker.get("quoteVolume", 0)
                     if volume_24h < self.config.min_24h_volume:
@@ -214,8 +214,8 @@ class DynamicSymbolSelector:
             return score
         
         try:
-            ticker = await self._exchange.fetch_ticker(symbol)
-            ohlcv = await self._exchange.fetch_ohlcv(symbol, "1h", limit=24)
+            ticker = await self._fetch_ticker_compat(symbol)
+            ohlcv = await self._fetch_ohlcv_compat(symbol, "1h", limit=24)
             
             if not ticker or not ohlcv:
                 return score
@@ -272,6 +272,140 @@ class DynamicSymbolSelector:
             logger.debug(f"评估 {symbol} 失败: {e}")
         
         return score
+
+    async def _fetch_markets_compat(self) -> List[Dict[str, Any]]:
+        """
+        兼容不同交易所接口：
+        - 优先 ccxt 风格 fetch_markets
+        - 回退到 get_exchange_info.supported_symbols
+        """
+        if not self._exchange:
+            return []
+
+        fetch_markets = getattr(self._exchange, "fetch_markets", None)
+        if callable(fetch_markets):
+            try:
+                rows = fetch_markets()
+                rows = await rows if asyncio.iscoroutine(rows) or hasattr(rows, "__await__") else rows
+                if isinstance(rows, list):
+                    out: List[Dict[str, Any]] = []
+                    for m in rows:
+                        if isinstance(m, dict):
+                            sym = str(m.get("symbol", "") or "")
+                            if not sym:
+                                continue
+                            mtype = str(m.get("type", "") or "").lower()
+                            if not mtype:
+                                if sym.endswith("/SWAP"):
+                                    mtype = "swap"
+                                elif sym.endswith("/USDT"):
+                                    mtype = "spot"
+                            out.append({"symbol": sym, "type": mtype})
+                    if out:
+                        return out
+            except Exception as e:
+                logger.debug(f"fetch_markets 调用失败，回退 exchange_info: {e}")
+
+        get_exchange_info = getattr(self._exchange, "get_exchange_info", None)
+        if callable(get_exchange_info):
+            try:
+                info = get_exchange_info()
+                info = await info if asyncio.iscoroutine(info) or hasattr(info, "__await__") else info
+                supported = getattr(info, "supported_symbols", None)
+                if not isinstance(supported, list) and isinstance(info, dict):
+                    supported = info.get("supported_symbols", [])
+                out = []
+                for sym in supported or []:
+                    s = str(sym or "").replace("-", "/")
+                    if not s:
+                        continue
+                    s_up = s.upper()
+                    mtype = "swap" if s_up.endswith("/SWAP") else "spot"
+                    out.append({"symbol": s, "type": mtype})
+                return out
+            except Exception as e:
+                logger.debug(f"get_exchange_info 回退失败: {e}")
+        return []
+
+    async def _fetch_ticker_compat(self, symbol: str) -> Dict[str, Any]:
+        """
+        兼容 ccxt 与项目内 exchange 封装的 ticker 字段。
+        返回统一字段: bid/ask/last/quoteVolume
+        """
+        if not self._exchange:
+            return {}
+
+        for name in ("fetch_ticker", "get_ticker"):
+            fn = getattr(self._exchange, name, None)
+            if not callable(fn):
+                continue
+            try:
+                data = fn(symbol)
+                data = await data if asyncio.iscoroutine(data) or hasattr(data, "__await__") else data
+                if not isinstance(data, dict):
+                    continue
+                last = data.get("last") or data.get("close") or data.get("price") or 0
+                bid = data.get("bid") or 0
+                ask = data.get("ask") or 0
+                quote_vol = (
+                    data.get("quoteVolume")
+                    or data.get("quote_volume")
+                    or data.get("volCcy24h")
+                    or data.get("baseVolume", 0) * (float(last or 0) if last else 0)
+                    or data.get("volume", 0) * (float(last or 0) if last else 0)
+                    or 0
+                )
+                return {
+                    "last": float(last or 0),
+                    "bid": float(bid or 0),
+                    "ask": float(ask or 0),
+                    "quoteVolume": float(quote_vol or 0),
+                }
+            except Exception as e:
+                logger.debug(f"{name}({symbol}) 失败: {e}")
+        return {}
+
+    async def _fetch_ohlcv_compat(self, symbol: str, timeframe: str, limit: int = 24) -> List[List[float]]:
+        """
+        兼容 ccxt 风格 fetch_ohlcv 与项目封装 get_klines。
+        返回 [[ts,o,h,l,c,v], ...]
+        """
+        if not self._exchange:
+            return []
+
+        fetch_ohlcv = getattr(self._exchange, "fetch_ohlcv", None)
+        if callable(fetch_ohlcv):
+            try:
+                rows = fetch_ohlcv(symbol, timeframe, limit=limit)
+                rows = await rows if asyncio.iscoroutine(rows) or hasattr(rows, "__await__") else rows
+                if isinstance(rows, list):
+                    return rows
+            except Exception as e:
+                logger.debug(f"fetch_ohlcv({symbol}) 失败: {e}")
+
+        get_klines = getattr(self._exchange, "get_klines", None)
+        if callable(get_klines):
+            try:
+                tf = str(timeframe).replace("h", "H")
+                rows = get_klines(symbol.replace("/", "-"), tf, limit=limit)
+                rows = await rows if asyncio.iscoroutine(rows) or hasattr(rows, "__await__") else rows
+                if isinstance(rows, list):
+                    out: List[List[float]] = []
+                    for r in rows:
+                        if isinstance(r, (list, tuple)) and len(r) >= 6:
+                            out.append([float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])])
+                        elif isinstance(r, dict):
+                            ts = r.get("ts") or r.get("timestamp") or r.get("t") or 0
+                            o = r.get("open", 0)
+                            h = r.get("high", 0)
+                            l = r.get("low", 0)
+                            c = r.get("close", 0)
+                            v = r.get("volume", 0)
+                            out.append([float(ts), float(o), float(h), float(l), float(c), float(v)])
+                    return out
+            except Exception as e:
+                logger.debug(f"get_klines({symbol}) 失败: {e}")
+        return []
     
     async def select_best_symbols(self, candidates: List[str]) -> List[str]:
         """

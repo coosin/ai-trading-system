@@ -138,6 +138,10 @@ class AITradingEngine:
         
         # 监控的交易对
         self.symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+        self._use_dynamic_symbols = True
+        self._dynamic_symbol_refresh_seconds = 300
+        self._max_dynamic_symbols = 12
+        self._last_symbol_sync_at: Optional[datetime] = None
         
         # 交易对黑名单
         self.symbol_blacklist = []
@@ -162,7 +166,11 @@ class AITradingEngine:
             "analysis_interval": DEFAULT_ANALYSIS_INTERVAL_SECONDS,
             "min_confidence": 0.75,
             "max_positions": DEFAULT_MAX_POSITIONS,
+            "max_same_direction_positions": 5,
+            "max_hedged_positions": 8,
             "risk_per_trade": 0.01,
+            "max_symbol_position_ratio": 0.2,
+            "max_total_exposure_ratio": 0.8,
             "trade_mode": "real",
             "auto_risk_management": True,
             "critical_risk_auto_close": True,
@@ -185,6 +193,9 @@ class AITradingEngine:
         # 自动平仓去重 - 避免重复平仓
         self._auto_close_attempts: Dict[str, float] = {}
         self._auto_close_cooldown = 60  # 自动平仓冷却时间（秒）
+        self._empty_position_reads = 0
+        self._wallet_snapshot: Dict[str, Any] = {}
+        self._sltp_bound_keys: set[str] = set()
         
         logger.info("全智能AI交易引擎初始化完成")
     
@@ -365,12 +376,27 @@ class AITradingEngine:
                 symbols = config.get("symbols")
                 if isinstance(symbols, list) and symbols:
                     self.symbols = symbols
+                self._use_dynamic_symbols = bool(
+                    config.get("dynamic_symbol_universe", self._use_dynamic_symbols)
+                )
+                self._dynamic_symbol_refresh_seconds = int(
+                    config.get(
+                        "dynamic_symbol_refresh_seconds",
+                        self._dynamic_symbol_refresh_seconds,
+                    )
+                    or self._dynamic_symbol_refresh_seconds
+                )
+                self._max_dynamic_symbols = int(
+                    config.get("max_dynamic_symbols", self._max_dynamic_symbols)
+                    or self._max_dynamic_symbols
+                )
                 contract_config = config.get("contract_config", {})
                 if isinstance(contract_config, dict):
                     self.contract_config.update(contract_config)
                 ai_cfg = config.get("ai_config", {})
                 if isinstance(ai_cfg, dict):
                     self.ai_config.update(ai_cfg)
+        await self._sync_symbols_from_selector(force=True)
         
         self._running = True
         logger.info(f"✅ 全智能AI交易引擎初始化完成")
@@ -397,6 +423,7 @@ class AITradingEngine:
     async def start(self) -> None:
         """启动AI交易引擎"""
         logger.info("🚀 启动全智能AI交易引擎...")
+        await self._bootstrap_live_state_takeover()
         
         # 启动主交易循环（受 single_write_owner 约束）
         if await self._autonomous_trading_execution_allowed():
@@ -464,6 +491,7 @@ class AITradingEngine:
         """
         while self._running:
             try:
+                await self._sync_symbols_from_selector(force=False)
                 for symbol in self.symbols:
                     if not self._running:
                         break
@@ -510,6 +538,36 @@ class AITradingEngine:
             except Exception as e:
                 logger.error(f"交易循环错误: {e}")
                 await asyncio.sleep(10)
+
+    async def _sync_symbols_from_selector(self, force: bool = False) -> None:
+        """按周期从动态选币器同步交易对，避免长期固定币对。"""
+        if not self._use_dynamic_symbols:
+            return
+        now = datetime.now()
+        if (
+            not force
+            and self._last_symbol_sync_at
+            and (now - self._last_symbol_sync_at).total_seconds()
+            < max(30, self._dynamic_symbol_refresh_seconds)
+        ):
+            return
+        mc = self.main_controller
+        selector = getattr(mc, "dynamic_symbol_selector", None) if mc else None
+        if not selector or not hasattr(selector, "get_trading_symbols"):
+            self._last_symbol_sync_at = now
+            return
+        try:
+            symbols = await selector.get_trading_symbols()
+            symbols = [str(s) for s in symbols if s]
+            if symbols:
+                symbols = symbols[: max(1, int(self._max_dynamic_symbols or 12))]
+                if symbols != self.symbols:
+                    self.symbols = symbols
+                    logger.info(f"🔁 动态交易对同步完成: {self.symbols}")
+        except Exception as e:
+            logger.debug(f"动态交易对同步失败: {e}")
+        finally:
+            self._last_symbol_sync_at = now
     
     async def _collect_market_data(self, symbol: str) -> Optional[Dict]:
         """采集市场数据"""
@@ -1057,6 +1115,7 @@ class AITradingEngine:
             
             # 构建决策提示词
             decision_prompt = self._build_decision_prompt(symbol, context, current_position)
+            recent_lessons = await self._recall_trade_lessons(symbol=symbol, limit=3)
             
             # 调用AI生成决策
             snap = context.metadata.get("unified_snapshot", {}) if isinstance(context.metadata, dict) else {}
@@ -1071,6 +1130,8 @@ class AITradingEngine:
                     "volatility": context.volatility,
                     "unified_data_quality": data_quality,
                     "unified_ai_analysis": ai_data_analysis,
+                    "recent_lessons": recent_lessons,
+                    "decision_prompt": decision_prompt,
                 }
             )
             
@@ -1143,7 +1204,8 @@ class AITradingEngine:
                 take_profit=take_profit,
                 metadata={
                     "ai_analysis": ai_decision,
-                    "market_context": context.__dict__
+                    "market_context": context.__dict__,
+                    "recent_lessons": recent_lessons,
                 }
             )
             
@@ -1231,9 +1293,17 @@ class AITradingEngine:
             # 获取账户余额
             if self.exchange:
                 balance = await self.exchange.get_balance()
-                available = balance.get("USDT", {}).get("free", 10000)
+                usdt = balance.get("USDT", 10000) if isinstance(balance, dict) else 10000
+                if isinstance(usdt, dict):
+                    available = float(usdt.get("free", usdt.get("available", 10000)) or 10000)
+                else:
+                    available = float(usdt or 10000)
             else:
                 available = 10000  # 默认
+
+            equity = max(available, self._estimate_total_equity_fallback(available))
+            total_exposure = self._estimate_total_exposure()
+            symbol_exposure = self._estimate_symbol_exposure(symbol)
             
             # 基于风险计算仓位
             risk_amount = available * self.ai_config["risk_per_trade"]
@@ -1245,11 +1315,17 @@ class AITradingEngine:
             # 这里简化处理，实际应该传入confidence
             
             position_value = risk_amount * volatility_factor
+            if action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
+                # 分散和资金链保护：单币和总敞口双限制
+                max_symbol_ratio = float(self.ai_config.get("max_symbol_position_ratio", 0.2) or 0.2)
+                max_total_ratio = float(self.ai_config.get("max_total_exposure_ratio", 0.8) or 0.8)
+                symbol_room_value = max(0.0, equity * max_symbol_ratio - symbol_exposure)
+                total_room_value = max(0.0, equity * max_total_ratio - total_exposure)
+                position_value = min(position_value, symbol_room_value, total_room_value)
+
             quantity = position_value / context.price if context.price > 0 else 0
-            
-            # 限制最大仓位
-            max_quantity = available * 0.1 / context.price if context.price > 0 else 0
-            quantity = min(quantity, max_quantity)
+            if quantity <= 0:
+                return 0.0
             
             return round(quantity, 6)
             
@@ -1261,15 +1337,18 @@ class AITradingEngine:
                                         action: TradeAction) -> tuple:
         """计算止损止盈价格"""
         price = context.price
+        vol = max(0.0, min(float(context.volatility or 0.0), 0.20))
+        stop_loss_pct = max(0.015, min(0.06, 0.015 + vol * 0.35))
+        take_profit_pct = max(0.03, min(0.12, stop_loss_pct * 1.8))
         
         if action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT]:
             # 多单
-            stop_loss = price * DEFAULT_STOP_LOSS_LONG_RATIO
-            take_profit = price * DEFAULT_TAKE_PROFIT_LONG_RATIO
+            stop_loss = price * (1 - stop_loss_pct)
+            take_profit = price * (1 + take_profit_pct)
         elif action in [TradeAction.OPEN_SHORT, TradeAction.CLOSE_LONG]:
             # 空单
-            stop_loss = price * DEFAULT_STOP_LOSS_SHORT_RATIO
-            take_profit = price * DEFAULT_TAKE_PROFIT_SHORT_RATIO
+            stop_loss = price * (1 + stop_loss_pct)
+            take_profit = price * (1 - take_profit_pct)
         else:
             return None, None
         
@@ -1280,16 +1359,46 @@ class AITradingEngine:
         try:
             # 对新开仓执行最大持仓数限制（优先读取外部配置，兼容测试）
             if decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
-                max_positions = self.ai_config.get("max_positions", DEFAULT_MAX_POSITIONS)
-                try:
-                    if isinstance(self.config, dict):
-                        max_positions = self.config.get("trading", {}).get("max_positions", max_positions)
-                except Exception:
-                    pass
+                max_same = int(self.ai_config.get("max_same_direction_positions", 5) or 5)
+                max_hedged = int(self.ai_config.get("max_hedged_positions", 8) or 8)
+                max_positions = int(self.ai_config.get("max_positions", DEFAULT_MAX_POSITIONS) or DEFAULT_MAX_POSITIONS)
+                long_cnt, short_cnt = self._count_open_directions()
+                opening_long = decision.action == TradeAction.OPEN_LONG
+                opening_short = decision.action == TradeAction.OPEN_SHORT
 
-                if len(self.positions) >= max_positions and decision.symbol not in self.positions:
-                    logger.info(f"📊 持仓数已达上限({max_positions})，拒绝新开仓: {decision.symbol}")
+                if opening_long and long_cnt >= max_same and decision.symbol not in self.positions:
+                    logger.info(f"📊 同向多仓已达上限({max_same})，拒绝新开多: {decision.symbol}")
                     return False
+                if opening_short and short_cnt >= max_same and decision.symbol not in self.positions:
+                    logger.info(f"📊 同向空仓已达上限({max_same})，拒绝新开空: {decision.symbol}")
+                    return False
+
+                # 仅单方向时使用基础上限；双方向对冲并存时可放宽到 max_hedged
+                has_both_directions = long_cnt > 0 and short_cnt > 0
+                total_cap = max_hedged if has_both_directions else max_positions
+                if len(self.positions) >= total_cap and decision.symbol not in self.positions:
+                    logger.info(f"📊 持仓数已达上限({total_cap})，拒绝新开仓: {decision.symbol}")
+                    return False
+
+                # 资金链保护：检查本次开仓后是否超总敞口
+                projected_value = float(decision.quantity or 0.0) * float(decision.price or 0.0)
+                if projected_value > 0:
+                    available = 10000.0
+                    if self.exchange:
+                        try:
+                            balance = await self.exchange.get_balance()
+                            usdt = balance.get("USDT", 10000) if isinstance(balance, dict) else 10000
+                            if isinstance(usdt, dict):
+                                available = float(usdt.get("free", usdt.get("available", 10000)) or 10000)
+                            else:
+                                available = float(usdt or 10000)
+                        except Exception:
+                            pass
+                    equity = max(available, self._estimate_total_equity_fallback(available))
+                    max_total_ratio = float(self.ai_config.get("max_total_exposure_ratio", 0.8) or 0.8)
+                    if self._estimate_total_exposure() + projected_value > equity * max_total_ratio:
+                        logger.info("📊 总敞口保护触发，拒绝开仓: %s", decision.symbol)
+                        return False
 
             existing = self.positions.get(decision.symbol)
             if existing:
@@ -1309,6 +1418,58 @@ class AITradingEngine:
         except Exception as e:
             logger.error(f"风险检查失败: {e}")
             return True
+
+    def _count_open_directions(self) -> tuple:
+        long_cnt = 0
+        short_cnt = 0
+        for pos in self.positions.values():
+            side = getattr(pos, "side", "")
+            if side == "long":
+                long_cnt += 1
+            elif side == "short":
+                short_cnt += 1
+        return long_cnt, short_cnt
+
+    def _estimate_total_exposure(self) -> float:
+        total = 0.0
+        for pos in self.positions.values():
+            qty = float(getattr(pos, "quantity", 0.0) or 0.0)
+            px = float(getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", 0.0) or 0.0)
+            total += abs(qty * px)
+        return total
+
+    def _estimate_symbol_exposure(self, symbol: str) -> float:
+        pos = self.positions.get(symbol)
+        if not pos:
+            return 0.0
+        qty = float(getattr(pos, "quantity", 0.0) or 0.0)
+        px = float(getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", 0.0) or 0.0)
+        return abs(qty * px)
+
+    def _estimate_total_equity_fallback(self, available: float) -> float:
+        # 没有完整账户权益时，使用可用余额 + 持仓名义价值作为保守估算。
+        return float(available or 0.0) + self._estimate_total_exposure()
+
+    async def _recall_trade_lessons(self, symbol: str, limit: int = 3) -> List[str]:
+        """读取近期交易经验/教训，注入到决策上下文。"""
+        mc = self.main_controller
+        gateway = getattr(mc, "memory_gateway", None) if mc else None
+        if not gateway or not hasattr(gateway, "recall"):
+            return []
+        try:
+            rows = await gateway.recall(
+                query=f"{symbol} 交易 复盘 经验 教训 策略优化",
+                limit=max(1, int(limit)),
+                min_importance=0.55,
+            )
+            out: List[str] = []
+            for r in rows or []:
+                content = str(getattr(r, "content", "") or "").strip()
+                if content:
+                    out.append(content[:180])
+            return out[: max(1, int(limit))]
+        except Exception:
+            return []
     
     async def _execute_decision(self, decision: AIDecision) -> bool:
         """执行AI决策"""
@@ -1632,19 +1793,32 @@ class AITradingEngine:
                 return
             
             positions = await self.exchange.get_positions()
+            if positions is None:
+                return
+            if not isinstance(positions, list):
+                logger.warning("持仓返回格式异常，跳过本次同步")
+                return
             
             existing_symbols = set(self.positions.keys())
             new_symbols = set()
+            valid_rows = 0
             
             for pos in positions:
-                symbol = pos.get("symbol")
+                symbol = (
+                    pos.get("symbol")
+                    or pos.get("instId")
+                    or pos.get("instrument_id")
+                    or pos.get("inst_id")
+                )
                 if not symbol:
                     continue
+                symbol = str(symbol).replace("-", "/")
                 
                 size = float(pos.get("size", 0) or pos.get("quantity", 0) or 0)
                 
                 if size == 0:
                     continue
+                valid_rows += 1
                 
                 new_symbols.add(symbol)
                 
@@ -1657,8 +1831,14 @@ class AITradingEngine:
                 old_stop_loss = existing_pos.stop_loss if existing_pos else None
                 old_take_profit = existing_pos.take_profit if existing_pos else None
                 
-                entry_price = float(pos.get("entry_price", 0) or 0)
-                side = pos.get("side", "long")
+                entry_price = float(pos.get("entry_price", 0) or pos.get("avgPx", 0) or 0)
+                side = (pos.get("side") or "").lower()
+                if side not in {"long", "short"}:
+                    raw_side = str(pos.get("posSide_raw", "") or pos.get("posSide", "")).lower()
+                    if raw_side in {"long", "short"}:
+                        side = raw_side
+                    else:
+                        side = "long" if size >= 0 else "short"
                 
                 if old_stop_loss is None and entry_price > 0:
                     if side == "long":
@@ -1679,13 +1859,35 @@ class AITradingEngine:
                     side=side,
                     entry_price=entry_price,
                     quantity=abs(size),
-                    current_price=float(pos.get("mark_price", 0) or pos.get("current_price", 0) or 0),
+                    current_price=float(
+                        pos.get("mark_price", 0)
+                        or pos.get("mark_px", 0)
+                        or pos.get("markPx", 0)
+                        or pos.get("current_price", 0)
+                        or 0
+                    ),
                     unrealized_pnl=float(pos.get("unrealized_pnl", 0) or 0),
-                    unrealized_pnl_percent=float(pos.get("pnl_ratio", 0) or pos.get("unrealized_pnl_percent", 0) or 0),
+                    unrealized_pnl_percent=float(
+                        pos.get("pnl_ratio", 0)
+                        or pos.get("uplRatio", 0)
+                        or pos.get("unrealized_pnl_percent", 0)
+                        or 0
+                    ),
                     stop_loss=old_stop_loss,
                     take_profit=old_take_profit
                 )
-            
+
+            if valid_rows == 0 and existing_symbols:
+                self._empty_position_reads += 1
+                if self._empty_position_reads < 3:
+                    logger.warning(
+                        "持仓同步返回空结果（第 %d 次），保留现有持仓避免误清空",
+                        self._empty_position_reads,
+                    )
+                    return
+            else:
+                self._empty_position_reads = 0
+
             closed_symbols = existing_symbols - new_symbols
             for symbol in closed_symbols:
                 logger.info(f"📊 {symbol} 已平仓，从监控列表移除")
@@ -1695,9 +1897,91 @@ class AITradingEngine:
                 logger.info(f"📊 当前监控 {len(self.positions)} 个持仓")
                 for sym, pos in self.positions.items():
                     logger.info(f"   - {sym}: {pos.side} {pos.quantity} | 止损={pos.stop_loss:.4f} | 止盈={pos.take_profit:.4f}")
+            await self._sync_wallet_snapshot()
+            await self._ensure_sltp_binding_for_positions()
             
         except Exception as e:
             logger.error(f"更新持仓失败: {e}")
+
+    async def _sync_wallet_snapshot(self) -> None:
+        """实时同步钱包数据，供风控与重启接管使用。"""
+        if not self.exchange:
+            return
+        try:
+            balance = await self.exchange.get_balance()
+            if isinstance(balance, dict):
+                self._wallet_snapshot = {
+                    "timestamp": datetime.now().isoformat(),
+                    "balance": balance,
+                }
+                if self.main_controller is not None:
+                    setattr(self.main_controller, "_latest_account_state", {
+                        "balance": balance,
+                        "positions": [
+                            {
+                                "symbol": p.symbol,
+                                "side": p.side,
+                                "quantity": p.quantity,
+                                "entry_price": p.entry_price,
+                                "mark_price": p.current_price,
+                                "unrealized_pnl": p.unrealized_pnl,
+                            }
+                            for p in self.positions.values()
+                        ],
+                        "timestamp": datetime.now().isoformat(),
+                    })
+        except Exception as e:
+            logger.debug(f"钱包同步失败: {e}")
+
+    async def _bootstrap_live_state_takeover(self) -> None:
+        """启动后立即接管交易所真实持仓/钱包，防止重启后丢失状态。"""
+        for i in range(3):
+            await self._update_positions()
+            await self._sync_wallet_snapshot()
+            if self.positions:
+                logger.info("✅ 启动接管成功：已同步到 %d 个实时持仓", len(self.positions))
+                return
+            await asyncio.sleep(2)
+        logger.warning("启动接管未发现持仓（可能确实空仓或交易所短时无返回）")
+
+    async def _ensure_sltp_binding_for_positions(self) -> None:
+        """确保接管到的持仓都挂上止盈止损跟踪（重启后尤其关键）。"""
+        if not self.main_controller:
+            return
+        stop_loss_manager = self.main_controller.get_stop_loss_manager()
+        if not stop_loss_manager:
+            return
+        for symbol, pos in list(self.positions.items()):
+            key = f"{symbol}|{pos.side}"
+            if key in self._sltp_bound_keys:
+                continue
+            if not pos.stop_loss or not pos.take_profit:
+                continue
+            try:
+                from .stop_loss_take_profit import StopLossConfig, TakeProfitConfig, StopType, TakeProfitType
+
+                sl_config = StopLossConfig(
+                    stop_type=StopType.FIXED,
+                    stop_value=pos.stop_loss,
+                    enable_breakeven=True,
+                    breakeven_trigger=0.02,
+                )
+                tp_config = TakeProfitConfig(
+                    tp_type=TakeProfitType.FIXED,
+                    tp_value=pos.take_profit,
+                )
+                await stop_loss_manager.create_order(
+                    symbol=symbol,
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    quantity=pos.quantity,
+                    stop_loss_config=sl_config,
+                    take_profit_config=tp_config,
+                    metadata={"source": "position_takeover"},
+                )
+                self._sltp_bound_keys.add(key)
+            except Exception as e:
+                logger.debug(f"补挂SLTP失败 {symbol}: {e}")
     
     async def _monitoring_loop(self) -> None:
         """监控循环 - 持仓跟踪和止损止盈检查"""
