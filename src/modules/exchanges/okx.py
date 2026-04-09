@@ -9,6 +9,7 @@ import base64
 import hmac
 import json
 import logging
+import os
 import ssl
 import time
 from datetime import datetime
@@ -17,6 +18,7 @@ from functools import wraps
 from urllib.parse import urlencode
 
 import aiohttp
+import certifi
 
 from .exchange_base import ExchangeBase, MarketData, OrderBook, Order, Balance, ExchangeInfo
 
@@ -67,20 +69,93 @@ class OKXExchange(ExchangeBase):
         self.ws_url = "wss://ws.okx.com:8443" if not self.testnet else "wss://wspap.okx.com:8443"
         self._session = None
         self._ws_connections = {}
-        self._request_semaphore = asyncio.Semaphore(10)  # 限制并发请求数
+        req_concurrency = int(os.getenv("OPENCLAW_OKX_MAX_CONCURRENCY", "4") or "4")
+        self._request_semaphore = asyncio.Semaphore(max(1, req_concurrency))  # 限制并发请求数
         self._last_request_time = 0
-        self._min_request_interval = 0.1  # 最小请求间隔（秒）
+        self._min_request_interval = float(os.getenv("OPENCLAW_OKX_MIN_REQUEST_INTERVAL", "0.2") or "0.2")
+        self._request_max_retries = int(os.getenv("OPENCLAW_OKX_MAX_RETRIES", "3") or "3")
+        self._timeout_total = float(os.getenv("OPENCLAW_OKX_TIMEOUT_TOTAL", "30") or "30")
+        self._timeout_connect = float(os.getenv("OPENCLAW_OKX_TIMEOUT_CONNECT", "10") or "10")
+        self._timeout_sock_read = float(os.getenv("OPENCLAW_OKX_TIMEOUT_SOCK_READ", "20") or "20")
         # 代理/直连自愈：代理不可用时自动降级为直连，避免实盘全链路失败
         self._proxy_mode: str = "unknown"  # unknown|direct|http|socks
         self._proxy_url: Optional[str] = None
+        self._proxy_from_env: bool = False
         self._proxy_disabled_until: float = 0.0
         self._session_recreate_lock = asyncio.Lock()
+        # 网络自愈：连续失败后主动重建会话/切换代理源
+        self._network_consecutive_failures: int = 0
+        self._network_failure_threshold: int = 5
+        self._last_recover_ts: float = 0.0
+        self._recover_cooldown_s: float = 30.0
         # instruments 缓存（公开接口），用于下单前的最小张数/步进预检
         self._instrument_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._instrument_cache_ttl_s: float = 300.0
 
+    def _build_ssl_context(self) -> ssl.SSLContext:
+        """
+        统一TLS上下文：
+        - 使用 certifi/system CA，避免证书链不一致
+        - 仅允许 TLS1.2+，提升兼容与安全性
+        """
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        return ctx
+
     def _proxy_temporarily_disabled(self) -> bool:
         return time.time() < float(self._proxy_disabled_until or 0.0)
+
+    async def _mark_request_success(self) -> None:
+        self._network_consecutive_failures = 0
+
+    async def _mark_request_failure(self, reason: str) -> None:
+        self._network_consecutive_failures += 1
+        if self._network_consecutive_failures >= self._network_failure_threshold:
+            logger.warning(
+                "⚠️ OKX网络连续失败达到阈值(%s)，触发自愈恢复: %s",
+                self._network_consecutive_failures,
+                reason,
+            )
+            await self._attempt_network_recovery(reason)
+
+    async def _attempt_network_recovery(self, reason: str) -> None:
+        now = time.time()
+        if now - self._last_recover_ts < self._recover_cooldown_s:
+            return
+        self._last_recover_ts = now
+
+        # 若代理来源于 ProxyManager，优先请求切换代理，再重建会话
+        if not self._proxy_from_env:
+            try:
+                from src.modules.core.proxy_manager import get_proxy_manager
+
+                proxy_manager = await get_proxy_manager()
+                if getattr(proxy_manager, "_running", False):
+                    switched = await proxy_manager.switch_proxy()
+                    if switched:
+                        proxy = await proxy_manager.get_proxy("www.okx.com")
+                        if proxy:
+                            self._proxy_url = proxy.url
+                            self._proxy_mode = "socks" if proxy.proxy_type.value in ("socks5", "socks4") else "http"
+                            logger.info("✅ OKX自愈已切换代理: %s", self._proxy_url)
+            except Exception as e:
+                logger.debug("OKX自愈切换代理失败，继续重建会话: %s", e)
+
+        # 始终重建一次会话，清理潜在坏连接
+        await self._rebuild_session(reason)
+        self._network_consecutive_failures = 0
+
+    async def _rebuild_session(self, reason: str) -> None:
+        async with self._session_recreate_lock:
+            old = self._session
+            connector = aiohttp.TCPConnector(ssl=self._build_ssl_context())
+            self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
+            if old:
+                try:
+                    await old.close()
+                except Exception:
+                    pass
+            logger.info("♻️ OKX会话已重建: %s", reason)
 
     async def _switch_to_direct_session(self, reason: str) -> None:
         """
@@ -97,7 +172,7 @@ class OKXExchange(ExchangeBase):
             self._proxy_url = None
 
             try:
-                ssl_context = ssl.create_default_context()
+                ssl_context = self._build_ssl_context()
                 connector = aiohttp.TCPConnector(ssl=ssl_context)
                 new_session = aiohttp.ClientSession(connector=connector, connector_owner=True)
             except Exception as e:
@@ -192,7 +267,7 @@ class OKXExchange(ExchangeBase):
             logger.debug(f"📤 Body: {body_str}")
             logger.debug(f"📤 Headers: OK-ACCESS-KEY={headers.get('OK-ACCESS-KEY')[:8]}..., TIMESTAMP={headers.get('OK-ACCESS-TIMESTAMP')}")
             
-            max_retries = 3
+            max_retries = self._request_max_retries
             retry_delay = 1.0
             
             proxy = getattr(self, '_proxy_url', None)
@@ -203,10 +278,14 @@ class OKXExchange(ExchangeBase):
             
             for attempt in range(max_retries + 1):
                 try:
-                    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+                    timeout = aiohttp.ClientTimeout(
+                        total=self._timeout_total,
+                        connect=self._timeout_connect,
+                        sock_read=self._timeout_sock_read,
+                    )
                     
                     if method == "GET":
-                        async with self._session.get(url, headers=headers, params=params, timeout=timeout, proxy=proxy, ssl=False) as response:
+                        async with self._session.get(url, headers=headers, params=params, timeout=timeout, proxy=proxy) as response:
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)
@@ -215,6 +294,7 @@ class OKXExchange(ExchangeBase):
                             
                             data = await response.json()
                             if data.get("code") == "0":
+                                await self._mark_request_success()
                                 return data.get("data", [])
                             else:
                                 error_code = data.get('code', '')
@@ -226,7 +306,7 @@ class OKXExchange(ExchangeBase):
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
                     elif method == "POST":
-                        async with self._session.post(url, headers=headers, data=body_str, timeout=timeout, proxy=proxy, ssl=False) as response:
+                        async with self._session.post(url, headers=headers, data=body_str, timeout=timeout, proxy=proxy) as response:
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)
@@ -236,6 +316,7 @@ class OKXExchange(ExchangeBase):
                             data = await response.json()
                             logger.debug(f"📥 OKX响应: {data}")
                             if data.get("code") == "0":
+                                await self._mark_request_success()
                                 return data.get("data", [])
                             else:
                                 error_msg = data.get('msg', '') or data.get('code', 'unknown')
@@ -243,7 +324,7 @@ class OKXExchange(ExchangeBase):
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
                     elif method == "DELETE":
-                        async with self._session.delete(url, headers=headers, json=body, timeout=timeout, proxy=proxy, ssl=False) as response:
+                        async with self._session.delete(url, headers=headers, json=body, timeout=timeout, proxy=proxy) as response:
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)
@@ -252,6 +333,7 @@ class OKXExchange(ExchangeBase):
                             
                             data = await response.json()
                             if data.get("code") == "0":
+                                await self._mark_request_success()
                                 return data.get("data", [])
                             else:
                                 error_code = data.get('code', '')
@@ -263,6 +345,7 @@ class OKXExchange(ExchangeBase):
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
                 except asyncio.TimeoutError as e:
+                    await self._mark_request_failure(f"timeout {method} {endpoint}")
                     if attempt < max_retries:
                         logger.warning(f"⚠️ OKX API 超时 (尝试 {attempt + 1}/{max_retries + 1}): {method} {endpoint}")
                         await asyncio.sleep(retry_delay)
@@ -273,6 +356,7 @@ class OKXExchange(ExchangeBase):
                         raise
                         
                 except aiohttp.ClientConnectorError as e:
+                    await self._mark_request_failure(f"connector {method} {endpoint}: {e}")
                     if attempt < max_retries:
                         logger.warning(f"⚠️ OKX API 连接失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
                         await asyncio.sleep(retry_delay)
@@ -283,6 +367,7 @@ class OKXExchange(ExchangeBase):
                         raise
                         
                 except aiohttp.ClientError as e:
+                    await self._mark_request_failure(f"client {method} {endpoint}: {e}")
                     # 代理/网络链路错误：若当前在用代理，自动降级直连并重试
                     err_s = str(e)
                     proxy_related = any(
@@ -312,6 +397,7 @@ class OKXExchange(ExchangeBase):
                         raise
                         
                 except Exception as e:
+                    await self._mark_request_failure(f"unknown {method} {endpoint}: {e}")
                     error_str = str(e)
                     # 代理链路导致的“全失败”常见报错，自动降级直连再试
                     if "All operations failed" in error_str and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None)):
@@ -333,51 +419,69 @@ class OKXExchange(ExchangeBase):
             ssl_context = None
             
             try:
-                from src.modules.core.proxy_manager import get_proxy_manager
-                proxy_manager = await get_proxy_manager()
-                
-                if not proxy_manager._running:
-                    if hasattr(self, '_config_manager') and self._config_manager:
-                        config_manager = self._config_manager
-                    else:
-                        from src.modules.core.config_manager import get_config_manager
-                        config_manager = await get_config_manager()
-                    
-                    proxy_config = await config_manager.get_config("proxy", {})
-                    logger.info(f"📋 加载代理配置: {proxy_config}")
-                    await proxy_manager.initialize(proxy_config)
-                else:
-                    logger.info(f"📋 proxy_manager已初始化, global_proxy={proxy_manager.global_proxy}, use_global_proxy={proxy_manager.use_global_proxy}")
-                
-                proxy = await proxy_manager.get_proxy("www.okx.com")
-                
-                if proxy:
-                    logger.info(f"✅ 使用代理: {proxy.url}")
-                    if proxy.proxy_type.value in ["socks5", "socks4"]:
-                        from aiohttp_socks import ProxyConnector
-                        connector = ProxyConnector.from_url(proxy.url, ssl=False)
-                        self._proxy_mode = "socks"
-                        self._proxy_url = proxy.url
-                    else:
-                        ssl_context = ssl.create_default_context()
-                        ssl_context.check_hostname = False
-                        ssl_context.verify_mode = ssl.CERT_NONE
-                        connector = aiohttp.TCPConnector(ssl=ssl_context)
-                        self._proxy_url = proxy.url
-                        self._proxy_mode = "http"
-                        logger.info(f"✅ 已配置HTTPS代理SSL上下文 (忽略证书验证)")
-                else:
-                    logger.warning("⚠️ 未找到可用代理，使用直连")
-                    ssl_context = ssl.create_default_context()
+                # 优先使用容器环境变量代理，保证与部署配置一致
+                env_proxy = (
+                    os.getenv("OPENCLAW_HTTPS_PROXY")
+                    or os.getenv("OPENCLAW_HTTP_PROXY")
+                    or os.getenv("HTTPS_PROXY")
+                    or os.getenv("HTTP_PROXY")
+                )
+                if env_proxy:
+                    ssl_context = self._build_ssl_context()
                     connector = aiohttp.TCPConnector(ssl=ssl_context)
-                    self._proxy_mode = "direct"
+                    self._proxy_url = env_proxy
+                    self._proxy_mode = "http"
+                    self._proxy_from_env = True
+                    logger.info(f"✅ OKX使用环境代理: {env_proxy}")
+                else:
+                    logger.info("ℹ️ 未检测到环境代理，尝试通过proxy_manager获取")
+
+                    from src.modules.core.proxy_manager import get_proxy_manager
+                    proxy_manager = await get_proxy_manager()
+                
+                    if not proxy_manager._running:
+                        if hasattr(self, '_config_manager') and self._config_manager:
+                            config_manager = self._config_manager
+                        else:
+                            from src.modules.core.config_manager import get_config_manager
+                            config_manager = await get_config_manager()
+                        
+                        proxy_config = await config_manager.get_config("proxy", {})
+                        logger.info(f"📋 加载代理配置: {proxy_config}")
+                        await proxy_manager.initialize(proxy_config)
+                    else:
+                        logger.info(f"📋 proxy_manager已初始化, global_proxy={proxy_manager.global_proxy}, use_global_proxy={proxy_manager.use_global_proxy}")
+                    
+                    proxy = await proxy_manager.get_proxy("www.okx.com")
+                    
+                    if proxy:
+                        logger.info(f"✅ 使用代理: {proxy.url}")
+                        if proxy.proxy_type.value in ["socks5", "socks4"]:
+                            from aiohttp_socks import ProxyConnector
+                            connector = ProxyConnector.from_url(proxy.url, ssl=self._build_ssl_context())
+                            self._proxy_mode = "socks"
+                            self._proxy_url = proxy.url
+                            self._proxy_from_env = False
+                        else:
+                            ssl_context = self._build_ssl_context()
+                            connector = aiohttp.TCPConnector(ssl=ssl_context)
+                            self._proxy_url = proxy.url
+                            self._proxy_mode = "http"
+                            self._proxy_from_env = False
+                    else:
+                        logger.warning("⚠️ 未找到可用代理，使用直连")
+                        ssl_context = self._build_ssl_context()
+                        connector = aiohttp.TCPConnector(ssl=ssl_context)
+                        self._proxy_mode = "direct"
+                        self._proxy_from_env = False
             except Exception as proxy_error:
                 logger.warning(f"⚠️ 加载代理配置失败: {proxy_error}，使用直连")
                 import traceback
                 traceback.print_exc()
-                ssl_context = ssl.create_default_context()
+                ssl_context = self._build_ssl_context()
                 connector = aiohttp.TCPConnector(ssl=ssl_context)
                 self._proxy_mode = "direct"
+                self._proxy_from_env = False
             
             self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
             await self.get_exchange_info()

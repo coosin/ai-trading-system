@@ -29,10 +29,23 @@ services:
       - http_proxy=
       - https_proxy=
       - all_proxy=
-      - OPENCLAW_HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-}
-      - OPENCLAW_HTTPS_PROXY=${OPENCLAW_HTTPS_PROXY:-}
+      # 容器内访问宿主机 Clash：host.docker.internal -> host-gateway（见 extra_hosts）
+      - OPENCLAW_HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-http://host.docker.internal:7890}
+      - OPENCLAW_HTTPS_PROXY=${OPENCLAW_HTTPS_PROXY:-http://host.docker.internal:7890}
+      - OPENCLAW_ALL_PROXY=${OPENCLAW_ALL_PROXY:-http://host.docker.internal:7890}
+      # OKX 高频请求稳态参数（由专项压测确定）
+      - OPENCLAW_OKX_MAX_CONCURRENCY=${OPENCLAW_OKX_MAX_CONCURRENCY:-4}
+      - OPENCLAW_OKX_MIN_REQUEST_INTERVAL=${OPENCLAW_OKX_MIN_REQUEST_INTERVAL:-0.2}
+      - OPENCLAW_OKX_MAX_RETRIES=${OPENCLAW_OKX_MAX_RETRIES:-3}
+      # 避免对容器内部地址走代理
+      - NO_PROXY=localhost,127.0.0.1,redis
+      - no_proxy=localhost,127.0.0.1,redis
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+    # 稳定 DNS：避免容器内偶发解析失败（如 api.okx.com）
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     networks:
       - trading-network
     extra_hosts:

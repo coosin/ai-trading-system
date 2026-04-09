@@ -90,6 +90,7 @@ function ControlHubModule() {
       { id: 'control-hub-module-checklist', title: '总控功能清单', group: '总控', path: '../../../docs/control-hub-module-checklist.md' },
       { id: 'dynamic-open-close', title: '动态开平仓与SLTP手册', group: '交易', path: '../../../docs/dynamic-open-close-and-sltp-playbook.md' },
       { id: 'maintenance-guide', title: '维护指南', group: '运维', path: '../../../docs/MAINTENANCE_GUIDE.md' },
+      { id: 'clash-proxy-baseline', title: 'Clash代理基线设置与排障指南', group: '运维', path: '../../../docs/CLASH_PROXY_BASELINE_GUIDE.md' },
       { id: 'api-doc', title: 'API 文档', group: '接口', path: '../../../docs/api.md' },
     ],
     []

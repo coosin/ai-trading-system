@@ -71,6 +71,7 @@ open http://localhost:8000/docs
 | [**快速开始指南**](./快速开始指南.md) | 环境搭建和开发流程 |
 | [**AI记忆文件**](./workspace/) | AI核心信念、身份定义、交易知识 |
 | [**记忆库使用与维护指南**](./docs/memory/MEMORY_LIBRARY_GUIDE.md) | MemoryGateway 单一真源：结构、写入/召回、总结晋升、清理与扩展 |
+| [**Clash代理基线设置与排障指南**](./docs/CLASH_PROXY_BASELINE_GUIDE.md) | 生产固化：规则模式/自动选择/DNS/环境变量/一键回归与排障 |
 
 ---
 
@@ -127,6 +128,9 @@ TELEGRAM_CHAT_ID=your-chat-id
 OPENCLAW_HTTP_PROXY=http://host.docker.internal:7890
 OPENCLAW_HTTPS_PROXY=http://host.docker.internal:7890
 ```
+
+推荐先阅读并固化生产代理基线：  
+[**Clash 代理基线设置与排障指南**](./docs/CLASH_PROXY_BASELINE_GUIDE.md)
 
 ### 交易配置
 
