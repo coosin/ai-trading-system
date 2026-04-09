@@ -331,6 +331,8 @@ class ConfigManager:
         },
         "research": {
             "enabled": True,
+            "auto_run": True,
+            "auto_interval_minutes": 360,
             "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
             "timeframe": "1h",
             "lookback_days": 30,

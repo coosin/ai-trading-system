@@ -265,6 +265,8 @@ class MainController:
         self._lock = asyncio.Lock()
         self._initialized = False
         self._running = False
+        self._last_strategy_research_at: Optional[datetime] = None
+        self._strategy_research_running = False
 
         # 增强事件系统
         self.event_system = None
@@ -1390,6 +1392,7 @@ class MainController:
         # 启动事件处理任务
         self._running = True
         self._tasks.append(asyncio.create_task(self._health_check_worker()))
+        self._tasks.append(asyncio.create_task(self._strategy_research_worker()))
 
         self._initialized = True
         logger.info("主控制器初始化完成")
@@ -4009,6 +4012,73 @@ class MainController:
                 await asyncio.sleep(self.health_check_interval)
 
         logger.info("健康检查工作线程停止")
+
+    async def _strategy_research_worker(self) -> None:
+        """
+        自动策略研发工作线程：
+        - 按 research 配置周期触发 walk-forward 研发
+        - 将通过门控的策略自动发布并启动实例
+        """
+        logger.info("自动策略研发工作线程启动")
+        while self._running:
+            try:
+                cfg = await self.config_manager.get_config("research", {}) if self.config_manager else {}
+                cfg = cfg if isinstance(cfg, dict) else {}
+                enabled = bool(cfg.get("enabled", True))
+                auto_run = bool(cfg.get("auto_run", True))
+                interval_minutes = float(cfg.get("auto_interval_minutes", 360) or 360)
+                interval_seconds = max(300, int(interval_minutes * 60))
+                loop_sleep = min(60, max(20, self.health_check_interval))
+
+                if not enabled or not auto_run:
+                    await asyncio.sleep(loop_sleep)
+                    continue
+
+                due = (
+                    self._last_strategy_research_at is None
+                    or (datetime.now() - self._last_strategy_research_at).total_seconds() >= interval_seconds
+                )
+                if not due or self._strategy_research_running:
+                    await asyncio.sleep(loop_sleep)
+                    continue
+
+                pipeline = getattr(self, "strategy_research_pipeline", None)
+                if not pipeline:
+                    await asyncio.sleep(loop_sleep)
+                    continue
+
+                symbols = cfg.get("symbols") or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+                if isinstance(symbols, str):
+                    symbols = [symbols]
+                timeframe = str(cfg.get("timeframe", "1h") or "1h")
+                lookback_days = int(cfg.get("lookback_days", 30) or 30)
+
+                self._strategy_research_running = True
+                try:
+                    result = await pipeline.run_cycle(
+                        symbols=symbols,
+                        timeframe=timeframe,
+                        lookback_days=lookback_days,
+                    )
+                    self._last_strategy_research_at = datetime.now()
+                    published_cnt = len((result or {}).get("published", []))
+                    logger.info(
+                        "自动策略研发完成: symbols=%s published=%s backtest_calls=%s",
+                        symbols,
+                        published_cnt,
+                        (result or {}).get("backtest_calls", 0),
+                    )
+                finally:
+                    self._strategy_research_running = False
+
+                await asyncio.sleep(loop_sleep)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._strategy_research_running = False
+                logger.error(f"自动策略研发线程异常: {e}")
+                await asyncio.sleep(30)
+        logger.info("自动策略研发工作线程停止")
 
     async def _send_notification_direct(self, title: str, message: str, priority: str = "medium"):
         """直接发送通知到底层渠道（不做智能去重/节流）。"""

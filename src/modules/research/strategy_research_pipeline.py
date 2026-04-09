@@ -553,6 +553,25 @@ class StrategyResearchPipeline:
         if not cfg:
             return None
 
+        # Auto-activate newly published strategy so research output can
+        # immediately enter live signal generation instead of staying dormant.
+        instance_id = None
+        activated = False
+        try:
+            from src.modules.core.strategy_manager import StrategyStatus
+
+            running = await strategy_manager.get_strategy_instances(
+                strategy_id=strategy_id, status=StrategyStatus.RUNNING
+            )
+            if not running:
+                instance_id = await strategy_manager.create_strategy_instance(strategy_id)
+                if instance_id:
+                    init_ok = await strategy_manager.initialize_strategy(instance_id)
+                    if init_ok:
+                        activated = await strategy_manager.start_strategy(instance_id)
+        except Exception as e:
+            logger.warning("publish strategy activate failed %s: %s", strategy_id, e)
+
         # Audit + memory trace
         if hasattr(self.main_controller, "log_audit_event"):
             try:
@@ -581,5 +600,11 @@ class StrategyResearchPipeline:
             except Exception:
                 pass
 
-        return {"strategy_id": strategy_id, "version": version, "test": test_metrics}
+        return {
+            "strategy_id": strategy_id,
+            "version": version,
+            "test": test_metrics,
+            "instance_id": instance_id,
+            "activated": activated,
+        }
 
