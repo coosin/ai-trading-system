@@ -31,7 +31,8 @@ def init_module_control_api(app, main_controller):
         if not hub or not hasattr(hub, "get_unified_snapshot"):
             return {"ok": True, "score": None, "message": "统一数据源中心不可用，跳过门控"}
         try:
-            snap = await hub.get_unified_snapshot(symbol)
+            # 防止上游行情/交易所抖动导致 API 入口阻塞。
+            snap = await asyncio.wait_for(hub.get_unified_snapshot(symbol), timeout=6.0)
             quality = (snap.get("数据质量评估") or {}) if isinstance(snap, dict) else {}
             score = quality.get("score")
             score_f = float(score) if score is not None else None
@@ -43,6 +44,8 @@ def init_module_control_api(app, main_controller):
                 "symbol": symbol,
                 "message": f"数据质量={score_f:.3f}, 阈值={float(min_score):.3f}",
             }
+        except asyncio.TimeoutError:
+            return {"ok": True, "score": None, "message": "质量门控超时，已降级放行"}
         except Exception as e:
             return {"ok": True, "score": None, "message": f"质量门控检查失败，已降级放行: {e}"}
 
