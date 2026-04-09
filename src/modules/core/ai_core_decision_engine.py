@@ -101,17 +101,28 @@ class AICoreDecisionEngine:
             "leverage_max": 50,
             "default_leverage": 20,
             "max_positions": 5,
-            "min_trade_interval": 120,
+            # 中频档：在不激进放宽风控的前提下，适度提升开单频率
+            "min_trade_interval": 80,
             "strategy_check_interval": 300,
             "backtest_lookback_days": 30,
             "aggressive_mode": False,
             "auto_create_strategy": True,
-            "min_confidence_to_trade": 0.75,
+            "min_confidence_to_trade": 0.72,
             "min_data_quality_to_trade": 0.55,
-            "min_rr_to_trade": 1.20,
-            "max_spread_bps_to_trade": 35.0,
+            "min_rr_to_trade": 1.15,
+            "max_spread_bps_to_trade": 40.0,
             "max_abs_depth_imbalance_to_trade": 0.92,
-            "degraded_data_quantity_factor": 0.60,
+            "degraded_data_quantity_factor": 0.68,
+            "boost_on_low_risk": True,
+            "low_risk_rr_multiplier": 0.96,
+            "low_risk_spread_multiplier": 1.08,
+            "high_risk_rr_multiplier": 1.08,
+            "high_risk_spread_multiplier": 0.90,
+            "auto_frequency_profile_switch": True,
+            "frequency_profile_switch_telegram_notify": True,
+            "frequency_profile_cooldown_seconds": 1800,
+            "frequency_profile_lookback_trades": 20,
+            "frequency_profile_max_drawdown_guard": 0.12,
             "auto_adaptive_guards": True,
             "auto_tune_guards": True,
             "auto_tune_by_symbol_group": True,
@@ -180,6 +191,8 @@ class AICoreDecisionEngine:
         self._sltp_group_adaptive: Dict[str, Dict[str, float]] = {}
         self._last_sltp_tune_at: Dict[str, datetime] = {}
         self._last_research_at: Optional[datetime] = None
+        self._frequency_profile: str = "balanced"
+        self._last_frequency_profile_switch_at: Optional[datetime] = None
         
         logger.info("🧠 AI核心决策引擎初始化（完整控制权版本）")
     
@@ -587,6 +600,9 @@ class AICoreDecisionEngine:
 
                 # 根据近期交易表现自动微调执行门控阈值（小步、带边界）
                 await self._auto_tune_guard_thresholds()
+
+                # 自动切换频率档位（稳健/中频/积极），带冷却防抖
+                await self._auto_switch_frequency_profile()
                 
             except Exception as e:
                 logger.error(f"策略管理循环错误: {e}")
@@ -784,6 +800,147 @@ class AICoreDecisionEngine:
                                 )
         except Exception as e:
             logger.debug(f"自动调参(执行门控)失败: {e}")
+
+    def _get_frequency_profiles(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            "conservative": {
+                "min_trade_interval": 110,
+                "min_confidence_to_trade": 0.75,
+                "min_rr_to_trade": 1.20,
+                "max_spread_bps_to_trade": 35.0,
+                "degraded_data_quantity_factor": 0.60,
+                "boost_on_low_risk": True,
+                "low_risk_rr_multiplier": 0.98,
+                "low_risk_spread_multiplier": 1.05,
+                "high_risk_rr_multiplier": 1.10,
+                "high_risk_spread_multiplier": 0.88,
+            },
+            "balanced": {
+                "min_trade_interval": 80,
+                "min_confidence_to_trade": 0.72,
+                "min_rr_to_trade": 1.15,
+                "max_spread_bps_to_trade": 40.0,
+                "degraded_data_quantity_factor": 0.68,
+                "boost_on_low_risk": True,
+                "low_risk_rr_multiplier": 0.96,
+                "low_risk_spread_multiplier": 1.08,
+                "high_risk_rr_multiplier": 1.08,
+                "high_risk_spread_multiplier": 0.90,
+            },
+            "aggressive": {
+                "min_trade_interval": 65,
+                "min_confidence_to_trade": 0.68,
+                "min_rr_to_trade": 1.10,
+                "max_spread_bps_to_trade": 48.0,
+                "degraded_data_quantity_factor": 0.75,
+                "boost_on_low_risk": True,
+                "low_risk_rr_multiplier": 0.94,
+                "low_risk_spread_multiplier": 1.12,
+                "high_risk_rr_multiplier": 1.10,
+                "high_risk_spread_multiplier": 0.88,
+            },
+        }
+
+    def _apply_frequency_profile(self, profile: str) -> Dict[str, Any]:
+        profiles = self._get_frequency_profiles()
+        p = str(profile or "").strip().lower()
+        if p not in profiles:
+            p = "balanced"
+        applied = {}
+        for k, v in profiles[p].items():
+            self.config[k] = v
+            applied[k] = v
+        self._frequency_profile = p
+        self._last_frequency_profile_switch_at = datetime.utcnow()
+        return applied
+
+    async def _auto_switch_frequency_profile(self) -> None:
+        if not bool(self.config.get("auto_frequency_profile_switch", True)):
+            return
+        try:
+            lookback = max(8, int(self.config.get("frequency_profile_lookback_trades", 20) or 20))
+            cooldown = max(300, int(self.config.get("frequency_profile_cooldown_seconds", 1800) or 1800))
+            if self._last_frequency_profile_switch_at:
+                elapsed = (datetime.utcnow() - self._last_frequency_profile_switch_at).total_seconds()
+                if elapsed < cooldown:
+                    return
+
+            pnls: List[float] = []
+            losses_streak = 0
+            max_losses_streak = 0
+            for rec in list(getattr(self, "_trade_history", []) or [])[-lookback:]:
+                d = rec.get("decision", {}) if isinstance(rec, dict) else {}
+                pnl = d.get("pnl")
+                try:
+                    p = float(pnl)
+                except Exception:
+                    continue
+                pnls.append(p)
+                if p < 0:
+                    losses_streak += 1
+                    max_losses_streak = max(max_losses_streak, losses_streak)
+                else:
+                    losses_streak = 0
+
+            if len(pnls) < 8:
+                return
+
+            wins = len([x for x in pnls if x > 0])
+            losses = len([x for x in pnls if x < 0])
+            total = max(1, wins + losses)
+            win_rate = wins / total
+            avg_pnl = sum(pnls) / len(pnls)
+
+            eq = 1.0
+            peak = 1.0
+            dd = 0.0
+            for p in pnls:
+                eq *= (1.0 + p)
+                peak = max(peak, eq)
+                if peak > 0:
+                    dd = max(dd, (peak - eq) / peak)
+
+            dd_guard = float(self.config.get("frequency_profile_max_drawdown_guard", 0.12) or 0.12)
+            target = self._frequency_profile or "balanced"
+            if dd >= dd_guard or max_losses_streak >= 3 or win_rate < 0.42:
+                target = "conservative"
+            elif win_rate >= 0.62 and avg_pnl > 0 and dd < dd_guard * 0.7 and max_losses_streak <= 1:
+                target = "aggressive"
+            else:
+                target = "balanced"
+
+            old_profile = self._frequency_profile or "balanced"
+            if target != old_profile:
+                self._apply_frequency_profile(target)
+                logger.info(
+                    "🎛️ 自动切档: %s -> %s (win_rate=%.2f avg_pnl=%.4f max_dd=%.3f max_loss_streak=%s sample=%s)",
+                    old_profile,
+                    target,
+                    win_rate,
+                    avg_pnl,
+                    dd,
+                    max_losses_streak,
+                    len(pnls),
+                )
+                if bool(self.config.get("frequency_profile_switch_telegram_notify", True)):
+                    try:
+                        if self.telegram_bot and hasattr(self.telegram_bot, "send_message") and self.telegram_bot.chat_ids:
+                            await self.telegram_bot.send_message(
+                                chat_id=self.telegram_bot.chat_ids[0],
+                                text=(
+                                    "🎛️ 自动频率切档\n"
+                                    f"档位: {old_profile} -> {target}\n"
+                                    f"胜率: {win_rate:.2%}\n"
+                                    f"平均PnL: {avg_pnl:.4f}\n"
+                                    f"最大回撤: {dd:.3f}\n"
+                                    f"最大连亏: {max_losses_streak}\n"
+                                    f"样本数: {len(pnls)}"
+                                ),
+                            )
+                    except Exception as e:
+                        logger.debug(f"发送自动切档Telegram通知失败: {e}")
+        except Exception as e:
+            logger.debug(f"自动切档失败: {e}")
 
     @staticmethod
     def _symbol_group_key(symbol: str) -> str:
@@ -2763,6 +2920,26 @@ class AICoreDecisionEngine:
                         min_rr = min_rr * 1.10
                         max_spread_bps = max(5.0, max_spread_bps * 0.80)
                         max_abs_imb = max(0.80, max_abs_imb * 0.95)
+
+                    # 在低风险状态下做轻度放宽以提高开单率；高风险时反向收紧。
+                    if bool(self.config.get("boost_on_low_risk", True)):
+                        risk_level = str(getattr(decision, "risk_level", "") or "").lower()
+                        if risk_level == "low":
+                            min_rr = min_rr * float(self.config.get("low_risk_rr_multiplier", 0.96) or 0.96)
+                            max_spread_bps = max_spread_bps * float(
+                                self.config.get("low_risk_spread_multiplier", 1.08) or 1.08
+                            )
+                        elif risk_level in ("high", "critical"):
+                            min_rr = min_rr * float(self.config.get("high_risk_rr_multiplier", 1.08) or 1.08)
+                            max_spread_bps = max(
+                                5.0,
+                                max_spread_bps
+                                * float(self.config.get("high_risk_spread_multiplier", 0.90) or 0.90),
+                            )
+
+                    min_rr = min(2.5, max(0.9, float(min_rr)))
+                    max_spread_bps = min(120.0, max(5.0, float(max_spread_bps)))
+                    max_abs_imb = min(0.995, max(0.75, float(max_abs_imb)))
                     self._adaptive_guard_profile = {
                         "profile": profile,
                         "symbol_group": symbol_group,
@@ -3120,11 +3297,23 @@ class AICoreDecisionEngine:
             "total_trades": len(self._trade_history) if hasattr(self, '_trade_history') else 0,
             "execution_guards": {
                 "config": {
+                    "min_trade_interval": self.config.get("min_trade_interval"),
+                    "min_confidence_to_trade": self.config.get("min_confidence_to_trade"),
                     "min_data_quality_to_trade": self.config.get("min_data_quality_to_trade"),
                     "min_rr_to_trade": self.config.get("min_rr_to_trade"),
                     "max_spread_bps_to_trade": self.config.get("max_spread_bps_to_trade"),
                     "max_abs_depth_imbalance_to_trade": self.config.get("max_abs_depth_imbalance_to_trade"),
                     "degraded_data_quantity_factor": self.config.get("degraded_data_quantity_factor"),
+                    "boost_on_low_risk": self.config.get("boost_on_low_risk"),
+                    "low_risk_rr_multiplier": self.config.get("low_risk_rr_multiplier"),
+                    "low_risk_spread_multiplier": self.config.get("low_risk_spread_multiplier"),
+                    "high_risk_rr_multiplier": self.config.get("high_risk_rr_multiplier"),
+                    "high_risk_spread_multiplier": self.config.get("high_risk_spread_multiplier"),
+                    "auto_frequency_profile_switch": self.config.get("auto_frequency_profile_switch"),
+                    "frequency_profile_switch_telegram_notify": self.config.get("frequency_profile_switch_telegram_notify"),
+                    "frequency_profile_cooldown_seconds": self.config.get("frequency_profile_cooldown_seconds"),
+                    "frequency_profile_lookback_trades": self.config.get("frequency_profile_lookback_trades"),
+                    "frequency_profile_max_drawdown_guard": self.config.get("frequency_profile_max_drawdown_guard"),
                     "auto_adaptive_guards": self.config.get("auto_adaptive_guards"),
                     "auto_tune_guards": self.config.get("auto_tune_guards"),
                     "auto_tune_by_symbol_group": self.config.get("auto_tune_by_symbol_group"),
@@ -3158,6 +3347,12 @@ class AICoreDecisionEngine:
                     self._last_global_tune_at.isoformat() if self._last_global_tune_at else None
                 ),
                 "stats": dict(self._execution_guards_stats),
+                "frequency_profile": self._frequency_profile,
+                "last_frequency_profile_switch_at": (
+                    self._last_frequency_profile_switch_at.isoformat()
+                    if self._last_frequency_profile_switch_at
+                    else None
+                ),
             },
         }
 
@@ -3170,11 +3365,23 @@ class AICoreDecisionEngine:
             if not isinstance(overrides, dict) or not overrides:
                 return
             keys = (
+                "min_trade_interval",
+                "min_confidence_to_trade",
                 "min_data_quality_to_trade",
                 "min_rr_to_trade",
                 "max_spread_bps_to_trade",
                 "max_abs_depth_imbalance_to_trade",
                 "degraded_data_quantity_factor",
+                "boost_on_low_risk",
+                "low_risk_rr_multiplier",
+                "low_risk_spread_multiplier",
+                "high_risk_rr_multiplier",
+                "high_risk_spread_multiplier",
+                "auto_frequency_profile_switch",
+                "frequency_profile_switch_telegram_notify",
+                "frequency_profile_cooldown_seconds",
+                "frequency_profile_lookback_trades",
+                "frequency_profile_max_drawdown_guard",
                 "auto_adaptive_guards",
                 "auto_tune_guards",
                 "auto_tune_by_symbol_group",
@@ -3204,6 +3411,9 @@ class AICoreDecisionEngine:
                         "auto_tune_by_session",
                         "auto_tune_global_enabled",
                         "auto_tune_sltp_params",
+                        "boost_on_low_risk",
+                        "auto_frequency_profile_switch",
+                        "frequency_profile_switch_telegram_notify",
                     ):
                         self.config[k] = bool(overrides[k])
                     elif k in ("auto_tune_group_step_rr", "auto_tune_group_step_spread_bps"):

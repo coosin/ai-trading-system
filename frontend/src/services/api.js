@@ -131,6 +131,12 @@ export const api = {
       request('/modules/commander/dispatch', { method: 'POST', body: JSON.stringify({ message, source }) }),
     getCommanderAudit: () =>
       request('/modules/commander/audit'),
+    getAiFrequencyProfile: () =>
+      request('/modules/ai/frequency-profile'),
+    setAiFrequencyProfile: (profile) =>
+      request('/modules/ai/frequency-profile', { method: 'POST', body: JSON.stringify({ profile }) }),
+    updateAiGuards: (data) =>
+      request('/modules/ai/guards', { method: 'POST', body: JSON.stringify(data || {}) }),
   },
   monitoring: {
     /** 若后端未实现则返回 404，总控会降级为空列表 */

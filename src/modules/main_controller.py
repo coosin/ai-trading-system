@@ -570,9 +570,17 @@ class MainController:
         if hasattr(self, "ai_core") and self.ai_core:
             await self.ai_core.start()
             logger.info("🧠 AI主控已启动: ai_core")
-        if enable_secondary and self.ai_trading_engine:
+        if self.ai_trading_engine:
+            # 即使在 ai_core 独占写入时，也启动 AITradingEngine 的被动能力：
+            # - 风险监控
+            # - 账户/持仓同步
+            # - 监控与优化循环
+            # 其主交易循环仍由 single_write_owner 策略自动抑制，不会与 ai_core 抢写。
             await self.ai_trading_engine.start()
-            logger.info("🧠 次级AI控制器已启动: ai_trading_engine")
+            if enable_secondary:
+                logger.info("🧠 次级AI控制器已启动: ai_trading_engine")
+            else:
+                logger.info("🛡️ AITradingEngine 已以被动监控模式启动（写入权仍受 S1 策略约束）")
 
     async def _start_ai_autonomous_supervision(self) -> None:
         policy = await self._get_ai_brain_policy()

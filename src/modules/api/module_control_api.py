@@ -449,9 +449,23 @@ def init_module_control_api(app, main_controller):
         }
         
         if main_controller:
+            monitor = None
             if hasattr(main_controller, 'risk_monitor') and main_controller.risk_monitor:
-                status = main_controller.risk_monitor.get_status()
-                risk_data.update(status)
+                monitor = main_controller.risk_monitor
+            elif (
+                hasattr(main_controller, 'ai_trading_engine')
+                and main_controller.ai_trading_engine
+                and hasattr(main_controller.ai_trading_engine, 'risk_monitor')
+                and main_controller.ai_trading_engine.risk_monitor
+            ):
+                monitor = main_controller.ai_trading_engine.risk_monitor
+
+            if monitor:
+                status = monitor.get_status() if hasattr(monitor, "get_status") else {}
+                risk_data.update(status if isinstance(status, dict) else {})
+                risk_data["monitor_running"] = bool(
+                    (status or {}).get("running", False) if isinstance(status, dict) else False
+                )
             
             if hasattr(main_controller, 'ai_trading_engine') and main_controller.ai_trading_engine:
                 engine = main_controller.ai_trading_engine
@@ -487,6 +501,8 @@ def init_module_control_api(app, main_controller):
                 "config": guards.get("config", {}),
                 "adaptive_profile": guards.get("adaptive_profile", {}),
                 "group_overrides": guards.get("group_overrides", {}),
+                "frequency_profile": guards.get("frequency_profile", "balanced"),
+                "last_frequency_profile_switch_at": guards.get("last_frequency_profile_switch_at"),
                 "group_last_tuned_at": guards.get("group_last_tuned_at", {}),
                 "global_last_tuned_at": guards.get("global_last_tuned_at"),
                 "stats": guards.get("stats", {}),
@@ -501,11 +517,23 @@ def init_module_control_api(app, main_controller):
             return {"success": False, "message": "AI核心决策引擎未初始化"}
         ai_core = main_controller.ai_core
         allowed = {
+            "min_trade_interval",
+            "min_confidence_to_trade",
             "min_data_quality_to_trade",
             "min_rr_to_trade",
             "max_spread_bps_to_trade",
             "max_abs_depth_imbalance_to_trade",
             "degraded_data_quantity_factor",
+            "boost_on_low_risk",
+            "low_risk_rr_multiplier",
+            "low_risk_spread_multiplier",
+            "high_risk_rr_multiplier",
+            "high_risk_spread_multiplier",
+            "auto_frequency_profile_switch",
+            "frequency_profile_switch_telegram_notify",
+            "frequency_profile_cooldown_seconds",
+            "frequency_profile_lookback_trades",
+            "frequency_profile_max_drawdown_guard",
             "auto_adaptive_guards",
             "auto_tune_guards",
             "auto_tune_by_symbol_group",
@@ -537,6 +565,9 @@ def init_module_control_api(app, main_controller):
                         "auto_tune_by_session",
                         "auto_tune_global_enabled",
                         "auto_tune_sltp_params",
+                        "boost_on_low_risk",
+                        "auto_frequency_profile_switch",
+                        "frequency_profile_switch_telegram_notify",
                     ):
                         ai_core.config[k] = bool(v)
                         applied[k] = bool(v)
@@ -555,6 +586,65 @@ def init_module_control_api(app, main_controller):
         return {
             "success": True,
             "message": "执行门控配置已更新",
+            "applied": applied,
+        }
+
+    @router.get("/ai/frequency-profile")
+    async def get_ai_frequency_profile():
+        """读取当前开单频率档位（根据关键门控参数推断）"""
+        if not main_controller or not hasattr(main_controller, "ai_core") or not main_controller.ai_core:
+            return {"success": False, "message": "AI核心决策引擎未初始化"}
+        cfg = main_controller.ai_core.config if hasattr(main_controller.ai_core, "config") else {}
+        min_interval = float(cfg.get("min_trade_interval", 120) or 120)
+        min_conf = float(cfg.get("min_confidence_to_trade", 0.75) or 0.75)
+        min_rr = float(cfg.get("min_rr_to_trade", 1.2) or 1.2)
+        spread = float(cfg.get("max_spread_bps_to_trade", 35.0) or 35.0)
+        if min_interval <= 70 and min_conf <= 0.70 and min_rr <= 1.10 and spread >= 45.0:
+            inferred = "aggressive"
+        elif min_interval <= 90 and min_conf <= 0.72 and min_rr <= 1.15 and spread >= 40.0:
+            inferred = "balanced"
+        else:
+            inferred = "conservative"
+        return {
+            "success": True,
+            "inferred_profile": inferred,
+            "config": {
+                "min_trade_interval": min_interval,
+                "min_confidence_to_trade": min_conf,
+                "min_rr_to_trade": min_rr,
+                "max_spread_bps_to_trade": spread,
+                "boost_on_low_risk": bool(cfg.get("boost_on_low_risk", True)),
+            },
+        }
+
+    @router.post("/ai/frequency-profile")
+    async def set_ai_frequency_profile(payload: Dict[str, Any]):
+        """一键切换开单频率档位（运行期生效）：conservative / balanced / aggressive"""
+        if not main_controller or not hasattr(main_controller, "ai_core") or not main_controller.ai_core:
+            return {"success": False, "message": "AI核心决策引擎未初始化"}
+        ai_core = main_controller.ai_core
+        requested = str((payload or {}).get("profile", "balanced")).strip().lower()
+        profiles = (
+            ai_core._get_frequency_profiles()
+            if hasattr(ai_core, "_get_frequency_profiles")
+            else {}
+        )
+        if requested not in profiles:
+            return {
+                "success": False,
+                "message": "无效档位，支持: conservative / balanced / aggressive",
+            }
+        if hasattr(ai_core, "_apply_frequency_profile"):
+            applied = ai_core._apply_frequency_profile(requested)
+        else:
+            applied = {}
+            for k, v in profiles[requested].items():
+                ai_core.config[k] = v
+                applied[k] = v
+        return {
+            "success": True,
+            "message": f"已切换到 {requested} 档位",
+            "profile": requested,
             "applied": applied,
         }
     

@@ -57,6 +57,8 @@ function ControlHubModule() {
   const [commanderSnapshotMode, setCommanderSnapshotMode] = useState('fast');
   const [commanderInput, setCommanderInput] = useState('执行系统巡检');
   const [commanderReply, setCommanderReply] = useState('');
+  const [frequencyProfile, setFrequencyProfile] = useState(null);
+  const [frequencyBusy, setFrequencyBusy] = useState(false);
 
   const [strategies, setStrategies] = useState([]);
   const [strategyOpt, setStrategyOpt] = useState(null);
@@ -192,17 +194,19 @@ function ControlHubModule() {
         return;
       }
 
-      const [healthRes, s1Res, guardsRes, sltpRes, histRes, logsRes] = await Promise.all([
+      const [healthRes, s1Res, guardsRes, sltpRes, histRes, logsRes, freqRes] = await Promise.all([
         api.request('/modules/system/health').catch(() => null),
         api.request('/s1/verify').catch(() => null),
         api.request('/modules/ai/guards').catch(() => null),
         api.request('/modules/stop-loss/stats').catch(() => null),
         api.trading.getHistory({ limit: 10 }).catch(() => []),
         api.monitoring?.getLogs ? api.monitoring.getLogs({ limit: 20 }).catch(() => []) : Promise.resolve([]),
+        api.modules.getAiFrequencyProfile().catch(() => null),
       ]);
       setHealth(healthRes);
       setS1(s1Res);
       setGuards(guardsRes);
+      setFrequencyProfile(freqRes);
       setSltpStats(sltpRes);
       setTradeHistory(Array.isArray(histRes?.data) ? histRes.data : Array.isArray(histRes) ? histRes : []);
       setMonitorLogs(Array.isArray(logsRes?.data) ? logsRes.data : Array.isArray(logsRes) ? logsRes : []);
@@ -218,6 +222,54 @@ function ControlHubModule() {
       await loadStrategyData();
     } finally {
       setLoading(false);
+    }
+  };
+
+  const applyFrequencyProfile = async (profile) => {
+    setFrequencyBusy(true);
+    try {
+      const res = await api.modules.setAiFrequencyProfile(profile);
+      if (!res?.success) throw new Error(res?.message || '切换档位失败');
+      showNotice(`已切换到 ${profile} 档位`);
+      await refresh();
+    } catch (e) {
+      showNotice(`切换档位失败：${e.message || e}`, 'error');
+    } finally {
+      setFrequencyBusy(false);
+    }
+  };
+
+  const toggleAutoFrequencySwitch = async () => {
+    const current = Boolean(guards?.config?.auto_frequency_profile_switch);
+    setFrequencyBusy(true);
+    try {
+      const res = await api.modules.updateAiGuards({
+        auto_frequency_profile_switch: !current,
+      });
+      if (!res?.success) throw new Error(res?.message || '更新自动切档开关失败');
+      showNotice(!current ? '已启用自动切档' : '已关闭自动切档');
+      await refresh();
+    } catch (e) {
+      showNotice(`更新自动切档开关失败：${e.message || e}`, 'error');
+    } finally {
+      setFrequencyBusy(false);
+    }
+  };
+
+  const toggleFrequencyTelegramNotify = async () => {
+    const current = Boolean(guards?.config?.frequency_profile_switch_telegram_notify);
+    setFrequencyBusy(true);
+    try {
+      const res = await api.modules.updateAiGuards({
+        frequency_profile_switch_telegram_notify: !current,
+      });
+      if (!res?.success) throw new Error(res?.message || '更新Telegram通知开关失败');
+      showNotice(!current ? '已启用切档Telegram通知' : '已关闭切档Telegram通知');
+      await refresh();
+    } catch (e) {
+      showNotice(`更新切档Telegram通知开关失败：${e.message || e}`, 'error');
+    } finally {
+      setFrequencyBusy(false);
     }
   };
 
@@ -662,6 +714,34 @@ function ControlHubModule() {
                 </div>
               ))}
               {!opportunities.length && <div style={{ padding: 10, color: 'var(--text-tertiary)' }}>暂无AI机会数据</div>}
+            </div>
+            <div style={{ marginTop: 12, border: '1px solid var(--border-light)', borderRadius: 8, padding: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>开单频率档位控制</div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 8 }}>
+                当前档位：{guards?.frequency_profile || frequencyProfile?.inferred_profile || '-'} · 自动切档：
+                {guards?.config?.auto_frequency_profile_switch ? '开启' : '关闭'}
+                {' · '}Telegram通知：{guards?.config?.frequency_profile_switch_telegram_notify ? '开启' : '关闭'}
+                {guards?.last_frequency_profile_switch_at
+                  ? ` · 最近切换: ${guards.last_frequency_profile_switch_at}`
+                  : ''}
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button type="button" className="btn btn-sm btn-outline" disabled={frequencyBusy} onClick={() => applyFrequencyProfile('conservative')}>
+                  稳健
+                </button>
+                <button type="button" className="btn btn-sm btn-primary" disabled={frequencyBusy} onClick={() => applyFrequencyProfile('balanced')}>
+                  中频
+                </button>
+                <button type="button" className="btn btn-sm btn-outline" disabled={frequencyBusy} onClick={() => applyFrequencyProfile('aggressive')}>
+                  积极
+                </button>
+                <button type="button" className="btn btn-sm btn-outline" disabled={frequencyBusy} onClick={toggleAutoFrequencySwitch}>
+                  {guards?.config?.auto_frequency_profile_switch ? '关闭自动切档' : '开启自动切档'}
+                </button>
+                <button type="button" className="btn btn-sm btn-outline" disabled={frequencyBusy} onClick={toggleFrequencyTelegramNotify}>
+                  {guards?.config?.frequency_profile_switch_telegram_notify ? '关闭切档Telegram通知' : '开启切档Telegram通知'}
+                </button>
+              </div>
             </div>
           </div>
         </div>
