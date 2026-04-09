@@ -982,8 +982,9 @@ def init_module_control_api(app, main_controller):
         mc = main_controller
         if not mc:
             return out
+        FAST_TIMEOUT_S = 4.0
         try:
-            st = await mc.get_system_status()
+            st = await asyncio.wait_for(mc.get_system_status(), timeout=FAST_TIMEOUT_S)
             out["system"] = {
                 "system_status": st.get("system_status"),
                 "module_count": st.get("module_count"),
@@ -1008,7 +1009,7 @@ def init_module_control_api(app, main_controller):
         try:
             gw = getattr(mc, "execution_gateway", None)
             if gw and hasattr(gw, "get_snapshot"):
-                out["execution"] = await gw.get_snapshot()
+                out["execution"] = await asyncio.wait_for(gw.get_snapshot(), timeout=FAST_TIMEOUT_S)
         except Exception as e:
             out["alerts"].append(f"执行网关快照失败: {e}")
 
@@ -1033,7 +1034,10 @@ def init_module_control_api(app, main_controller):
                     need_refresh = True
             if need_refresh and hasattr(mc, "force_sync_account_state"):
                 try:
-                    st = await mc.force_sync_account_state(reason="snapshot_fast")
+                    st = await asyncio.wait_for(
+                        mc.force_sync_account_state(reason="snapshot_fast"),
+                        timeout=FAST_TIMEOUT_S,
+                    )
                 except Exception:
                     st = getattr(mc, "_latest_account_state", None)
             st = st if isinstance(st, dict) else {}
@@ -1084,11 +1088,24 @@ def init_module_control_api(app, main_controller):
         try:
             mode_l = str(mode or "fast").strip().lower()
             if mode_l == "full":
-                data = await main_controller.build_ai_commander_snapshot(symbol=symbol)
+                data = await asyncio.wait_for(
+                    main_controller.build_ai_commander_snapshot(symbol=symbol),
+                    timeout=15.0,
+                )
                 data["mode"] = "full"
             else:
-                data = await _build_commander_fast_snapshot(symbol=symbol)
+                data = await asyncio.wait_for(_build_commander_fast_snapshot(symbol=symbol), timeout=8.0)
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except asyncio.TimeoutError:
+            return {
+                "success": True,
+                "data": {
+                    "timestamp": datetime.now().isoformat(),
+                    "mode": "fast_degraded_timeout",
+                    "alerts": ["snapshot_timeout_degraded"],
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
@@ -1165,8 +1182,15 @@ def init_module_control_api(app, main_controller):
         if not hasattr(main_controller, "get_account_sync_diagnostics"):
             return {"success": False, "message": "诊断接口不可用", "timestamp": datetime.now().isoformat()}
         try:
-            data = await main_controller.get_account_sync_diagnostics()
+            data = await asyncio.wait_for(main_controller.get_account_sync_diagnostics(), timeout=8.0)
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except asyncio.TimeoutError:
+            return {
+                "success": True,
+                "degraded": True,
+                "data": {"status": "timeout_degraded", "hint": "account_diagnostics_timeout"},
+                "timestamp": datetime.now().isoformat(),
+            }
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 

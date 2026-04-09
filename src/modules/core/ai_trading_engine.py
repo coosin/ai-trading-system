@@ -179,6 +179,8 @@ class AITradingEngine:
             "max_drawdown_limit": 0.15,
             "min_data_quality_for_open": 0.38,
             "low_quality_confidence_penalty": 0.08,
+            "fallback_open_min_quality": 0.55,
+            "fallback_open_block_seconds": 45,
         }
         
         # 运行状态
@@ -196,6 +198,17 @@ class AITradingEngine:
         self._empty_position_reads = 0
         self._wallet_snapshot: Dict[str, Any] = {}
         self._sltp_bound_keys: set[str] = set()
+        self._last_market_route: Dict[str, Dict[str, Any]] = {}
+        self._execution_observability: Dict[str, Any] = {
+            "reconcile_total": 0,
+            "reconcile_success": 0,
+            "reconcile_timeout_like": 0,
+            "reconcile_avg_ms": 0.0,
+            "fallback_blocked_opens": 0,
+            "last_reconcile_ms": 0.0,
+            "last_reconcile_symbol": None,
+            "last_reconcile_action": None,
+        }
         
         logger.info("全智能AI交易引擎初始化完成")
     
@@ -635,6 +648,35 @@ class AITradingEngine:
                 timeout_seconds=Timeouts.ORDERBOOK_FETCH,
                 default_value={},
             )
+            # 获取增强实时快照（主通道），失败时不影响主流程
+            realtime_snapshot = await _call_exchange(
+                "get_realtime_market_data",
+                symbol,
+                timeout_seconds=Timeouts.ORDERBOOK_FETCH,
+                default_value=None,
+            )
+            if isinstance(realtime_snapshot, dict) and realtime_snapshot:
+                # 记录主备路由质量，供后续决策/执行链可观测
+                self._last_market_route[symbol] = {
+                    "route_channel": realtime_snapshot.get("route_channel", "unknown"),
+                    "route_fallback": bool(realtime_snapshot.get("route_fallback", False)),
+                    "quality_score": float(realtime_snapshot.get("quality_score", 0.0) or 0.0),
+                    "latency_ms": int(realtime_snapshot.get("latency_ms", 0) or 0),
+                    "ts": datetime.now().isoformat(),
+                }
+                # 当常规 ticker 缺失时，用增强快照补齐，避免数据断档
+                if not ticker:
+                    close_px = float(realtime_snapshot.get("close", 0) or 0)
+                    if close_px > 0:
+                        extras = realtime_snapshot.get("market_extras", {}) or {}
+                        ticker = {
+                            "symbol": symbol,
+                            "last": close_px,
+                            "bid": float(extras.get("best_bid", 0) or 0),
+                            "ask": float(extras.get("best_ask", 0) or 0),
+                            "volume": float(realtime_snapshot.get("volume", 0) or 0),
+                            "timestamp": int(time.time() * 1000),
+                        }
             
             # 获取订单簿 (带超时)
             order_book = await _call_exchange(
@@ -682,6 +724,8 @@ class AITradingEngine:
                 "order_book": order_book,
                 "balance": balance,
                 "positions": positions,
+                "realtime_snapshot": realtime_snapshot if isinstance(realtime_snapshot, dict) else {},
+                "market_route": self._last_market_route.get(symbol, {}),
                 "timestamp": datetime.now().isoformat()
             }
         except Exception as e:
@@ -875,7 +919,12 @@ class AITradingEngine:
                         sentiment="greed" if fi_sentiment > 0.6 else "fear" if fi_sentiment < 0.4 else "neutral",
                         support_levels=ai_analysis.get("support_levels", []),
                         resistance_levels=ai_analysis.get("resistance_levels", []),
-                        metadata={"unified_snapshot": unified_snapshot or {}, "analysis_data": analysis_data},
+                        metadata={
+                            "unified_snapshot": unified_snapshot or {},
+                            "analysis_data": analysis_data,
+                            "market_route": market_data.get("market_route", {}),
+                            "realtime_snapshot": market_data.get("realtime_snapshot", {}),
+                        },
                     )
                     logger.info(f"✅ AI增强分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}")
                 else:
@@ -892,7 +941,12 @@ class AITradingEngine:
                         sentiment=getattr(fi_sentiment, 'value', str(fi_sentiment)) if fi_sentiment else "neutral",
                         support_levels=ai_analysis.get("support_levels", []),
                         resistance_levels=ai_analysis.get("resistance_levels", []),
-                        metadata={"unified_snapshot": unified_snapshot or {}, "analysis_data": analysis_data},
+                        metadata={
+                            "unified_snapshot": unified_snapshot or {},
+                            "analysis_data": analysis_data,
+                            "market_route": market_data.get("market_route", {}),
+                            "realtime_snapshot": market_data.get("realtime_snapshot", {}),
+                        },
                     )
                     logger.info(f"✅ AI增强分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}, "
                                f"信号强度={getattr(fi_signal, 'value', 'N/A') if fi_signal else 'N/A'}")
@@ -907,7 +961,12 @@ class AITradingEngine:
                     sentiment=ai_analysis.get("sentiment", "neutral"),
                     support_levels=ai_analysis.get("support_levels", []),
                     resistance_levels=ai_analysis.get("resistance_levels", []),
-                    metadata={"unified_snapshot": unified_snapshot or {}, "analysis_data": analysis_data},
+                    metadata={
+                        "unified_snapshot": unified_snapshot or {},
+                        "analysis_data": analysis_data,
+                        "market_route": market_data.get("market_route", {}),
+                        "realtime_snapshot": market_data.get("realtime_snapshot", {}),
+                    },
                 )
                 
                 logger.info(f"✅ AI分析完成 {symbol}: 趋势={context.trend}, 情绪={context.sentiment}")
@@ -1359,6 +1418,29 @@ class AITradingEngine:
         try:
             # 对新开仓执行最大持仓数限制（优先读取外部配置，兼容测试）
             if decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
+                # 数据路由联动硬门控：当处于回退通道且质量过低时，短时阻断开仓。
+                md = decision.metadata or {}
+                mc = md.get("market_context", {}) if isinstance(md, dict) else {}
+                mm = mc.get("metadata", {}) if isinstance(mc, dict) else {}
+                route = mm.get("market_route", {}) if isinstance(mm, dict) else {}
+                route_fallback = bool(route.get("route_fallback", False))
+                try:
+                    route_quality = float(route.get("quality_score", 0.0) or 0.0)
+                except Exception:
+                    route_quality = 0.0
+                fb_min_q = float(self.ai_config.get("fallback_open_min_quality", 0.55) or 0.55)
+                if route_fallback and route_quality < fb_min_q:
+                    self._execution_observability["fallback_blocked_opens"] = int(
+                        self._execution_observability.get("fallback_blocked_opens", 0)
+                    ) + 1
+                    logger.warning(
+                        "📊 回退通道质量不足，阻断开仓: symbol=%s quality=%.2f threshold=%.2f",
+                        decision.symbol,
+                        route_quality,
+                        fb_min_q,
+                    )
+                    return False
+
                 max_same = int(self.ai_config.get("max_same_direction_positions", 5) or 5)
                 max_hedged = int(self.ai_config.get("max_hedged_positions", 8) or 8)
                 max_positions = int(self.ai_config.get("max_positions", DEFAULT_MAX_POSITIONS) or DEFAULT_MAX_POSITIONS)
@@ -1526,7 +1608,8 @@ class AITradingEngine:
             # 添加元数据用于OKX下单
             order.metadata = {
                 "posSide": pos_side,
-                "is_close": is_close
+                "is_close": is_close,
+                "market_route": (decision.metadata or {}).get("market_context", {}).get("metadata", {}).get("market_route", {}),
             }
 
             # 兼容不同交易所接口：优先 place_order，其次 create_order（测试 mock 使用此接口）
@@ -1608,7 +1691,7 @@ class AITradingEngine:
                 
                 await self._save_trade_to_memory(decision, result)
                 
-                await self._update_positions()
+                await self._post_order_reconcile(decision, result)
                 
                 is_open = decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]
                 if is_open and decision.stop_loss and decision.take_profit:
@@ -1622,6 +1705,83 @@ class AITradingEngine:
         except Exception as e:
             logger.error(f"执行决策失败: {e}", exc_info=True)
             return False
+
+    async def _post_order_reconcile(self, decision: AIDecision, order_result: Optional[Dict[str, Any]] = None) -> None:
+        """
+        下单后主动作一致性对账：
+        - 重试同步持仓/钱包，减少“订单成功但本地状态未接管”的窗口
+        - 对开仓/平仓分别做最小一致性检查
+        """
+        started = time.time()
+        target_symbol = decision.symbol
+        is_open = decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]
+        is_close = decision.action in [TradeAction.CLOSE_LONG, TradeAction.CLOSE_SHORT]
+        order_id = ""
+        if isinstance(order_result, dict):
+            order_id = str(order_result.get("order_id") or order_result.get("id") or "").strip()
+
+        # 下单确认补偿：优先核验订单状态（如果交易所提供接口）
+        if order_id:
+            try:
+                if hasattr(self.exchange, "get_order"):
+                    _ = await self.exchange.get_order(order_id, target_symbol)
+                elif hasattr(self.exchange, "get_open_orders_strict"):
+                    _ = await self.exchange.get_open_orders_strict(target_symbol)
+                elif hasattr(self.exchange, "get_open_orders"):
+                    _ = await self.exchange.get_open_orders(target_symbol)
+            except Exception as e:
+                logger.debug("下单确认补偿检查失败(order_id=%s): %s", order_id, e)
+
+        for attempt in range(1, 4):
+            await self._update_positions()
+            pos = self.positions.get(target_symbol)
+            has_pos = bool(pos and float(getattr(pos, "quantity", 0) or 0) > 1e-12)
+
+            if is_open and has_pos:
+                self._update_reconcile_observability(
+                    elapsed_ms=(time.time() - started) * 1000.0,
+                    success=True,
+                    symbol=target_symbol,
+                    action=decision.action.value,
+                )
+                return
+            if is_close and not has_pos:
+                self._update_reconcile_observability(
+                    elapsed_ms=(time.time() - started) * 1000.0,
+                    success=True,
+                    symbol=target_symbol,
+                    action=decision.action.value,
+                )
+                return
+
+            await asyncio.sleep(1.2 * attempt)
+
+        self._update_reconcile_observability(
+            elapsed_ms=(time.time() - started) * 1000.0,
+            success=False,
+            symbol=target_symbol,
+            action=decision.action.value,
+        )
+        logger.warning(
+            "下单后对账未完全收敛: symbol=%s action=%s final_has_pos=%s",
+            target_symbol,
+            decision.action.value,
+            bool(self.positions.get(target_symbol)),
+        )
+
+    def _update_reconcile_observability(self, elapsed_ms: float, success: bool, symbol: str, action: str) -> None:
+        obs = self._execution_observability
+        total = int(obs.get("reconcile_total", 0)) + 1
+        ok = int(obs.get("reconcile_success", 0)) + (1 if success else 0)
+        if not success:
+            obs["reconcile_timeout_like"] = int(obs.get("reconcile_timeout_like", 0)) + 1
+        prev_avg = float(obs.get("reconcile_avg_ms", 0.0) or 0.0)
+        obs["reconcile_total"] = total
+        obs["reconcile_success"] = ok
+        obs["reconcile_avg_ms"] = ((prev_avg * (total - 1)) + float(elapsed_ms)) / max(1, total)
+        obs["last_reconcile_ms"] = round(float(elapsed_ms), 2)
+        obs["last_reconcile_symbol"] = symbol
+        obs["last_reconcile_action"] = action
 
     def _is_order_result_success(self, result: Any) -> bool:
         """Normalize exchange order response success semantics."""
@@ -2217,13 +2377,34 @@ class AITradingEngine:
     
     def get_status(self) -> Dict:
         """获取引擎状态"""
+        route_info = {}
+        fallback_symbols = []
+        for sym, route in self._last_market_route.items():
+            if not isinstance(route, dict):
+                continue
+            route_info[sym] = {
+                "route_channel": route.get("route_channel"),
+                "route_fallback": bool(route.get("route_fallback", False)),
+                "quality_score": route.get("quality_score"),
+                "latency_ms": route.get("latency_ms"),
+                "ts": route.get("ts"),
+            }
+            if bool(route.get("route_fallback", False)):
+                fallback_symbols.append(sym)
+
         status = {
             "state": self.state.value,
             "running": self._running,
             "positions": len(self.positions),
             "trade_count": len(self.trade_history),
             "symbols": self.symbols,
-            "ai_config": self.ai_config
+            "ai_config": self.ai_config,
+            "market_route_status": {
+                "tracked_symbols": len(route_info),
+                "fallback_symbols": fallback_symbols,
+                "routes": route_info,
+            },
+            "execution_observability": self._execution_observability,
         }
         
         if self.risk_monitor:

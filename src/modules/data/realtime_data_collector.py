@@ -116,6 +116,7 @@ class RealTimeDataCollector:
         self._tasks: List[asyncio.Task] = []
         self._running = False
         self._lock = asyncio.Lock()
+        self._routing_stats: Dict[str, Dict[str, int]] = {}
 
         logger.info("实时数据采集器初始化完成")
 
@@ -178,6 +179,12 @@ class RealTimeDataCollector:
         self.data_sources[config.name] = config
         self.connection_status[config.name] = ConnectionStatus.DISCONNECTED
         self.data_buffers[config.name] = DataBuffer(symbol=config.symbol)
+        self._routing_stats.setdefault(config.name, {
+            "primary_ok": 0,
+            "fallback_ok": 0,
+            "mock_used": 0,
+            "errors": 0,
+        })
         
         logger.info(f"注册数据源: {config.name}")
         return True
@@ -408,22 +415,41 @@ class RealTimeDataCollector:
                 await asyncio.sleep(config.update_interval)
                 source = self.source_instances.get(source_name)
                 live_data = await self._fetch_live_exchange_data(source, config.symbol)
-                payload = live_data if live_data else self._generate_mock_data(config.symbol)
+                if live_data:
+                    payload = live_data
+                else:
+                    payload = self._generate_mock_data(config.symbol)
+                    stats = self._routing_stats.setdefault(source_name, {"primary_ok": 0, "fallback_ok": 0, "mock_used": 0, "errors": 0})
+                    stats["mock_used"] += 1
                 await self._process_data(source_name, payload)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                stats = self._routing_stats.setdefault(source_name, {"primary_ok": 0, "fallback_ok": 0, "mock_used": 0, "errors": 0})
+                stats["errors"] += 1
                 logger.error(f"交易所工作任务错误 {source_name}: {e}")
                 await asyncio.sleep(config.reconnect_delay)
         
         logger.info(f"交易所工作任务停止: {source_name}")
 
     async def _fetch_live_exchange_data(self, source: Any, symbol: str) -> Optional[Dict[str, Any]]:
-        """从真实交易所对象提取 OHLCV 快照。"""
+        """从真实交易所对象提取 OHLCV 快照（主备并行：增强主通道 + 传统回退）。"""
         if not source:
             return None
         try:
+            # 主通道：优先使用交易所增强实时快照（更丰富、更实时）
+            if hasattr(source, "get_realtime_market_data"):
+                try:
+                    rich = await asyncio.wait_for(source.get_realtime_market_data(symbol), timeout=4.5)
+                    if rich and float(rich.get("close") or 0.0) > 0:
+                        rich["route_channel"] = rich.get("route_channel", "primary_enhanced")
+                        rich["route_fallback"] = False
+                        return rich
+                except Exception as e:
+                    logger.debug(f"增强主通道失败，尝试回退 {symbol}: {e}")
+
+            # 备通道：保留既有 ticker 路径，作为稳定回退
             ticker = await source.get_ticker(symbol) if hasattr(source, "get_ticker") else None
             if not ticker:
                 return None
@@ -443,6 +469,8 @@ class RealTimeDataCollector:
                 "close": price,
                 "volume": max(0.0, volume),
                 "is_live": True,
+                "route_channel": "fallback_ticker",
+                "route_fallback": True,
             }
         except Exception as e:
             logger.debug(f"抓取实时交易所数据失败 {symbol}: {e}")
@@ -483,6 +511,12 @@ class RealTimeDataCollector:
         # 添加到缓冲区
         if source_name in self.data_buffers:
             self.data_buffers[source_name].add(cleaned_data)
+        route_channel = str(cleaned_data.get("route_channel", "unknown"))
+        stats = self._routing_stats.setdefault(source_name, {"primary_ok": 0, "fallback_ok": 0, "mock_used": 0, "errors": 0})
+        if route_channel.startswith("primary"):
+            stats["primary_ok"] += 1
+        elif route_channel.startswith("fallback"):
+            stats["fallback_ok"] += 1
 
         # 推送到业务流程管理器
         if self.business_process_manager:
@@ -600,7 +634,8 @@ class RealTimeDataCollector:
                         "enabled": config.enabled,
                         "type": config.source_type.value,
                         "status": self.connection_status.get(name, ConnectionStatus.DISCONNECTED).value,
-                        "buffer_size": len(self.data_buffers[name].data) if name in self.data_buffers else 0
+                        "buffer_size": len(self.data_buffers[name].data) if name in self.data_buffers else 0,
+                        "routing": self._routing_stats.get(name, {}),
                     }
                     for name, config in self.data_sources.items()
                 }

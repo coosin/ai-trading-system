@@ -12,7 +12,9 @@ import logging
 import os
 import ssl
 import time
+from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from functools import wraps
 from urllib.parse import urlencode
@@ -77,6 +79,11 @@ class OKXExchange(ExchangeBase):
         self._timeout_total = float(os.getenv("OPENCLAW_OKX_TIMEOUT_TOTAL", "30") or "30")
         self._timeout_connect = float(os.getenv("OPENCLAW_OKX_TIMEOUT_CONNECT", "10") or "10")
         self._timeout_sock_read = float(os.getenv("OPENCLAW_OKX_TIMEOUT_SOCK_READ", "20") or "20")
+        self._base_min_request_interval = self._min_request_interval
+        self._adaptive_min_request_interval = self._min_request_interval
+        self._max_adaptive_interval = float(
+            os.getenv("OPENCLAW_OKX_MAX_ADAPTIVE_INTERVAL", "1.2") or "1.2"
+        )
         # 代理/直连自愈：代理不可用时自动降级为直连，避免实盘全链路失败
         self._proxy_mode: str = "unknown"  # unknown|direct|http|socks
         self._proxy_url: Optional[str] = None
@@ -87,10 +94,39 @@ class OKXExchange(ExchangeBase):
         self._network_consecutive_failures: int = 0
         self._network_failure_threshold: int = 5
         self._last_recover_ts: float = 0.0
-        self._recover_cooldown_s: float = 30.0
+        self._recover_cooldown_s: float = float(
+            os.getenv("OPENCLAW_OKX_RECOVER_COOLDOWN", "60") or "60"
+        )
         # instruments 缓存（公开接口），用于下单前的最小张数/步进预检
         self._instrument_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._instrument_cache_ttl_s: float = 300.0
+        # Payload recorder: runtime channel-field matrix from live responses
+        self._payload_recorder_enabled: bool = str(
+            os.getenv("OPENCLAW_OKX_PAYLOAD_RECORDER", "1")
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._payload_sample_limit: int = max(
+            1, int(os.getenv("OPENCLAW_OKX_PAYLOAD_SAMPLE_LIMIT", "30") or "30")
+        )
+        self._payload_flush_interval_s: float = float(
+            os.getenv("OPENCLAW_OKX_PAYLOAD_FLUSH_INTERVAL", "120") or "120"
+        )
+        self._payload_output_dir: Path = Path(
+            os.getenv("OPENCLAW_OKX_PAYLOAD_DIR", "logs/okx_payload_matrix")
+        )
+        self._payload_channel_fields: Dict[str, set] = defaultdict(set)
+        self._payload_channel_samples: Dict[str, int] = defaultdict(int)
+        self._payload_last_flush_ts: float = 0.0
+        self._payload_expected_fields: Dict[str, List[str]] = {
+            "books": ["instId", "bids", "asks", "ts"],
+            "tickers": ["instId", "last", "bidPx", "askPx", "vol24h", "ts"],
+            "funding-rate": ["instId", "fundingRate", "nextFundingTime"],
+            "mark-price": ["instId", "markPx", "ts"],
+            "positions": ["instId", "pos", "avgPx", "markPx", "upl", "liqPx", "lever"],
+            "candles": ["0", "1", "2", "3", "4", "5"],
+            "open-interest": ["instId", "oi", "ts"],
+            "order": ["ordId", "instId", "side", "ordType", "state", "accFillSz"],
+            "account-balance": ["details", "ccy", "eq", "availEq"],
+        }
 
     def _build_ssl_context(self) -> ssl.SSLContext:
         """
@@ -107,9 +143,17 @@ class OKXExchange(ExchangeBase):
 
     async def _mark_request_success(self) -> None:
         self._network_consecutive_failures = 0
+        self._adaptive_min_request_interval = max(
+            self._base_min_request_interval,
+            float(self._adaptive_min_request_interval) * 0.9,
+        )
 
     async def _mark_request_failure(self, reason: str) -> None:
         self._network_consecutive_failures += 1
+        self._adaptive_min_request_interval = min(
+            self._max_adaptive_interval,
+            max(self._base_min_request_interval, float(self._adaptive_min_request_interval) * 1.2),
+        )
         if self._network_consecutive_failures >= self._network_failure_threshold:
             logger.warning(
                 "⚠️ OKX网络连续失败达到阈值(%s)，触发自愈恢复: %s",
@@ -226,6 +270,142 @@ class OKXExchange(ExchangeBase):
             return endpoint
         return endpoint + "?" + urlencode(items)
 
+    def _infer_channel_from_endpoint(self, endpoint: str) -> str:
+        ep = str(endpoint or "")
+        if "market/books" in ep:
+            return "books"
+        if "market/ticker" in ep:
+            return "tickers"
+        if "public/funding-rate" in ep:
+            return "funding-rate"
+        if "public/mark-price" in ep:
+            return "mark-price"
+        if "account/positions" in ep:
+            return "positions"
+        if "market/candles" in ep:
+            return "candles"
+        if "public/open-interest" in ep:
+            return "open-interest"
+        if "trade/order" in ep:
+            return "order"
+        if "account/balance" in ep:
+            return "account-balance"
+        return "unknown"
+
+    def _flatten_fields(self, payload: Any, prefix: str = "") -> set:
+        fields: set = set()
+        if isinstance(payload, dict):
+            for k, v in payload.items():
+                key = f"{prefix}.{k}" if prefix else str(k)
+                fields.add(key)
+                fields.update(self._flatten_fields(v, key))
+        elif isinstance(payload, list):
+            for idx, item in enumerate(payload[:3]):
+                key = f"{prefix}[{idx}]" if prefix else str(idx)
+                fields.add(key)
+                fields.update(self._flatten_fields(item, key))
+        return fields
+
+    async def _record_payload_sample(self, endpoint: str, data: Any) -> None:
+        if not self._payload_recorder_enabled:
+            return
+        channel = self._infer_channel_from_endpoint(endpoint)
+        if self._payload_channel_samples[channel] >= self._payload_sample_limit:
+            return
+        fields = self._flatten_fields(data)
+        if not fields:
+            return
+        self._payload_channel_fields[channel].update(fields)
+        self._payload_channel_samples[channel] += 1
+        await self._flush_payload_matrix(force=False)
+
+    def _build_payload_matrix_markdown(self) -> str:
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        lines = [
+            "# OKX Payload Field Matrix",
+            "",
+            f"- generated_at: {now}",
+            f"- sample_limit_per_channel: {self._payload_sample_limit}",
+            "",
+            "## Channels",
+            "",
+            "| channel | samples | observed_fields | missing_expected |",
+            "|---|---:|---:|---:|",
+        ]
+        for channel in sorted(self._payload_channel_fields.keys()):
+            observed = self._payload_channel_fields.get(channel, set())
+            expected = self._payload_expected_fields.get(channel, [])
+            missing = [
+                e for e in expected if not any(f == e or f.endswith(f".{e}") for f in observed)
+            ]
+            lines.append(
+                f"| {channel} | {self._payload_channel_samples.get(channel, 0)} | "
+                f"{len(observed)} | {len(missing)} |"
+            )
+        lines.extend(["", "## Detailed Fields", ""])
+        for channel in sorted(self._payload_channel_fields.keys()):
+            lines.append(f"### {channel}")
+            expected = self._payload_expected_fields.get(channel, [])
+            observed = sorted(self._payload_channel_fields.get(channel, set()))
+            missing = [
+                e for e in expected if not any(f == e or f.endswith(f".{e}") for f in observed)
+            ]
+            lines.append(f"- missing_expected: {', '.join(missing) if missing else 'none'}")
+            lines.append("- observed_fields:")
+            for field in observed[:300]:
+                lines.append(f"  - {field}")
+            if len(observed) > 300:
+                lines.append(f"  - ... ({len(observed) - 300} more)")
+            lines.append("")
+        return "\n".join(lines) + "\n"
+
+    def _log_missing_fields_warnings(self) -> None:
+        for channel, expected in self._payload_expected_fields.items():
+            observed = self._payload_channel_fields.get(channel, set())
+            if not observed:
+                continue
+            missing = [
+                e for e in expected if not any(f == e or f.endswith(f".{e}") for f in observed)
+            ]
+            if missing:
+                logger.warning(
+                    "OKX payload字段缺口: channel=%s missing=%s",
+                    channel,
+                    ",".join(missing),
+                )
+
+    async def _flush_payload_matrix(self, force: bool = False) -> None:
+        if not self._payload_recorder_enabled:
+            return
+        now = time.time()
+        if not force and (now - self._payload_last_flush_ts) < self._payload_flush_interval_s:
+            return
+        self._payload_last_flush_ts = now
+        try:
+            self._payload_output_dir.mkdir(parents=True, exist_ok=True)
+            md_path = self._payload_output_dir / "okx_payload_field_matrix.md"
+            json_path = self._payload_output_dir / "okx_payload_field_matrix.json"
+            md_path.write_text(self._build_payload_matrix_markdown(), encoding="utf-8")
+            payload = {
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "sample_limit_per_channel": self._payload_sample_limit,
+                "channels": {
+                    ch: {
+                        "samples": int(self._payload_channel_samples.get(ch, 0)),
+                        "observed_fields": sorted(list(self._payload_channel_fields.get(ch, set()))),
+                        "expected_fields": self._payload_expected_fields.get(ch, []),
+                    }
+                    for ch in sorted(self._payload_channel_fields.keys())
+                },
+            }
+            json_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._log_missing_fields_warnings()
+        except Exception as e:
+            logger.debug("OKX payload matrix flush failed: %s", e)
+
     def _to_okx_inst_id(self, symbol: str, default_type: str = "SPOT") -> str:
         """
         将系统内 symbol 统一转换为 OKX instId。
@@ -246,14 +426,87 @@ class OKXExchange(ExchangeBase):
         if default_type.upper() == "SWAP" and not okx_symbol.upper().endswith("-SWAP"):
             okx_symbol = okx_symbol + "-SWAP"
         return okx_symbol
+
+    def _build_request_profile(self, method: str, endpoint: str) -> Dict[str, float]:
+        """
+        分级请求策略：
+        - critical_exec: 下单/平仓/账户关键同步，优先成功率
+        - account_sync: 账户/持仓同步，平衡成功率与时延
+        - market_fast: 实时行情，控制抖动扩散
+        - analytics_bg: 背景分析类，优先降压
+        """
+        ep = str(endpoint or "")
+        m = str(method or "").upper()
+
+        profile = {
+            "name": "default",
+            "max_retries": float(self._request_max_retries),
+            "timeout_total": float(self._timeout_total),
+            "timeout_connect": float(self._timeout_connect),
+            "timeout_sock_read": float(self._timeout_sock_read),
+            "retry_delay": 1.0,
+            "retry_backoff": 1.6,
+            "interval_multiplier": 1.0,
+        }
+
+        if ep.startswith("/api/v5/trade/") or ep in (
+            "/api/v5/account/positions",
+            "/api/v5/account/balance",
+            "/api/v5/account/config",
+            "/api/v5/account/set-leverage",
+        ):
+            profile.update(
+                {
+                    "name": "critical_exec",
+                    "max_retries": float(max(self._request_max_retries + 1, 4)),
+                    "timeout_total": min(float(self._timeout_total), 22.0),
+                    "timeout_connect": min(float(self._timeout_connect), 7.0),
+                    "timeout_sock_read": min(float(self._timeout_sock_read), 12.0),
+                    "retry_delay": 0.8,
+                    "retry_backoff": 1.5,
+                    "interval_multiplier": 1.0,
+                }
+            )
+        elif ep.startswith("/api/v5/market/") and m == "GET":
+            profile.update(
+                {
+                    "name": "market_fast",
+                    "max_retries": float(max(1, self._request_max_retries - 1)),
+                    "timeout_total": min(float(self._timeout_total), 12.0),
+                    "timeout_connect": min(float(self._timeout_connect), 4.5),
+                    "timeout_sock_read": min(float(self._timeout_sock_read), 7.0),
+                    "retry_delay": 0.6,
+                    "retry_backoff": 1.45,
+                    "interval_multiplier": 1.25,
+                }
+            )
+        elif ep.startswith("/api/v5/public/") and m == "GET":
+            profile.update(
+                {
+                    "name": "analytics_bg",
+                    "max_retries": float(max(1, self._request_max_retries - 1)),
+                    "timeout_total": min(float(self._timeout_total), 10.0),
+                    "timeout_connect": min(float(self._timeout_connect), 4.0),
+                    "timeout_sock_read": min(float(self._timeout_sock_read), 6.0),
+                    "retry_delay": 0.5,
+                    "retry_backoff": 1.35,
+                    "interval_multiplier": 1.5,
+                }
+            )
+        return profile
     
     async def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None, body: Dict[str, Any] = None) -> Any:
         """发送请求到OKX API - 带重试和限流机制"""
         async with self._request_semaphore:
+            profile = self._build_request_profile(method, endpoint)
             current_time = time.time()
             time_since_last = current_time - self._last_request_time
-            if time_since_last < self._min_request_interval:
-                await asyncio.sleep(self._min_request_interval - time_since_last)
+            effective_interval = max(
+                self._min_request_interval,
+                self._adaptive_min_request_interval,
+            ) * float(profile.get("interval_multiplier", 1.0) or 1.0)
+            if time_since_last < effective_interval:
+                await asyncio.sleep(effective_interval - time_since_last)
             
             self._last_request_time = time.time()
             
@@ -262,13 +515,20 @@ class OKXExchange(ExchangeBase):
 
             request_path = self._build_request_path(endpoint, params if str(method).upper() == "GET" else None)
             headers = self._get_headers(method, request_path, body_str)
+            request_params = params
+            if str(method).upper() == "GET" and request_path != endpoint:
+                # Ensure signature query and actual query are byte-consistent.
+                # Using full URL with request_path avoids potential params re-encoding mismatch.
+                url = self.api_url + request_path
+                request_params = None
             
             logger.debug(f"📤 OKX请求: {method} {endpoint}")
             logger.debug(f"📤 Body: {body_str}")
             logger.debug(f"📤 Headers: OK-ACCESS-KEY={headers.get('OK-ACCESS-KEY')[:8]}..., TIMESTAMP={headers.get('OK-ACCESS-TIMESTAMP')}")
             
-            max_retries = self._request_max_retries
-            retry_delay = 1.0
+            max_retries = int(profile.get("max_retries", self._request_max_retries) or self._request_max_retries)
+            retry_delay = float(profile.get("retry_delay", 1.0) or 1.0)
+            retry_backoff = float(profile.get("retry_backoff", 1.6) or 1.6)
             
             proxy = getattr(self, '_proxy_url', None)
             if proxy and not self._proxy_temporarily_disabled():
@@ -279,21 +539,22 @@ class OKXExchange(ExchangeBase):
             for attempt in range(max_retries + 1):
                 try:
                     timeout = aiohttp.ClientTimeout(
-                        total=self._timeout_total,
-                        connect=self._timeout_connect,
-                        sock_read=self._timeout_sock_read,
+                        total=float(profile.get("timeout_total", self._timeout_total) or self._timeout_total),
+                        connect=float(profile.get("timeout_connect", self._timeout_connect) or self._timeout_connect),
+                        sock_read=float(profile.get("timeout_sock_read", self._timeout_sock_read) or self._timeout_sock_read),
                     )
                     
                     if method == "GET":
-                        async with self._session.get(url, headers=headers, params=params, timeout=timeout, proxy=proxy) as response:
+                        async with self._session.get(url, headers=headers, params=request_params, timeout=timeout, proxy=proxy) as response:
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)
-                                retry_delay *= 2
+                                retry_delay *= retry_backoff
                                 continue
                             
                             data = await response.json()
                             if data.get("code") == "0":
+                                await self._record_payload_sample(endpoint, data.get("data", []))
                                 await self._mark_request_success()
                                 return data.get("data", [])
                             else:
@@ -310,12 +571,13 @@ class OKXExchange(ExchangeBase):
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)
-                                retry_delay *= 2
+                                retry_delay *= retry_backoff
                                 continue
                             
                             data = await response.json()
                             logger.debug(f"📥 OKX响应: {data}")
                             if data.get("code") == "0":
+                                await self._record_payload_sample(endpoint, data.get("data", []))
                                 await self._mark_request_success()
                                 return data.get("data", [])
                             else:
@@ -328,11 +590,12 @@ class OKXExchange(ExchangeBase):
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)
-                                retry_delay *= 2
+                                retry_delay *= retry_backoff
                                 continue
                             
                             data = await response.json()
                             if data.get("code") == "0":
+                                await self._record_payload_sample(endpoint, data.get("data", []))
                                 await self._mark_request_success()
                                 return data.get("data", [])
                             else:
@@ -349,7 +612,7 @@ class OKXExchange(ExchangeBase):
                     if attempt < max_retries:
                         logger.warning(f"⚠️ OKX API 超时 (尝试 {attempt + 1}/{max_retries + 1}): {method} {endpoint}")
                         await asyncio.sleep(retry_delay)
-                        retry_delay *= 1.5
+                        retry_delay *= max(1.2, retry_backoff - 0.2)
                         continue
                     else:
                         logger.error(f"❌ OKX API 超时，已达到最大重试次数: {method} {endpoint}")
@@ -360,7 +623,7 @@ class OKXExchange(ExchangeBase):
                     if attempt < max_retries:
                         logger.warning(f"⚠️ OKX API 连接失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
                         await asyncio.sleep(retry_delay)
-                        retry_delay *= 2
+                        retry_delay *= retry_backoff
                         continue
                     else:
                         logger.error(f"❌ OKX API 连接失败，已达到最大重试次数: {e}")
@@ -390,7 +653,7 @@ class OKXExchange(ExchangeBase):
                     if attempt < max_retries and "SSL" in err_s:
                         logger.warning(f"⚠️ OKX API SSL错误 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
                         await asyncio.sleep(retry_delay)
-                        retry_delay *= 2
+                        retry_delay *= retry_backoff
                         continue
                     else:
                         logger.error(f"OKX API网络错误: {method} {endpoint} - {type(e).__name__}: {e}")
@@ -486,6 +749,12 @@ class OKXExchange(ExchangeBase):
             self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
             await self.get_exchange_info()
             self._running = True
+            if self._payload_recorder_enabled:
+                logger.info(
+                    "OKX payload recorder enabled: dir=%s, sample_limit=%s",
+                    str(self._payload_output_dir),
+                    self._payload_sample_limit,
+                )
             logger.info(f"OKX交易所初始化成功")
             return True
         except Exception as e:
@@ -495,6 +764,7 @@ class OKXExchange(ExchangeBase):
     async def cleanup(self) -> None:
         """清理资源"""
         try:
+            await self._flush_payload_matrix(force=True)
             if self._session:
                 await self._session.close()
             # 关闭所有WebSocket连接
@@ -833,6 +1103,42 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.error(f"获取OKX未成交订单失败: {e}")
             return []
+
+    async def get_open_orders_strict(self, symbol: Optional[str] = None) -> List[Order]:
+        """
+        严格模式获取未成交订单：
+        - 与 get_open_orders 相同语义
+        - 任何上游业务错误/签名错误都会抛出异常，便于健康度统计与诊断
+        """
+        endpoint = "/api/v5/trade/orders-pending"
+        params = {"instType": "SPOT"}
+        if symbol:
+            params["instId"] = self._to_okx_inst_id(symbol, default_type="SPOT")
+        data = await self._make_request("GET", endpoint, params)
+        orders: List[Order] = []
+        for order_data in data or []:
+            status_map = {
+                "live": "open",
+                "partially_filled": "partial",
+                "filled": "closed",
+                "cancelled": "cancelled",
+            }
+            orders.append(
+                Order(
+                    order_id=order_data["ordId"],
+                    symbol=order_data["instId"].replace("-", "/"),
+                    side=order_data["side"],
+                    order_type=order_data["ordType"],
+                    quantity=float(order_data["sz"]),
+                    price=float(order_data["px"]) if order_data.get("px") else None,
+                    status=status_map.get(order_data["state"], "unknown"),
+                    executed_quantity=float(order_data["accFillSz"]),
+                    avg_price=float(order_data["avgPx"]) if order_data.get("avgPx") else 0.0,
+                    timestamp=datetime.fromtimestamp(int(order_data["cTime"]) / 1000),
+                    client_order_id=order_data.get("clOrdId"),
+                )
+            )
+        return orders
     
     async def get_balances(self) -> List[Balance]:
         """获取资产余额"""
@@ -1506,3 +1812,84 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.debug(f"获取多空比失败: {e}")
         return None
+
+    async def get_realtime_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        增强实时行情快照（主通道）：
+        - 并行拉取 ticker/order_book/funding_rate/open_interest
+        - 与现有 get_ticker 兼容，失败时由上层自动回退
+        """
+        started = time.time()
+        try:
+            ticker_task = self.get_ticker(symbol)
+            ob_task = self.get_order_book(symbol, depth=5)
+            fr_task = self.get_funding_rate(symbol)
+            oi_task = self.get_open_interest(symbol)
+            ticker, order_book, funding_rate, open_interest = await asyncio.gather(
+                ticker_task,
+                ob_task,
+                fr_task,
+                oi_task,
+                return_exceptions=True,
+            )
+
+            if isinstance(ticker, Exception) or not ticker:
+                return None
+
+            price = float(ticker.get("last") or ticker.get("close") or 0.0)
+            if price <= 0:
+                return None
+            high = float(ticker.get("high") or price)
+            low = float(ticker.get("low") or price)
+            open_price = float(ticker.get("open") or price)
+            volume = float(ticker.get("quoteVolume") or ticker.get("volume") or 0.0)
+
+            spread_bps = None
+            best_bid = float(ticker.get("bid") or 0.0)
+            best_ask = float(ticker.get("ask") or 0.0)
+            if best_bid > 0 and best_ask > 0 and price > 0:
+                spread_bps = ((best_ask - best_bid) / price) * 10000
+
+            quality_score = 0.35
+            if volume > 0:
+                quality_score += 0.2
+            if isinstance(order_book, OrderBook) and order_book.bids and order_book.asks:
+                quality_score += 0.2
+            if not isinstance(funding_rate, Exception) and funding_rate is not None:
+                quality_score += 0.15
+            if not isinstance(open_interest, Exception) and open_interest:
+                quality_score += 0.1
+            quality_score = min(1.0, max(0.0, quality_score))
+
+            return {
+                "symbol": symbol,
+                "timestamp": datetime.now(),
+                "open": open_price,
+                "high": max(high, low, price),
+                "low": min(high, low, price),
+                "close": price,
+                "volume": max(0.0, volume),
+                "is_live": True,
+                "route_channel": "primary_enhanced",
+                "route_fallback": False,
+                "latency_ms": int((time.time() - started) * 1000),
+                "quality_score": quality_score,
+                "market_extras": {
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "spread_bps": spread_bps,
+                    "funding_rate": None if isinstance(funding_rate, Exception) else funding_rate,
+                    "open_interest": None if isinstance(open_interest, Exception) else open_interest,
+                    "orderbook_depth5": (
+                        {
+                            "bids": order_book.bids[:5],
+                            "asks": order_book.asks[:5],
+                        }
+                        if isinstance(order_book, OrderBook)
+                        else None
+                    ),
+                },
+            }
+        except Exception as e:
+            logger.debug(f"OKX增强实时快照失败 {symbol}: {e}")
+            return None
