@@ -19,6 +19,8 @@ import asyncio
 
 logger = logging.getLogger(__name__)
 
+from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
+
 
 class MemoryLevel:
 
@@ -38,7 +40,7 @@ class MemoryLevel:
 class HierarchicalMemoryManager:
     """层次化记忆管理器"""
     
-    def __init__(self, base_path: str = None, config_manager: Any = None):
+    def __init__(self, base_path: str = None, config_manager: Any = None, memory_gateway: Any = None):
         if base_path is None:
             base_path = (
                 config_manager.get_path_sync("memory_path", None) if config_manager else None
@@ -65,6 +67,7 @@ class HierarchicalMemoryManager:
         
         self.session_context: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
+        self.memory_gateway = memory_gateway
         
         logger.info(f"层次化记忆管理器初始化完成，路径: {self.base_path}")
     
@@ -72,6 +75,27 @@ class HierarchicalMemoryManager:
         """保存每日交易记忆"""
         if date is None:
             date = datetime.now()
+
+        # Migrate-to-gateway mode: store as structured memories (single source)
+        if self.memory_gateway is not None:
+            d = date.strftime("%Y-%m-%d")
+            try:
+                await self.memory_gateway.add_memory(
+                    memory_type="daily_summary",
+                    content=str(content or "").strip(),
+                    summary=f"每日摘要 {d}",
+                    metadata=base_metadata(
+                        source_module="hierarchical_memory",
+                        kind="daily_summary",
+                        extra={"date": d},
+                    ),
+                    importance=0.7,
+                    source_module="hierarchical_memory",
+                    tags=tags(kind_tag("summary"), kind_tag("daily")),
+                )
+                return
+            except Exception as e:
+                logger.debug(f"写入 daily_summary 到 MemoryGateway 失败，回退写文件: {e}")
         
         filename = f"{date.strftime('%Y-%m-%d')}.md"
         filepath = self.daily_path / filename
@@ -100,6 +124,25 @@ class HierarchicalMemoryManager:
     
     async def save_lesson_learned(self, lesson_type: str, lesson: str, context: str):
         """保存经验教训"""
+        if self.memory_gateway is not None:
+            try:
+                await self.memory_gateway.add_memory(
+                    memory_type="lesson_learned",
+                    content=f"[{lesson_type}] {lesson}\n上下文: {context}".strip(),
+                    summary=f"经验教训 {lesson_type}",
+                    metadata=base_metadata(
+                        source_module="hierarchical_memory",
+                        kind="lesson_learned",
+                        extra={"lesson_type": lesson_type, "context": context},
+                    ),
+                    importance=0.78,
+                    source_module="hierarchical_memory",
+                    tags=tags(kind_tag("lesson"), kind_tag(lesson_type)),
+                )
+                return
+            except Exception as e:
+                logger.debug(f"写入 lesson_learned 到 MemoryGateway 失败，回退写文件: {e}")
+
         filename = f"{lesson_type}.md"
         filepath = self.lessons_path / filename
         
@@ -118,6 +161,26 @@ class HierarchicalMemoryManager:
     
     async def save_market_insight(self, symbol: str, insight: str, confidence: float):
         """保存市场洞察"""
+        if self.memory_gateway is not None:
+            try:
+                await self.memory_gateway.add_memory(
+                    memory_type="market_observation",
+                    content=f"洞察: {symbol} conf={confidence:.2f} {insight}".strip(),
+                    summary=f"市场洞察 {symbol}",
+                    metadata=base_metadata(
+                        source_module="hierarchical_memory",
+                        kind="market_insight",
+                        symbol=symbol,
+                        extra={"confidence": float(confidence)},
+                    ),
+                    importance=0.6 + 0.3 * float(confidence),
+                    source_module="hierarchical_memory",
+                    tags=tags(kind_tag("insight"), symbol_tag(symbol)),
+                )
+                return
+            except Exception as e:
+                logger.debug(f"写入 market_observation 到 MemoryGateway 失败，回退写文件: {e}")
+
         filename = f"{symbol.replace('/', '_')}.md"
         filepath = self.insights_path / filename
         

@@ -70,6 +70,7 @@ open http://localhost:8000/docs
 | [**系统架构文档**](./ARCHITECTURE.md) | 详细的系统架构、模块说明、配置指南 |
 | [**快速开始指南**](./快速开始指南.md) | 环境搭建和开发流程 |
 | [**AI记忆文件**](./workspace/) | AI核心信念、身份定义、交易知识 |
+| [**记忆库使用与维护指南**](./docs/memory/MEMORY_LIBRARY_GUIDE.md) | MemoryGateway 单一真源：结构、写入/召回、总结晋升、清理与扩展 |
 
 ---
 
@@ -146,6 +147,7 @@ trading:
 ### 记忆系统配置（MemoryGateway）
 
 - **核心入口**：系统内部统一通过 `MemoryGateway` 读写记忆（带 `scope`、trace、可选 rerank）。
+- **文件配置**：`data/config/memory.json` 必须以顶层 **`"memory": { ... }`** 与配置段对齐；详见 [*记忆库使用与维护指南*](./docs/memory/MEMORY_LIBRARY_GUIDE.md)。
 - **推荐配置方式**：使用 `OPENCLAW__memory__...` 覆盖。
 
 常用覆盖示例：

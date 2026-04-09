@@ -1948,7 +1948,7 @@ class APIServer:
                 ai_executor = getattr(self.main_controller, 'ai_command_executor', None)
                 if ai_executor:
                     logger.debug(f"回退到AICommandExecutor处理: {message[:50]}...")
-                    result = await ai_executor.process_input(message)
+                    result = await ai_executor.process_input(message, source="api_chat")
                     if result.get("success"):
                         return {
                             "status": "success",
@@ -2137,6 +2137,59 @@ class APIServer:
                     "message": f"统一记忆检索失败: {str(e)}",
                     "timestamp": datetime.now().isoformat()
                 }
+
+        @api_v1_router.get("/ai/memory/trace", tags=["ai-memory"])
+        async def memory_trace():
+            """获取最近一次 recall 的 trace（可观测性）"""
+            try:
+                memory_manager = _resolve_memory_manager()
+                trace = {}
+                if hasattr(memory_manager, "get_last_recall_trace"):
+                    trace = memory_manager.get_last_recall_trace()
+                return {"status": "success", "data": {"trace": trace}, "timestamp": datetime.now().isoformat()}
+            except Exception as e:
+                return {"status": "error", "message": str(e), "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.get("/ai/memory/summaries/status", tags=["ai-memory"])
+        async def memory_summaries_status():
+            """每日/每周总结生成状态（best-effort）"""
+            try:
+                memory_manager = _resolve_memory_manager()
+                status = {}
+                if hasattr(memory_manager, "get_summary_status"):
+                    status = memory_manager.get_summary_status()
+                return {"status": "success", "data": {"status": status}, "timestamp": datetime.now().isoformat()}
+            except Exception as e:
+                return {"status": "error", "message": str(e), "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.get("/ai/memory/quality", tags=["ai-memory"])
+        async def memory_quality_metrics():
+            """记忆质量与分布指标（best-effort，进程内召回命中率）"""
+            try:
+                memory_manager = _resolve_memory_manager()
+                data: Dict[str, Any] = {}
+                if hasattr(memory_manager, "get_quality_metrics"):
+                    data["quality"] = memory_manager.get_quality_metrics()
+                if hasattr(memory_manager, "get_stats"):
+                    full = memory_manager.get_stats()
+                    g = (full or {}).get("gateway") or {}
+                    if isinstance(g, dict) and "recall" in g:
+                        data["recall"] = g.get("recall")
+                return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+            except Exception as e:
+                return {"status": "error", "message": str(e), "timestamp": datetime.now().isoformat()}
+
+        @api_v1_router.post("/ai/memory/disk-policy/run", tags=["ai-memory"])
+        async def memory_disk_policy_run():
+            """手动触发一次磁盘阈值清理（best-effort）"""
+            try:
+                memory_manager = _resolve_memory_manager()
+                out = {}
+                if hasattr(memory_manager, "enforce_disk_policy"):
+                    out = await memory_manager.enforce_disk_policy()
+                return {"status": "success", "data": out, "timestamp": datetime.now().isoformat()}
+            except Exception as e:
+                return {"status": "error", "message": str(e), "timestamp": datetime.now().isoformat()}
 
         @api_v1_router.post("/ai/memory/instruction", tags=["ai-memory"])
         async def add_system_instruction(instruction_data: Dict[str, Any]):

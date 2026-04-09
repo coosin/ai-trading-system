@@ -20,6 +20,8 @@ from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
+from src.modules.core.commander_charter import CHARTER, CONTEXT_FRAMING_FOR_CHAT
+
 logger = logging.getLogger(__name__)
 
 
@@ -243,16 +245,6 @@ class TelegramBot:
             logger.info(f"📩 收到消息 [{message.from_user}]: {message.text[:100] if len(message.text) > 100 else message.text}")
             text = (message.text or "").strip()
 
-            # 轻量问候：避免把“你好/在吗”误触发为巡检/任务并回一句固定摘要。
-            greeting = text.lower().strip()
-            if greeting in {"你好", "在吗", "hi", "hello", "hey"}:
-                await self._send_message(TelegramResponse(
-                    chat_id=message.chat_id,
-                    text="我在。你想查看什么？\n\n例如：\n- 拉取司令部快照\n- 同步持仓和余额\n- 执行系统巡检并列出失败项\n- 查询SL/TP状态",
-                    reply_to_message_id=message.message_id
-                ))
-                return
-
             # 追问理解：若用户在追问“哪几项失败/说清楚”，优先用上一条巡检结果直接解释。
             follow_up = await self._maybe_answer_follow_up_from_context(message)
             if follow_up:
@@ -295,12 +287,6 @@ class TelegramBot:
                     except Exception:
                         response_text = "处理完成"
                 success = (result or {}).get("success", False)
-                # AI优先：仅在失败时使用快捷规则兜底，避免把AI变成关键词机器人。
-                if not success:
-                    fallback = await self._try_commander_fallback(text)
-                    if fallback:
-                        response_text = fallback
-                        success = True
                 logger.info(f"📤 AI响应: success={success}, response长度={len(response_text)}")
                 await self._send_message(TelegramResponse(
                     chat_id=message.chat_id,
@@ -311,24 +297,21 @@ class TelegramBot:
                 logger.info(f"Telegram使用llm_integration处理消息")
                 system_context = await self._get_system_context()
                 
-                prompt = f"""你是一个全自主的量化交易AI助手。用户通过Telegram与你交流。
+                prompt = f"""{CHARTER}
+
+{CONTEXT_FRAMING_FOR_CHAT}
 
 {system_context}
 
 用户消息: {message.text}
 
-请自由理解用户意图并执行相应操作。你可以：
-1. 回答用户问题
-2. 执行交易操作（开仓、平仓、查询等）
-3. 分析市场
-4. 开发或优化策略
-5. 调整系统配置
-6. 任何用户需要的操作
+用中文按宪章自然回复；不必把上文整理成状态简报。"""
 
-你有完全的自主权，根据用户意图和市场情况做出最佳决策。
-请用中文回复，保持简洁专业。"""
-
-                response = await self.llm_integration.generate(prompt)
+                response = await self.llm_integration.generate(
+                    prompt,
+                    conversation_scope="channel:telegram",
+                    memory_channel="telegram",
+                )
                 
                 if response and response.success:
                     await self._send_message(TelegramResponse(
@@ -408,24 +391,6 @@ class TelegramBot:
         lines.append("如果你要，我可以现在重新执行一次巡检并对比变化。")
         return "\n".join(lines)
 
-    async def _try_commander_fallback(self, user_text: str) -> Optional[str]:
-        """
-        当AI核心不可用时的轻量兜底。
-        注意：这里是 fallback，不是主流程，避免规则绑死 AI。
-        """
-        text = (user_text or "").strip()
-        commander_keywords = ["总控", "巡检", "全局状态", "司令部", "状态汇总", "健康检查"]
-        chore_keywords = ["执行日常", "自动维护", "一键维护", "运行维护任务"]
-        optimize_keywords = ["带优化", "触发优化", "并优化"]
-        if any(k in text for k in commander_keywords) and self.main_controller and hasattr(self.main_controller, "build_ai_commander_snapshot"):
-            snapshot = await self.main_controller.build_ai_commander_snapshot()
-            return self._format_commander_snapshot(snapshot)
-        if any(k in text for k in chore_keywords) and self.main_controller and hasattr(self.main_controller, "run_ai_commander_chores"):
-            trigger_opt = any(k in text for k in optimize_keywords)
-            report = await self.main_controller.run_ai_commander_chores(trigger_optimize=trigger_opt)
-            return self._format_commander_snapshot(report)
-        return None
-
     def _load_ai_commander_profile(self) -> str:
         """
         读取“司令部人格/边界/任务”记忆：
@@ -448,50 +413,11 @@ class TelegramBot:
         return ""
 
     def _build_enriched_user_message(self, user_text: str, profile: str) -> str:
-        """
-        将人格与边界注入为“软约束记忆”，不替代AI自主判断。
-        """
-        if not profile:
-            return user_text
-        return (
-            f"{user_text}\n\n"
-            "[司令部记忆/人格与边界]\n"
-            f"{profile}\n\n"
-            "[执行原则]\n"
-            "- 优先自主分析与决策，不做僵硬关键词匹配。\n"
-            "- 在边界内尽量主动完成任务并清晰反馈。\n"
-            "- 高风险动作先说明依据与风险，再执行或请求确认。"
-        )
-
-    def _format_commander_snapshot(self, payload: Dict[str, Any]) -> str:
-        """把AI司令部快照转为Telegram友好文本。"""
-        try:
-            system = payload.get("system", {}) if isinstance(payload, dict) else {}
-            data_hub = payload.get("data_hub", {}) if isinstance(payload, dict) else {}
-            strategy = payload.get("strategy", {}) if isinstance(payload, dict) else {}
-            alerts = payload.get("alerts", []) if isinstance(payload, dict) else []
-            quality = data_hub.get("quality", {}) if isinstance(data_hub, dict) else {}
-            ai = data_hub.get("ai_analysis", {}) if isinstance(data_hub, dict) else {}
-            lines = [
-                "🧠 AI司令部总览",
-                f"时间: {payload.get('timestamp', datetime.now().isoformat())}",
-                f"系统: {system.get('system_status', '-')} | 模块: {system.get('running_modules', '-')}/{system.get('module_count', '-')}",
-                f"数据质量: {quality.get('score', '-')} ({quality.get('grade', '-')}) | 来源: {data_hub.get('provenance', '-')}",
-                f"AI判断: 趋势={ai.get('trend', '-')} 倾向={ai.get('action_bias', '-')} 置信度={ai.get('confidence', '-')}",
-                f"策略池: {strategy.get('total_strategies', '-')} / {strategy.get('pool_limit', '-')}",
-            ]
-            chores = payload.get("chores", {}) if isinstance(payload, dict) else {}
-            if chores:
-                opt = chores.get("optimize_result")
-                if isinstance(opt, dict):
-                    lines.append(f"维护任务: optimize={opt.get('success', '-')}, msg={opt.get('message', '-')}")
-            if alerts:
-                lines.append("告警:")
-                for a in alerts[:5]:
-                    lines.append(f"- {a}")
-            return "\n".join(lines)
-        except Exception:
-            return f"🧠 AI司令部总览\n{str(payload)[:2500]}"
+        """宪章 + 可选记忆节选；不堆行为细则。"""
+        parts = [user_text.strip(), "", CHARTER]
+        if (profile or "").strip():
+            parts.extend(["", "【记忆节选】", (profile or "").strip()[:1200]])
+        return "\n".join(parts).strip()
 
     async def _get_system_context(self) -> str:
         """获取系统上下文 - 包含实时持仓信息"""
@@ -505,7 +431,6 @@ class TelegramBot:
         
         if self.main_controller:
             mc = self.main_controller
-            
             # 获取实时持仓
             if hasattr(mc, 'okx_exchange') and mc.okx_exchange:
                 context_parts.append("- 交易所: OKX (已连接)")
@@ -520,9 +445,9 @@ class TelegramBot:
                             size = p.get('size', 0)
                             pnl = float(p.get('unrealized_pnl', 0) or 0)
                             pos_info.append(f"  {symbol}: {side} {size} | 盈亏: ${pnl:+.2f}")
-                        context_parts.append(f"- 当前持仓 ({len(active_pos)}个):\n" + "\n".join(pos_info))
+                        context_parts.append(f"- 交易所非零持仓 ({len(active_pos)}笔):\n" + "\n".join(pos_info))
                     else:
-                        context_parts.append("- 当前持仓: 无")
+                        context_parts.append("- 交易所非零持仓: 当前接口返回 0 笔")
                 except Exception as e:
                     context_parts.append(f"- 当前持仓: 获取失败 ({e})")
             

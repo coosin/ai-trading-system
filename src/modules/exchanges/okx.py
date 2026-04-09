@@ -753,30 +753,98 @@ class OKXExchange(ExchangeBase):
             return []
     
     async def get_positions(self) -> List[Dict[str, Any]]:
-        """获取持仓信息"""
+        """
+        获取持仓：合并多类 instType 查询，避免只拉「全量」时漏掉 SWAP/FUTURES；
+        支持 net 单向持仓（方向由 pos 正负决定）。
+        """
         endpoint = "/api/v5/account/positions"
-        
+
+        def _parse_row(pos_data: Dict[str, Any]) -> Dict[str, Any]:
+            inst_id = pos_data.get("instId", "") or ""
+            try:
+                pos_val = float(pos_data.get("pos", 0) or 0)
+            except (TypeError, ValueError):
+                pos_val = 0.0
+            ps = (pos_data.get("posSide") or "").strip().lower()
+            if ps == "long":
+                side = "long"
+            elif ps == "short":
+                side = "short"
+            elif ps == "net":
+                if pos_val > 0:
+                    side = "long"
+                elif pos_val < 0:
+                    side = "short"
+                else:
+                    side = "long"
+            else:
+                side = "long" if pos_val >= 0 else "short"
+            size_abs = abs(pos_val)
+            entry = float(pos_data.get("avgPx", 0) or 0)
+            mark_px = float(pos_data.get("markPx", 0) or 0)
+            return {
+                "instId": inst_id,
+                "symbol": inst_id.replace("-", "/") if inst_id else "",
+                "posSide_raw": str(pos_data.get("posSide") or ""),
+                "side": side,
+                "raw_pos": pos_val,
+                "size": size_abs,
+                "entry_price": entry,
+                "mark_px": mark_px,
+                "unrealized_pnl": float(pos_data.get("upl", 0) or 0),
+                "leverage": float(pos_data.get("lever", 1) or 1),
+                "margin": float(pos_data.get("margin", 0) or 0),
+                "liquidation_price": float(pos_data.get("liqPx", 0) or 0),
+                "timestamp": int(pos_data.get("cTime", 0) or 0),
+            }
+
+        def _ingest_rows(rows: Any, bucket: Dict[str, Dict[str, Any]]) -> None:
+            for pos_data in rows or []:
+                if not isinstance(pos_data, dict):
+                    continue
+                parsed = _parse_row(pos_data)
+                if parsed["size"] <= 1e-12:
+                    continue
+                key = f"{parsed['instId']}|{parsed.get('posSide_raw', '')}|{parsed['side']}"
+                prev = bucket.get(key)
+                if prev is None or parsed["size"] > prev["size"]:
+                    bucket[key] = parsed
+
+        last_error: Optional[Exception] = None
+
+        # 关键：不能先把「全量 positions」与 SWAP 再合并。
+        # OKX 全量接口有时仍带已平仓合约的陈旧行；若 SWAP 侧已无该 instId，
+        # 合并后会留下「幽灵仓位」（用户看到的 ETH 等假持仓）。
+        # 原则：U 本位永续以 instType=SWAP 为唯一真相源；仅当 SWAP 请求失败时再降级。
+
+        swap_bucket: Dict[str, Dict[str, Any]] = {}
         try:
-            data = await self._make_request("GET", endpoint)
-            positions = []
-            
-            for pos_data in data:
-                positions.append({
-                    "symbol": pos_data.get("instId", "").replace("-", "/"),
-                    "side": "long" if pos_data.get("posSide") == "long" else "short",
-                    "size": float(pos_data.get("pos", 0) or 0),
-                    "entry_price": float(pos_data.get("avgPx", 0) or 0),
-                    "unrealized_pnl": float(pos_data.get("upl", 0) or 0),
-                    "leverage": float(pos_data.get("lever", 1) or 1),
-                    "margin": float(pos_data.get("margin", 0) or 0),
-                    "liquidation_price": float(pos_data.get("liqPx", 0) or 0),
-                    "timestamp": int(pos_data.get("cTime", 0) or 0)
-                })
-            
-            return positions
+            data = await self._make_request("GET", endpoint, params={"instType": "SWAP"})
+            _ingest_rows(data, swap_bucket)
+            out = list(swap_bucket.values())
+            logger.info("OKX 持仓(SWAP 权威): 非零 %d 条", len(out))
+            return out
         except Exception as e:
-            logger.error(f"获取OKX持仓信息失败: {e}")
-            return []
+            last_error = e
+            logger.warning(f"OKX get_positions SWAP 失败，尝试降级: {e}")
+
+        fallback: Dict[str, Dict[str, Any]] = {}
+        for pv in ({"instType": "FUTURES"}, None):
+            try:
+                data = await self._make_request("GET", endpoint, params=pv)
+                _ingest_rows(data, fallback)
+            except Exception as e2:
+                last_error = e2
+                logger.debug(f"OKX get_positions 降级子查询失败 params={pv}: {e2}")
+                continue
+
+        if fallback:
+            out = list(fallback.values())
+            logger.info("OKX 持仓(降级合并 FUTURES/全量): 非零 %d 条", len(out))
+            return out
+        if last_error:
+            logger.error(f"获取OKX持仓信息失败: {last_error}")
+        return []
     
     async def get_exchange_info(self) -> ExchangeInfo:
         """获取交易所信息"""

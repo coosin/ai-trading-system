@@ -125,12 +125,13 @@ class TradingSystem:
         logger.info("🔄 启动系统主循环...")
 
         try:
-            # 使用 MainController 的完整启动流程（包含依赖顺序、状态管理与健康检查链路）
-            await self.main_controller.start_system()
-
+            # 先启动 API（避免 start_system 因外部依赖阻塞导致“端口未监听”）
             if self.api_server:
                 await self.api_server.start()
                 logger.info(f"API服务器已启动，访问 http://{self.api_server.host}:{self.api_server.port}/docs 查看文档")
+
+            # 使用 MainController 的完整启动流程（包含依赖顺序、状态管理与健康检查链路）
+            await self.main_controller.start_system()
 
             await self.shutdown_event.wait()
 

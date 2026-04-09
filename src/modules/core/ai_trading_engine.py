@@ -27,6 +27,8 @@ from ..exchanges.exchange_base import Order
 
 logger = logging.getLogger(__name__)
 
+from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
+
 # Risk/loop defaults to avoid magic numbers scattered in methods
 DEFAULT_MAX_POSITIONS = 5
 DEFAULT_ANALYSIS_INTERVAL_SECONDS = 120
@@ -1503,15 +1505,28 @@ class AITradingEngine:
             side = "long" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "short"
             
             if is_open:
-                memory.save_trade_open(
-                    symbol=decision.symbol,
-                    side=side,
-                    price=decision.price,
-                    quantity=decision.quantity,
-                    reason=decision.reasoning,
-                    stop_loss=decision.stop_loss,
-                    take_profit=decision.take_profit,
-                    strategy=decision.metadata.get("strategy", "AI智能决策")
+                await memory.add_memory(
+                    memory_type="trade_record",
+                    content=f"开仓: {decision.symbol} {side} @ {decision.price} qty={decision.quantity}",
+                    summary=f"📈 开仓 {decision.symbol} {side} @{decision.price}",
+                    metadata=base_metadata(
+                        source_module="ai_trading_engine",
+                        kind="trade_open",
+                        symbol=decision.symbol,
+                        extra={
+                            "side": side,
+                            "price": decision.price,
+                            "quantity": decision.quantity,
+                            "reason": decision.reasoning,
+                            "stop_loss": decision.stop_loss,
+                            "take_profit": decision.take_profit,
+                            "strategy": (getattr(decision, "metadata", {}) or {}).get("strategy", "AI智能决策"),
+                            "result": result,
+                        },
+                    ),
+                    importance=0.9,
+                    source_module="ai_trading_engine",
+                    tags=tags(kind_tag("trade"), kind_tag("open"), symbol_tag(decision.symbol)),
                 )
             else:
                 existing = self.positions.get(decision.symbol)
@@ -1533,15 +1548,28 @@ class AITradingEngine:
                         pnl = (open_price - decision.price) * decision.quantity
                         pnl_percent = (open_price - decision.price) / open_price * 100
                 
-                memory.save_trade_close(
-                    symbol=decision.symbol,
-                    side=side,
-                    open_price=open_price,
-                    close_price=decision.price,
-                    quantity=decision.quantity,
-                    pnl=pnl,
-                    pnl_percent=pnl_percent,
-                    reason=decision.reasoning
+                await memory.add_memory(
+                    memory_type="trade_record",
+                    content=f"平仓: {decision.symbol} {side} {open_price}->{decision.price} qty={decision.quantity} pnl={pnl:.4f}({pnl_percent:.2f}%)",
+                    summary=f"📉 平仓 {decision.symbol} pnl={pnl_percent:.2f}%",
+                    metadata=base_metadata(
+                        source_module="ai_trading_engine",
+                        kind="trade_close",
+                        symbol=decision.symbol,
+                        extra={
+                            "side": side,
+                            "open_price": open_price,
+                            "close_price": decision.price,
+                            "quantity": decision.quantity,
+                            "pnl": pnl,
+                            "pnl_percent": pnl_percent,
+                            "reason": decision.reasoning,
+                            "result": result,
+                        },
+                    ),
+                    importance=0.9,
+                    source_module="ai_trading_engine",
+                    tags=tags(kind_tag("trade"), kind_tag("close"), symbol_tag(decision.symbol)),
                 )
                 
                 logger.info(f"💾 交易记录已保存到记忆库")
@@ -2034,9 +2062,26 @@ class AITradingEngine:
             if not memory:
                 return
             
-            await memory.record_risk_event(
-                event=f"{event_type}: {description}",
-                level="warning" if "warning" in event_type.lower() else "critical"
+            level = "warning" if "warning" in str(event_type).lower() else "critical"
+            await memory.add_memory(
+                memory_type="risk_event",
+                content=f"风险事件[{level}]: {symbol} {event_type} - {description} | 处置: {action_taken} | 影响: {impact}",
+                summary=f"⚠️ 风险事件 {symbol} {event_type}",
+                metadata=base_metadata(
+                    source_module="ai_trading_engine",
+                    kind="risk_event",
+                    symbol=symbol,
+                    extra={
+                        "event_type": event_type,
+                        "description": description,
+                        "action_taken": action_taken,
+                        "impact": impact,
+                        "level": level,
+                    },
+                ),
+                importance=0.85 if level == "warning" else 0.95,
+                source_module="ai_trading_engine",
+                tags=tags(kind_tag("risk"), kind_tag(level), symbol_tag(symbol), extra=[f"event:{event_type}"]),
             )
             
             logger.info(f"⚠️ 风险事件已保存到记忆库: {event_key}")

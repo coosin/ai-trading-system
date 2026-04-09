@@ -22,6 +22,7 @@ from src.modules.core.optimized_memory_system import (
 )
 
 from src.modules.memory.providers.native import NativeMemoryProvider
+from src.modules.memory.memory_schema import attach_idempotency, trade_idempotency_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,15 @@ class MemoryGateway:
     """
 
     DEFAULT_SCOPE = "global"
-    ALLOWED_WORKSPACE_FILES = {"SOUL.md", "IDENTITY.md", "USER.md", "INSTRUCTIONS.md", "TRADING.md"}
+    ALLOWED_WORKSPACE_FILES = {
+        "SOUL.md",
+        "IDENTITY.md",
+        "USER.md",
+        "INSTRUCTIONS.md",
+        "TRADING.md",
+        "MEMORY.md",
+        "LESSONS_ESSENCE.md",
+    }
 
     def __init__(
         self,
@@ -70,6 +79,8 @@ class MemoryGateway:
         self.config_manager = config_manager
         self.provider = NativeMemoryProvider(backend=memory_backend)
         self._last_recall_trace: Dict[str, Any] = {}
+        self._recall_calls: int = 0
+        self._recall_nonempty_hits: int = 0
 
     @classmethod
     async def create(
@@ -116,6 +127,12 @@ class MemoryGateway:
         md = dict(metadata or {})
         md.setdefault("created_at", datetime.now().isoformat())
         md.setdefault("scope", scope or self.DEFAULT_SCOPE)
+        fp = trade_idempotency_fingerprint(category, md)
+        if fp:
+            md = attach_idempotency(md, fp)
+        exist = self._find_dedup_existing_id(category=str(category), fingerprint=fp, metadata=md)
+        if exist:
+            return exist
         mapped_category = self._map_category(category)
         mapped_layer = self._map_layer(category)
         return await self.memory_backend.remember(
@@ -171,6 +188,7 @@ class MemoryGateway:
             rerank_candidate_pool_size=rerank_candidate_pool_size,
         )
         self._last_recall_trace = dict(result.trace or {})
+        self._recall_calls += 1
         records: List[MemoryRecord] = []
         for item in result.items:
             md = dict(item.metadata or {})
@@ -188,6 +206,8 @@ class MemoryGateway:
                     access_count=int(md.get("access_count", 0)) if isinstance(md, dict) else 0,
                 )
             )
+        if records:
+            self._recall_nonempty_hits += 1
         return records
 
     def get_last_recall_trace(self) -> Dict[str, Any]:
@@ -218,6 +238,54 @@ class MemoryGateway:
 
     async def forget(self, memory_id: str) -> bool:
         return await self.memory_backend.forget(memory_id)
+
+    async def enforce_disk_policy(self) -> Dict[str, Any]:
+        """
+        Best-effort disk-driven cleanup for WORKING/HISTORY layers.
+        Config: memory.disk_policy.max_bytes (int), memory.disk_policy.min_importance (float)
+        """
+        max_bytes = 0
+        min_importance = 0.6
+        try:
+            cfg = self.config_manager.get_config_sync("memory", None, {}) if self.config_manager else {}
+            disk = cfg.get("disk_policy", {}) if isinstance(cfg, dict) else {}
+            if isinstance(disk, dict):
+                max_bytes = int(disk.get("max_bytes", 0) or 0)
+                min_importance = float(disk.get("min_importance", min_importance))
+        except Exception:
+            pass
+
+        removed = 0
+        if max_bytes and hasattr(self.memory_backend, "cleanup_by_disk_threshold"):
+            try:
+                removed = await self.memory_backend.cleanup_by_disk_threshold(
+                    max_bytes=max_bytes,
+                    min_importance=min_importance,
+                )
+            except Exception as e:
+                logger.debug(f"disk_policy cleanup failed: {e}")
+        return {"max_bytes": max_bytes, "min_importance": min_importance, "removed": removed}
+
+    def get_summary_status(self) -> Dict[str, Any]:
+        """Return best-effort counters for daily/weekly summaries."""
+        out = {"daily": {"count": 0, "latest_date": None}, "weekly": {"count": 0, "latest_date": None}}
+        try:
+            mems = getattr(self.memory_backend, "_memories", {}) or {}
+            for _id, entry in mems.items():
+                md = dict(getattr(entry, "metadata", {}) or {})
+                kind = str(md.get("kind") or "")
+                date = md.get("date")
+                if kind == "daily_summary":
+                    out["daily"]["count"] += 1
+                    if isinstance(date, str) and (out["daily"]["latest_date"] is None or date > out["daily"]["latest_date"]):
+                        out["daily"]["latest_date"] = date
+                if kind == "weekly_summary":
+                    out["weekly"]["count"] += 1
+                    if isinstance(date, str) and (out["weekly"]["latest_date"] is None or date > out["weekly"]["latest_date"]):
+                        out["weekly"]["latest_date"] = date
+        except Exception:
+            pass
+        return out
 
     # ---------- legacy compatibility ----------
     async def retrieve_memories(
@@ -476,9 +544,115 @@ class MemoryGateway:
                 "workspace_path": str(self.workspace_path),
                 "allowed_workspace_files": sorted(self.ALLOWED_WORKSPACE_FILES),
                 "default_scope": self.DEFAULT_SCOPE,
+                "recall": {
+                    "calls": self._recall_calls,
+                    "nonempty_hits": self._recall_nonempty_hits,
+                    "hit_rate": (
+                        round(self._recall_nonempty_hits / max(self._recall_calls, 1), 4)
+                    ),
+                },
             },
             "backend": stats,
+            "quality": self.get_quality_metrics(),
         }
+
+    def get_quality_metrics(self) -> Dict[str, Any]:
+        """Distribution + duplication hints for governance (best-effort, in-process)."""
+        thresh = 8
+        try:
+            cfg = self.config_manager.get_config_sync("memory", None, {}) if self.config_manager else {}
+            qm = (cfg.get("quality_metrics") or {}) if isinstance(cfg, dict) else {}
+            if isinstance(qm, dict):
+                thresh = int(qm.get("short_content_threshold", thresh))
+        except Exception:
+            pass
+
+        mems = getattr(self.memory_backend, "_memories", {}) or {}
+        total = len(mems)
+        empty_content = 0
+        short_content = 0
+        by_layer: Dict[str, int] = {}
+        by_cat: Dict[str, int] = {}
+        trade_with_order = 0
+        trade_total = 0
+        idem_dup: Dict[str, int] = {}
+
+        for _id, entry in mems.items():
+            layer = getattr(entry, "layer", None)
+            if layer is not None:
+                lk = getattr(layer, "value", str(layer))
+                by_layer[lk] = by_layer.get(lk, 0) + 1
+            cat = getattr(entry, "category", None)
+            ck = getattr(cat, "value", str(cat)) if cat else "unknown"
+            by_cat[ck] = by_cat.get(ck, 0) + 1
+            c = str(getattr(entry, "content", "") or "").strip()
+            if not c:
+                empty_content += 1
+            elif len(c) < thresh:
+                short_content += 1
+            if ck == "trade_record":
+                trade_total += 1
+                md = dict(getattr(entry, "metadata", {}) or {})
+                if md.get("order_id") or md.get("orderId"):
+                    trade_with_order += 1
+            md2 = dict(getattr(entry, "metadata", {}) or {})
+            ik = md2.get("idempotency_key")
+            if ik:
+                sik = str(ik)
+                idem_dup[sik] = idem_dup.get(sik, 0) + 1
+
+        duplicate_idem_keys = sum(1 for _k, v in idem_dup.items() if v > 1)
+        top_duplicate_idem = sorted(
+            ((k, v) for k, v in idem_dup.items() if v > 1), key=lambda x: -x[1]
+        )[:12]
+
+        return {
+            "total_entries": total,
+            "empty_content": empty_content,
+            "short_content_lt": short_content,
+            "short_content_threshold": thresh,
+            "by_layer": by_layer,
+            "by_category": by_cat,
+            "trade_record_total": trade_total,
+            "trade_record_with_order_id": trade_with_order,
+            "duplicate_idempotency_keys": duplicate_idem_keys,
+            "top_duplicate_idempotency_keys": [{"key": k, "count": v} for k, v in top_duplicate_idem],
+        }
+
+    def _find_dedup_existing_id(
+        self,
+        *,
+        category: str,
+        fingerprint: Optional[str],
+        metadata: Dict[str, Any],
+    ) -> Optional[str]:
+        if not fingerprint:
+            return None
+        try:
+            cfg = self.config_manager.get_config_sync("memory", None, {}) if self.config_manager else {}
+            dedup = cfg.get("dedup", {}) if isinstance(cfg, dict) else {}
+            if not isinstance(dedup, dict) or not bool(dedup.get("enabled", True)):
+                return None
+            cats = [str(c).strip().lower() for c in (dedup.get("categories") or ["trade_record", "risk_event"])]
+            if str(category).strip().lower() not in cats:
+                return None
+            window = int(dedup.get("window_sec", 172800))
+            cutoff = datetime.now() - timedelta(seconds=max(window, 60))
+            target_cat = self._map_category(category)
+            mems = getattr(self.memory_backend, "_memories", {}) or {}
+            for mid, entry in mems.items():
+                if getattr(entry, "category", None) != target_cat:
+                    continue
+                created = getattr(entry, "created_at", None)
+                if created is not None and created < cutoff:
+                    continue
+                emd = dict(getattr(entry, "metadata", {}) or {})
+                other = trade_idempotency_fingerprint(category, emd)
+                if other and other == fingerprint:
+                    return str(mid)
+        except Exception:
+            return None
+        return None
 
     async def build_context(self, query: str, max_tokens: int = 2000) -> str:
         return await self.memory_backend.build_context(query, max_tokens=max_tokens)
@@ -509,6 +683,8 @@ class MemoryGateway:
             "user_preference": MemoryCategory.USER_PREFERENCE,
             "decision": MemoryCategory.LESSON_LEARNED,
             "system_state": MemoryCategory.DAILY_SUMMARY,
+            "daily_summary": MemoryCategory.DAILY_SUMMARY,
+            "lesson_learned": MemoryCategory.LESSON_LEARNED,
         }
         return mapping.get(key, MemoryCategory.CONVERSATION)
 
@@ -516,6 +692,8 @@ class MemoryGateway:
         key = (category or "").strip().lower()
         if key in {"trading_rule", "user_preference"}:
             return MemoryLayer.CORE
-        if key in {"decision", "trade_record", "risk_event"}:
+        if key in {"decision", "lesson_learned", "trade_record", "risk_event"}:
             return MemoryLayer.EXPERIENCE
+        if key in {"daily_summary"}:
+            return MemoryLayer.WORKING
         return MemoryLayer.WORKING

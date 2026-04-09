@@ -14,6 +14,7 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 from .timing_constants import SLEEP_2S, SLEEP_5S, SLEEP_10S, SLEEP_60S, SLEEP_1H
+from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
 
 
 class TradeMode(Enum):
@@ -107,10 +108,12 @@ class ActiveTrader:
                     logger.debug(f"读取active_trader配置失败，使用默认值: {e}")
         
         try:
-            from .unified_intelligent_memory import get_unified_memory
-            self.memory = get_unified_memory()
+            # 单一真源：只使用主控制器 MemoryGateway
+            self.memory = getattr(self.main_controller, "ai_memory_manager", None) if self.main_controller else None
+            if not self.memory:
+                logger.debug("初始化记忆系统失败（MemoryGateway未就绪），继续无记忆模式")
         except Exception as e:
-            logger.debug(f"初始化统一记忆系统失败，继续无记忆模式: {e}")
+            logger.debug(f"初始化记忆系统失败，继续无记忆模式: {e}")
         
         await self._load_user_rules()
         
@@ -620,26 +623,32 @@ class ActiveTrader:
             return
         
         try:
-            from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
-            
+            sym = getattr(opportunity, "symbol", None)
             await self.memory.add_memory(
-                memory_type=UnifiedMemoryType.TRADING_DECISION,
+                memory_type="trade_record",
                 content=f"执行交易: {opportunity.symbol} {opportunity.action} {opportunity.side} @ {opportunity.entry_price}",
                 summary=f"🎯 交易执行: {opportunity.symbol} {opportunity.side} @{opportunity.entry_price}",
-                metadata={
-                    "symbol": opportunity.symbol,
-                    "action": opportunity.action,
-                    "side": opportunity.side,
-                    "price": opportunity.entry_price,
-                    "quantity": opportunity.quantity,
-                    "leverage": opportunity.leverage,
-                    "order_id": order.get("orderId"),
-                    "reason": opportunity.reason
-                },
-                priority=MemoryPriority.HIGH,
+                metadata=base_metadata(
+                    source_module="active_trader",
+                    kind="trade_execution",
+                    symbol=sym,
+                    extra={
+                        "action": opportunity.action,
+                        "side": opportunity.side,
+                        "price": opportunity.entry_price,
+                        "quantity": opportunity.quantity,
+                        "leverage": opportunity.leverage,
+                        "order_id": order.get("orderId"),
+                        "reason": opportunity.reason,
+                    },
+                ),
                 importance=0.9,
                 source_module="active_trader",
-                tags=["trade", "execution", opportunity.symbol.replace("/", "")]
+                tags=tags(
+                    kind_tag("trade"),
+                    kind_tag("execution"),
+                    symbol_tag(sym),
+                ),
             )
             
             logger.info("💾 交易记录已保存到记忆库")

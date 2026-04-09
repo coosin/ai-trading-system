@@ -407,10 +407,15 @@ class UnifiedMemorySystem:
             logger.error(f"清理失败: {e}")
 
 
-async def get_unified_memory(
+async def build_unified_memory_system(
     workspace_path: Optional[str] = None
 ) -> UnifiedMemorySystem:
-    """获取统一记忆系统实例"""
+    """
+    构建 UnifiedMemorySystem 实例（内部使用）。
+
+    注意：项目记忆系统已收敛到 MemoryGateway 为唯一对外入口，
+    不应再通过 get_unified_memory 形式被业务模块当作 fallback 直接调用。
+    """
     memory = UnifiedMemorySystem(workspace_path=workspace_path)
     await memory.initialize()
     return memory

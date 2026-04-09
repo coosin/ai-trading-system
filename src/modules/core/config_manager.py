@@ -268,6 +268,33 @@ class ConfigManager:
             "auto_recall": {
                 "enabled": True,
             },
+            "disk_policy": {
+                "max_bytes": 0,
+                "min_importance": 0.6,
+            },
+            "dedup": {
+                "enabled": True,
+                "window_sec": 172800,
+                "categories": ["trade_record", "risk_event"],
+            },
+            "quality_metrics": {
+                "short_content_threshold": 8,
+            },
+            "context_policy": {
+                "conversation_recent_limit": 12,
+                "conversation_recall_limit": 8,
+                "rules_recall_limit": 5,
+                "line_max_chars": 220,
+                "recall_line_max_chars": 240,
+                "startup_bundle_max_total_chars": 12000,
+                "startup_max_chars_per_file": 4000,
+                "decision_engine_recall": {
+                    "trade_experience_limit": 12,
+                    "strategy_performance_limit": 6,
+                    "lesson_query": "经验教训 止损 止盈 滑点",
+                    "lesson_limit": 8,
+                },
+            },
         },
         "notifications": {
             "enabled": True,

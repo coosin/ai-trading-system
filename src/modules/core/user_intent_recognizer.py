@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
+
 
 class UserIntentType(Enum):
     """用户意图类型"""
@@ -534,88 +536,93 @@ class AutoMemoryRecorder:
     
     async def _record_blacklist(self, item: Dict[str, Any]) -> Optional[str]:
         """记录黑名单"""
-        from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
-        
+        sym = item.get("symbol")
         return await self.memory.add_memory(
-            memory_type=UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            memory_type="trading_rule",
             content=f"黑名单: {item['symbol']} - {item['reason']}",
             summary=f"🚫 交易对黑名单: {item['symbol']}",
-            metadata={
-                "type": "blacklist",
-                "symbol": item["symbol"],
-                "reason": item["reason"],
-                "auto_recorded": True
-            },
-            priority=MemoryPriority.CRITICAL,
+            metadata=base_metadata(
+                source_module="intent_recognizer",
+                kind="blacklist",
+                symbol=sym,
+                extra={"type": "blacklist", "reason": item.get("reason"), "auto_recorded": True},
+            ),
             importance=1.0,
             source_module="intent_recognizer",
-            tags=["blacklist", item["symbol"].replace("/", "")]
+            tags=tags(kind_tag("blacklist"), symbol_tag(sym)),
         )
     
     async def _record_authorization(self, auth: Dict[str, Any], original: str) -> Optional[str]:
         """记录授权"""
-        from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
-        
         return await self.memory.add_memory(
-            memory_type=UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            memory_type="trading_rule",
             content=f"交易授权: 全权负责={auth['full_authorization']}, 自动交易={auth['auto_trading']}, 排除={auth['excluded_symbols']}",
             summary=f"✅ 交易授权: {'全权负责' if auth['full_authorization'] else '部分授权'}",
-            metadata={
-                "type": "authorization",
-                "full_authorization": auth["full_authorization"],
-                "auto_trading": auth["auto_trading"],
-                "excluded_symbols": auth["excluded_symbols"],
-                "auto_recorded": True
-            },
-            priority=MemoryPriority.CRITICAL,
+            metadata=base_metadata(
+                source_module="intent_recognizer",
+                kind="authorization",
+                extra={
+                    "type": "authorization",
+                    "full_authorization": auth.get("full_authorization"),
+                    "auto_trading": auth.get("auto_trading"),
+                    "excluded_symbols": auth.get("excluded_symbols"),
+                    "auto_recorded": True,
+                },
+            ),
             importance=0.95,
             source_module="intent_recognizer",
-            tags=["authorization", "trading"]
+            tags=tags(kind_tag("authorization"), kind_tag("trading")),
         )
     
     async def _record_intent_from_data(self, intent_data: Dict[str, Any], original: str) -> Optional[str]:
         """从意图数据记录"""
-        from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
-        
         type_mapping = {
-            "preference": UnifiedMemoryType.USER_PREFERENCE,
-            "instruction": UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            "risk_setting": UnifiedMemoryType.RISK_SETTING,
-            "trading_rule": UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            "reminder": UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            "prohibition": UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            "goal": UnifiedMemoryType.USER_PREFERENCE,
-            "feedback": UnifiedMemoryType.USER_PREFERENCE,
-            "blacklist": UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            "authorization": UnifiedMemoryType.SYSTEM_INSTRUCTION,
-            "work_duty": UnifiedMemoryType.SYSTEM_INSTRUCTION,
+            "preference": "user_preference",
+            "instruction": "trading_rule",
+            "risk_setting": "risk_event",
+            "trading_rule": "trading_rule",
+            "reminder": "trading_rule",
+            "prohibition": "trading_rule",
+            "goal": "user_preference",
+            "feedback": "user_preference",
+            "blacklist": "trading_rule",
+            "authorization": "trading_rule",
+            "work_duty": "trading_rule",
         }
         
         intent_type = intent_data["type"]
-        memory_type = type_mapping.get(intent_type, UnifiedMemoryType.USER_PREFERENCE)
+        memory_type = type_mapping.get(intent_type, "user_preference")
         
         confidence = intent_data["confidence"]
         if confidence >= 0.9:
-            priority = MemoryPriority.CRITICAL
+            priority = "critical"
         elif confidence >= 0.8:
-            priority = MemoryPriority.HIGH
+            priority = "high"
         else:
-            priority = MemoryPriority.NORMAL
+            priority = "normal"
         
         return await self.memory.add_memory(
             memory_type=memory_type,
             content=original,
             summary=f"[{intent_type}] {intent_data['content'][:100]}",
-            metadata={
-                "intent_type": intent_type,
-                "confidence": confidence,
-                "keywords": intent_data.get("keywords", []),
-                "auto_recorded": True
-            },
-            priority=priority,
+            metadata=base_metadata(
+                source_module="intent_recognizer",
+                kind=f"intent:{intent_type}",
+                extra={
+                    "intent_type": intent_type,
+                    "confidence": confidence,
+                    "keywords": intent_data.get("keywords", []),
+                    "auto_recorded": True,
+                    "priority": priority,
+                },
+            ),
             importance=confidence,
             source_module="intent_recognizer",
-            tags=intent_data.get("keywords", []) + [intent_type]
+            tags=tags(
+                kind_tag("intent"),
+                kind_tag(intent_type),
+                extra=list(intent_data.get("keywords", []) or []),
+            ),
         )
 
 

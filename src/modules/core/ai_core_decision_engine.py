@@ -15,9 +15,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
-from src.modules.core.unified_intelligent_memory import UnifiedMemoryType
-
 logger = logging.getLogger(__name__)
+
+from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
 
 from src.modules.core.timing_constants import (
     SLEEP_1S,
@@ -239,12 +239,8 @@ class AICoreDecisionEngine:
         if self.memory:
             logger.info("✅ 记忆系统已连接（主控制器核心记忆）")
         else:
-            try:
-                from .unified_intelligent_memory import get_unified_memory
-                self.memory = await get_unified_memory()
-                logger.info("✅ 记忆系统已连接")
-            except Exception as e:
-                logger.warning(f"记忆系统连接失败: {e}")
+            # 单一真源：不再 fallback 到并行记忆实现
+            logger.warning("⚠️ MemoryGateway 未就绪：AI核心决策引擎将以无记忆模式运行")
         
         # 加载用户规则
         await self._load_user_rules()
@@ -889,17 +885,24 @@ class AICoreDecisionEngine:
             # 2. 保存交易分析到记忆
             if self.memory:
                 try:
-                    from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
-                    
                     await self.memory.add_memory(
-                        memory_type=UnifiedMemoryType.TRADING_DECISION,
+                        memory_type="decision",
                         content=f"交易分析: {decision.symbol} {decision.action} {decision.side} - {decision.reasoning}",
                         summary=f"📊 交易复盘: {decision.symbol} {decision.side}",
-                        metadata=trade_analysis,
-                        priority=MemoryPriority.HIGH,
+                        metadata=base_metadata(
+                            source_module="ai_core_decision_engine",
+                            kind="trade_post_analysis",
+                            symbol=trade_analysis.get("symbol"),
+                            extra=trade_analysis,
+                        ),
                         importance=0.85,
                         source_module="ai_core_decision_engine",
-                        tags=["trade_analysis", "post_trade", decision.symbol.replace("/", "")]
+                        tags=tags(
+                            kind_tag("trade_analysis"),
+                            kind_tag("post_trade"),
+                            symbol_tag(trade_analysis.get("symbol")),
+                            extra=["module:ai_core_decision_engine"],
+                        ),
                     )
                     logger.info("💾 交易分析已保存到记忆库")
                 except Exception as e:
@@ -966,14 +969,11 @@ class AICoreDecisionEngine:
             response = await self.llm.generate(prompt, is_user_input=False)
             
             if response and self.memory:
-                from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
-                
                 await self.memory.add_memory(
-                    memory_type=UnifiedMemoryType.LEARNING_SUMMARY,
+                    memory_type="decision",
                     content=f"交易经验: {trade_analysis['symbol']} - {response.content[:200]}",
                     summary=f"💡 交易经验总结: {trade_analysis['symbol']}",
                     metadata=trade_analysis,
-                    priority=MemoryPriority.MEDIUM,
                     importance=0.75,
                     source_module="ai_core_decision_engine",
                     tags=["trade_experience", "learning"]
@@ -999,11 +999,30 @@ class AICoreDecisionEngine:
             return
         
         try:
+            from src.modules.memory.memory_context_policy import get_effective_context_policy
+
+            cfg_mgr = (
+                getattr(self.main_controller, "config_manager", None)
+                if self.main_controller
+                else None
+            )
+            der = get_effective_context_policy(cfg_mgr).get("decision_engine_recall") or {}
+            te_limit = int(der.get("trade_experience_limit", 12))
+            sp_limit = int(der.get("strategy_performance_limit", 6))
+            lq = str(der.get("lesson_query", "经验教训 止损 止盈 滑点"))
+            ll = int(der.get("lesson_limit", 8))
+
             # 获取交易经验
             trade_experiences = await self.memory.retrieve_memories(
-                query="交易 经验 教训 盈利 亏损",
-                min_importance=0.7,
-                limit=10
+                query="交易 经验 教训 开平仓 止损 止盈 滑点",
+                min_importance=0.65,
+                limit=te_limit,
+            )
+
+            lesson_pack = await self.memory.retrieve_memories(
+                query=lq,
+                min_importance=0.55,
+                limit=ll,
             )
             
             if trade_experiences:
@@ -1012,12 +1031,14 @@ class AICoreDecisionEngine:
                 # 分析经验，提取有效策略
                 for exp in trade_experiences[:3]:
                     logger.info(f"   - 经验: {exp.content[:100]}...")
-            
+            if lesson_pack:
+                logger.info(f"📒 定向经验教训召回 {len(lesson_pack)} 条（决策引擎）")
+
             # 获取策略表现
             strategy_performance = await self.memory.retrieve_memories(
                 query="策略 回测 表现 收益",
                 min_importance=0.6,
-                limit=5
+                limit=sp_limit,
             )
             
             if strategy_performance:
@@ -1352,10 +1373,8 @@ class AICoreDecisionEngine:
             return
         
         try:
-            from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
-            
             await self.memory.add_memory(
-                memory_type=UnifiedMemoryType.STRATEGY_GENERATED,
+                memory_type="decision",
                 content=f"AI生成策略: {config['name']} - {proposal.reasoning}",
                 summary=f"📊 AI策略: {config['name']} ({config['strategy_type']})",
                 metadata={
@@ -1365,7 +1384,6 @@ class AICoreDecisionEngine:
                     "symbols": config['symbols'],
                     "parameters": config['parameters'],
                 },
-                priority=MemoryPriority.HIGH,
                 importance=0.9,
                 source_module="ai_core_decision_engine",
                 tags=["ai_strategy", "auto_generated"]
@@ -3001,10 +3019,8 @@ class AICoreDecisionEngine:
             return
         
         try:
-            from .unified_intelligent_memory import UnifiedMemoryType, MemoryPriority
-            
             await self.memory.add_memory(
-                memory_type=UnifiedMemoryType.TRADING_DECISION,
+                memory_type="trade_record",
                 content=f"AI决策: {decision.symbol} {decision.action} {decision.side} @{decision.entry_price} - {decision.reasoning}",
                 summary=f"🎯 AI交易决策: {decision.symbol} {decision.side} @{decision.entry_price}",
                 metadata={
@@ -3018,7 +3034,6 @@ class AICoreDecisionEngine:
                     "strategy": decision.strategy_used,
                     "order_id": order.get('orderId'),
                 },
-                priority=MemoryPriority.HIGH,
                 importance=0.9,
                 source_module="ai_core_decision_engine",
                 tags=["ai_decision", "trade", decision.symbol.replace("/", "")]

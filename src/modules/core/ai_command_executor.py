@@ -12,13 +12,33 @@ import logging
 import json
 import re
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 from .timing_constants import SLEEP_5S, SLEEP_60S
+from .commander_charter import (
+    CHARTER,
+    CONTEXT_FRAMING_FOR_CHAT,
+    WORKSPACE_READ_PREFIXES,
+    WORKSPACE_SELF_MAINTAIN_PREFIXES,
+)
+from src.modules.memory.memory_schema import SummaryKey, base_metadata, kind_tag, tags
+from src.modules.memory.memory_context_policy import (
+    format_task_memory_block,
+    load_startup_workspace_bundle,
+)
+from src.modules.memory.workspace_boundaries import (
+    WorkspaceBoundaries,
+    DEFAULT_FORCE_CLOSE_MSG,
+    DEFAULT_FORCE_OPEN_MSG,
+    DEFAULT_WORKSPACE_EDIT_MSG,
+    effective_high_risk_phrases,
+    effective_workspace_phrases,
+    load_workspace_boundaries,
+)
 
 
 @dataclass
@@ -34,10 +54,12 @@ class AICommandExecutor:
     AI 指令执行器 - 智能增强版
     
     核心改进：
-    1. 记忆驱动 - 每次响应都检索和应用用户规则
-    2. 黑名单强制检查 - 交易前必须检查黑名单
+    1. 记忆驱动 - 每次响应都检索和应用用户规则（含 workspace 自然语言边界）
+    2. 交易前结合记忆与黑名单等信号
     3. 授权感知 - 根据授权范围决定行动
     4. 主动工作 - 不等待指令，自主执行职责
+    
+    业务分寸与闸门文案优先从 workspace/BOUNDARIES_AND_LEARNING.md 读取；代码仅保留路径安全等必要技术校验。
     """
     
     def __init__(self, main_controller=None):
@@ -53,11 +75,18 @@ class AICommandExecutor:
             "full_authorization": True,
             "auto_trading": True,
             "auto_strategy": True,
+            # 与司令部宪章一致的「授权口径」（供状态展示与未来扩展，未知键不影响 .get）
+            "push_trade_lifecycle_alerts": True,
+            "push_risk_and_regime_alerts": True,
+            "push_data_and_system_anomalies": True,
+            "use_skill_manager_capabilities": True,
         }
         self.work_duties = []
         
         self._autonomous_running = False
         self._last_daily_summary_date = None
+        self._workspace_startup_bundle: str = ""
+        self._workspace_boundaries: Optional[WorkspaceBoundaries] = None
         
         logger.info("AI指令执行器（智能增强版）初始化完成")
     
@@ -75,25 +104,71 @@ class AICommandExecutor:
                 self.memory_manager = self.main_controller.ai_memory_manager
         
         try:
-            from .unified_intelligent_memory import get_unified_memory
             from .user_intent_recognizer import UserIntentRecognizer
 
-            # 优先使用主控制器核心记忆，保持与核心大脑一致
+            # 单一真源：只使用主控制器注入的 MemoryGateway（ai_memory_manager）。
             self.unified_memory = (
                 getattr(self.main_controller, "ai_memory_manager", None)
                 if self.main_controller else None
             )
             if self.unified_memory is None:
-                self.unified_memory = await get_unified_memory()
+                logger.warning("⚠️ MemoryGateway 未就绪：AI 将在无记忆模式下运行（不会再 fallback 到并行记忆实现）")
+
             self.user_intent_recognizer = UserIntentRecognizer
-            logger.info("✅ 统一记忆系统和用户意图识别器已加载")
-            
+            logger.info("✅ 用户意图识别器已加载")
+
             await self._load_user_rules_from_memory()
-            
+
+            try:
+                from pathlib import Path as _Path
+
+                ws = "workspace"
+                if self.main_controller and getattr(self.main_controller, "config_manager", None):
+                    ws = (
+                        self.main_controller.config_manager.get_config_sync(
+                            "paths", "workspace_path", ws
+                        )
+                        or ws
+                    )
+                self._workspace_startup_bundle = load_startup_workspace_bundle(
+                    _Path(ws),
+                    config_manager=getattr(self.main_controller, "config_manager", None)
+                    if self.main_controller
+                    else None,
+                )
+                if self._workspace_startup_bundle:
+                    logger.info("✅ 已加载 Workspace 启动摘要（人格/职责/经验锚点）")
+                try:
+                    _root = _Path(__file__).resolve().parents[3]
+                    _wspath = _Path(ws) if _Path(ws).is_absolute() else _root / ws
+                    self._workspace_boundaries = load_workspace_boundaries(_wspath)
+                    if self._workspace_boundaries and self._workspace_boundaries.learning_prose:
+                        logger.info("✅ 已加载 workspace 边界与学习自然语言")
+                except Exception as e:
+                    logger.debug(f"Workspace 边界文件跳过: {e}")
+            except Exception as e:
+                logger.debug(f"Workspace 启动摘要跳过: {e}")
+                self._workspace_startup_bundle = ""
+
         except Exception as e:
-            logger.warning(f"加载统一记忆系统失败: {e}")
+            logger.warning(f"加载用户意图识别器/记忆系统失败: {e}")
         
         logger.info("✅ AI指令执行器（智能增强版）初始化完成")
+    
+    def _get_workspace_boundaries(self) -> WorkspaceBoundaries:
+        """懒加载 workspace/BOUNDARIES_AND_LEARNING.md（initialize 已加载则直接复用）。"""
+        if self._workspace_boundaries is None:
+            try:
+                root = Path(__file__).resolve().parents[3]
+                ws = "workspace"
+                if self.main_controller and getattr(self.main_controller, "config_manager", None):
+                    ws = self.main_controller.config_manager.get_config_sync("paths", "workspace_path", ws) or ws
+                wspath = Path(ws) if Path(ws).is_absolute() else root / ws
+                self._workspace_boundaries = load_workspace_boundaries(wspath)
+            except Exception as e:
+                logger.debug(f"workspace boundaries lazy load: {e}")
+                self._workspace_boundaries = WorkspaceBoundaries()
+        return self._workspace_boundaries
     
     def _get_ai_core(self):
         """动态获取AI核心决策引擎（运行时获取，避免初始化顺序问题）"""
@@ -140,12 +215,17 @@ class AICommandExecutor:
         except Exception as e:
             logger.error(f"加载用户规则失败: {e}")
     
-    async def process_input(self, user_input: str) -> Dict[str, Any]:
+    async def process_input(self, user_input: str, source: str = "system") -> Dict[str, Any]:
         """
         处理用户输入 - 智能增强版
         核心改进：在处理前检索和应用记忆中的用户规则
+
+        source: 与 MainController.process_user_command 对齐（如 telegram、api_chat），用于 MemoryGateway
+        的 channel:<source> 对话连续性与 context_policy.channels 覆盖。
         """
         logger.info(f"处理用户输入: {user_input}")
+        conv_scope = f"channel:{source}" if source else None
+        memory_channel = str(source).strip() if source else None
         
         try:
             if self.unified_memory:
@@ -159,20 +239,41 @@ class AICommandExecutor:
                         await self._load_user_rules_from_memory()
             
             intent = await self._parse_intent(user_input)
-            
+            # 意图模型常误选 system_inspection，导致每条回复都像「巡检报告」。
+            # 自然语言主入口不跑 skill 巡检；完整巡检请用司令部 API / 运维入口。
+            if intent.action == "system_inspection":
+                intent = Intent(action="chat", params=intent.params, confidence=intent.confidence)
+
             user_rules = await self._get_user_rules_context()
             
             if intent.action != "unknown":
-                result = await self._execute_intent(intent, user_input, user_rules)
+                result = await self._execute_intent(
+                    intent,
+                    user_input,
+                    user_rules,
+                    conversation_scope=conv_scope,
+                    memory_channel=memory_channel,
+                )
             else:
-                result = await self._general_chat(user_input, user_rules)
+                act_ctx = intent.action if intent.action != "unknown" else "chat"
+                result = await self._general_chat(
+                    user_input,
+                    user_rules,
+                    intent_action=act_ctx,
+                    conversation_scope=conv_scope,
+                    memory_channel=memory_channel,
+                )
             
             if self.unified_memory:
                 await self.unified_memory.add_memory(
                     memory_type=self._get_memory_type_from_intent(intent.action),
                     content=f"用户: {user_input}",
                     summary=f"用户指令: {user_input[:100]}",
-                    metadata={"intent": intent.action, "params": intent.params},
+                    metadata=base_metadata(
+                        source_module="ai_command_executor",
+                        kind="user_input",
+                        extra={"intent": intent.action, "params": intent.params},
+                    ),
                     source_module="ai_command_executor"
                 )
                 try:
@@ -182,9 +283,17 @@ class AICommandExecutor:
                             memory_type="conversation",
                             content=f"动作结果[{intent.action}] {action_msg}",
                             summary=f"{intent.action} 执行结果摘要",
-                            metadata={"intent": intent.action, "success": bool((result or {}).get("success", False))},
+                            metadata=base_metadata(
+                                source_module="ai_command_executor",
+                                kind="action_result",
+                                extra={
+                                    "intent": intent.action,
+                                    "success": bool((result or {}).get("success", False)),
+                                },
+                            ),
                             source_module="ai_command_executor",
                             importance=0.55,
+                            tags=tags(kind_tag("action_result"), kind_tag(intent.action)),
                         )
                 except Exception:
                     pass
@@ -210,174 +319,140 @@ class AICommandExecutor:
     
     async def _get_user_rules_context(self) -> str:
         """
-        获取用户规则上下文 - 核心改进
-        每次响应前检索用户的关键规则和偏好
+        注入「宪章」+ 少量高信号记忆（黑名单等），不堆砌行为细则。
         """
-        if not self.unified_memory:
-            return ""
-        
-        context_parts = []
-        context_parts.append("\n" + "=" * 40)
-        context_parts.append("【用户规则 - 必须遵守】")
-        context_parts.append("=" * 40)
-        
-        blacklist_memories = await self.unified_memory.retrieve_memories(
-            query="黑名单 禁区 不要",
-            min_importance=0.8,
-            limit=5
-        )
-        if blacklist_memories:
-            context_parts.append("\n🚫 【黑名单/禁区】")
-            for mem in blacklist_memories:
-                context_parts.append(f"  • {mem.content}")
-                # 不再自动将ETH加入黑名单
-                if "ETH" in mem.content or "以太坊" in mem.content:
-                    logger.info(f"ℹ️ 忽略ETH黑名单记忆: 已移除ETH限制")
-        
-        auth_memories = await self.unified_memory.retrieve_memories(
-            query="全权 负责 授权",
-            min_importance=0.8,
-            limit=3
-        )
-        if auth_memories:
-            context_parts.append("\n✅ 【交易授权】")
-            for mem in auth_memories:
-                context_parts.append(f"  • {mem.content}")
-        
-        duty_memories = await self.unified_memory.retrieve_memories(
-            query="职责 工作 必须 自动",
-            min_importance=0.7,
-            limit=5
-        )
-        if duty_memories:
-            context_parts.append("\n📋 【工作职责】")
-            for mem in duty_memories:
-                context_parts.append(f"  • {mem.content}")
-        
-        pref_memories = await self.unified_memory.retrieve_memories(
-            query="偏好 喜欢 目标",
-            min_importance=0.6,
-            limit=3
-        )
-        if pref_memories:
-            context_parts.append("\n👤 【用户偏好】")
-            for mem in pref_memories:
-                context_parts.append(f"  • {mem.content}")
-        
-        # 新增：检索最近的交易执行记录
-        trade_memories = await self.unified_memory.retrieve_memories(
-            query="交易 执行 开仓 平仓",
-            min_importance=0.8,
-            limit=10
-        )
-        if trade_memories:
-            context_parts.append("\n📈 【最近交易执行】")
-            for mem in trade_memories:
-                if "执行交易" in mem.content or "交易执行" in mem.content:
-                    context_parts.append(f"  • {mem.content}")
-        
-        # 新增：从active_trader获取实时持仓状态
-        if self.main_controller and hasattr(self.main_controller, 'active_trader'):
-            active_trader = self.main_controller.active_trader
-            if active_trader:
-                status = active_trader.get_status()
-                if status.get("active_positions", 0) > 0:
-                    context_parts.append("\n📊 【当前持仓状态】")
-                    context_parts.append(f"  • 持仓数量: {status.get('active_positions', 0)}")
-                    positions = status.get("positions", {})
-                    for symbol, pos in positions.items():
-                        context_parts.append(f"  • {symbol}: {pos.get('side')} {pos.get('quantity')} @{pos.get('entry_price')}")
-                context_parts.append(f"\n🎯 【策略状态】")
-                context_parts.append(f"  • 已加载策略: {status.get('strategies', 0)}个")
-                context_parts.append(f"  • 总交易次数: {status.get('total_trades', 0)}次")
-        
-        context_parts.append("\n" + "=" * 40)
-        context_parts.append("【重要提醒】")
-        context_parts.append("1. 黑名单中的交易对绝对不能操作")
-        context_parts.append("2. 已授权的交易要主动执行，不需要用户提醒")
-        context_parts.append("3. 工作职责是自动进行的，不是等待指令")
-        context_parts.append("4. 回答用户问题时，要报告当前交易状态和持仓情况")
-        context_parts.append("=" * 40 + "\n")
-        skill_pack = self._read_trading_skill_pack()
-        if skill_pack:
-            context_parts.append("【交易技能包】")
-            context_parts.append(skill_pack)
-            context_parts.append("")
-        
-        return "\n".join(context_parts)
+        parts: List[str] = [CHARTER]
 
-    def _read_trading_skill_pack(self) -> str:
-        candidates = [
-            Path.cwd() / "workspace" / "memory" / "core" / "SKILL_PACK_TRADING_OPS.md",
-            Path("/app/data/memory/core/SKILL_PACK_TRADING_OPS.md"),
-        ]
-        for p in candidates:
+        if getattr(self, "_workspace_startup_bundle", None):
+            parts.append("\n" + self._workspace_startup_bundle.strip())
+
+        try:
+            wb = self._get_workspace_boundaries()
+            if wb.learning_prose:
+                cap = 4500
+                lp = wb.learning_prose.strip()
+                if len(lp) > cap:
+                    lp = lp[:cap] + "…"
+                parts.append("\n【边界与学习（workspace 自然语言）】\n" + lp)
+        except Exception as e:
+            logger.debug(f"inject boundaries prose: {e}")
+
+        if self.unified_memory:
             try:
-                if p.exists() and p.is_file():
-                    data = p.read_text(encoding="utf-8").strip()
-                    if data:
-                        return data[:6000]
-            except Exception:
-                continue
-        return ""
-    
+                blacklist_memories = await self.unified_memory.retrieve_memories(
+                    query="黑名单 禁区 不要",
+                    min_importance=0.8,
+                    limit=3,
+                )
+                if blacklist_memories:
+                    parts.append("\n【记忆：禁区/黑名单要点】")
+                    for mem in blacklist_memories:
+                        line = (mem.content or "").strip()
+                        if "ETH" in line or "以太坊" in line:
+                            continue
+                        if line:
+                            parts.append(f"- {line[:240]}")
+            except Exception as e:
+                logger.debug(f"检索黑名单记忆失败: {e}")
+
+        return "\n".join(parts).strip()
+
     def _get_memory_type_from_intent(self, action: str):
         """根据意图类型获取记忆类型"""
-        from .unified_intelligent_memory import UnifiedMemoryType
-        
+        # MemoryGateway 使用字符串 category，并负责映射到内部 MemoryCategory/MemoryLayer。
         mapping = {
-            "trade": UnifiedMemoryType.TRADING_DECISION,
-            "signals": UnifiedMemoryType.AI_PREDICTION,
-            "market_analysis": UnifiedMemoryType.MARKET_INSIGHT,
-            "risk": UnifiedMemoryType.RISK_SETTING,
-            "strategy_create": UnifiedMemoryType.STRATEGY_GENERATED,
-            "strategy_optimize": UnifiedMemoryType.RL_OPTIMIZATION,
+            "trade": "trade_record",
+            "signals": "market_observation",
+            "market_analysis": "market_observation",
+            "risk": "risk_event",
+            "strategy_create": "decision",
+            "strategy_optimize": "decision",
         }
-        return mapping.get(action, UnifiedMemoryType.CONVERSATION)
+        return mapping.get(action, "conversation")
     
+    def _parse_llm_json(self, content: str) -> Optional[Dict[str, Any]]:
+        """从模型输出中尽量解析 JSON（允许 ```json 围栏）。"""
+        if not content:
+            return None
+        raw = content.strip()
+        if "```" in raw:
+            try:
+                start = raw.find("```")
+                chunk = raw[start + 3 :]
+                if chunk.lstrip().startswith("json"):
+                    chunk = chunk.lstrip()[4:].lstrip()
+                end = chunk.find("```")
+                if end != -1:
+                    raw = chunk[:end].strip()
+            except Exception:
+                pass
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                i, j = raw.find("{"), raw.rfind("}")
+                if i != -1 and j != -1 and j > i:
+                    return json.loads(raw[i : j + 1])
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def _normalize_intent_action(self, action: str) -> str:
+        """兼容历史/别名 action 字符串，不做自然语言关键词判断。"""
+        if not action:
+            return "chat"
+        al = str(action).strip().lower()
+        aliases = {
+            "system.inspection.run": "system_inspection",
+            "system.inspection": "system_inspection",
+            "system_inspection": "system_inspection",
+            "inspection": "system_inspection",
+            "health_check": "system_inspection",
+            "healthcheck": "system_inspection",
+            "trade_history": "trade_history",
+            "trades": "trade_history",
+            "order_history": "trade_history",
+            "history": "trade_history",
+        }
+        if al in aliases:
+            return aliases[al]
+        return al.replace(" ", "_").replace("-", "_")
+
     async def _parse_intent(self, user_input: str) -> Intent:
-        """解析用户意图 - 使用LLM自由理解"""
-        
+        """解析用户意图：由 LLM 理解语义并选择动作；不在此处做关键词规则。"""
+        params = await self._extract_params(user_input, "")
         if self.llm_integration:
             try:
-                prompt = f"""分析用户消息，理解真实意图。
+                prompt = f"""任务：根据用户消息选一个 action，输出一条 JSON。
 
-用户消息: {user_input}
+action ∈ chat, system_status, trade_history, positions, balance, market_analysis, trade, strategy_create, strategy_optimize, backtest, risk, signals, third_party_data, workspace_read, workspace_edit
 
-返回JSON格式：
-{{
-    "action": "动作类型",
-    "params": {{相关参数}},
-    "confidence": 0.0-1.0,
-    "reasoning": "理解理由"
-}}
+说明：
+- workspace_read：params 必须包含 path（字符串，相对仓库根的路径，用 /）。
+- workspace_edit：params 必须包含 path、edit_type、content；edit_type 为 insert|delete|replace|full_replace；delete/replace 需 start_line、end_line（从 1 起的行号）；full_replace 用 content 替换整个文件；insert 可用 start_line 指定插入位置。
 
-动作类型包括：
-- trade: 交易相关
-- market_analysis: 市场分析
-- strategy_create: 创建策略
-- strategy_optimize: 优化策略
-- system_status: 系统状态
-- chat: 普通对话
+用户消息：
+{user_input}
 
-只返回JSON。"""
+输出 JSON（无 markdown）：
+{{"action":"...","params":{{}},"confidence":0.0,"reasoning":"一句话"}}"""
 
                 response = await self.llm_integration.generate(prompt, is_user_input=False)
-                
-                if response:
-                    try:
-                        result = json.loads(response.content)
+                if response and response.content:
+                    result = self._parse_llm_json(response.content)
+                    if isinstance(result, dict):
+                        merged_params = dict(params)
+                        rp = result.get("params")
+                        if isinstance(rp, dict):
+                            merged_params.update(rp)
                         return Intent(
-                            action=result.get("action", "chat"),
-                            params=result.get("params", {}),
-                            confidence=result.get("confidence", 0.8)
+                            action=self._normalize_intent_action(str(result.get("action", "chat"))),
+                            params=merged_params,
+                            confidence=float(result.get("confidence", 0.75) or 0.75),
                         )
-                    except json.JSONDecodeError:
-                        pass
             except Exception as e:
                 logger.warning(f"LLM解析意图失败: {e}")
-        
-        params = await self._extract_params(user_input, "")
+
         return Intent(action="chat", params=params, confidence=0.5)
     
     async def _extract_params(self, user_input: str, action: str) -> Dict[str, Any]:
@@ -398,17 +473,204 @@ class AICommandExecutor:
                 params['value'] = float(numbers[0])
         
         return params
+
+    def _repo_root(self) -> Path:
+        return Path(__file__).resolve().parents[3]
+
+    @staticmethod
+    def _workspace_blocked(rel_posix: str) -> bool:
+        lower = rel_posix.lower()
+        needles = (".env", "secrets/", ".pem", "id_rsa", "__pycache__", "node_modules/", ".git/")
+        return any(n in lower for n in needles)
+
+    @staticmethod
+    def _under_workspace_prefix(rel_posix: str, prefixes: Tuple[str, ...]) -> bool:
+        rel = rel_posix.replace("\\", "/").lstrip("/")
+        for p in prefixes:
+            base = p.replace("\\", "/").strip().rstrip("/")
+            if rel == base or rel.startswith(base + "/"):
+                return True
+        return False
+
+    def _is_self_maintain_path(self, rel_posix: str) -> bool:
+        return self._under_workspace_prefix(rel_posix, WORKSPACE_SELF_MAINTAIN_PREFIXES)
+
+    def _resolve_workspace_path(self, raw: str) -> Tuple[Optional[Path], Optional[str]]:
+        root = self._repo_root()
+        s = (raw or "").strip().replace("\\", "/").lstrip("/")
+        if not s:
+            return None, "未提供 path（相对仓库根，例如 src/modules/core/commander_charter.py）"
+        if ".." in Path(s).parts:
+            return None, "禁止路径中包含 .."
+        path = (root / s).resolve()
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return None, "路径必须在仓库根目录内"
+        rel_posix = str(rel).replace("\\", "/")
+        if self._workspace_blocked(rel_posix):
+            return None, "该路径禁止通过司令部工作区接口访问"
+        if not self._under_workspace_prefix(rel_posix, WORKSPACE_READ_PREFIXES):
+            return None, (
+                "路径不在允许前缀内。可读写的目录前缀为: "
+                + ", ".join(WORKSPACE_READ_PREFIXES)
+            )
+        return path, None
+
+    def _path_relative_repo(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self._repo_root())).replace("\\", "/")
+        except ValueError:
+            return str(path)
+
+    async def _workspace_read(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        raw = params.get("path") or params.get("file_path") or ""
+        path, err = self._resolve_workspace_path(str(raw))
+        if err:
+            return {"success": False, "response": err, "timestamp": datetime.now().isoformat()}
+        if not path.is_file():
+            return {
+                "success": False,
+                "response": f"不是文件或不存在: {self._path_relative_repo(path)}",
+                "timestamp": datetime.now().isoformat(),
+            }
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return {
+                "success": False,
+                "response": f"读取失败: {e}",
+                "timestamp": datetime.now().isoformat(),
+            }
+        max_len = 120_000
+        if len(text) > max_len:
+            note = f"\n\n… 已截断，原文件约 {len(text)} 字符"
+            text = text[:max_len] + note
+        rel = self._path_relative_repo(path)
+        return {
+            "success": True,
+            "response": f"【已读取 {rel}】\n\n{text}",
+            "data": {"path": rel, "length": len(text)},
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    async def _workspace_edit(self, params: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+        mc = self.main_controller
+        if not mc or not hasattr(mc, "edit_code"):
+            return {
+                "success": False,
+                "response": "主控制器不可用或不支持 edit_code",
+                "timestamp": datetime.now().isoformat(),
+            }
+        raw = params.get("path") or params.get("file_path") or ""
+        path, err = self._resolve_workspace_path(str(raw))
+        if err:
+            return {"success": False, "response": err, "timestamp": datetime.now().isoformat()}
+        rel = self._path_relative_repo(path)
+        if not self._is_self_maintain_path(rel):
+            b = self._get_workspace_boundaries()
+            wph = effective_workspace_phrases(b)
+            if not any(k in (user_input or "") for k in wph):
+                tmpl = b.workspace_edit_message_template or DEFAULT_WORKSPACE_EDIT_MSG
+                try:
+                    msg = tmpl.format(rel=rel)
+                except Exception:
+                    msg = DEFAULT_WORKSPACE_EDIT_MSG.format(rel=rel)
+                return {
+                    "success": True,
+                    "response": msg,
+                    "needs_confirmation": True,
+                    "timestamp": datetime.now().isoformat(),
+                }
+
+        op = str(params.get("edit_type") or params.get("operation") or "replace").lower()
+        content = str(params.get("content") if params.get("content") is not None else "")
+        start_line = params.get("start_line")
+        end_line = params.get("end_line")
+
+        if op in ("full", "full_replace", "replace_all", "whole_file"):
+            if not path.is_file():
+                return {
+                    "success": False,
+                    "response": "整文件替换要求文件已存在",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            try:
+                original = path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                return {"success": False, "response": f"读取失败: {e}", "timestamp": datetime.now().isoformat()}
+            line_list = original.split("\n")
+            start_line, end_line = 1, max(1, len(line_list))
+            op = "replace"
+
+        if op not in ("insert", "delete", "replace"):
+            return {
+                "success": False,
+                "response": f"不支持的 edit_type: {op}（需 insert / delete / replace 或 full_replace）",
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        try:
+            sl = int(start_line) if start_line is not None else None
+            el = int(end_line) if end_line is not None else None
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "response": "start_line / end_line 必须是整数",
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        if op == "insert":
+            if sl is None:
+                sl = 1
+            el = sl
+        elif sl is None or el is None:
+            return {
+                "success": False,
+                "response": f"{op} 需要 start_line 与 end_line（或在 full_replace 时省略行号）",
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        desc = str(params.get("description") or "ai_command_executor workspace_edit")
+        result = await mc.edit_code(
+            file_path=str(path),
+            edit_type=op,
+            content=content,
+            start_line=sl,
+            end_line=el,
+            description=desc,
+        )
+        ok = False
+        msg = ""
+        if isinstance(result, dict):
+            st = str(result.get("status") or "").lower()
+            errs = result.get("errors") or []
+            ok = st == "success" and not errs
+            msg = str(result.get("message") or "")
+        else:
+            msg = str(result)
+        if not msg:
+            msg = "已完成" if ok else "失败"
+        return {
+            "success": bool(ok),
+            "response": f"【写入 {rel}】{msg}" if ok else f"【写入失败 {rel}】{msg}",
+            "data": result if isinstance(result, dict) else {"raw": result},
+            "timestamp": datetime.now().isoformat(),
+        }
     
-    async def _execute_intent(self, intent: Intent, user_input: str, user_rules: str = "") -> Dict[str, Any]:
+    async def _execute_intent(
+        self,
+        intent: Intent,
+        user_input: str,
+        user_rules: str = "",
+        *,
+        conversation_scope: Optional[str] = None,
+        memory_channel: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """执行意图 - 带用户规则检查"""
-        action = intent.action
-        params = intent.params
-        # 当意图解析成 chat 时，尝试用自然语言别名映射到技能动作。
-        if action == "chat":
-            guessed = self._guess_skill_action_from_text(user_input)
-            if guessed:
-                action = guessed
-        
+        action = self._normalize_intent_action(intent.action)
+        params = intent.params or {}
+
         if action in ["trade", "market_analysis"]:
             symbol = params.get('symbol', '')
             if symbol in self.blacklist:
@@ -445,10 +707,31 @@ class AICommandExecutor:
                 return await self._get_third_party_data(params, user_input)
             elif action == "system_status":
                 return await self._get_system_status()
+            elif action == "system_inspection":
+                return await self._run_system_inspection()
+            elif action == "trade_history":
+                return await self._get_trade_history(params)
+            elif action == "workspace_read":
+                return await self._workspace_read(params)
+            elif action == "workspace_edit":
+                return await self._workspace_edit(params, user_input)
             elif action == "chat":
-                return await self._general_chat(user_input, user_rules)
+                return await self._general_chat(
+                    user_input,
+                    user_rules,
+                    intent_action="chat",
+                    conversation_scope=conversation_scope,
+                    memory_channel=memory_channel,
+                )
             else:
-                return await self._ai_autonomous_action(action, params, user_input, user_rules)
+                return await self._ai_autonomous_action(
+                    action,
+                    params,
+                    user_input,
+                    user_rules,
+                    conversation_scope=conversation_scope,
+                    memory_channel=memory_channel,
+                )
                 
         except Exception as e:
             logger.error(f"执行意图失败: {action} - {e}")
@@ -458,36 +741,71 @@ class AICommandExecutor:
                 "timestamp": datetime.now().isoformat()
             }
 
-    def _guess_skill_action_from_text(self, user_input: str) -> Optional[str]:
-        # 注意：这里必须是“弱规则”且尽量减少误触发。
-        # 我们只在用户表达明确执行意图时才把 chat 映射成技能动作。
-        text_raw = str(user_input or "").strip()
-        text = text_raw.lower()
+    async def _get_trade_history(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """从统一交易历史服务读取记录，并说明与交易所持仓口径可能不一致。"""
+        mc = self.main_controller
+        if not mc:
+            return {"success": False, "response": "主控制器不可用", "timestamp": datetime.now().isoformat()}
+        ths = getattr(mc, "trade_history_service", None)
+        if not ths:
+            return {"success": False, "response": "交易历史服务未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            limit = int(params.get("limit", 25) or 25)
+            days = int(params.get("days", 30) or 30)
+        except (TypeError, ValueError):
+            limit, days = 25, 30
 
-        # 若是纯提问/质疑/闲聊，不做技能映射，交给 LLM 自由对话与澄清。
-        if any(q in text_raw for q in ["？", "?"]) or any(q in text for q in ["为什么", "怎么", "什么情况", "哪两项", "说清楚", "解释"]):
-            return None
+        pos_n = 0
+        try:
+            if hasattr(mc, "okx_exchange") and mc.okx_exchange:
+                positions = await mc.okx_exchange.get_positions()
+                for p in positions or []:
+                    sz = float(p.get("pos", p.get("size", 0)) or 0)
+                    if sz != 0:
+                        pos_n += 1
+        except Exception as e:
+            logger.debug(f"读取持仓数量用于对比说明失败: {e}")
 
-        intent_verbs = ("执行", "运行", "开始", "拉取", "获取", "同步", "查询", "看看", "帮我查", "帮我看")
-        has_exec_intent = any(v in text_raw for v in intent_verbs)
-        if not has_exec_intent:
-            return None
+        try:
+            stats = await ths.get_statistics(days=days, force_refresh=True)
+            trades = await ths.get_recent_trades(limit=limit)
+        except Exception as e:
+            return {"success": False, "response": f"读取交易历史失败: {e}", "timestamp": datetime.now().isoformat()}
 
-        mapping = [
-            (["系统巡检", "健康检查", "巡检"], "system.inspection.run"),
-            (["每日复盘", "日总结", "日报总结"], "memory.summary.daily"),
-            (["策略研发", "研究策略", "生成策略"], "strategy.research.run"),
-            (["回测", "跑回测"], "strategy.backtest.run"),
-            (["策略优化", "优化策略", "立即优化"], "strategy.optimize.run"),
-            (["强制开仓", "立即开仓"], "execution.open.force"),
-            (["强制平仓", "立即平仓", "全部平仓"], "execution.close.force"),
-            (["止盈止损", "sltp", "风控状态"], "risk.sltp.adjust"),
+        total = 0
+        if isinstance(stats, dict):
+            total = int(stats.get("total_trades", 0) or 0)
+
+        lines: List[str] = [
+            f"📜 交易历史（本机已记录，近 {days} 天统计口径）",
+            f"- 已记录成交/平仓笔数: {total}",
         ]
-        for kws, action in mapping:
-            if any(k in text for k in kws):
-                return action
-        return None
-    
+        if pos_n:
+            lines.append(
+                f"- 当前交易所仍有约 {pos_n} 笔持仓：若上表为 0，多为本地未写入历史、手动/外部终端下单或同步尚未覆盖，不等同于「无仓位」。"
+            )
+        if not trades:
+            lines.append("\n暂无逐笔明细（本地库为空）。")
+        else:
+            lines.append("\n最近记录（最多展示 20 条）：")
+            for i, t in enumerate(trades[:20], 1):
+                if not isinstance(t, dict):
+                    continue
+                ts = str(t.get("timestamp", ""))[:19]
+                sym = t.get("symbol", "?")
+                side = t.get("side", "?")
+                q = t.get("quantity", 0)
+                price = t.get("price", 0)
+                pnl = t.get("pnl", 0)
+                lines.append(f"{i}. {ts} {sym} {side} qty={q} @ {price} pnl={pnl}")
+
+        return {
+            "success": True,
+            "response": "\n".join(lines),
+            "data": {"stats": stats, "trades": trades[:20], "exchange_open_positions_hint": pos_n},
+            "timestamp": datetime.now().isoformat(),
+        }
+
     async def _execute_backtest(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """执行策略回测"""
         try:
@@ -1194,23 +1512,50 @@ class AICommandExecutor:
         except Exception as e:
             return {"success": False, "response": f"获取系统状态失败: {str(e)}"}
     
-    async def _general_chat(self, user_input: str, user_rules: str = "") -> Dict[str, Any]:
+    async def _general_chat(
+        self,
+        user_input: str,
+        user_rules: str = "",
+        *,
+        intent_action: str = "chat",
+        conversation_scope: Optional[str] = None,
+        memory_channel: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """通用对话 - 带用户规则上下文"""
         try:
             if self.llm_integration:
                 system_context = await self._get_system_context()
+                task_mem = ""
+                if self.unified_memory:
+                    try:
+                        task_mem = await format_task_memory_block(
+                            self.unified_memory,
+                            intent_action,
+                            user_input=user_input,
+                            config_manager=getattr(self.main_controller, "config_manager", None)
+                            if self.main_controller
+                            else None,
+                        )
+                    except Exception as e:
+                        logger.debug(f"任务记忆片段注入跳过: {e}")
                 
-                prompt = f"""你是一个专业的量化交易AI助手。
+                prompt = f"""{user_rules}
+
+{CONTEXT_FRAMING_FOR_CHAT}
 
 {system_context}
-
-{user_rules}
+{task_mem}
 
 用户消息：{user_input}
 
-请用自然、友好的方式回复，就像和一个朋友聊天一样。不要使用JSON格式或命令格式。"""
+请按宪章与上文自然回复；闲聊不必硬贴数据，涉及盘面与仓位时以数据为准。"""
 
-                response = await self.llm_integration.generate(prompt, is_user_input=False)
+                response = await self.llm_integration.generate(
+                    prompt,
+                    is_user_input=False,
+                    conversation_scope=conversation_scope,
+                    memory_channel=memory_channel,
+                )
                 
                 if response:
                     return {
@@ -1223,6 +1568,86 @@ class AICommandExecutor:
             
         except Exception as e:
             return {"success": False, "response": f"对话处理失败: {str(e)}"}
+
+    @staticmethod
+    def _nonzero_exchange_positions(positions: Optional[List]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for p in positions or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                sz = float(p.get("pos", p.get("size", 0)) or 0)
+            except (TypeError, ValueError):
+                sz = 0.0
+            if abs(sz) > 1e-12:
+                out.append(p)
+        return out
+
+    async def _refresh_account_cache_if_stale(self, mc: Any, max_age_sec: float = 50.0) -> None:
+        """对话生成上下文前适度刷新交易所余额/持仓缓存，供 SLTP 与司令部一致。"""
+        if not hasattr(mc, "force_sync_account_state"):
+            return
+        need = True
+        ls = getattr(mc, "_latest_account_state", None)
+        if isinstance(ls, dict) and ls.get("timestamp"):
+            try:
+                raw = str(ls["timestamp"]).replace("Z", "")
+                t = datetime.fromisoformat(raw[:26])
+                if (datetime.now() - t).total_seconds() < max_age_sec:
+                    need = False
+            except Exception:
+                pass
+        if not need:
+            return
+        try:
+            await mc.force_sync_account_state(reason="ai_context")
+        except Exception as e:
+            logger.debug(f"刷新账户缓存失败: {e}")
+
+    async def _authoritative_position_context_lines(self, mc: Any) -> List[str]:
+        """把交易所接口返回的持仓快照放在上下文前部（纯数据，不给模型下行为指令）。"""
+        await self._refresh_account_cache_if_stale(mc)
+        lines: List[str] = [
+            "\n" + "=" * 50,
+            "【交易所·持仓快照】",
+        ]
+        pos: Optional[List] = None
+        try:
+            if hasattr(mc, "okx_exchange") and mc.okx_exchange:
+                pos = await mc.okx_exchange.get_positions()
+        except Exception as e:
+            lines.append(f"拉取持仓失败: {e}")
+            lines.append("=" * 50)
+            return lines
+
+        active = self._nonzero_exchange_positions(pos)
+        lines.append(f"非零持仓笔数: {len(active)}")
+        if not active:
+            lines.append("（本次接口返回无非零仓位）")
+        for p in active[:12]:
+            sym = p.get("instId") or p.get("symbol", "?")
+            side = p.get("side", "?")
+            psr = p.get("posSide_raw", "")
+            sz = p.get("size", p.get("pos", 0))
+            upl = p.get("unrealized_pnl", p.get("upl", 0))
+            psr_note = f" OKXposSide={psr}" if psr else ""
+            lines.append(f"  • {sym} {side}{psr_note} size={sz} 未实现盈亏≈{upl}")
+
+        try:
+            if getattr(mc, "stop_loss_manager", None):
+                st = mc.stop_loss_manager.get_stats()
+                lines.append(
+                    f"止盈止损跟踪器: 当前跟踪订单数≈{st.get('total_orders', 0)} "
+                    f"(动态调整次数 {st.get('dynamic_adjustments', 0)})"
+                )
+        except Exception as e:
+            logger.debug(f"读取 SLTP 统计失败: {e}")
+
+        ls = getattr(mc, "_latest_account_state", None)
+        if isinstance(ls, dict) and ls.get("timestamp"):
+            lines.append(f"最近账户同步时间: {ls.get('timestamp')}")
+        lines.append("=" * 50)
+        return lines
     
     async def _get_system_context(self) -> str:
         """获取系统上下文 - 包含所有模块详细状态"""
@@ -1232,6 +1657,10 @@ class AICommandExecutor:
         
         if self.main_controller:
             mc = self.main_controller
+            try:
+                context_parts.extend(await self._authoritative_position_context_lines(mc))
+            except Exception as e:
+                logger.debug(f"权威持仓上下文失败: {e}")
             
             context_parts.append("\n" + "=" * 50)
             context_parts.append("【系统模块状态】")
@@ -1311,13 +1740,12 @@ class AICommandExecutor:
             else:
                 context_parts.append(f"\n🔌 第三方数据系统: ❌ 未连接")
             
-            # 4. AI交易引擎状态
+            # 4. AI交易引擎状态（内存持仓可能与交易所不一致，以上方【交易所·实时持仓】为准）
             if hasattr(mc, 'ai_trading_engine') and mc.ai_trading_engine:
                 engine = mc.ai_trading_engine
                 context_parts.append(f"\n🤖 AI交易引擎: ✅ 已连接")
-                positions = getattr(engine, 'positions', {})
-                if positions:
-                    context_parts.append(f"   - 当前持仓: {len(positions)}个")
+                positions = getattr(engine, 'positions', {}) or {}
+                context_parts.append(f"   - 引擎内存持仓条目: {len(positions)}（可能与交易所不一致）")
             else:
                 context_parts.append(f"\n🤖 AI交易引擎: ❌ 未连接")
             
@@ -1363,27 +1791,45 @@ class AICommandExecutor:
                 context_parts.append(f"\n📝 记忆系统: ✅ 已连接")
             else:
                 context_parts.append(f"\n📝 记忆系统: ❌ 未连接")
+
+            if hasattr(mc, "skill_manager") and mc.skill_manager:
+                sm = mc.skill_manager
+                reg = sorted(sm.skills.keys())
+                context_parts.append(
+                    f"\n🔧 SkillManager: ✅ 已注册 {len(reg)} 个技能 — {', '.join(reg)}"
+                )
+                context_parts.append(
+                    "   自然语言可触发 workspace_read / workspace_edit 读取或修改允许路径；"
+                    "巡检与健康检查仍走 system_inspection 或司令部 API。"
+                )
+                context_parts.append(
+                    f"   自维护区（编辑可无「确认修改」口令）: {', '.join(WORKSPACE_SELF_MAINTAIN_PREFIXES)}"
+                )
             
             context_parts.append("\n" + "=" * 50)
-            
-            # 获取当前持仓详情
-            if hasattr(mc, 'okx_exchange') and mc.okx_exchange:
-                try:
-                    positions = await mc.okx_exchange.get_positions()
-                    if positions:
-                        context_parts.append("\n【当前持仓详情】")
-                        for pos in positions[:5]:
-                            symbol = pos.get('instId', pos.get('symbol', 'Unknown'))
-                            side = pos.get('posSide', pos.get('side', 'unknown'))
-                            size = pos.get('pos', pos.get('size', 0))
-                            pnl = pos.get('upl', pos.get('unrealized_pnl', 0))
-                            context_parts.append(f"  {symbol}: {side} {size} | 盈亏: ${pnl:+.2f}")
-                except Exception as e:
-                    logger.debug(f"读取持仓详情失败: {e}")
+
+            try:
+                ths = getattr(mc, "trade_history_service", None)
+                if ths:
+                    st = await ths.get_statistics(days=30, force_refresh=False)
+                    if isinstance(st, dict):
+                        context_parts.append("\n【本机成交记录统计】")
+                        context_parts.append(f"  近30天已记录笔数: {st.get('total_trades', 0)}")
+            except Exception as e:
+                logger.debug(f"交易统计上下文失败: {e}")
         
         return "\n".join(context_parts)
     
-    async def _ai_autonomous_action(self, action: str, params: Dict[str, Any], user_input: str, user_rules: str = "") -> Dict[str, Any]:
+    async def _ai_autonomous_action(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        user_input: str,
+        user_rules: str = "",
+        *,
+        conversation_scope: Optional[str] = None,
+        memory_channel: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """AI自主行动"""
         try:
             routed = await self._route_skill_action(action=action, params=params, user_input=user_input, user_rules=user_rules)
@@ -1391,19 +1837,37 @@ class AICommandExecutor:
                 return routed
             if self.llm_integration:
                 system_context = await self._get_system_context()
-                
-                prompt = f"""你是一个全自主的量化交易AI助手。
+                task_mem = ""
+                if self.unified_memory:
+                    try:
+                        task_mem = await format_task_memory_block(
+                            self.unified_memory,
+                            str(action or "chat"),
+                            user_input=user_input,
+                            config_manager=getattr(self.main_controller, "config_manager", None)
+                            if self.main_controller
+                            else None,
+                        )
+                    except Exception:
+                        pass
+                prompt = f"""{user_rules}
+
+{CONTEXT_FRAMING_FOR_CHAT}
 
 {system_context}
-
-{user_rules}
+{task_mem}
 
 用户消息: {user_input}
-识别的动作: {action}
+当前动作标签: {action}
 
-请理解用户意图，用自然语言回复。你有完全的自主权。"""
+请按宪章与上文自然回复；需要执行或说明时再引用系统数据。"""
 
-                response = await self.llm_integration.generate(prompt, is_user_input=False)
+                response = await self.llm_integration.generate(
+                    prompt,
+                    is_user_input=False,
+                    conversation_scope=conversation_scope,
+                    memory_channel=memory_channel,
+                )
                 
                 if response:
                     return {
@@ -1413,7 +1877,13 @@ class AICommandExecutor:
                         "timestamp": datetime.now().isoformat()
                     }
             
-            return await self._general_chat(user_input, user_rules)
+            return await self._general_chat(
+                user_input,
+                user_rules,
+                intent_action=str(action or "chat"),
+                conversation_scope=conversation_scope,
+                memory_channel=memory_channel,
+            )
             
         except Exception as e:
             return {"success": False, "response": f"AI自主行动失败: {str(e)}"}
@@ -1441,10 +1911,13 @@ class AICommandExecutor:
         if alias == "strategy_optimize":
             return await self._optimize_strategy(params, user_input)
         if alias == "trade_force_open":
-            if not any(k in (user_input or "") for k in ["确认", "立即执行", "批准"]):
+            b = self._get_workspace_boundaries()
+            hph = effective_high_risk_phrases(b)
+            if not any(k in (user_input or "") for k in hph):
+                msg = b.force_open_message or DEFAULT_FORCE_OPEN_MSG
                 return {
                     "success": True,
-                    "response": "检测到高风险动作【强制开仓】。请回复“确认 强制开仓”或“立即执行 强制开仓”后执行。",
+                    "response": msg,
                     "needs_confirmation": True,
                     "timestamp": datetime.now().isoformat(),
                 }
@@ -1452,10 +1925,13 @@ class AICommandExecutor:
             p.setdefault("force", True)
             return await self._execute_trade(p, user_input or "强制开仓", user_rules)
         if alias == "trade_force_close":
-            if not any(k in (user_input or "") for k in ["确认", "立即执行", "批准"]):
+            b = self._get_workspace_boundaries()
+            hph = effective_high_risk_phrases(b)
+            if not any(k in (user_input or "") for k in hph):
+                msg = b.force_close_message or DEFAULT_FORCE_CLOSE_MSG
                 return {
                     "success": True,
-                    "response": "检测到高风险动作【强制平仓】。请回复“确认 强制平仓”或“立即执行 强制平仓”后执行。",
+                    "response": msg,
                     "needs_confirmation": True,
                     "timestamp": datetime.now().isoformat(),
                 }
@@ -1601,6 +2077,9 @@ class AICommandExecutor:
                 await self._auto_market_scan()
                 
                 await self._auto_daily_summary()
+
+                # Weekly summary: lightweight + idempotent
+                await self._auto_weekly_summary()
                 
             except Exception as e:
                 logger.error(f"自主工作循环出错: {e}")
@@ -1652,16 +2131,96 @@ class AICommandExecutor:
                 f"最大回撤={stats.get('max_drawdown', 0)}"
             )
             if self.unified_memory and hasattr(self.unified_memory, "add_memory"):
+                # Idempotency: don't generate duplicates for the same day
+                try:
+                    backend = getattr(self.unified_memory, "memory_backend", None)
+                    if backend and hasattr(backend, "_memories"):
+                        for _id, entry in (getattr(backend, "_memories", {}) or {}).items():
+                            md = dict(getattr(entry, "metadata", {}) or {})
+                            if md.get("kind") == "daily_summary" and md.get("date") == today:
+                                self._last_daily_summary_date = today
+                                return True
+                except Exception:
+                    pass
+
+                key = SummaryKey(kind="daily_summary", date=today)
                 await self.unified_memory.add_memory(
-                    memory_type="lesson_learned",
+                    memory_type="daily_summary",
                     content=summary,
-                    summary="每日交易复盘自动总结",
-                    metadata={"date": today, "stats": stats},
+                    summary="每日交易复盘自动总结（working）",
+                    metadata=base_metadata(
+                        source_module="ai_command_executor",
+                        kind="daily_summary",
+                        extra={"date": today, "stats": stats, **key.to_metadata()},
+                    ),
                     source_module="ai_command_executor",
                     importance=0.72,
+                    tags=tags(kind_tag("summary"), kind_tag("daily")),
+                )
+                # Also write an experience-level lesson (compact, actionable)
+                await self.unified_memory.add_memory(
+                    memory_type="lesson_learned",
+                    content=f"经验/教训({today}): {summary}",
+                    summary="每日经验教训（experience）",
+                    metadata=base_metadata(
+                        source_module="ai_command_executor",
+                        kind="daily_lessons",
+                        extra={"date": today, "stats": stats, **key.to_metadata()},
+                    ),
+                    source_module="ai_command_executor",
+                    importance=0.78,
+                    tags=tags(kind_tag("lesson"), kind_tag("daily")),
                 )
             self._last_daily_summary_date = today
             return True
         except Exception as e:
             logger.warning(f"每日自动总结失败: {e}")
+            return False
+
+    async def _auto_weekly_summary(self, force: bool = False) -> bool:
+        """每周自动总结：汇总近7天关键指标，写入长期经验（experience）。"""
+        now = datetime.now()
+        year, week, _ = now.isocalendar()
+        week_key = f"{year}-W{int(week):02d}"
+        mc = self.main_controller
+        if not mc:
+            return False
+        try:
+            # Idempotency
+            if not force:
+                try:
+                    backend = getattr(self.unified_memory, "memory_backend", None) if self.unified_memory else None
+                    if backend and hasattr(backend, "_memories"):
+                        for _id, entry in (getattr(backend, "_memories", {}) or {}).items():
+                            md = dict(getattr(entry, "metadata", {}) or {})
+                            if md.get("kind") == "weekly_summary" and md.get("date") == week_key:
+                                return True
+                except Exception:
+                    pass
+
+            ths = getattr(mc, "trade_history_service", None)
+            stats = await ths.get_statistics(days=7, force_refresh=True) if ths and hasattr(ths, "get_statistics") else {}
+            text = (
+                f"每周交易总结 {week_key}: 总交易={stats.get('total_trades', 0)}, "
+                f"胜率={stats.get('win_rate', 0)}%, 总盈亏={stats.get('total_pnl', 0)}, "
+                f"最大回撤={stats.get('max_drawdown', 0)}"
+            )
+            if self.unified_memory and hasattr(self.unified_memory, "add_memory"):
+                key = SummaryKey(kind='weekly_summary', date=week_key)
+                await self.unified_memory.add_memory(
+                    memory_type="lesson_learned",
+                    content=f"经验/教训({week_key}): {text}",
+                    summary="每周经验教训（experience）",
+                    metadata=base_metadata(
+                        source_module="ai_command_executor",
+                        kind="weekly_summary",
+                        extra={"date": week_key, "stats": stats, **key.to_metadata()},
+                    ),
+                    source_module="ai_command_executor",
+                    importance=0.8,
+                    tags=tags(kind_tag("lesson"), kind_tag("weekly")),
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"每周自动总结失败: {e}")
             return False

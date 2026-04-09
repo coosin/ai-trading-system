@@ -1016,15 +1016,24 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             out["alerts"].append(f"SLTP统计读取失败: {e}")
 
-        # 账户/持仓：优先取启动接管缓存；若没有则做一次轻量强制同步（不阻塞失败）。
+        # 账户/持仓：缓存超过 45s 则强制再同步，避免快照里持仓/余额长期不刷新。
         try:
             st = getattr(mc, "_latest_account_state", None)
-            if not st and hasattr(mc, "force_sync_account_state"):
+            need_refresh = not isinstance(st, dict) or not st.get("positions")
+            if isinstance(st, dict) and st.get("timestamp"):
+                try:
+                    raw = str(st["timestamp"]).replace("Z", "")
+                    t0 = datetime.fromisoformat(raw[:26])
+                    if (datetime.now() - t0).total_seconds() > 45:
+                        need_refresh = True
+                except Exception:
+                    need_refresh = True
+            if need_refresh and hasattr(mc, "force_sync_account_state"):
                 try:
                     st = await mc.force_sync_account_state(reason="snapshot_fast")
                 except Exception:
-                    st = None
-            st = st or {}
+                    st = getattr(mc, "_latest_account_state", None)
+            st = st if isinstance(st, dict) else {}
             out["account"] = {
                 "balance": st.get("balance"),
                 "positions": st.get("positions"),
@@ -1142,6 +1151,35 @@ def init_module_control_api(app, main_controller):
         add("api.module_control", True, "routes_registered")
         all_passed = all(c["passed"] for c in checks)
         return {"success": True, "all_passed": all_passed, "checks": checks, "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/account-diagnostics")
+    async def commander_account_diagnostics():
+        """
+        交易所实时持仓/余额 vs 本地 SLTP 跟踪 — 排查同步问题（不依赖本机成交笔数）。
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_account_sync_diagnostics"):
+            return {"success": False, "message": "诊断接口不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = await main_controller.get_account_sync_diagnostics()
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/account-sync/run")
+    async def commander_account_sync_run(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """强制同步余额/持仓并接管 SLTP（与启动时 force_sync 相同语义）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "force_sync_account_state"):
+            return {"success": False, "message": "同步能力不可用", "timestamp": datetime.now().isoformat()}
+        reason = str((payload or {}).get("reason") or "api")
+        try:
+            data = await main_controller.force_sync_account_state(reason=reason)
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
     s1_router = APIRouter(prefix="/api/v1/s1", tags=["s1"])
 

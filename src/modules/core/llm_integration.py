@@ -338,6 +338,8 @@ class EnhancedLLMIntegration:
         self.llm_manager = llm_manager
         self.memory_manager = memory_manager
         self.enhanced_memory = None
+        # 可选：用于读取 memory.context_policy（条数/Budget）
+        self.policy_config_manager = None
         self._initialized = False
     
     async def initialize(self, config: Dict[str, Any]):
@@ -364,13 +366,18 @@ class EnhancedLLMIntegration:
         logger.info("增强大模型集成已设置外部LLM管理器")
     
     async def generate(self, prompt: str, provider: Optional[str] = None, 
-                       is_user_input: bool = True, **kwargs):
+                       is_user_input: bool = True,
+                       conversation_scope: Optional[str] = None,
+                       memory_channel: Optional[str] = None,
+                       **kwargs):
         """生成文本（带记忆注入）
         
         Args:
             prompt: 输入提示词
             provider: 模型提供商
             is_user_input: 是否是真正的用户输入（False表示系统生成的提示词，不保存到记忆）
+            conversation_scope: 若设置（如 channel:telegram），注入该 scope 的最近对话；可与 is_user_input=False 联用（主入口已写入 MainController 时避免重复存用户句）
+            memory_channel: 记忆策略里的渠道键（如 telegram），用于合并 context_policy.channels.<key> 的条数上限
         """
         from src.modules.core.enhanced_llm_manager import LLMResponse
         
@@ -385,18 +392,78 @@ class EnhancedLLMIntegration:
         
         memory_context = ""
         
-        if is_user_input:
-            if self.enhanced_memory:
-                try:
-                    if hasattr(self.enhanced_memory, "build_memory_context"):
-                        memory_context = self.enhanced_memory.build_memory_context(prompt)
-                    elif hasattr(self.enhanced_memory, "retrieve_memories"):
-                        items = await self.enhanced_memory.retrieve_memories(query=prompt, limit=5)
-                        if isinstance(items, list):
-                            memory_context = "\n".join(
-                                [str((m or {}).get("content", m)) for m in items[:5]]
-                            )
+        if self.enhanced_memory and (is_user_input or conversation_scope is not None):
+            try:
+                from src.modules.memory.memory_context_policy import get_effective_context_policy
 
+                pol = get_effective_context_policy(
+                    getattr(self, "policy_config_manager", None),
+                    channel=memory_channel,
+                )
+                recent_n = int(pol.get("conversation_recent_limit", 12))
+                recall_n = int(pol.get("conversation_recall_limit", 8))
+                rules_n = int(pol.get("rules_recall_limit", 5))
+                line_mc = int(pol.get("line_max_chars", 220))
+                recall_mc = int(pol.get("recall_line_max_chars", 240))
+                rules_q = str(pol.get("rules_recall_query", "黑名单 授权 偏好 风控"))
+
+                parts = []
+                # 1) Hard context: recent conversation in the same channel/scope (prevents immediate amnesia)
+                try:
+                    if hasattr(self.enhanced_memory, "recent_conversation"):
+                        recent_scope = None
+                        if conversation_scope is not None:
+                            recent_scope = conversation_scope
+                        elif is_user_input:
+                            recent_scope = None  # global history
+                        recent = await self.enhanced_memory.recent_conversation(
+                            scope=recent_scope, limit=max(4, recent_n)
+                        )
+                        if isinstance(recent, list) and recent:
+                            parts.append("【最近对话】")
+                            for r in recent[-recent_n:]:
+                                try:
+                                    c = str(getattr(r, "content", "") or (r.get("content") if isinstance(r, dict) else ""))
+                                except Exception:
+                                    c = str(r)
+                                if c:
+                                    parts.append(f"- {c[:line_mc]}")
+                except Exception:
+                    pass
+
+                # 2) Soft context: relevant recalled memories（仅对用户原句检索，避免对编排后超长 system prompt 噪声检索）
+                if is_user_input and hasattr(self.enhanced_memory, "retrieve_memories"):
+                    items = await self.enhanced_memory.retrieve_memories(query=prompt, limit=recall_n)
+                    if isinstance(items, list) and items:
+                        parts.append("\n【相关记忆】")
+                        for m in items[:recall_n]:
+                            try:
+                                c = str(getattr(m, "content", "") or (m.get("content") if isinstance(m, dict) else ""))
+                            except Exception:
+                                c = str(m)
+                            if c:
+                                parts.append(f"- {c[:recall_mc]}")
+
+                # 3) Rules / preferences
+                if hasattr(self.enhanced_memory, "retrieve_memories") and (
+                    is_user_input or conversation_scope is not None
+                ):
+                    rules = await self.enhanced_memory.retrieve_memories(
+                        query=rules_q, limit=rules_n
+                    )
+                    if isinstance(rules, list) and rules:
+                        parts.append("\n【规则/偏好要点】")
+                        for m in rules[:rules_n]:
+                            try:
+                                c = str(getattr(m, "content", "") or (m.get("content") if isinstance(m, dict) else ""))
+                            except Exception:
+                                c = str(m)
+                            if c:
+                                parts.append(f"- {c[:recall_mc]}")
+
+                memory_context = "\n".join([p for p in parts if p]).strip()
+
+                if is_user_input:
                     if hasattr(self.enhanced_memory, "add_message"):
                         self.enhanced_memory.add_message("user", prompt)
                     elif hasattr(self.enhanced_memory, "add_memory"):
@@ -407,17 +474,17 @@ class EnhancedLLMIntegration:
                             tags=["conversation"],
                             source_module="llm_integration",
                         )
-                except Exception as e:
-                    logger.warning(f"增强记忆注入失败: {e}")
-            elif self.memory_manager:
-                try:
-                    memory_context = await self.memory_manager.build_memory_context(prompt)
-                    await self.memory_manager.add_short_term_memory(
-                        f"用户: {prompt}",
-                        importance=0.7
-                    )
-                except Exception as e:
-                    logger.warning(f"记忆注入失败: {e}")
+            except Exception as e:
+                logger.warning(f"增强记忆注入失败: {e}")
+        elif self.memory_manager and is_user_input:
+            try:
+                memory_context = await self.memory_manager.build_memory_context(prompt)
+                await self.memory_manager.add_short_term_memory(
+                    f"用户: {prompt}",
+                    importance=0.7
+                )
+            except Exception as e:
+                logger.warning(f"记忆注入失败: {e}")
         
         if memory_context:
             full_prompt = f"""[系统记忆上下文]

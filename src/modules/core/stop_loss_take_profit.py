@@ -12,6 +12,7 @@
 import asyncio
 import logging
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable, Tuple
@@ -20,6 +21,8 @@ from pathlib import Path
 import math
 
 logger = logging.getLogger(__name__)
+
+from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
 
 
 class StopType(Enum):
@@ -160,6 +163,8 @@ class StopLossTakeProfitConfig:
     max_orders: int = 100
     persist_file: str = "data/stop_loss_orders.json"
     sync_exchange_positions_on_startup: bool = True
+    # 运行中周期性把交易所持仓再登记到 SLTP（防止仅启动时同步一次后漂移）
+    exchange_resync_interval_sec: int = 45
     # 触发 SL/TP/时间止损时是否调用交易所真实平仓（经 ExecutionGateway）
     execute_exchange_on_trigger: bool = True
     # 动态跟踪：根据实时盘口/波动微调止盈止损
@@ -206,6 +211,7 @@ class StopLossTakeProfitManager:
         
         self._exchange = None
         self._main_controller = None
+        self._last_exchange_sync_ts: float = 0.0
         self._audit_logger = None
         self._enhanced_monitoring = None
         
@@ -314,8 +320,65 @@ class StopLossTakeProfitManager:
             return
         
         self._running = True
+        self._last_exchange_sync_ts = time.time()
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info("✅ 止盈止损监控已启动")
+
+    @staticmethod
+    def _canonical_symbol_from_position(p: Dict[str, Any]) -> str:
+        """统一用 instId 转 slash 形式，避免 BTC-USDT-SWAP 与 BTC/USDT/SWAP 混用导致 index 对不上。"""
+        iid = str(p.get("instId") or "").strip()
+        if iid:
+            return iid.replace("-", "/")
+        return str(p.get("symbol") or "").strip()
+
+    @staticmethod
+    def _resolved_side_from_position(p: Dict[str, Any]) -> str:
+        """方向以适配器解析后的 side 为准；禁止直接用 posSide=net。缺失时用 raw_pos 符号。"""
+        s = str(p.get("side") or "").strip().lower()
+        if s in ("long", "short"):
+            return s
+        try:
+            rp = float(p.get("raw_pos", 0) or 0)
+        except (TypeError, ValueError):
+            rp = 0.0
+        if rp > 0:
+            return "long"
+        if rp < 0:
+            return "short"
+        return "long"
+
+    @staticmethod
+    def _normalize_index_key(idx_key: str) -> str:
+        """统一 symbol|side：把 BTC-USDT-SWAP|long 与 BTC/USDT/SWAP|long 视为同一键。"""
+        k = (idx_key or "").strip()
+        if "|" not in k:
+            return k
+        sym_part, side_part = k.rsplit("|", 1)
+        sp = sym_part.strip()
+        if sp and "-" in sp and "/" not in sp:
+            sp = sp.replace("-", "/")
+        return f"{sp}|{side_part.strip().lower()}"
+
+    def _index_key_lookup_variants(self, sym: str, side: str) -> List[str]:
+        """order_index 可能存旧 dash 键或新 slash 键，查找时都要试。"""
+        side_l = str(side or "").strip().lower()
+        sym = (sym or "").strip()
+        keys: List[str] = []
+        nk = self._normalize_index_key(f"{sym}|{side_l}")
+        keys.append(nk)
+        if "/" in sym:
+            keys.append(f"{sym.replace('/', '-')}|{side_l}")
+        keys = list(dict.fromkeys(keys))
+        return keys
+
+    def _order_index_keys_to_clear(self, order: "StopLossTakeProfitOrder") -> List[str]:
+        mk = (order.metadata or {}).get("index_key")
+        if mk:
+            return list(
+                dict.fromkeys([mk, self._normalize_index_key(mk), self._normalize_index_key(f"{order.symbol}|{order.side}")])
+            )
+        return self._index_key_lookup_variants(order.symbol, order.side)
 
     async def sync_open_positions_from_exchange(self) -> Dict[str, Any]:
         """
@@ -340,21 +403,24 @@ class StopLossTakeProfitManager:
         skipped = 0
         stale_cancelled = 0
         live_index_keys = set()
+        raw_row_count = len(positions or [])
 
         for p in positions or []:
             try:
+                if not isinstance(p, dict):
+                    continue
                 sz = float(p.get("size", 0) or 0)
                 if abs(sz) < 1e-12:
                     continue
-                sym = str(p.get("symbol", "") or p.get("instId", "") or "").strip()
+                sym = self._canonical_symbol_from_position(p)
                 if not sym:
                     continue
-                side = str(p.get("side", "") or p.get("posSide", "") or "long").lower()
-                if side not in ("long", "short"):
-                    side = "long" if sz > 0 else "short"
+                side = self._resolved_side_from_position(p)
                 live_index_keys.add(f"{sym}|{side}")
             except Exception:
                 continue
+
+        live_norm = {self._normalize_index_key(k) for k in live_index_keys}
 
         # 清理本地已不存在于交易所的活动跟踪单，避免历史脏数据长期残留。
         for oid, order in list(self.orders.items()):
@@ -362,31 +428,39 @@ class StopLossTakeProfitManager:
                 if order.status != StopLossTakeProfitStatus.ACTIVE:
                     continue
                 idx_key = (order.metadata or {}).get("index_key") or f"{order.symbol}|{order.side}"
-                if idx_key not in live_index_keys:
+                idx_key = self._normalize_index_key(idx_key)
+                if idx_key not in live_norm:
                     order.status = StopLossTakeProfitStatus.CANCELLED
                     order.trigger_reason = "stale_not_in_exchange"
                     order.updated_at = datetime.now()
-                    if self.order_index.get(idx_key) == oid:
-                        del self.order_index[idx_key]
+                    for vk in self._order_index_keys_to_clear(order):
+                        if self.order_index.get(vk) == oid:
+                            del self.order_index[vk]
                     stale_cancelled += 1
             except Exception:
                 continue
 
         for p in positions or []:
             try:
+                if not isinstance(p, dict):
+                    continue
                 sz = float(p.get("size", 0) or 0)
                 if abs(sz) < 1e-12:
                     continue
-                sym = str(p.get("symbol", "") or p.get("instId", "") or "").strip()
+                sym = self._canonical_symbol_from_position(p)
                 if not sym:
                     continue
-                side = str(p.get("side", "") or p.get("posSide", "") or "long").lower()
-                if side not in ("long", "short"):
-                    side = "long" if sz > 0 else "short"
+                side = self._resolved_side_from_position(p)
                 entry = float(p.get("entry_price", 0) or 0)
-                index_key = f"{sym}|{side}"
+                if entry <= 0:
+                    entry = float(p.get("mark_px", 0) or 0)
+                index_key = self._normalize_index_key(f"{sym}|{side}")
 
-                oid = self.order_index.get(index_key)
+                oid = None
+                for cand in self._index_key_lookup_variants(sym, side):
+                    oid = self.order_index.get(cand)
+                    if oid:
+                        break
                 if oid:
                     existing = self.orders.get(oid)
                     if existing and existing.status == StopLossTakeProfitStatus.ACTIVE:
@@ -401,7 +475,7 @@ class StopLossTakeProfitManager:
                     except Exception:
                         pass
                 if entry <= 0:
-                    logger.warning(f"sync_open_positions: 跳过 {index_key}（无有效入场价）")
+                    logger.warning(f"sync_open_positions: 跳过 {index_key}（无有效入场价/标记价）")
                     continue
 
                 if len(self.orders) >= self.config.max_orders:
@@ -424,8 +498,17 @@ class StopLossTakeProfitManager:
 
         if stale_cancelled > 0:
             await self._save_orders()
-        logger.info(f"📌 交易所持仓→止盈止损跟踪: 新建 {synced}，已存在跳过 {skipped}，清理陈旧 {stale_cancelled}")
-        return {"synced": synced, "skipped": skipped, "stale_cancelled": stale_cancelled}
+        logger.info(
+            f"📌 交易所持仓→止盈止损跟踪: 新建 {synced}，已存在跳过 {skipped}，清理陈旧 {stale_cancelled}，"
+            f"live_keys={len(live_index_keys)} raw_rows={raw_row_count}"
+        )
+        return {
+            "synced": synced,
+            "skipped": skipped,
+            "stale_cancelled": stale_cancelled,
+            "live_index_keys": sorted(live_index_keys),
+            "raw_row_count": raw_row_count,
+        }
     
     async def stop(self) -> None:
         """停止监控"""
@@ -945,6 +1028,41 @@ class StopLossTakeProfitManager:
         
         await self._notify_callbacks("on_stop_loss", order, current_price)
 
+        # Persist a structured risk_event memory (single source: MemoryGateway)
+        try:
+            mc = getattr(self, "main_controller", None)
+            mg = getattr(mc, "memory_gateway", None) if mc else None
+            if mg:
+                await mg.add_memory(
+                    memory_type="risk_event",
+                    content=f"SL触发: {order.symbol} side={order.side} entry={order.entry_price} sl={order.stop_loss_price} px={current_price} pnl%={pnl_percent*100:.2f}",
+                    summary=f"🧯 止损触发 {order.symbol} {order.side}",
+                    metadata=base_metadata(
+                        source_module="stop_loss_take_profit",
+                        kind="sltp_stop_loss_triggered",
+                        symbol=order.symbol,
+                        extra={
+                            "side": order.side,
+                            "entry_price": order.entry_price,
+                            "stop_loss_price": order.stop_loss_price,
+                            "current_price": current_price,
+                            "pnl_percent": pnl_percent,
+                            "trigger_reason": order.trigger_reason,
+                            "triggered_at": order.triggered_at.isoformat() if order.triggered_at else None,
+                            "idempotency_key": (
+                                f"sltp:{order.symbol}:stop_loss:"
+                                f"{order.triggered_at.isoformat() if order.triggered_at else ''}"
+                            ),
+                            "order": order.to_dict() if hasattr(order, "to_dict") else {},
+                        },
+                    ),
+                    importance=0.95,
+                    source_module="stop_loss_take_profit",
+                    tags=tags(kind_tag("sltp"), kind_tag("stop_loss"), symbol_tag(order.symbol)),
+                )
+        except Exception as e:
+            logger.debug(f"写入止损触发记忆失败: {e}")
+
         await self._execute_exchange_close_on_trigger(order, "stop_loss")
         
         await self._save_orders()
@@ -1009,6 +1127,41 @@ class StopLossTakeProfitManager:
             )
         
         await self._notify_callbacks("on_take_profit", order, current_price)
+
+        # Persist a structured risk_event memory (single source: MemoryGateway)
+        try:
+            mc = getattr(self, "main_controller", None)
+            mg = getattr(mc, "memory_gateway", None) if mc else None
+            if mg:
+                await mg.add_memory(
+                    memory_type="risk_event",
+                    content=f"TP触发: {order.symbol} side={order.side} entry={order.entry_price} tp={order.take_profit_price} px={current_price} pnl%={pnl_percent*100:.2f}",
+                    summary=f"🎯 止盈触发 {order.symbol} {order.side}",
+                    metadata=base_metadata(
+                        source_module="stop_loss_take_profit",
+                        kind="sltp_take_profit_triggered",
+                        symbol=order.symbol,
+                        extra={
+                            "side": order.side,
+                            "entry_price": order.entry_price,
+                            "take_profit_price": order.take_profit_price,
+                            "current_price": current_price,
+                            "pnl_percent": pnl_percent,
+                            "trigger_reason": order.trigger_reason,
+                            "triggered_at": order.triggered_at.isoformat() if order.triggered_at else None,
+                            "idempotency_key": (
+                                f"sltp:{order.symbol}:take_profit:"
+                                f"{order.triggered_at.isoformat() if order.triggered_at else ''}"
+                            ),
+                            "order": order.to_dict() if hasattr(order, "to_dict") else {},
+                        },
+                    ),
+                    importance=0.9,
+                    source_module="stop_loss_take_profit",
+                    tags=tags(kind_tag("sltp"), kind_tag("take_profit"), symbol_tag(order.symbol)),
+                )
+        except Exception as e:
+            logger.debug(f"写入止盈触发记忆失败: {e}")
 
         await self._execute_exchange_close_on_trigger(order, "take_profit")
         
@@ -1131,7 +1284,18 @@ class StopLossTakeProfitManager:
                 if not self._exchange:
                     await asyncio.sleep(self.config.check_interval)
                     continue
-                
+
+                # 周期性再同步交易所持仓 → SLTP，避免「仅启动同步一次」或重启后 drift
+                if self.config.sync_exchange_positions_on_startup:
+                    try:
+                        now = time.time()
+                        interval = float(getattr(self.config, "exchange_resync_interval_sec", 45) or 45)
+                        if now - self._last_exchange_sync_ts >= interval:
+                            await self.sync_open_positions_from_exchange()
+                            self._last_exchange_sync_ts = now
+                    except Exception as e:
+                        logger.warning(f"周期持仓再同步失败: {e}")
+
                 active_orders = await self.get_all_active_orders()
                 
                 for order in active_orders:

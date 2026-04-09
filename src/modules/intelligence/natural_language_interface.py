@@ -205,12 +205,8 @@ class NaturalLanguageInterface:
                 if self.memory is not None:
                     logger.info("✅ 记忆系统已连接到自然语言接口（主控制器核心记忆）")
                     return
-            try:
-                from src.modules.core.unified_intelligent_memory import get_unified_memory
-                self.memory = await get_unified_memory()
-                logger.info("✅ 记忆系统已连接到自然语言接口")
-            except Exception as e:
-                logger.warning(f"记忆系统连接失败: {e}")
+            # 单一真源：不再 fallback 到并行记忆实现
+            logger.warning("⚠️ MemoryGateway 未就绪：自然语言接口将以无记忆模式运行")
     
     def _load_personality_files(self):
         personality_parts = []

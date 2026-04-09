@@ -470,7 +470,7 @@ class MainController:
         # 1) 优先：意图解析 + 可执行动作（交易/策略/行情/持仓等）
         if getattr(self, "ai_command_executor", None):
             try:
-                result = await self.ai_command_executor.process_input(command)
+                result = await self.ai_command_executor.process_input(command, source=source)
                 if isinstance(result, dict):
                     result.setdefault("source", "ai_command_executor")
                     await _store_assistant_reply(result)
@@ -759,6 +759,10 @@ class MainController:
         # 设置统一记忆系统（增强功能）
         if self.unified_memory:
             self.llm_integration.unified_memory = self.unified_memory
+
+        # 对话记忆条数/Budget 与 memory.context_policy 对齐
+        if self.config_manager:
+            self.llm_integration.policy_config_manager = self.config_manager
         
         logger.info("大模型集成系统已连接到统一记忆系统")
         
@@ -1807,11 +1811,101 @@ class MainController:
             if getattr(self, "stop_loss_manager", None):
                 if getattr(self, "okx_exchange", None):
                     self.stop_loss_manager.set_exchange(self.okx_exchange)
-                await self.stop_loss_manager.sync_open_positions_from_exchange()
+                out["sltp_sync"] = await self.stop_loss_manager.sync_open_positions_from_exchange()
         except Exception as e:
             out["sltp_sync_error"] = str(e)
 
+        # 5) 可观测性：非零持仓数量（原始 API 解析后）
+        try:
+            raw = out.get("positions")
+            if isinstance(raw, list):
+                nz = 0
+                for p in raw:
+                    if not isinstance(p, dict):
+                        continue
+                    try:
+                        sz = float(p.get("pos", p.get("size", 0)) or 0)
+                    except (TypeError, ValueError):
+                        sz = 0.0
+                    if abs(sz) > 1e-12:
+                        nz += 1
+                out["nonzero_position_count"] = nz
+        except Exception:
+            pass
+
         return out
+
+    async def get_account_sync_diagnostics(self) -> Dict[str, Any]:
+        """
+        排查「交易所 ↔ 系统」持仓/余额是否一致：
+        数据来源均为实时接口 + 本地 SLTP 状态，不依赖本机成交记录笔数。
+        """
+        diag: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "exchange": None,
+            "balance_error": None,
+            "positions_error": None,
+            "nonzero_positions": 0,
+            "position_samples": [],
+            "sltp": None,
+            "sltp_config": None,
+            "latest_cache": getattr(self, "_latest_account_state", None),
+        }
+        ex = self.get_exchange() if hasattr(self, "get_exchange") else None
+        ex = ex or getattr(self, "okx_exchange", None)
+        if not ex:
+            diag["exchange"] = "missing"
+            return diag
+        diag["exchange"] = type(ex).__name__
+
+        try:
+            bal = await ex.get_balance()
+            diag["balance_keys"] = list(bal.keys())[:20] if isinstance(bal, dict) else str(type(bal))
+        except Exception as e:
+            diag["balance_error"] = str(e)
+
+        try:
+            pos = await ex.get_positions()
+            nz = []
+            for p in pos or []:
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    sz = float(p.get("pos", p.get("size", 0)) or 0)
+                except (TypeError, ValueError):
+                    sz = 0.0
+                if abs(sz) > 1e-12:
+                    nz.append(p)
+            diag["nonzero_positions"] = len(nz)
+            for p in nz[:8]:
+                diag["position_samples"].append(
+                    {
+                        "instId": p.get("instId"),
+                        "symbol": p.get("symbol"),
+                        "side": p.get("side"),
+                        "posSide_raw": p.get("posSide_raw"),
+                        "size": p.get("size"),
+                        "entry_price": p.get("entry_price"),
+                        "mark_px": p.get("mark_px"),
+                    }
+                )
+        except Exception as e:
+            diag["positions_error"] = str(e)
+
+        mgr = getattr(self, "stop_loss_manager", None)
+        if mgr:
+            try:
+                diag["sltp"] = mgr.get_stats()
+                cfg = getattr(mgr, "config", None)
+                if cfg:
+                    diag["sltp_config"] = {
+                        "sync_exchange_positions_on_startup": getattr(cfg, "sync_exchange_positions_on_startup", None),
+                        "exchange_resync_interval_sec": getattr(cfg, "exchange_resync_interval_sec", None),
+                    }
+            except Exception as e:
+                diag["sltp_error"] = str(e)
+
+        return diag
 
     async def stop_system(self) -> bool:
         """

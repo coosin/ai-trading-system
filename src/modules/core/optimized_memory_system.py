@@ -30,6 +30,7 @@ from pathlib import Path
 from collections import defaultdict
 import aiofiles
 import threading
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -690,6 +691,59 @@ class OptimizedMemorySystem:
         self._stats["last_cleanup"] = now.isoformat()
         logger.info(f"✓ 清理过期记忆: {cleaned} 条")
         return cleaned
+
+    def _storage_size_bytes(self) -> int:
+        try:
+            total = 0
+            for root, _dirs, files in os.walk(self.storage_path):
+                for fn in files:
+                    try:
+                        total += (Path(root) / fn).stat().st_size
+                    except OSError:
+                        continue
+            return total
+        except Exception:
+            return 0
+
+    async def cleanup_by_disk_threshold(
+        self,
+        *,
+        max_bytes: int,
+        categories_to_prune: Optional[Set[MemoryCategory]] = None,
+        min_importance: float = 0.6,
+        max_remove: int = 500,
+    ) -> int:
+        """
+        Disk-driven cleanup: only prunes low-importance WORKING/HISTORY entries.
+        CORE/EXPERIENCE are never removed here.
+        """
+        if not max_bytes or max_bytes <= 0:
+            return 0
+        cur = self._storage_size_bytes()
+        if cur <= max_bytes:
+            return 0
+
+        cats = categories_to_prune or {MemoryCategory.CONVERSATION, MemoryCategory.DAILY_SUMMARY}
+        removed = 0
+        async with self._async_lock:
+            # oldest + low importance first
+            candidates = [
+                e
+                for e in (self._memories or {}).values()
+                if e.layer in {MemoryLayer.WORKING, MemoryLayer.HISTORY}
+                and e.category in cats
+                and float(e.importance or 0.0) < float(min_importance)
+            ]
+            candidates.sort(key=lambda x: (x.created_at, float(x.importance or 0.0)))
+            for e in candidates[: max(1, int(max_remove))]:
+                ok = await self.forget(e.id)
+                if ok:
+                    removed += 1
+                    if self._storage_size_bytes() <= max_bytes:
+                        break
+        if removed:
+            logger.warning(f"🧹 磁盘阈值清理: removed={removed} size={cur}B -> <= {max_bytes}B")
+        return removed
     
     async def save_trade_record(
         self,
