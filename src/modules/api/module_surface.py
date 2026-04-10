@@ -84,16 +84,23 @@ def build_static_route_catalog() -> List[Dict[str, Any]]:
     # S1
     rows.append(r("GET", f"{S1_PREFIX}/verify", impl, "s1", "全自动验收探针"))
 
-    # 预留：数据 / 执行 / 智能 / 技能 / 插件（薄扩展位）
-    reserved_paths = [
-        ("GET", f"{MODULES_PREFIX}/data/integration/health", "data", "数据源集成健康度"),
-        ("GET", f"{MODULES_PREFIX}/data/onchain/status", "data", "链上集成状态"),
-        ("POST", f"{MODULES_PREFIX}/intelligence/batch-analyze", "intelligence", "批量分析任务"),
-        ("POST", f"{MODULES_PREFIX}/execution/simulate-order", "execution", "模拟下单（纸交易）"),
-        ("GET", f"{MODULES_PREFIX}/plugins/status", "plugins", "插件状态"),
-    ]
-    for method, path, domain, note in reserved_paths:
-        rows.append(r(method, path, res, domain, note))
+    # 预留（仅占位 ping 等）
+    rows.append(
+        r(
+            "GET",
+            f"{MODULES_PREFIX}/reserved/{{domain}}/ping",
+            res,
+            "surface",
+            "通用预留探测",
+        )
+    )
+
+    # 已实现：数据 / 智能 / 执行 / 插件（薄委托主控制器）
+    rows.append(r("GET", f"{MODULES_PREFIX}/data/integration/health", impl, "data", "DataIntegration 源健康"))
+    rows.append(r("GET", f"{MODULES_PREFIX}/data/onchain/status", impl, "data", "链上集成是否就绪"))
+    rows.append(r("POST", f"{MODULES_PREFIX}/intelligence/batch-analyze", impl, "intelligence", "多品种 MI 视图"))
+    rows.append(r("POST", f"{MODULES_PREFIX}/execution/simulate-order", impl, "execution", "模拟盘下单"))
+    rows.append(r("GET", f"{MODULES_PREFIX}/plugins/status", impl, "plugins", "插件列表与状态摘要"))
 
     # 已实现：技能目录与调用（委托 SkillManager）
     rows.append(r("GET", f"{MODULES_PREFIX}/skills/catalog", impl, "skills", "已注册技能名"))
@@ -217,3 +224,126 @@ def attach_module_surface_routes(router: APIRouter, main_controller: Any) -> Non
             "count": len(names),
             "timestamp": datetime.now().isoformat(),
         }
+
+    @router.get("/data/integration/health")
+    async def data_integration_health() -> Dict[str, Any]:
+        mc = main_controller
+        di = getattr(mc, "data_integration", None) if mc else None
+        if not di or not hasattr(di, "get_source_health_report"):
+            return _reserved("data", "/modules/data/integration/health")
+        try:
+            report = di.get_source_health_report()
+            return {
+                "success": True,
+                "implemented": True,
+                "report": report,
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/data/onchain/status")
+    async def data_onchain_status() -> Dict[str, Any]:
+        mc = main_controller
+        oci = mc.get_onchain_integrator() if mc and hasattr(mc, "get_onchain_integrator") else None
+        if not oci:
+            return {
+                "success": True,
+                "implemented": True,
+                "ready": False,
+                "detail": "onchain_integrator not configured",
+                "timestamp": datetime.now().isoformat(),
+            }
+        prov = getattr(oci, "providers", None) or getattr(oci, "_providers", None)
+        nprov = len(prov) if prov is not None and hasattr(prov, "__len__") else None
+        return {
+            "success": True,
+            "implemented": True,
+            "ready": True,
+            "class": type(oci).__name__,
+            "provider_count": nprov,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    @router.get("/plugins/status")
+    async def plugins_status() -> Dict[str, Any]:
+        mc = main_controller
+        pm = getattr(mc, "plugin_manager", None) if mc else None
+        if not pm or not hasattr(pm, "get_all_plugins"):
+            return _reserved("plugins", "/modules/plugins/status")
+        try:
+            plugs = pm.get_all_plugins()
+            names = sorted(list(plugs.keys())) if isinstance(plugs, dict) else []
+            brief = []
+            for name in names:
+                p = plugs.get(name)
+                brief.append(
+                    {
+                        "name": name,
+                        "type": type(p).__name__ if p is not None else None,
+                    }
+                )
+            return {
+                "success": True,
+                "implemented": True,
+                "count": len(names),
+                "plugins": brief,
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/intelligence/batch-analyze")
+    async def intelligence_batch_analyze(payload: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+        mc = main_controller
+        raw = (payload or {}).get("symbols") or ["BTC/USDT"]
+        if isinstance(raw, str):
+            symbols = [s.strip() for s in raw.split(",") if s.strip()]
+        else:
+            symbols = [str(s).strip() for s in raw if str(s).strip()]
+        symbols = symbols[:16]
+        mi = getattr(mc, "market_intelligence", None) or getattr(mc, "market_intelligence_engine", None)
+        if not mi or not hasattr(mi, "get_symbol_view"):
+            return _reserved("intelligence", "/modules/intelligence/batch-analyze")
+        views: Dict[str, Any] = {}
+        for sym in symbols:
+            try:
+                view = await asyncio.wait_for(mi.get_symbol_view(sym, include_snapshot=False), timeout=4.0)
+                views[sym] = view.to_dict() if hasattr(view, "to_dict") else {"summary": str(getattr(view, "summary", ""))}
+            except Exception as e:
+                views[sym] = {"error": str(e)}
+        return {
+            "success": True,
+            "implemented": True,
+            "symbols": symbols,
+            "views": views,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    @router.post("/execution/simulate-order")
+    async def execution_simulate_order(payload: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+        mc = main_controller
+        p = payload or {}
+        symbol = str(p.get("symbol") or "BTC/USDT").strip()
+        side = str(p.get("side") or "buy").strip().lower()
+        try:
+            size = float(p.get("size") or p.get("quantity") or 0)
+        except (TypeError, ValueError):
+            size = 0.0
+        price = p.get("price")
+        price_f = float(price) if price is not None and str(price) != "" else None
+        if not mc or not getattr(mc, "simulated_market", None):
+            return _reserved("execution", "/modules/execution/simulate-order")
+        if size <= 0:
+            return {"success": False, "message": "size/quantity 必须为正数", "timestamp": datetime.now().isoformat()}
+        try:
+            result = mc.execute_simulated_order(symbol, side, size, price_f)
+            return {
+                "success": True,
+                "implemented": True,
+                "paper": True,
+                "result": result,
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}

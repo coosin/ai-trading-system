@@ -26,6 +26,16 @@
 | `/api/v1/market/*` | 行情 / MI 视图 |
 | `/api/v1/s1/*` | 全自动验收探针 |
 
+### Surface 薄委托（已实现）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/modules/data/integration/health` | `DataIntegration.get_source_health_report` |
+| GET | `/api/v1/modules/data/onchain/status` | 链上集成是否就绪、提供者数量 |
+| GET | `/api/v1/modules/plugins/status` | 已加载插件列表摘要 |
+| POST | `/api/v1/modules/intelligence/batch-analyze` | body: `{ "symbols": ["BTC/USDT", ...] }`，MI 多品种视图 |
+| POST | `/api/v1/modules/execution/simulate-order` | body: `{ "symbol", "side", "size"|"quantity", "price"? }`，模拟盘 |
+
 ## 核心域（摘要）
 
 - **数据**：`data/data_integration.py`、`data/data_source_hub.py` — 采集与聚合；`GET .../modules/data/hub/unified-snapshot` 为薄委托。
