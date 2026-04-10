@@ -13,6 +13,7 @@ import asyncio
 import logging
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable, Tuple
@@ -745,6 +746,34 @@ class StopLossTakeProfitManager:
         self._stats["total_orders"] += 1
         
         await self._save_orders()
+
+        # Trade domain event (best-effort): reserve for frontend/TG fanout
+        try:
+            mc = getattr(self, "_main_controller", None) or getattr(self, "main_controller", None)
+            hub = getattr(mc, "trade_event_hub", None) if mc else None
+            if hub and hasattr(hub, "publish_position_update"):
+                trace_id = (meta.get("trace_id") or meta.get("traceId") or None) or str(uuid.uuid4())
+                await hub.publish_position_update(
+                    trace_id=str(trace_id),
+                    source="stop_loss_take_profit",
+                    symbol=str(symbol),
+                    side=str(side),
+                    kind="sltp.create",
+                    data={
+                        "index_key": meta.get("index_key") or index_key,
+                        "order_id": order_id,
+                        "entry_price": float(entry_price),
+                        "stop_loss_price": float(stop_loss_price),
+                        "take_profit_price": float(take_profit_price),
+                        "stop_loss_type": getattr(sl_config.stop_type, "value", str(sl_config.stop_type)),
+                        "take_profit_type": getattr(tp_config.tp_type, "value", str(tp_config.tp_type)),
+                        "quantity": float(quantity),
+                        "metadata": dict(meta),
+                    },
+                    tg_message=f"🧷 SLTP 建立\n{symbol} {side}\nsl={stop_loss_price:.4g} tp={take_profit_price:.4g}\ntrace_id={trace_id}",
+                )
+        except Exception:
+            pass
         
         logger.info(f"✅ 创建止盈止损订单: {symbol} {side}")
         logger.info(f"   入场价: {entry_price:.4f}")
@@ -976,12 +1005,6 @@ class StopLossTakeProfitManager:
                     q = ((snap.get("数据质量评估") or {}).get("score")) if isinstance(snap, dict) else None
                     if q is not None:
                         unified_quality = float(q)
-                    ai_blk = (snap.get("AI智能分析") or {}) if isinstance(snap, dict) else {}
-                    ai_bias = str(ai_blk.get("action_bias") or "").lower() or None
-                    try:
-                        ai_confidence = float(ai_blk.get("confidence")) if ai_blk.get("confidence") is not None else None
-                    except Exception:
-                        ai_confidence = None
                     whale_blk = (snap.get("大资金与大户监控") or {}) if isinstance(snap, dict) else {}
                     whale_count = int(whale_blk.get("链上大户活跃条数") or 0)
                     high_risk_positions = int(
@@ -990,6 +1013,15 @@ class StopLossTakeProfitManager:
                     whale_risk = whale_count >= 6 or high_risk_positions >= 1
                 except Exception:
                     pass
+
+            # Prefer MarketIntelligenceEngine for bias/confidence (analysis is NOT owned by data hub).
+            try:
+                if mc and getattr(mc, "market_intelligence", None) and hasattr(mc.market_intelligence, "get_symbol_view"):
+                    view = await mc.market_intelligence.get_symbol_view(order.symbol, include_snapshot=False)
+                    ai_bias = str(getattr(view, "action_bias", "") or "").lower() or None
+                    ai_confidence = getattr(view, "confidence", None)
+            except Exception:
+                pass
 
             # 维护短窗价格状态，提取趋势与波动率
             ph = meta.get("price_history", [])
@@ -1241,6 +1273,33 @@ class StopLossTakeProfitManager:
         
         await self._notify_callbacks("on_stop_loss", order, current_price)
 
+        # Trade domain event (best-effort)
+        try:
+            mc = getattr(self, "_main_controller", None) or getattr(self, "main_controller", None)
+            hub = getattr(mc, "trade_event_hub", None) if mc else None
+            if hub and hasattr(hub, "publish_position_update"):
+                trace_id = ((order.metadata or {}).get("trace_id") or (order.metadata or {}).get("traceId")) or str(uuid.uuid4())
+                await hub.publish_position_update(
+                    trace_id=str(trace_id),
+                    source="stop_loss_take_profit",
+                    symbol=str(order.symbol),
+                    side=str(order.side),
+                    kind="sltp.trigger",
+                    data={
+                        "trigger_reason": "stop_loss",
+                        "entry_price": float(order.entry_price or 0),
+                        "stop_loss_price": float(order.stop_loss_price or 0),
+                        "take_profit_price": float(order.take_profit_price or 0),
+                        "current_price": float(current_price or 0),
+                        "pnl_percent": float(pnl_percent or 0),
+                        "order_id": getattr(order, "order_id", None),
+                        "index_key": (order.metadata or {}).get("index_key"),
+                    },
+                    tg_message=f"🧯 止损触发\n{order.symbol} {order.side}\npx={current_price:.4g} pnl={pnl_percent*100:.2f}%\ntrace_id={trace_id}",
+                )
+        except Exception:
+            pass
+
         # Persist a structured risk_event memory (single source: MemoryGateway)
         try:
             mc = getattr(self, "main_controller", None)
@@ -1340,6 +1399,33 @@ class StopLossTakeProfitManager:
             )
         
         await self._notify_callbacks("on_take_profit", order, current_price)
+
+        # Trade domain event (best-effort)
+        try:
+            mc = getattr(self, "_main_controller", None) or getattr(self, "main_controller", None)
+            hub = getattr(mc, "trade_event_hub", None) if mc else None
+            if hub and hasattr(hub, "publish_position_update"):
+                trace_id = ((order.metadata or {}).get("trace_id") or (order.metadata or {}).get("traceId")) or str(uuid.uuid4())
+                await hub.publish_position_update(
+                    trace_id=str(trace_id),
+                    source="stop_loss_take_profit",
+                    symbol=str(order.symbol),
+                    side=str(order.side),
+                    kind="sltp.trigger",
+                    data={
+                        "trigger_reason": "take_profit",
+                        "entry_price": float(order.entry_price or 0),
+                        "stop_loss_price": float(order.stop_loss_price or 0),
+                        "take_profit_price": float(order.take_profit_price or 0),
+                        "current_price": float(current_price or 0),
+                        "pnl_percent": float(pnl_percent or 0),
+                        "order_id": getattr(order, "order_id", None),
+                        "index_key": (order.metadata or {}).get("index_key"),
+                    },
+                    tg_message=f"🎯 止盈触发\n{order.symbol} {order.side}\npx={current_price:.4g} pnl={pnl_percent*100:.2f}%\ntrace_id={trace_id}",
+                )
+        except Exception:
+            pass
 
         # Persist a structured risk_event memory (single source: MemoryGateway)
         try:

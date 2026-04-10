@@ -16,6 +16,8 @@ def init_module_control_api(app, main_controller):
     from fastapi import APIRouter, Body
 
     router = APIRouter(prefix="/api/v1/modules", tags=["modules"])
+    trade_router = APIRouter(prefix="/api/v1/trade", tags=["trade"])
+    market_router = APIRouter(prefix="/api/v1/market", tags=["market"])
     research_jobs: Dict[str, Dict[str, Any]] = {}
     research_jobs_lock = asyncio.Lock()
     research_semaphore = asyncio.Semaphore(1)
@@ -56,15 +58,16 @@ def init_module_control_api(app, main_controller):
                 return
             symbol = str(gate.get("symbol") or "BTC/USDT")
             ai_line = ""
-            hub = getattr(main_controller, "data_source_hub", None)
-            if hub and hasattr(hub, "get_ai_analysis"):
+            # analysis moved to MarketIntelligenceEngine
+            mi = getattr(main_controller, "market_intelligence", None)
+            if mi and hasattr(mi, "get_symbol_view"):
                 try:
-                    ai = await hub.get_ai_analysis(symbol=symbol)
+                    view = await mi.get_symbol_view(symbol, include_snapshot=False)
                     ai_line = (
-                        f"\nAI分析: 趋势={ai.get('trend') or '-'} | 倾向={ai.get('action_bias') or '-'} | "
-                        f"置信度={ai.get('confidence') if ai.get('confidence') is not None else '-'}"
+                        f"\nMI: 趋势={getattr(view, 'trend', '-') or '-'} | 倾向={getattr(view, 'action_bias', '-') or '-'} | "
+                        f"置信度={getattr(view, 'confidence', None) if getattr(view, 'confidence', None) is not None else '-'}"
                     )
-                    summary = str(ai.get("summary") or "").strip()
+                    summary = str(getattr(view, "summary", "") or "").strip()
                     if summary:
                         ai_line += f"\n摘要: {summary[:180]}"
                 except Exception:
@@ -117,6 +120,70 @@ def init_module_control_api(app, main_controller):
                     "started_at": datetime.now().isoformat(),
                 }
             )
+
+    @trade_router.get("/events")
+    async def get_trade_events(limit: int = 200) -> Dict[str, Any]:
+        """
+        获取最近交易域事件（Intent/Fill/Position）。
+        前端可轮询或配合 WebSocket 订阅 channel=trade.*。
+        """
+        mc = main_controller
+        hub = getattr(mc, "trade_event_hub", None) if mc else None
+        if not hub or not hasattr(hub, "get_recent"):
+            return {"ok": False, "events": [], "message": "TradeEventHub unavailable"}
+        try:
+            return {"ok": True, "events": hub.get_recent(limit=int(limit or 200))}
+        except Exception as e:
+            return {"ok": False, "events": [], "message": str(e)}
+
+    @trade_router.get("/execution_spine")
+    async def get_execution_spine_snapshot() -> Dict[str, Any]:
+        """返回 S1 ExecutionGateway 快照（包含 policy_metrics）。"""
+        mc = main_controller
+        gw = getattr(mc, "execution_gateway", None) if mc else None
+        if not gw or not hasattr(gw, "get_snapshot"):
+            return {"ok": False, "message": "ExecutionGateway unavailable"}
+        try:
+            snap = await gw.get_snapshot()
+            return {"ok": True, "snapshot": snap}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    @market_router.get("/symbol/{symbol}")
+    async def get_market_symbol_view(
+        symbol: str,
+        include_snapshot: bool = False,
+        fields: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """统一行情汇总：单品种视图（供前端/模块复用）。"""
+        mc = main_controller
+        mi = getattr(mc, "market_intelligence", None) if mc else None
+        if not mi or not hasattr(mi, "get_symbol_view"):
+            return {"ok": False, "message": "MarketIntelligenceEngine unavailable"}
+        try:
+            view = await mi.get_symbol_view(symbol, include_snapshot=bool(include_snapshot))
+            out_view = view.to_dict()
+            if fields:
+                allow = {k.strip() for k in str(fields).split(",") if k.strip()}
+                allow.add("symbol")
+                allow.add("timestamp")
+                out_view = {k: v for k, v in out_view.items() if k in allow}
+            return {"ok": True, "view": out_view, "snapshot": view.snapshot if include_snapshot else None}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    @market_router.get("/state")
+    async def get_market_state() -> Dict[str, Any]:
+        """统一行情汇总：全局市场状态（多 symbol 聚合）。"""
+        mc = main_controller
+        mi = getattr(mc, "market_intelligence", None) if mc else None
+        if not mi or not hasattr(mi, "get_market_state"):
+            return {"ok": False, "message": "MarketIntelligenceEngine unavailable"}
+        try:
+            state = await mi.get_market_state()
+            return {"ok": True, "state": state}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
 
         def _run_cycle_in_thread() -> Dict[str, Any]:
             # 在独立线程事件循环中执行重型研究流程，避免阻塞主 API loop。
@@ -1491,5 +1558,7 @@ def init_module_control_api(app, main_controller):
         }
     
     app.include_router(router)
+    app.include_router(trade_router)
+    app.include_router(market_router)
     app.include_router(s1_router)
     logger.info("✅ 模块控制API已初始化")

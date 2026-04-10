@@ -2470,23 +2470,36 @@ class APIServer:
         # 多源数据融合分析API - 支持 /api/v1/data-fusion/analyze/{symbol}
         @api_v1_router.get("/data-fusion/analyze/{symbol}", tags=["data-fusion"])
         async def analyze_market(symbol: str):
-            """多源数据融合市场分析"""
+            """多源数据融合市场分析（已迁移到 MarketIntelligenceEngine）。"""
             try:
-                result = await data_source_hub.analyze_market(symbol)
-                return {"status": "success", "data": result, "timestamp": datetime.now().isoformat()}
-            except Exception as e:
-                logger.error(f"多源数据分析失败: {e}")
+                mc = getattr(data_source_hub, "main_controller", None)
+                mi = getattr(mc, "market_intelligence", None) if mc else None
+                if mi and hasattr(mi, "get_symbol_view"):
+                    view = await asyncio.wait_for(mi.get_symbol_view(symbol, include_snapshot=False), timeout=6.0)
+                    return {
+                        "status": "deprecated",
+                        "message": "已迁移：请使用 /api/v1/market/symbol/{symbol}",
+                        "data": view.to_dict() if hasattr(view, "to_dict") else view,
+                        "timestamp": datetime.now().isoformat(),
+                    }
                 return {
-                    "status": "error",
-                    "message": f"多源数据分析失败: {str(e)}",
+                    "status": "deprecated",
+                    "message": "已迁移：请使用 /api/v1/market/symbol/{symbol}",
+                    "data": {"symbol": symbol},
+                    "timestamp": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                logger.error(f"多源数据分析(迁移)失败: {e}")
+                return {
+                    "status": "degraded",
+                    "message": f"多源数据分析已迁移，当前回退失败: {str(e)}",
                     "timestamp": datetime.now().isoformat()
                 }
 
         @api_v1_router.get("/data-fusion/analyze", tags=["data-fusion"])
         async def analyze_market_q(symbol: str):
-            """兼容 query 参数形式：/data-fusion/analyze?symbol=BTC/USDT"""
-            result = await data_source_hub.analyze_market(symbol)
-            return {"status": "success", "data": result, "timestamp": datetime.now().isoformat()}
+            """兼容 query 参数形式：/data-fusion/analyze?symbol=BTC/USDT（已迁移）"""
+            return await analyze_market(symbol)
 
         @api_v1_router.get("/external/analyze-trends", tags=["external"])
         async def external_analyze_trends(symbol: str):
@@ -2545,6 +2558,41 @@ class APIServer:
                     "timestamp": datetime.now().isoformat(),
                 }
 
+        @api_v1_router.get("/data-hub/contract", tags=["data-hub"])
+        async def data_hub_contract():
+            """
+            数据源采集契约（给前端自动适配用）：
+            - stable output contract (shape-only)
+            - current collector config snapshot (enabled collectors/providers)
+            """
+            try:
+                contract = (
+                    data_source_hub.get_collector_contract()
+                    if hasattr(data_source_hub, "get_collector_contract")
+                    else {}
+                )
+                mc = getattr(data_source_hub, "main_controller", None)
+                cfg = {}
+                if mc and hasattr(mc, "get_ai_managed_config"):
+                    try:
+                        cfg = await mc.get_ai_managed_config("data_source_hub", {})
+                    except Exception:
+                        cfg = {}
+                return {
+                    "status": "success",
+                    "data": {
+                        "contract": contract,
+                        "config": cfg,
+                    },
+                    "timestamp": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                return {
+                    "status": "degraded",
+                    "data": {"message": f"contract 获取失败: {e}"},
+                    "timestamp": datetime.now().isoformat(),
+                }
+
         @api_v1_router.get("/data-hub/quality-advice", tags=["data-hub"])
         async def data_hub_quality_advice(symbol: str = "BTC/USDT"):
             """数据质量与作用评分建议（插件化能力输出）。"""
@@ -2567,11 +2615,26 @@ class APIServer:
 
         @api_v1_router.get("/data-hub/ai-analysis", tags=["data-hub"])
         async def data_hub_ai_analysis(symbol: str = "BTC/USDT"):
-            """统一数据快照的 AI 智能分析结果。"""
+            """统一数据快照的 AI 智能分析结果（已迁移到 MarketIntelligenceEngine）。"""
             try:
-                snapshot = await asyncio.wait_for(data_source_hub.get_unified_snapshot(symbol), timeout=6.0)
-                ai_out = snapshot.get("AI智能分析", {})
-                return {"status": "success", "data": ai_out, "timestamp": datetime.now().isoformat()}
+                mc = getattr(data_source_hub, "main_controller", None)
+                mi = getattr(mc, "market_intelligence", None) if mc else None
+                if mi and hasattr(mi, "get_symbol_view"):
+                    view = await asyncio.wait_for(mi.get_symbol_view(symbol, include_snapshot=False), timeout=6.0)
+                    d = view.to_dict() if hasattr(view, "to_dict") else (view if isinstance(view, dict) else {})
+                    # Keep the same endpoint but return MI view so frontends don't break.
+                    return {
+                        "status": "deprecated",
+                        "message": "已迁移：请使用 /api/v1/market/symbol/{symbol}",
+                        "data": d,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                return {
+                    "status": "deprecated",
+                    "message": "已迁移：请使用 /api/v1/market/symbol/{symbol}",
+                    "data": {"symbol": symbol},
+                    "timestamp": datetime.now().isoformat(),
+                }
             except asyncio.TimeoutError:
                 return {
                     "status": "degraded",

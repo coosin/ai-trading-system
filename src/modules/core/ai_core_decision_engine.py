@@ -2171,6 +2171,15 @@ class AICoreDecisionEngine:
             # 9. 获取多源数据融合结果 - 实时
             multi_source_analysis = await self._get_multi_source_analysis(symbol)
             logger.info(f"   ✅ 多源数据融合: {multi_source_analysis.get('status', 'unknown')}")
+
+            # 9.5 统一行情情报（只读）：供 prompt 与门控参考
+            mi_view = None
+            try:
+                mi = getattr(self.main_controller, "market_intelligence", None) if self.main_controller else None
+                if mi and hasattr(mi, "get_symbol_view"):
+                    mi_view = await mi.get_symbol_view(symbol, include_snapshot=False)
+            except Exception:
+                mi_view = None
             
             # 10. 获取AI交易引擎分析 - 实时
             ai_engine_analysis = await self._get_ai_engine_analysis(symbol)
@@ -2217,7 +2226,8 @@ class AICoreDecisionEngine:
                 third_party_data=third_party_data,
                 historical_experience=historical_experience,
                 multi_source_analysis=multi_source_analysis,
-                ai_engine_analysis=ai_engine_analysis
+                ai_engine_analysis=ai_engine_analysis,
+                market_intelligence=(mi_view.to_dict() if mi_view else None),
             )
             
             response = await self.llm.generate(prompt, is_user_input=False)
@@ -2760,12 +2770,21 @@ class AICoreDecisionEngine:
         
         return result
     
-    def _build_decision_prompt(self, symbol: str, market_data: Dict, 
-                                technical: Dict, strategy_advice: Dict,
-                                risk_assessment: Dict, current_positions: List[Dict],
-                                account_balance: Dict = None,
-                                third_party_data: Dict = None, historical_experience: str = "",
-                                multi_source_analysis: Dict = None, ai_engine_analysis: Dict = None) -> str:
+    def _build_decision_prompt(
+        self,
+        symbol: str,
+        market_data: Dict,
+        technical: Dict,
+        strategy_advice: Dict,
+        risk_assessment: Dict,
+        current_positions: List[Dict],
+        account_balance: Dict = None,
+        third_party_data: Dict = None,
+        historical_experience: str = "",
+        multi_source_analysis: Dict = None,
+        ai_engine_analysis: Dict = None,
+        market_intelligence: Optional[Dict] = None,
+    ) -> str:
         """构建AI决策prompt - 融合所有模块数据进行决策，全部实时数据"""
         
         if account_balance is None:
@@ -2776,6 +2795,8 @@ class AICoreDecisionEngine:
             multi_source_analysis = {}
         if ai_engine_analysis is None:
             ai_engine_analysis = {}
+        if market_intelligence is None:
+            market_intelligence = {}
         
         aggressive_note = ""
         if self.config.get("aggressive_mode"):
@@ -2818,6 +2839,29 @@ class AICoreDecisionEngine:
 - 情绪分析: {ai_engine_analysis.get('sentiment', 'neutral')}
 - 信号强度: {ai_engine_analysis.get('signal_strength', 0)}
 """
+
+        # 构建统一行情情报（只读支撑数据）
+        mi_detail = ""
+        try:
+            if isinstance(market_intelligence, dict) and market_intelligence:
+                exs = market_intelligence.get("exchange_support") or {}
+                rs = market_intelligence.get("risk_support") or {}
+                es = market_intelligence.get("execution_support") or {}
+                guards = (es.get("guards") or {}) if isinstance(es, dict) else {}
+                sltp = (es.get("sltp_suggestions") or {}) if isinstance(es, dict) else {}
+                mi_detail = f"""
+【统一行情情报汇总（只读支撑数据，不是下单指令）】
+- 数据质量: {market_intelligence.get('quality_score')} | provenance={market_intelligence.get('provenance')}
+- 盘口: spread_bps={market_intelligence.get('spread_bps')} depth_imbalance={guards.get('depth_imbalance_top5')}
+- 波动: atr_pct_1h={market_intelligence.get('atr_pct_1h')} | 24h涨跌={market_intelligence.get('change_24h')}
+- 执行门控建议: min_quality>={guards.get('min_quality_score_to_trade')} max_spread_bps<={guards.get('max_spread_bps_to_trade')} min_rr>={guards.get('min_rr_to_trade')}
+- SLTP建议: risk_pct={sltp.get('risk_pct')} tp_pct={sltp.get('take_profit_pct')} trailing_offset={sltp.get('trailing_offset')}
+- 汇总趋势/倾向(参考): trend={market_intelligence.get('trend')} bias={market_intelligence.get('action_bias')} conf={market_intelligence.get('confidence')}
+- 冲突: {market_intelligence.get('conflicts')}
+（你必须结合技术指标/多源融合/风险与持仓独立复核；若证据不足或冲突明显，action 必须为 hold）
+"""
+        except Exception:
+            mi_detail = ""
         
         # 构建持仓详情
         positions_detail = "无持仓"
@@ -2887,6 +2931,7 @@ class AICoreDecisionEngine:
 {third_party_detail}
 {multi_source_detail}
 {ai_engine_detail}
+{mi_detail}
 【用户规则】
 - 黑名单: {list(self.blacklist)} (绝对不能操作)
 - 授权状态: {'已授权全权交易' if self.authorization.get('full_authorization') else '未授权'}
@@ -3387,6 +3432,34 @@ class AICoreDecisionEngine:
             order = None
             trace_id = str(uuid.uuid4())
 
+            # Trade intent event (best-effort): for frontend/TG + audit correlation
+            try:
+                hub = getattr(self.main_controller, "trade_event_hub", None) if self.main_controller else None
+                if hub and hasattr(hub, "publish_intent"):
+                    from src.modules.core.trade_event_hub import TradeIntent
+
+                    await hub.publish_intent(
+                        TradeIntent(
+                            trace_id=trace_id,
+                            source="ai_core",
+                            symbol=str(decision.symbol),
+                            side=str(decision.side),
+                            action="close" if decision.action == "close" else "open",
+                            quantity=float(decision.quantity) if decision.action != "close" else None,
+                            leverage=int(decision.leverage) if decision.action != "close" else None,
+                            reason=str(getattr(decision, "strategy_used", "") or "ai_core_decision"),
+                            context={
+                                "decision_action": decision.action,
+                                "confidence": getattr(decision, "confidence", None),
+                                "risk_level": getattr(decision, "risk_level", None),
+                                "strategy_used": getattr(decision, "strategy_used", None),
+                                "decision_reasoning": getattr(decision, "reasoning", None),
+                            },
+                        )
+                    )
+            except Exception:
+                pass
+
             # 优先走主控制器执行验证网关，避免直接裸下单
             if self.main_controller and hasattr(self.main_controller, "execute_command"):
                 try:
@@ -3647,6 +3720,31 @@ class AICoreDecisionEngine:
         if depth_imbalance is not None:
             if (decision.side == "long" and depth_imbalance < -0.40) or (decision.side == "short" and depth_imbalance > 0.40):
                 trailing_offset = max(0.006, trailing_offset * 0.85)
+
+        # 若 MarketIntelligence 提供了更全面的 SLTP 建议参数，则在边界内优先采用（统一真源）
+        try:
+            mi = getattr(self.main_controller, "market_intelligence", None)
+            if mi and hasattr(mi, "get_symbol_view"):
+                v = await mi.get_symbol_view(decision.symbol, include_snapshot=False)
+                es = getattr(v, "execution_support", None)
+                sugg = (es.get("sltp_suggestions") or {}) if isinstance(es, dict) else {}
+                r2 = sugg.get("risk_pct")
+                t2 = sugg.get("take_profit_pct")
+                tr2 = sugg.get("trailing_offset")
+                if r2 is not None:
+                    r2f = float(r2)
+                    if 0.004 <= r2f <= 0.10:
+                        risk_pct = min(0.08, max(0.006, r2f))
+                if t2 is not None:
+                    t2f = float(t2)
+                    if 0.006 <= t2f <= 0.30:
+                        tp_pct = min(0.20, max(0.010, t2f))
+                if tr2 is not None:
+                    tr2f = float(tr2)
+                    if 0.004 <= tr2f <= 0.05:
+                        trailing_offset = min(0.03, max(0.006, tr2f))
+        except Exception:
+            pass
 
         idx_key = f"{decision.symbol}|{decision.side}"
         symbol_group = self._symbol_group_key(decision.symbol)

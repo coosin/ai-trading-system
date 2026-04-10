@@ -19,6 +19,7 @@ import asyncio
 import logging
 import math
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -229,6 +230,34 @@ class ExecutionGateway:
         ex = self._exchange()
         self._snapshot.exchange_connected = ex is not None
         if not ex:
+            # trade event fanout (best-effort)
+            try:
+                hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
+                trace_id = None
+                if context and isinstance(context, dict):
+                    trace_id = context.get("trace_id")
+                if not trace_id:
+                    trace_id = str(uuid.uuid4())
+                if hub and hasattr(hub, "publish_fill"):
+                    from src.modules.core.trade_event_hub import TradeFill
+
+                    await hub.publish_fill(
+                        TradeFill(
+                            trace_id=str(trace_id),
+                            source=str(source or "gateway"),
+                            symbol=str(symbol),
+                            side=str(side),
+                            action="close",
+                            success=False,
+                            order_id=None,
+                            price=None,
+                            quantity=float(size) if size is not None else None,
+                            detail="no_exchange",
+                            raw={"error": "no_exchange"},
+                        )
+                    )
+            except Exception:
+                pass
             self._record_order(source, "close", False, "no_exchange")
             return {"success": False, "error": "no_exchange"}
 
@@ -304,11 +333,64 @@ class ExecutionGateway:
                             "context": context or {},
                         }
                     )
+                # trade event fanout (best-effort)
+                try:
+                    hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
+                    trace_id = None
+                    if context and isinstance(context, dict):
+                        trace_id = context.get("trace_id")
+                    if not trace_id:
+                        trace_id = str(uuid.uuid4())
+                    if hub and hasattr(hub, "publish_fill"):
+                        from src.modules.core.trade_event_hub import TradeFill
+
+                        await hub.publish_fill(
+                            TradeFill(
+                                trace_id=str(trace_id),
+                                source=str(source or "gateway"),
+                                symbol=str(symbol),
+                                side=str(side),
+                                action="close",
+                                success=bool(ok),
+                                order_id=(res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
+                                price=float(res.get("average") or res.get("price") or 0) if isinstance(res, dict) and (res.get("average") or res.get("price")) else None,
+                                quantity=float(size) if size is not None else None,
+                                detail=detail,
+                                raw=dict(res) if isinstance(res, dict) else {"raw": str(res)},
+                            )
+                        )
+                except Exception:
+                    pass
                 return res if isinstance(res, dict) else {"success": ok, "raw": res}
             except Exception as e:
                 self._metric_inc("close_fail")
                 self._record_order(source, "close", False, str(e), symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
                 logger.exception("ExecutionGateway.close_swap: %s", e)
+                try:
+                    hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
+                    trace_id = None
+                    if context and isinstance(context, dict):
+                        trace_id = context.get("trace_id")
+                    if not trace_id:
+                        trace_id = str(uuid.uuid4())
+                    if hub and hasattr(hub, "publish_fill"):
+                        from src.modules.core.trade_event_hub import TradeFill
+
+                        await hub.publish_fill(
+                            TradeFill(
+                                trace_id=str(trace_id),
+                                source=str(source or "gateway"),
+                                symbol=str(symbol),
+                                side=str(side),
+                                action="close",
+                                success=False,
+                                quantity=float(size) if size is not None else None,
+                                detail=str(e)[:500],
+                                raw={"error": str(e)},
+                            )
+                        )
+                except Exception:
+                    pass
                 return {"success": False, "error": str(e)}
 
     async def open_swap(
@@ -337,6 +419,31 @@ class ExecutionGateway:
         ex = self._exchange()
         self._snapshot.exchange_connected = ex is not None
         if not ex:
+            try:
+                hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
+                trace_id = None
+                if context and isinstance(context, dict):
+                    trace_id = context.get("trace_id")
+                if not trace_id:
+                    trace_id = str(uuid.uuid4())
+                if hub and hasattr(hub, "publish_fill"):
+                    from src.modules.core.trade_event_hub import TradeFill
+
+                    await hub.publish_fill(
+                        TradeFill(
+                            trace_id=str(trace_id),
+                            source=str(source or "gateway"),
+                            symbol=str(symbol),
+                            side=str(side),
+                            action="open",
+                            success=False,
+                            quantity=float(size) if size is not None else None,
+                            detail="no_exchange",
+                            raw={"error": "no_exchange"},
+                        )
+                    )
+            except Exception:
+                pass
             self._metric_inc("open_fail")
             self._record_order(source, "open", False, "no_exchange")
             return {"success": False, "error": "no_exchange"}
@@ -470,11 +577,64 @@ class ExecutionGateway:
                             "context": context or {},
                         }
                     )
+                # trade event fanout (best-effort)
+                try:
+                    hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
+                    trace_id = None
+                    if context and isinstance(context, dict):
+                        trace_id = context.get("trace_id")
+                    if not trace_id:
+                        trace_id = str(uuid.uuid4())
+                    if hub and hasattr(hub, "publish_fill"):
+                        from src.modules.core.trade_event_hub import TradeFill
+
+                        await hub.publish_fill(
+                            TradeFill(
+                                trace_id=str(trace_id),
+                                source=str(source or "gateway"),
+                                symbol=str(symbol),
+                                side=str(side),
+                                action="open",
+                                success=bool(ok),
+                                order_id=(res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
+                                price=float(res.get("average") or res.get("price") or 0) if isinstance(res, dict) and (res.get("average") or res.get("price")) else None,
+                                quantity=float(size) if size is not None else None,
+                                detail=detail,
+                                raw=dict(res) if isinstance(res, dict) else {"raw": str(res)},
+                            )
+                        )
+                except Exception:
+                    pass
                 return res if isinstance(res, dict) else {"success": ok, "raw": res}
             except Exception as e:
                 self._metric_inc("open_fail")
                 self._record_order(source, "open", False, str(e), symbol=symbol, side=side, size=size, leverage=lev, reason=reason, context=context)
                 logger.exception("ExecutionGateway.open_swap: %s", e)
+                try:
+                    hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
+                    trace_id = None
+                    if context and isinstance(context, dict):
+                        trace_id = context.get("trace_id")
+                    if not trace_id:
+                        trace_id = str(uuid.uuid4())
+                    if hub and hasattr(hub, "publish_fill"):
+                        from src.modules.core.trade_event_hub import TradeFill
+
+                        await hub.publish_fill(
+                            TradeFill(
+                                trace_id=str(trace_id),
+                                source=str(source or "gateway"),
+                                symbol=str(symbol),
+                                side=str(side),
+                                action="open",
+                                success=False,
+                                quantity=float(size) if size is not None else None,
+                                detail=str(e)[:500],
+                                raw={"error": str(e)},
+                            )
+                        )
+                except Exception:
+                    pass
                 return {"success": False, "error": str(e)}
 
     def _record_order(

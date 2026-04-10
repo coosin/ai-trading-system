@@ -284,7 +284,7 @@ class BusinessProcessManager:
 
     async def _trigger_strategy_analysis(self, symbol: str) -> None:
         """
-        触发策略分析（集成AI智能分析）
+        触发策略分析（集成 MarketIntelligenceEngine / 可选LLM）
 
         Args:
             symbol: 交易对

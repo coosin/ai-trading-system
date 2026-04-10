@@ -1095,6 +1095,23 @@ class MainController:
         except Exception as e:
             logger.warning(f"⚠️ 统一数据源中心初始化失败: {e}")
             self.data_source_hub = None
+
+        # 初始化市场情报汇总引擎（只读：汇总行情/信号，供 ai_core/风控/前端复用）
+        try:
+            from src.modules.core.market_intelligence_engine import MarketIntelligenceEngine
+
+            mi_cfg = {}
+            try:
+                mi_cfg = await self.get_ai_managed_config("market_intelligence", {})
+            except Exception:
+                mi_cfg = {}
+            self.market_intelligence = MarketIntelligenceEngine(self, mi_cfg)
+            await self.market_intelligence.initialize()
+            await self.market_intelligence.start()
+            logger.info("✅ MarketIntelligenceEngine 已启动")
+        except Exception as e:
+            logger.warning("⚠️ MarketIntelligenceEngine 初始化失败: %s", e)
+            self.market_intelligence = None
         
         # 初始化缓存管理器
         try:
@@ -1395,6 +1412,24 @@ class MainController:
         except Exception as e:
             logger.warning(f"⚠️ API服务器初始化失败: {e}")
             self.api_server = None
+
+        # 交易事件中枢（Intent/Fill/Position）：向前端 WS 与 TG 预留统一出口
+        try:
+            if self.event_system:
+                from src.modules.core.trade_event_hub import TradeEventHub
+
+                self.trade_event_hub = TradeEventHub(
+                    self.event_system,
+                    api_server=self.api_server,
+                    telegram_bot=getattr(self, "telegram_bot", None),
+                    buffer_size=800,
+                    tg_enabled=True,
+                    tg_min_interval_sec=2.0,
+                )
+                logger.info("✅ TradeEventHub 已初始化")
+        except Exception as e:
+            logger.warning("⚠️ TradeEventHub 初始化失败: %s", e)
+            self.trade_event_hub = None
 
         # 注册默认事件处理器
         self._register_default_handlers()
@@ -4213,9 +4248,18 @@ class MainController:
                     "symbol": symbol,
                     "quality": (snap.get("数据质量评估") or {}),
                     "advisor": (snap.get("数据质量与作用评分") or {}),
-                    "ai_analysis": (snap.get("AI智能分析") or {}),
                     "provenance": ((snap.get("数据来源状态") or {}).get("provenance")),
                 }
+                # analysis moved to MarketIntelligenceEngine
+                try:
+                    mi = getattr(self, "market_intelligence", None)
+                    if mi and hasattr(mi, "get_symbol_view"):
+                        view = await mi.get_symbol_view(symbol, include_snapshot=False)
+                        out["data_hub"]["market_intelligence"] = (
+                            view.to_dict() if hasattr(view, "to_dict") else {}
+                        )
+                except Exception:
+                    out["data_hub"]["market_intelligence"] = {}
                 for a in (snap.get("监控告警") or []):
                     if isinstance(a, dict):
                         out["alerts"].append(str(a.get("标题") or "数据告警") + ": " + str(a.get("消息") or ""))

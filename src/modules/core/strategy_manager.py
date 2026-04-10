@@ -1083,11 +1083,17 @@ class StrategyManager:
                                     if isinstance(unified_snapshot, dict)
                                     else None
                                 )
-                                signal.metadata["ai_data_analysis"] = (
-                                    (unified_snapshot.get("AI智能分析") or {})
-                                    if isinstance(unified_snapshot, dict)
-                                    else {}
-                                )
+                                # analysis moved to MarketIntelligenceEngine (data hub is collector-only)
+                                try:
+                                    mc = getattr(self.trade_engine, "main_controller", None) if self.trade_engine else None
+                                    mi = getattr(mc, "market_intelligence", None) if mc else None
+                                    if mi and hasattr(mi, "get_symbol_view"):
+                                        view = await mi.get_symbol_view(symbol, include_snapshot=False)
+                                        signal.metadata["market_intelligence"] = (
+                                            view.to_dict() if hasattr(view, "to_dict") else {}
+                                        )
+                                except Exception:
+                                    signal.metadata["market_intelligence"] = {}
                             out.append(signal)
                         return out
                     except Exception as e:

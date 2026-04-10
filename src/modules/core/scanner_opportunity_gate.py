@@ -82,9 +82,16 @@ def _simple_atr_pct(highs: List[float], lows: List[float], closes: List[float], 
 class ScannerOpportunityGate:
     """基於實時行情與 K 線的掃描機會初篩。"""
 
-    def __init__(self, exchange: Any, config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        exchange: Any,
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        main_controller: Any = None,
+    ) -> None:
         self.exchange = exchange
         self.config = dict(config or {})
+        self.main_controller = main_controller
 
     def _c(self, key: str, default: Any) -> Any:
         return self.config.get(key, default)
@@ -101,6 +108,23 @@ class ScannerOpportunityGate:
             return ScannerGateResult(False, "empty_symbol", {})
 
         metrics: Dict[str, Any] = {"symbol": sym}
+
+        # 优先使用统一行情情报引擎的门控建议（单一真源）
+        try:
+            mi = getattr(self.main_controller, "market_intelligence", None) if self.main_controller else None
+            if mi and hasattr(mi, "get_symbol_view"):
+                view = await mi.get_symbol_view(sym, include_snapshot=False)
+                es = getattr(view, "execution_support", None)
+                guards = (es.get("guards") or {}) if isinstance(es, dict) else {}
+                if guards:
+                    metrics["mi_guards"] = dict(guards)
+                    # 若 gate 本身未显式配置，采用 MI 建议值
+                    if "max_spread_bps" not in self.config:
+                        self.config["max_spread_bps"] = guards.get("max_spread_bps_to_trade", self._c("max_spread_bps", 45.0))
+                    if "min_risk_reward" not in self.config:
+                        self.config["min_risk_reward"] = guards.get("min_rr_to_trade", self._c("min_risk_reward", 1.05))
+        except Exception:
+            pass
 
         try:
             ticker = await self.exchange.get_ticker(sym.replace("/", "-"))

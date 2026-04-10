@@ -1022,7 +1022,16 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     price = float(ticker.get("last") or ticker.get("price") or 0.0)
                     if price > 0:
                         quality = ((snapshot or {}).get("数据质量评估") or {}).get("score", 0.0)
-                        trend = ((snapshot or {}).get("统一分析判断") or {}).get("overall_sentiment", "unknown")
+                        # analysis moved to MarketIntelligenceEngine
+                        trend = "unknown"
+                        try:
+                            mc = self.main_controller
+                            mi = getattr(mc, "market_intelligence", None) if mc else None
+                            if mi and hasattr(mi, "get_symbol_view"):
+                                view = await mi.get_symbol_view(symbol, include_snapshot=False)
+                                trend = getattr(view, "trend", "unknown") or "unknown"
+                        except Exception:
+                            trend = "unknown"
                         if self.llm_integration:
                             prompt = f"""分析以下市场数据：
 

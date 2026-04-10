@@ -171,6 +171,65 @@ class ConfigManager:
                 "DOT/USDT", "MATIC/USDT", "LINK/USDT", "ATOM/USDT",
             ],
         },
+        "market_intelligence": {
+            # cache horizon for per-symbol view (seconds)
+            "cache_ttl_sec": 20,
+            # periodic push loop interval (seconds)
+            "push_interval_sec": 15,
+            # optional watch list to publish updates even without explicit requests
+            "watch_symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
+            # contract spec cache (instruments) TTL; ok to be long
+            "contract_cache_ttl_sec": 3600,
+            # cost model (execution-facing, read-only hints)
+            "fee_rate_taker": 0.0005,
+            "fee_rate_maker": 0.0002,
+            "slippage_spread_multiplier": 1.0,
+            # anomaly thresholds
+            "funding_rate_extreme_abs": 0.0010,
+            "funding_rate_high_abs": 0.0005,
+            # set >0 to enable; leave 0 to disable by default
+            "open_interest_high": 0,
+            # providers are reserved for future data modules (ordered, optional)
+            # supported now: "unified_snapshot" (DataSourceHub.get_unified_snapshot)
+            "providers": ["unified_snapshot"],
+            # optional deep AI analysis (LLM) inside MI (analysis layer)
+            "enable_llm_analysis": False,
+            "llm_timeout_sec": 3.5,
+            "min_quality_score_for_llm": 0.55,
+        },
+        "data_source_hub": {
+            # Keep legacy external analysis endpoints for compatibility, but disable by default.
+            # When disabled, endpoints return a structured "disabled" payload instead of 404.
+            "enable_legacy_external_analysis": False,
+            # Data collector behavior
+            "fetch_timeout_sec": 2.8,
+            "snapshot_timeout_sec": 6.0,
+            "include_klines_1h": True,
+            "klines_1h_limit": 64,
+            # Provider routing (reserved for future add/remove without code churn)
+            # Exchange channel includes these collectors:
+            "exchange_collectors": [
+                "ticker",
+                "order_book",
+                "klines_1h",
+                "open_interest",
+                "funding_rate",
+                "positions",
+                "open_orders",
+                "liquidation_proxy",
+            ],
+            # Intel channel includes these collectors:
+            "intel_collectors": [
+                "onchain.sentiment",
+                "onchain.flows",
+                "onchain.whales",
+                "third_party.sentiment",
+                "third_party.news",
+            ],
+            # Extra providers allow new data modules to attach payloads without changing snapshot schema.
+            # main_controller can expose `data_provider_plugins` as {name: async (symbol)->dict}.
+            "extra_providers": [],
+        },
         "system_maintenance": {
             "health_thresholds": {
                 "cpu_warning": 70,

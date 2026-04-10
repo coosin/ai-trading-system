@@ -302,7 +302,7 @@ class ProactiveMarketScanner:
 
                 gc = self.config.get("scanner_opportunity_gate") or {}
                 self._opportunity_gate = (
-                    ScannerOpportunityGate(self.exchange, gc) if self.exchange else None
+                    ScannerOpportunityGate(self.exchange, gc, main_controller=self.main_controller) if self.exchange else None
                 )
             except Exception as e:
                 logger.debug("ScannerOpportunityGate 初始化跳过: %s", e)

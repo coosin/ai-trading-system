@@ -73,20 +73,17 @@ class DataQualityAdvisor:
 
         channel_a = snapshot.get("渠道A_交易所实时执行数据") or {}
         channel_b = snapshot.get("渠道B_链上新闻舆情数据") or {}
-        analysis = snapshot.get("统一分析判断") or {}
 
         # 作用评分：衡量这份数据对“可交易决策”的支持程度
         has_price = self._safe_float((channel_a.get("ticker") or {}).get("price"), 0.0) > 0
         has_orderbook = bool((channel_a.get("order_book") or {}).get("bids"))
         has_position_info = isinstance(channel_a.get("positions"), list)
-        has_signal = bool(analysis.get("recommendation") or analysis.get("trend"))
         has_intel = bool((channel_b.get("sentiment") or {}) or (channel_b.get("onchain") or {}))
         effect_score = (
             (0.25 if has_price else 0.0)
             + (0.2 if has_orderbook else 0.0)
             + (0.15 if has_position_info else 0.0)
-            + (0.2 if has_signal else 0.0)
-            + (0.2 if has_intel else 0.0)
+            + (0.4 if has_intel else 0.0)
         )
 
         self._quality_hist[symbol].append(q_score)
@@ -123,7 +120,6 @@ class DataQualityAdvisor:
             "has_price": has_price,
             "has_orderbook": has_orderbook,
             "has_position_info": has_position_info,
-            "has_signal": has_signal,
             "has_intel": has_intel,
             "quality_current": q_score,
             "quality_avg": q_avg,

@@ -770,6 +770,15 @@ class AITradingEngine:
             except Exception as e:
                 logger.warning(f"统一数据源快照获取失败: {e}")
 
+            # 统一分析入口：MarketIntelligenceEngine（分析模块）
+            mi_view = None
+            try:
+                mi = getattr(self.main_controller, "market_intelligence", None) if self.main_controller else None
+                if mi and hasattr(mi, "get_symbol_view"):
+                    mi_view = await mi.get_symbol_view(symbol, include_snapshot=False)
+            except Exception as e:
+                logger.debug(f"MarketIntelligenceEngine 获取失败(降级): {e}")
+
             # 使用多源数据融合分析（如果可用）
             fused_intelligence = None
             if hasattr(self, 'data_fusion') and self.data_fusion:
@@ -815,6 +824,11 @@ class AITradingEngine:
             }
             if unified_snapshot:
                 analysis_data["unified_snapshot"] = unified_snapshot
+            if mi_view is not None:
+                try:
+                    analysis_data["market_intelligence"] = mi_view.to_dict() if hasattr(mi_view, "to_dict") else {}
+                except Exception:
+                    analysis_data["market_intelligence"] = {}
             
             # 如果有多源数据，添加到分析中
             if fused_intelligence:
@@ -1185,8 +1199,16 @@ class AITradingEngine:
             
             # 调用AI生成决策
             snap = context.metadata.get("unified_snapshot", {}) if isinstance(context.metadata, dict) else {}
-            ai_data_analysis = (snap.get("AI智能分析") or {}) if isinstance(snap, dict) else {}
             data_quality = (snap.get("数据质量评估") or {}) if isinstance(snap, dict) else {}
+            # Prefer MarketIntelligenceEngine output instead of data-hub analysis fields.
+            mi_view = None
+            try:
+                mc = getattr(self, "main_controller", None)
+                mi = getattr(mc, "market_intelligence", None) if mc else None
+                if mi and hasattr(mi, "get_symbol_view"):
+                    mi_view = await mi.get_symbol_view(symbol, include_snapshot=False)
+            except Exception:
+                mi_view = None
             ai_decision = await self.llm_integration.generate_trading_signal(
                 {
                     "symbol": symbol,
@@ -1195,7 +1217,7 @@ class AITradingEngine:
                     "sentiment": context.sentiment,
                     "volatility": context.volatility,
                     "unified_data_quality": data_quality,
-                    "unified_ai_analysis": ai_data_analysis,
+                    "market_intelligence": (mi_view.to_dict() if mi_view and hasattr(mi_view, "to_dict") else None),
                     "recent_lessons": recent_lessons,
                     "decision_prompt": decision_prompt,
                 }
