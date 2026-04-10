@@ -1265,26 +1265,17 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             out["alerts"].append(f"SLTP统计读取失败: {e}")
 
-        # 账户/持仓：缓存超过 45s 则强制再同步，避免快照里持仓/余额长期不刷新。
+        # 账户/持仓（快速版）：只读缓存，避免因交易所/网络抖动导致快照阻塞。
         try:
             st = getattr(mc, "_latest_account_state", None)
-            need_refresh = not isinstance(st, dict) or not st.get("positions")
             if isinstance(st, dict) and st.get("timestamp"):
                 try:
                     raw = str(st["timestamp"]).replace("Z", "")
                     t0 = datetime.fromisoformat(raw[:26])
                     if (datetime.now() - t0).total_seconds() > 45:
-                        need_refresh = True
+                        out["alerts"].append("account_state_stale>45s")
                 except Exception:
-                    need_refresh = True
-            if need_refresh and hasattr(mc, "force_sync_account_state"):
-                try:
-                    st = await asyncio.wait_for(
-                        mc.force_sync_account_state(reason="snapshot_fast"),
-                        timeout=FAST_TIMEOUT_S,
-                    )
-                except Exception:
-                    st = getattr(mc, "_latest_account_state", None)
+                    pass
             st = st if isinstance(st, dict) else {}
             out["account"] = {
                 "balance": st.get("balance"),
@@ -1315,12 +1306,56 @@ def init_module_control_api(app, main_controller):
                                 v = 0.0
                             pos_map[str(sym)] = {"value": v, **p}
             if available and hasattr(mc, "get_position_recommendations"):
-                out["risk"]["position_recommendations"] = await mc.get_position_recommendations(
-                    account_balance=float(available),
-                    current_positions=pos_map,
-                )
+                try:
+                    out["risk"]["position_recommendations"] = await asyncio.wait_for(
+                        mc.get_position_recommendations(
+                            account_balance=float(available),
+                            current_positions=pos_map,
+                        ),
+                        timeout=1.8,
+                    )
+                except Exception:
+                    out["risk"]["position_recommendations"] = out["risk"].get("position_recommendations") or {}
         except Exception:
             pass
+
+        # 数据/分析模块快照（快速版：不触发交易所重型聚合）
+        try:
+            di = getattr(mc, "data_integration", None)
+            if di and hasattr(di, "get_source_health_report"):
+                out["data_hub"]["data_integration_health"] = di.get_source_health_report()
+        except Exception:
+            pass
+        try:
+            tpi = getattr(mc, "third_party_data_integrator", None)
+            if tpi:
+                prov = getattr(tpi, "providers", {}) or {}
+                disabled = list(getattr(tpi, "_disabled_providers", set()) or [])
+                out["data_hub"]["third_party"] = {
+                    "provider_count": len(prov),
+                    "disabled_count": len(disabled),
+                }
+        except Exception:
+            pass
+        try:
+            mi = getattr(mc, "market_intelligence", None) or getattr(mc, "market_intelligence_engine", None)
+            if mi:
+                cached = mi.get_cached_symbol_view(symbol) if hasattr(mi, "get_cached_symbol_view") else {}
+                if cached:
+                    out["data_hub"]["market_intelligence"] = cached
+                elif hasattr(mi, "get_symbol_view"):
+                    view = await asyncio.wait_for(mi.get_symbol_view(symbol, include_snapshot=False), timeout=2.2)
+                    out["data_hub"]["market_intelligence"] = view.to_dict() if hasattr(view, "to_dict") else {}
+                # Still empty: report warm-up state so caller knows it's connected.
+                if not out["data_hub"].get("market_intelligence"):
+                    out["data_hub"]["market_intelligence"] = {
+                        "status": "warming_up",
+                        "hint": "market_intelligence_connected_but_no_cached_view_yet",
+                    }
+        except Exception:
+            out["data_hub"]["market_intelligence"] = out["data_hub"].get("market_intelligence") or {
+                "status": "warming_up_or_busy",
+            }
         return out
 
     @router.get("/commander/snapshot")
@@ -1351,6 +1386,19 @@ def init_module_control_api(app, main_controller):
                 },
                 "timestamp": datetime.now().isoformat(),
             }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/capabilities")
+    async def commander_capabilities():
+        """司令部能力与子智能体清单（对齐 OpenClaw 文档中的回路/专家概念，便于运维对接）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_commander_capabilities"):
+            return {"success": False, "message": "capabilities 不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.get_commander_capabilities()
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
@@ -1406,16 +1454,97 @@ def init_module_control_api(app, main_controller):
         add("commander.snapshot", hasattr(mc, "build_ai_commander_snapshot"), "build_ai_commander_snapshot")
         add("commander.chores", hasattr(mc, "run_ai_commander_chores"), "run_ai_commander_chores")
         add("commander.dispatch", hasattr(mc, "process_user_command"), "process_user_command")
+        add("commander.capabilities", hasattr(mc, "get_commander_capabilities"), "get_commander_capabilities")
+        add("surface.registry", True, "GET /api/v1/modules/surface/registry")
         add("message.telegram", bool(getattr(mc, "telegram_bot", None)), "telegram_bot")
         add("notification.unified", hasattr(mc, "_send_notification_handler"), "_send_notification_handler")
         add("memory.gateway", bool(getattr(mc, "memory_gateway", None)), "memory_gateway")
+        add(
+            "commander.unrestricted",
+            str(__import__("os").environ.get("OPENCLAW_COMMANDER_UNRESTRICTED", "1")).strip().lower() not in {"0", "false", "no", "off"},
+            "OPENCLAW_COMMANDER_UNRESTRICTED",
+        )
         add("data.hub", bool(getattr(mc, "data_source_hub", None)), "data_source_hub")
+        add("data.integration", bool(getattr(mc, "data_integration", None)), "data_integration")
+        add("data.third_party", bool(getattr(mc, "third_party_data_integrator", None)), "third_party_data_integrator")
+        add("analysis.market_intelligence", bool(getattr(mc, "market_intelligence", None)), "market_intelligence")
+        add("plugin.manager", bool(getattr(mc, "plugin_manager", None)), "plugin_manager")
         add("strategy.manager", bool(getattr(mc, "strategy_manager", None)), "strategy_manager")
         add("risk.sltp", bool(getattr(mc, "stop_loss_manager", None)), "stop_loss_manager")
         add("execution.gateway", bool(getattr(mc, "execution_gateway", None)), "execution_gateway")
         add("api.module_control", True, "routes_registered")
         all_passed = all(c["passed"] for c in checks)
         return {"success": True, "all_passed": all_passed, "checks": checks, "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/memory/status")
+    async def commander_memory_status():
+        """司令部记忆系统自检：网关/后端统计/召回命中率等。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        gw = getattr(main_controller, "memory_gateway", None)
+        if not gw:
+            return {"success": False, "message": "MemoryGateway 未就绪", "timestamp": datetime.now().isoformat()}
+        try:
+            stats = gw.get_stats() if hasattr(gw, "get_stats") else {}
+            summary = gw.get_summary_status() if hasattr(gw, "get_summary_status") else {}
+            return {
+                "success": True,
+                "data": {
+                    "stats": stats,
+                    "summary": summary,
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/memory/workspace")
+    async def commander_memory_workspace(filename: str = ""):
+        """读取 workspace 记忆文件（默认读取允许集合；可用 env 放开全部）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        gw = getattr(main_controller, "memory_gateway", None)
+        if not gw or not hasattr(gw, "get_workspace_memory"):
+            return {"success": False, "message": "MemoryGateway 未就绪", "timestamp": datetime.now().isoformat()}
+        try:
+            data = gw.get_workspace_memory(filename=filename or None)
+            # 避免一次性回传超大：每个文件最多返回 200k 字符
+            clipped = {}
+            for k, v in (data or {}).items():
+                s = v if isinstance(v, str) else str(v)
+                clipped[k] = s if len(s) <= 200_000 else (s[:200_000] + "\n\n…已截断…")
+            return {"success": True, "data": clipped, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/memory/persona-preview")
+    async def commander_memory_persona_preview(source: str = "api"):
+        """
+        司令部人格/身份/职责是否已注入：返回「将被注入到对话提示词的摘要」预览。
+        用于排查“司令部好像不知道自己是谁/做什么”的问题。
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        exe = getattr(main_controller, "ai_command_executor", None)
+        if not exe or not hasattr(exe, "_get_user_rules_context"):
+            return {"success": False, "message": "AICommandExecutor 未就绪", "timestamp": datetime.now().isoformat()}
+        try:
+            # _get_user_rules_context 会包含 CHARTER + startup bundle + boundaries prose + 关键记忆片段
+            text = await exe._get_user_rules_context()
+            cap = 18_000
+            preview = text if len(text) <= cap else (text[:cap] + "\n\n…已截断…")
+            return {
+                "success": True,
+                "data": {
+                    "source": source,
+                    "preview": preview,
+                    "length": len(text),
+                    "has_startup_bundle": bool(getattr(exe, "_workspace_startup_bundle", "") or ""),
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
     @router.get("/commander/account-diagnostics")
     async def commander_account_diagnostics():
@@ -1571,7 +1700,11 @@ def init_module_control_api(app, main_controller):
             "checks": checks,
             "details": details,
         }
-    
+
+    from src.modules.api.module_surface import attach_module_surface_routes
+
+    attach_module_surface_routes(router, main_controller)
+
     app.include_router(router)
     app.include_router(trade_router)
     app.include_router(market_router)

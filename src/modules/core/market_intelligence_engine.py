@@ -983,3 +983,27 @@ class MarketIntelligenceEngine:
         self._cache_ts[cache_key] = now
         return view
 
+    def get_cached_symbol_view(self, symbol: str) -> Dict[str, Any]:
+        """
+        Fast-path for control-plane (Commander fast snapshot).
+        Returns cached symbol view if fresh; otherwise returns {} without fetching any data.
+        """
+        try:
+            sym = str(symbol or "").strip()
+            if not sym:
+                return {}
+            cache_key = sym.upper()
+            now = self._now()
+            if cache_key in self._cache and (now - self._cache_ts.get(cache_key, 0)) < self._cache_ttl_sec:
+                cached = self._cache.get(cache_key) or {}
+                view = cached.get("view") or {}
+                # Never include the heavy snapshot in this fast-path.
+                out = dict(view) if isinstance(view, dict) else {}
+                out.pop("snapshot", None)
+                out.setdefault("cached_only", True)
+                out.setdefault("cache_age_sec", round(now - float(self._cache_ts.get(cache_key, 0) or 0), 3))
+                return out
+        except Exception:
+            return {}
+        return {}
+

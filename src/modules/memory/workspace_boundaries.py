@@ -1,5 +1,5 @@
 """
-从 workspace/BOUNDARIES_AND_LEARNING.md 读取自然语言边界、学习要点与闸门用语。
+从 workspace/COMMANDER_PROFILE.md 读取自然语言边界、学习要点与闸门用语。
 
 业务分寸以正文叙述为准；附录中的短语仅用于少量字符串匹配，不写死业务规则本体。
 """
@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-BOUNDARIES_FILENAME = "BOUNDARIES_AND_LEARNING.md"
+BOUNDARIES_FILENAME = "COMMANDER_PROFILE.md"
 
 DEFAULT_HIGH_RISK_PHRASES: Tuple[str, ...] = ("确认", "立即执行", "批准")
 DEFAULT_WORKSPACE_EDIT_PHRASES: Tuple[str, ...] = ("确认修改", "确认编辑", "批准修改")

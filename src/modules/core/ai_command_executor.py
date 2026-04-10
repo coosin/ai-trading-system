@@ -11,6 +11,7 @@ import asyncio
 import logging
 import json
 import re
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
@@ -59,7 +60,7 @@ class AICommandExecutor:
     3. 授权感知 - 根据授权范围决定行动
     4. 主动工作 - 不等待指令，自主执行职责
     
-    业务分寸与闸门文案优先从 workspace/BOUNDARIES_AND_LEARNING.md 读取；代码仅保留路径安全等必要技术校验。
+    业务分寸与闸门文案优先从 workspace/COMMANDER_PROFILE.md 读取；代码仅保留路径安全等必要技术校验。
     """
     
     def __init__(self, main_controller=None):
@@ -156,7 +157,7 @@ class AICommandExecutor:
         logger.info("✅ AI指令执行器（智能增强版）初始化完成")
     
     def _get_workspace_boundaries(self) -> WorkspaceBoundaries:
-        """懒加载 workspace/BOUNDARIES_AND_LEARNING.md（initialize 已加载则直接复用）。"""
+        """懒加载 workspace/COMMANDER_PROFILE.md（initialize 已加载则直接复用）。"""
         if self._workspace_boundaries is None:
             try:
                 root = Path(__file__).resolve().parents[3]
@@ -237,32 +238,126 @@ class AICommandExecutor:
                         await self._load_user_rules_from_memory()
                     if memory_result.get("authorization_updated"):
                         await self._load_user_rules_from_memory()
-            
-            intent = await self._parse_intent(user_input)
-            # 意图模型常误选 system_inspection，导致每条回复都像「巡检报告」。
-            # 自然语言主入口不跑 skill 巡检；完整巡检请用司令部 API / 运维入口。
-            if intent.action == "system_inspection":
-                intent = Intent(action="chat", params=intent.params, confidence=intent.confidence)
 
-            user_rules = await self._get_user_rules_context()
+            # 极简模式下原先只走 _general_chat，模型会「假装查价」并编造数字。
+            # 1) 身份类：直接回 workspace 已加载摘要，不现编。
+            # 2) 「对接数据源/分析系统」类：走系统内 ticker（默认币对可环境变量）。
+            # 3) 明确问价短句：同上。
+            utter = self._strip_user_utterance_for_routing(user_input)
+
+            if self._looks_like_identity_question(utter):
+                result = await self._answer_identity_from_workspace()
+                intent = Intent(action="chat", params={}, confidence=1.0)
+                if self.unified_memory:
+                    try:
+                        await self.unified_memory.add_memory(
+                            memory_type=self._get_memory_type_from_intent(intent.action),
+                            content=f"用户: {user_input}",
+                            summary=f"用户指令: {user_input[:100]}",
+                            metadata=base_metadata(
+                                source_module="ai_command_executor",
+                                kind="user_input",
+                                extra={"intent": intent.action, "params": intent.params},
+                            ),
+                            source_module="ai_command_executor",
+                        )
+                        action_msg = str((result or {}).get("response") or "")[:500]
+                        if action_msg:
+                            await self.unified_memory.add_memory(
+                                memory_type="conversation",
+                                content=f"动作结果[{intent.action}] {action_msg}",
+                                summary=f"{intent.action} 执行结果摘要",
+                                metadata=base_metadata(
+                                    source_module="ai_command_executor",
+                                    kind="action_result",
+                                    extra={
+                                        "intent": intent.action,
+                                        "success": bool((result or {}).get("success", False)),
+                                    },
+                                ),
+                                source_module="ai_command_executor",
+                                importance=0.55,
+                                tags=tags(kind_tag("action_result"), kind_tag(intent.action)),
+                            )
+                    except Exception:
+                        pass
+                return result
+
+            internal_q = self._looks_like_internal_price_query(utter)
+            sym = self._resolve_symbol_for_price(utter)
+            if internal_q:
+                sym = sym or str(os.environ.get("OPENCLAW_DEFAULT_PRICE_SYMBOL", "ETH/USDT")).strip()
+            if sym and (internal_q or self._looks_like_live_price_only_request(utter)):
+                result = await self._answer_live_price_from_exchange(sym)
+                intent = Intent(action="market_analysis", params={"symbol": sym}, confidence=1.0)
+                if self.unified_memory:
+                    try:
+                        await self.unified_memory.add_memory(
+                            memory_type=self._get_memory_type_from_intent(intent.action),
+                            content=f"用户: {user_input}",
+                            summary=f"用户指令: {user_input[:100]}",
+                            metadata=base_metadata(
+                                source_module="ai_command_executor",
+                                kind="user_input",
+                                extra={"intent": intent.action, "params": intent.params},
+                            ),
+                            source_module="ai_command_executor",
+                        )
+                        action_msg = str((result or {}).get("response") or "")[:500]
+                        if action_msg:
+                            await self.unified_memory.add_memory(
+                                memory_type="conversation",
+                                content=f"动作结果[{intent.action}] {action_msg}",
+                                summary=f"{intent.action} 执行结果摘要",
+                                metadata=base_metadata(
+                                    source_module="ai_command_executor",
+                                    kind="action_result",
+                                    extra={
+                                        "intent": intent.action,
+                                        "success": bool((result or {}).get("success", False)),
+                                    },
+                                ),
+                                source_module="ai_command_executor",
+                                importance=0.55,
+                                tags=tags(kind_tag("action_result"), kind_tag(intent.action)),
+                            )
+                    except Exception:
+                        pass
+                return result
             
-            if intent.action != "unknown":
-                result = await self._execute_intent(
-                    intent,
-                    user_input,
-                    user_rules,
-                    conversation_scope=conv_scope,
-                    memory_channel=memory_channel,
-                )
-            else:
-                act_ctx = intent.action if intent.action != "unknown" else "chat"
+            # 默认极简自由模式：直接自然对话，避免复杂规则/模板链路介入。
+            if self._is_minimal_free_mode():
+                user_rules = await self._get_user_rules_context()
                 result = await self._general_chat(
                     user_input,
                     user_rules,
-                    intent_action=act_ctx,
+                    intent_action="chat",
                     conversation_scope=conv_scope,
                     memory_channel=memory_channel,
                 )
+                intent = Intent(action="chat", params={}, confidence=1.0)
+            else:
+                intent = await self._parse_intent(user_input)
+            # 用户已要求“取消限制”：不再把 system_inspection 意图强制降级为 chat。
+                user_rules = await self._get_user_rules_context()
+                
+                if intent.action != "unknown":
+                    result = await self._execute_intent(
+                        intent,
+                        user_input,
+                        user_rules,
+                        conversation_scope=conv_scope,
+                        memory_channel=memory_channel,
+                    )
+                else:
+                    act_ctx = intent.action if intent.action != "unknown" else "chat"
+                    result = await self._general_chat(
+                        user_input,
+                        user_rules,
+                        intent_action=act_ctx,
+                        conversation_scope=conv_scope,
+                        memory_channel=memory_channel,
+                    )
             
             if self.unified_memory:
                 await self.unified_memory.add_memory(
@@ -319,12 +414,17 @@ class AICommandExecutor:
     
     async def _get_user_rules_context(self) -> str:
         """
-        注入「宪章」+ 少量高信号记忆（黑名单等），不堆砌行为细则。
+        人格与口吻以 workspace/COMMANDER_PROFILE.md（启动摘要）为主，宪章为辅；再补边界解析与记忆禁区。
         """
-        parts: List[str] = [CHARTER]
+        parts: List[str] = []
 
         if getattr(self, "_workspace_startup_bundle", None):
-            parts.append("\n" + self._workspace_startup_bundle.strip())
+            parts.append(
+                "【人格与画像】节选来自 workspace/COMMANDER_PROFILE.md（改这个文件即可调性格与分寸，不必改代码）。\n"
+                + self._workspace_startup_bundle.strip()
+            )
+
+        parts.append("\n【司令部宪章 · 原则锚点】\n" + CHARTER)
 
         try:
             wb = self._get_workspace_boundaries()
@@ -333,7 +433,7 @@ class AICommandExecutor:
                 lp = wb.learning_prose.strip()
                 if len(lp) > cap:
                     lp = lp[:cap] + "…"
-                parts.append("\n【边界与学习（workspace 自然语言）】\n" + lp)
+                parts.append("\n【边界与学习（同文件自然语言）】\n" + lp)
         except Exception as e:
             logger.debug(f"inject boundaries prose: {e}")
 
@@ -425,9 +525,11 @@ class AICommandExecutor:
             try:
                 prompt = f"""任务：根据用户消息选一个 action，输出一条 JSON。
 
-action ∈ chat, system_status, trade_history, positions, balance, market_analysis, trade, strategy_create, strategy_optimize, backtest, risk, signals, third_party_data, workspace_read, workspace_edit
+action ∈ chat, system_status, trade_history, positions, balance, market_analysis, trade, strategy_create, strategy_optimize, backtest, risk, signals, third_party_data, workspace_read, workspace_edit, plugin_list, plugin_reload, plugin_load, plugin_unload
 
 说明：
+- 非工作话题（生活/学习/娱乐/情绪支持/日常建议）默认 action=chat。
+- 只有用户明确要求系统状态/巡检/交易执行/策略操作，才选择对应工作 action。
 - workspace_read：params 必须包含 path（字符串，相对仓库根的路径，用 /）。
 - workspace_edit：params 必须包含 path、edit_type、content；edit_type 为 insert|delete|replace|full_replace；delete/replace 需 start_line、end_line（从 1 起的行号）；full_replace 用 content 替换整个文件；insert 可用 start_line 指定插入位置。
 
@@ -445,8 +547,19 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                         rp = result.get("params")
                         if isinstance(rp, dict):
                             merged_params.update(rp)
+                        action = self._normalize_intent_action(str(result.get("action", "chat")))
+
+                        # 防呆：有时模型会把“检查一下系统/司令部情况”误判成 workspace_read/edit，
+                        # 但又不给 path，导致看起来像“机械报错”。这里做最小纠偏：无 path 的 workspace_* 一律回退。
+                        if action in ("workspace_read", "workspace_edit") and not merged_params.get("path"):
+                            text = (user_input or "").strip()
+                            if any(k in text for k in ("检查", "看看", "状态", "情况", "运行")):
+                                action = "system_status"
+                            else:
+                                action = "chat"
+
                         return Intent(
-                            action=self._normalize_intent_action(str(result.get("action", "chat"))),
+                            action=action,
                             params=merged_params,
                             confidence=float(result.get("confidence", 0.75) or 0.75),
                         )
@@ -476,6 +589,252 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
 
     def _repo_root(self) -> Path:
         return Path(__file__).resolve().parents[3]
+
+    @staticmethod
+    def _looks_like_work_topic(text: str) -> bool:
+        t = str(text or "").lower()
+        keys = [
+            "交易", "开仓", "平仓", "止盈", "止损", "风控", "持仓", "余额",
+            "策略", "回测", "司令部", "系统", "模块", "运行状态",
+            "okx", "btc", "eth", "usdt", "risk", "strategy", "position",
+            "balance", "trade", "backtest", "module", "system", "commander",
+        ]
+        return any(k in t for k in keys)
+
+    @staticmethod
+    def _is_commander_unrestricted() -> bool:
+        """
+        司令部无限制模式（默认开启）：
+        - 1/true/yes/on => 开启
+        - 0/false/no/off => 关闭
+        """
+        raw = str(os.environ.get("OPENCLAW_COMMANDER_UNRESTRICTED", "1") or "").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _is_minimal_free_mode() -> bool:
+        """
+        极简自由模式（默认开启）：
+        - 仅保留“自然对话 + 记忆记录”主链路
+        - 不强制走复杂意图路由/模板流程
+        """
+        raw = str(os.environ.get("OPENCLAW_COMMANDER_MINIMAL_MODE", "1") or "").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _strip_user_utterance_for_routing(raw: str) -> str:
+        """
+        Telegram 等通道会在用户原话后拼接宪章/记忆节选；意图与查价检测只应看「用户原话」。
+        """
+        text = (raw or "").strip()
+        for sep in ("【司令部宪章】", "【记忆节选】"):
+            if sep in text:
+                text = text.split(sep, 1)[0].strip()
+        return text[:2000]
+
+    @staticmethod
+    def _resolve_symbol_for_price(text: str) -> Optional[str]:
+        """从用户句子里解析交易对，默认 USDT 计价。"""
+        t = (text or "").strip()
+        if not t:
+            return None
+        m = re.search(
+            r"\b(BTC|ETH|SOL|BNB|XRP|DOGE|ADA|AVAX|DOT|MATIC|LINK|LTC)[-/]?(USDT|USD)?\b",
+            t,
+            re.IGNORECASE,
+        )
+        if m:
+            return f"{m.group(1).upper()}/USDT"
+        if "比特币" in t:
+            return "BTC/USDT"
+        if "以太坊" in t or re.search(r"(?<![A-Za-z])以太(?![A-Za-z])", t):
+            return "ETH/USDT"
+        return None
+
+    @staticmethod
+    def _looks_like_internal_price_query(text: str) -> bool:
+        """
+        用户要求用「本系统数据源 / 分析模块 / 对接」查价，未必带币种简称。
+        注意：不要用子串「分析」做排除词，否则会误伤「分析系统」。
+        """
+        t = (text or "").strip()
+        if not t or len(t) > 900:
+            return False
+        sys_kw = (
+            "数据源",
+            "分析系统",
+            "对接",
+            "系统内部",
+            "内部数据",
+            "对齐",
+            "行情模块",
+            "交易所接口",
+            "market intelligence",
+            "数据集成",
+        )
+        act_kw = ("查", "拉", "读", "取", "多少", "价格", "价位", "行情", "实时", "报价")
+        if not any(k in t for k in sys_kw):
+            return False
+        if not any(k in t for k in act_kw):
+            return False
+        return True
+
+    @staticmethod
+    def _looks_like_identity_question(text: str) -> bool:
+        t = (text or "").strip()
+        if not t or len(t) > 1200:
+            return False
+        return bool(
+            re.search(
+                r"(你是谁|你究竟是谁|什么身份|何种身份|身份文件|人格文件|commander_profile|读取.*身份|读到.*身份|知道你是谁)",
+                t,
+                re.IGNORECASE,
+            )
+        )
+
+    async def _answer_identity_from_workspace(self) -> Dict[str, Any]:
+        """用已加载的 workspace 摘要回答身份，避免模型现编。"""
+        bundle = (getattr(self, "_workspace_startup_bundle", None) or "").strip()
+        head = (
+            "我是本系统里的「司令部」助理（OpenClaw）。\n"
+            "人格、口吻与职责写在 **workspace/COMMANDER_PROFILE.md**，启动时会读入摘要；总原则在《司令部宪章》。\n"
+            "下面是你文件里的节选（不是现编的）：\n\n"
+        )
+        body = bundle[:4500] if bundle else "（当前未读到 COMMANDER_PROFILE.md 摘要，请检查工作区路径与挂载。）"
+        return {
+            "success": True,
+            "response": (head + body)[:6500],
+            "source": "identity_workspace",
+        }
+
+    @staticmethod
+    def _looks_like_live_price_only_request(text: str) -> bool:
+        """
+        仅「现价/报价」类短问：走交易所真实 ticker，禁止交给纯模型编造数字。
+        含「趋势/建议/…」等深度分析意图则不走本快路径（但「分析系统」不在此列）。
+        """
+        t = (text or "").strip()
+        if not t or len(t) > 600:
+            return False
+        if any(
+            k in t
+            for k in (
+                "趋势",
+                "走势",
+                "建议",
+                "看法",
+                "技术",
+                "多空",
+                "布局",
+                "策略",
+                "预测",
+                "怎么看",
+                "觉得",
+            )
+        ):
+            return False
+        if any(k in t for k in ("你是谁", "什么身份", "什么人格", "宪章")):
+            return False
+        sym = AICommandExecutor._resolve_symbol_for_price(t)
+        if not sym:
+            return False
+        low = t.lower()
+        price_kw = (
+            "价格",
+            "行情",
+            "现价",
+            "多少钱",
+            "什么价",
+            "报价",
+            "实时",
+            "价位",
+            "ticker",
+            "quote",
+            "usd",
+            "u价",
+        )
+        if any(k in t for k in price_kw) or any(k in low for k in price_kw):
+            return True
+        # 「ETH 多少」「比特币现在多少」
+        if re.search(r"(多少|几个|几块钱|啥价)", t):
+            return True
+        return False
+
+    async def _answer_live_price_from_exchange(self, symbol: str) -> Dict[str, Any]:
+        """只返回交易所接口事实；拿不到则明确失败，禁止编造。"""
+        ticker: Optional[Dict[str, Any]] = None
+        mc = self.main_controller
+        hub = getattr(mc, "data_source_hub", None) if mc else None
+        if hub:
+            try:
+                ticker = await hub.get_ticker(symbol)
+            except Exception as e:
+                logger.debug(f"data_source_hub.get_ticker failed: {e}")
+                ticker = None
+        last = float((ticker or {}).get("last") or (ticker or {}).get("price") or 0.0)
+        if last <= 0 and mc:
+            okx = getattr(mc, "okx_exchange", None)
+            if okx and hasattr(okx, "get_ticker"):
+                try:
+                    raw = await okx.get_ticker(symbol.replace("/", "-"))
+                    if isinstance(raw, dict):
+                        ticker = raw
+                        last = float(raw.get("last") or raw.get("price") or 0.0)
+                except Exception as e:
+                    logger.debug(f"okx get_ticker failed: {e}")
+        if last <= 0 and mc:
+            mi = getattr(mc, "market_intelligence", None)
+            if mi and hasattr(mi, "get_symbol_view"):
+                try:
+                    view = await mi.get_symbol_view(symbol, include_snapshot=False)
+                    px = getattr(view, "price", None) if view is not None else None
+                    if px is not None and float(px) > 0:
+                        last = float(px)
+                        ticker = {
+                            "last": last,
+                            "price": last,
+                            "source": "market_intelligence_engine",
+                            "provenance": getattr(view, "provenance", None),
+                        }
+                except Exception as e:
+                    logger.debug(f"market_intelligence get_symbol_view: {e}")
+        if last <= 0:
+            return {
+                "success": True,
+                "response": (
+                    f"我刚用系统内数据源（交易所 / DataSourceHub / 市场情报）拉 {symbol}，都没拿到有效最新价。\n"
+                    "这不是推脱：这一下接口确实没有可信数字，我不会编区间糊弄你。请检查 API 与主进程是否就绪。"
+                ),
+                "source": "live_ticker_unavailable",
+                "data": {"symbol": symbol},
+            }
+        src_lbl = (ticker or {}).get("source") or "exchange"
+        if src_lbl == "market_intelligence_engine":
+            head = f"{symbol}：市场情报模块本次给出的参考价 {last:,.2f} USDT（系统内计算/汇总，非模型瞎编）。"
+        else:
+            head = f"{symbol}：接口这次返回的最新价约 {last:,.2f} USDT（来自交易所/数据源，不是模型猜的）。"
+        lines = [head]
+        hi = (ticker or {}).get("high")
+        lo = (ticker or {}).get("low")
+        vol = (ticker or {}).get("volume")
+        for label, v in (("24h高", hi), ("24h低", lo), ("24h成交量", vol)):
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+                if fv:
+                    lines.append(f"{label}: {fv:,.4f}")
+            except (TypeError, ValueError):
+                pass
+        lines.append(f"（数据来源: {src_lbl}）")
+        lines.append("")
+        lines.append("若和你 App 里差一点点，多半是延迟或盘口口径差异。")
+        return {
+            "success": True,
+            "response": "\n".join(lines),
+            "source": "live_ticker",
+            "data": {"symbol": symbol, "ticker": ticker},
+        }
 
     @staticmethod
     def _workspace_blocked(rel_posix: str) -> bool:
@@ -508,9 +867,9 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         except ValueError:
             return None, "路径必须在仓库根目录内"
         rel_posix = str(rel).replace("\\", "/")
-        if self._workspace_blocked(rel_posix):
+        if self._workspace_blocked(rel_posix) and not self._is_commander_unrestricted():
             return None, "该路径禁止通过司令部工作区接口访问"
-        if not self._under_workspace_prefix(rel_posix, WORKSPACE_READ_PREFIXES):
+        if (not self._is_commander_unrestricted()) and (not self._under_workspace_prefix(rel_posix, WORKSPACE_READ_PREFIXES)):
             return None, (
                 "路径不在允许前缀内。可读写的目录前缀为: "
                 + ", ".join(WORKSPACE_READ_PREFIXES)
@@ -567,7 +926,7 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         if err:
             return {"success": False, "response": err, "timestamp": datetime.now().isoformat()}
         rel = self._path_relative_repo(path)
-        if not self._is_self_maintain_path(rel):
+        if (not self._is_commander_unrestricted()) and (not self._is_self_maintain_path(rel)):
             b = self._get_workspace_boundaries()
             wph = effective_workspace_phrases(b)
             if not any(k in (user_input or "") for k in wph):
@@ -671,7 +1030,7 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         action = self._normalize_intent_action(intent.action)
         params = intent.params or {}
 
-        if action in ["trade", "market_analysis"]:
+        if (not self._is_commander_unrestricted()) and action in ["trade", "market_analysis"]:
             symbol = params.get('symbol', '')
             if symbol in self.blacklist:
                 return {
@@ -715,6 +1074,14 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                 return await self._workspace_read(params)
             elif action == "workspace_edit":
                 return await self._workspace_edit(params, user_input)
+            elif action == "plugin_list":
+                return await self._plugin_list()
+            elif action == "plugin_reload":
+                return await self._plugin_reload(params)
+            elif action == "plugin_unload":
+                return await self._plugin_unload(params)
+            elif action == "plugin_load":
+                return await self._plugin_load(params)
             elif action == "chat":
                 return await self._general_chat(
                     user_input,
@@ -1437,11 +1804,11 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
             return {"success": False, "response": f"获取第三方数据失败: {str(e)}"}
     
     async def _get_system_status(self) -> Dict[str, Any]:
-        """获取系统状态 - 详细版"""
+        """获取系统状态（自然表达版，避免模板化播报）。"""
         try:
             if self.main_controller:
                 mc = self.main_controller
-                
+
                 modules = {
                     "策略管理器": hasattr(mc, 'strategy_manager') and mc.strategy_manager is not None,
                     "AI交易引擎": hasattr(mc, 'ai_trading_engine') and mc.ai_trading_engine is not None,
@@ -1467,33 +1834,36 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     ),
                     "AI核心决策引擎": hasattr(mc, 'ai_core') and mc.ai_core is not None,
                 }
-                
-                response = "📊 系统状态报告\n\n"
-                response += "【核心模块】\n"
-                for name, status in modules.items():
-                    emoji = "✅" if status else "❌"
-                    response += f"{emoji} {name}\n"
-                
+
+                status_payload: Dict[str, Any] = {
+                    "modules": modules,
+                    "strategy": {},
+                    "data_sources": {},
+                    "external_data_health": {},
+                    "ai_core": {},
+                    "user_rules": {},
+                    "positions": [],
+                }
+
                 # 策略详情
                 if hasattr(mc, 'strategy_manager') and mc.strategy_manager:
                     sm = mc.strategy_manager
                     strategies = getattr(sm, 'strategy_configs', {})
-                    response += f"\n【策略管理器】\n"
-                    response += f"已注册策略: {len(strategies)}个\n"
+                    status_payload["strategy"]["count"] = len(strategies)
+                    names = []
                     if strategies:
-                        for sid, config in list(strategies.items())[:3]:
-                            name = getattr(config, 'name', 'Unknown') if hasattr(config, 'name') else config.get('name', 'Unknown')
-                            response += f"  • {name}\n"
-                
+                        for _sid, config in list(strategies.items())[:3]:
+                            name = getattr(config, 'name', None) if hasattr(config, 'name') else (config.get('name') if isinstance(config, dict) else None)
+                            if name:
+                                names.append(str(name))
+                    status_payload["strategy"]["examples"] = names
+
                 # 第三方数据详情
-                response += f"\n【第三方数据源】\n"
                 # 1) 插件体系（若存在）
                 if hasattr(mc, 'plugin_manager') and mc.plugin_manager:
                     pm = mc.plugin_manager
                     plugins_info = pm.get_all_plugin_info() if hasattr(pm, 'get_all_plugin_info') else {}
-                    response += f"已加载插件: {len(plugins_info)}个\n"
-                    for plugin_name in list(plugins_info.keys())[:5]:
-                        response += f"  • {plugin_name}\n"
+                    status_payload["data_sources"]["plugins_loaded"] = len(plugins_info)
                 # 2) 代码内置 ThirdPartyDataIntegrator（若存在）
                 try:
                     tpi = getattr(mc, "third_party_data_integrator", None)
@@ -1502,7 +1872,8 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     if tpi:
                         prov = getattr(tpi, "providers", {}) or {}
                         disabled = list(getattr(tpi, "_disabled_providers", set()) or [])
-                        response += f"内置数据源: {len(prov)} 个（disabled={len(disabled)}）\n"
+                        status_payload["data_sources"]["builtin_count"] = len(prov)
+                        status_payload["data_sources"]["builtin_disabled_count"] = len(disabled)
                         if disabled:
                             # DataSource Enum or str
                             ds = []
@@ -1511,7 +1882,7 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                                     ds.append(getattr(x, "value", str(x)))
                                 except Exception:
                                     ds.append(str(x))
-                            response += "已禁用源(常见原因403/401/限流): " + ", ".join(ds) + "\n"
+                            status_payload["data_sources"]["disabled_examples"] = ds
                 except Exception:
                     pass
 
@@ -1521,104 +1892,80 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     if data_integration and hasattr(data_integration, "get_source_health_report"):
                         ds_health = data_integration.get_source_health_report()
                         degraded = ds_health.get("degraded_sources") or []
-                        response += f"\n【外部数据源健康】\n"
-                        if degraded:
-                            response += f"状态: 退化（{len(degraded)}个）\n"
-                            response += f"退化源: {', '.join(degraded[:5])}\n"
-                        else:
-                            response += "状态: 正常\n"
+                        status_payload["external_data_health"]["degraded_count"] = len(degraded)
+                        status_payload["external_data_health"]["degraded_examples"] = degraded[:5]
                 except Exception as e:
                     logger.debug(f"读取外部数据源健康失败: {e}")
-                
+
                 # AI核心决策引擎详情
                 if hasattr(mc, 'ai_core') and mc.ai_core:
                     ai_core = mc.ai_core
                     status = ai_core.get_status() if hasattr(ai_core, 'get_status') else {}
                     modules_status = status.get('modules', {})
-                    response += f"\n【AI核心决策引擎】\n"
-                    response += f"运行状态: {'运行中' if status.get('running') else '已停止'}\n"
+                    status_payload["ai_core"]["running"] = bool(status.get("running"))
                     connected = [k for k, v in modules_status.items() if v]
-                    response += f"已连接模块: {', '.join(connected) if connected else '无'}\n"
+                    status_payload["ai_core"]["connected_modules"] = connected
                     guards = status.get("execution_guards", {})
                     gcfg = guards.get("config", {})
                     gprof = guards.get("adaptive_profile", {})
-                    gmap = guards.get("group_overrides", {})
                     g_global_at = guards.get("global_last_tuned_at")
                     gstats = guards.get("stats", {})
-                    if gcfg:
-                        response += "\n【执行门控】\n"
-                        response += (
-                            f"数据质量阈值: {gcfg.get('min_data_quality_to_trade', 'N/A')} | "
-                            f"最小RR: {gcfg.get('min_rr_to_trade', 'N/A')} | "
-                            f"最大价差(bps): {gcfg.get('max_spread_bps_to_trade', 'N/A')}\n"
-                        )
-                        response += f"自适应门控: {'开启' if gcfg.get('auto_adaptive_guards', True) else '关闭'}\n"
-                        response += (
-                            f"自动学习: {'开启' if gcfg.get('auto_tune_guards', True) else '关闭'} | "
-                            f"分组学习: {'开启' if gcfg.get('auto_tune_by_symbol_group', True) else '关闭'} | "
-                            f"时段学习: {'开启' if gcfg.get('auto_tune_by_session', True) else '关闭'}\n"
-                        )
-                        response += (
-                            f"全局基准慢调: {'开启' if gcfg.get('auto_tune_global_enabled', True) else '关闭'} | "
-                            f"全局冷却(s): {gcfg.get('auto_tune_global_cooldown_seconds', 'N/A')} | "
-                            f"上次全局调参: {g_global_at or '无'}\n"
-                        )
-                        response += (
-                            f"全局步长 RR/价差: {gcfg.get('auto_tune_global_step_rr', 'N/A')} / "
-                            f"{gcfg.get('auto_tune_global_step_spread_bps', 'N/A')}\n"
-                        )
-                        response += (
-                            f"分组步长 RR/价差: {gcfg.get('auto_tune_group_step_rr') or gcfg.get('auto_tune_step_rr', 'N/A')} / "
-                            f"{gcfg.get('auto_tune_group_step_spread_bps') or gcfg.get('auto_tune_step_spread_bps', 'N/A')}\n"
-                        )
-                        response += (
-                            f"分组冷却(s): {gcfg.get('auto_tune_cooldown_seconds', 'N/A')} | "
-                            f"最小RR变动: {gcfg.get('auto_tune_min_rr_delta', 'N/A')} | "
-                            f"最小价差变动(bps): {gcfg.get('auto_tune_min_spread_delta_bps', 'N/A')}\n"
-                        )
-                        response += (
-                            f"SLTP学习: {'开启' if gcfg.get('auto_tune_sltp_params', True) else '关闭'} | "
-                            f"SLTP冷却(s): {gcfg.get('auto_tune_sltp_cooldown_seconds', 'N/A')} | "
-                            f"tighten/extend步长: {gcfg.get('auto_tune_sltp_step_tighten', 'N/A')}/{gcfg.get('auto_tune_sltp_step_extend', 'N/A')}\n"
-                        )
-                    if gprof:
-                        response += (
-                            f"当前档位: {gprof.get('profile', 'normal')} | "
-                            f"分组: {gprof.get('symbol_group', 'DEFAULT')} | "
-                            f"时段: {gprof.get('session_group', 'N/A')} | "
-                            f"ATR占比(1H): {float(gprof.get('atr_pct_1h', 0) or 0):.3%} | "
-                            f"生效RR: {gprof.get('effective_min_rr', 'N/A')}\n"
-                        )
-                    if gmap:
-                        response += f"分组学习覆盖: {len(gmap)} 组\n"
-                    if gstats:
-                        response += (
-                            f"门控统计: 质量拦截={gstats.get('data_quality_guard_hold', 0)}, "
-                            f"RR拒绝={gstats.get('rr_rejected', 0)}, "
-                            f"价差拒绝={gstats.get('spread_rejected', 0)}, "
-                            f"失衡拒绝={gstats.get('depth_imbalance_rejected', 0)}\n"
-                        )
-                
-                response += f"\n【用户规则】"
-                response += f"\n黑名单: {self.blacklist if self.blacklist else '无'}"
-                response += f"\n交易授权: {'已授权' if self.authorization.get('full_authorization') else '未授权'}"
-                
+                    status_payload["ai_core"]["execution_guards"] = {
+                        "config": gcfg,
+                        "adaptive_profile": gprof,
+                        "global_last_tuned_at": g_global_at,
+                        "stats": gstats,
+                    }
+
+                status_payload["user_rules"] = {
+                    "blacklist_empty": not bool(self.blacklist),
+                    "full_authorization": bool(self.authorization.get("full_authorization")),
+                }
+
                 # 获取持仓
                 if hasattr(mc, 'okx_exchange') and mc.okx_exchange:
                     try:
                         positions = await mc.okx_exchange.get_positions()
                         if positions:
-                            response += f"\n\n【当前持仓】"
                             for pos in positions[:5]:
                                 symbol = pos.get('instId', pos.get('symbol', 'Unknown'))
                                 side = pos.get('posSide', pos.get('side', 'unknown'))
                                 size = pos.get('pos', pos.get('size', 0))
-                                side_zh = {"long": "做多", "short": "做空"}.get(str(side).lower(), str(side))
-                                response += f"\n  {symbol}: {side_zh} {size}"
+                                status_payload["positions"].append(
+                                    {"symbol": symbol, "side": str(side), "size": size}
+                                )
                     except Exception as e:
                         logger.debug(f"查询持仓信息失败: {e}")
-                
-                return {"success": True, "response": response, "data": modules}
+
+                if self.llm_integration:
+                    bundle = (getattr(self, "_workspace_startup_bundle", None) or "").strip()
+                    persona_hint = (
+                        f"\n【人格与画像节选】\n{bundle[:2500]}\n"
+                        if bundle
+                        else ""
+                    )
+                    free_prompt = f"""{persona_hint}
+【司令部宪章 · 原则锚点】
+{CHARTER}
+
+下面是当前系统状态（JSON，事实以这里为准）：
+{json.dumps(status_payload, ensure_ascii=False)}
+
+用符合「人格与画像」的口吻、像真人一样说；别按表格机械念。挑最重要几点说清；有矛盾就点出来；最后最多问一句接下来你最关心啥。
+"""
+                    try:
+                        llm_resp = await self.llm_integration.generate(
+                            free_prompt,
+                            is_user_input=False,
+                        )
+                        if llm_resp and getattr(llm_resp, "content", None):
+                            return {"success": True, "response": llm_resp.content, "data": status_payload}
+                    except Exception as e:
+                        logger.debug(f"系统状态自然化生成失败，降级简答: {e}")
+
+                ok_count = sum(1 for _k, v in modules.items() if v)
+                fallback = f"司令部在线。当前核心模块就绪 {ok_count}/{len(modules)}。如果你愿意，我现在直接盯你最关心的一件事（比如持仓风险或为什么没开仓）。"
+                return {"success": True, "response": fallback, "data": status_payload}
             
             return {"success": False, "response": "主控制器未初始化"}
             
@@ -1637,22 +1984,23 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         """通用对话 - 带用户规则上下文"""
         try:
             if self.llm_integration:
-                system_context = await self._get_system_context()
-                task_mem = ""
-                if self.unified_memory:
-                    try:
-                        task_mem = await format_task_memory_block(
-                            self.unified_memory,
-                            intent_action,
-                            user_input=user_input,
-                            config_manager=getattr(self.main_controller, "config_manager", None)
-                            if self.main_controller
-                            else None,
-                        )
-                    except Exception as e:
-                        logger.debug(f"任务记忆片段注入跳过: {e}")
-                
-                prompt = f"""{user_rules}
+                use_work_context = bool(intent_action and intent_action != "chat")
+                if use_work_context:
+                    system_context = await self._get_system_context()
+                    task_mem = ""
+                    if self.unified_memory:
+                        try:
+                            task_mem = await format_task_memory_block(
+                                self.unified_memory,
+                                intent_action,
+                                user_input=user_input,
+                                config_manager=getattr(self.main_controller, "config_manager", None)
+                                if self.main_controller
+                                else None,
+                            )
+                        except Exception as e:
+                            logger.debug(f"任务记忆片段注入跳过: {e}")
+                    prompt = f"""{user_rules}
 
 {CONTEXT_FRAMING_FOR_CHAT}
 
@@ -1661,7 +2009,17 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
 
 用户消息：{user_input}
 
-请按宪章与上文自然回复；闲聊不必硬贴数据，涉及盘面与仓位时以数据为准。"""
+按上面「人格与画像」与宪章自然说人话；涉及盘面/仓位时只信上文里给的数据，没有就承认没有，别编。
+若本回复没有出现「接口/系统」给出的具体数字，就不要写任何价位或区间。"""
+                else:
+                    prompt = f"""{user_rules}
+
+{CONTEXT_FRAMING_FOR_CHAT}
+
+用户消息：{user_input}
+
+按「人格与画像」与宪章像真人一样说话：有温度、有判断；话题可以很宽。不必套模板、不必列条。没把握就说没把握。
+若本回复没有附带系统接口返回的价位，就不要编造价格或「外部联网」假查询。"""
 
                 response = await self.llm_integration.generate(
                     prompt,
@@ -1669,14 +2027,14 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     conversation_scope=conversation_scope,
                     memory_channel=memory_channel,
                 )
-                
+
                 if response:
                     return {
                         "success": True,
                         "response": response.content,
                         "timestamp": datetime.now().isoformat()
                     }
-            
+
             return {"success": False, "response": "AI服务暂时不可用"}
             
         except Exception as e:
@@ -2024,6 +2382,10 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         if alias == "strategy_optimize":
             return await self._optimize_strategy(params, user_input)
         if alias == "trade_force_open":
+            if self._is_commander_unrestricted():
+                p = dict(params or {})
+                p.setdefault("force", True)
+                return await self._execute_trade(p, user_input or "强制开仓", user_rules)
             b = self._get_workspace_boundaries()
             hph = effective_high_risk_phrases(b)
             if not any(k in (user_input or "") for k in hph):
@@ -2038,6 +2400,10 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
             p.setdefault("force", True)
             return await self._execute_trade(p, user_input or "强制开仓", user_rules)
         if alias == "trade_force_close":
+            if self._is_commander_unrestricted():
+                p = dict(params or {})
+                p.setdefault("force_close", True)
+                return await self._execute_trade(p, user_input or "强制平仓", user_rules)
             b = self._get_workspace_boundaries()
             hph = effective_high_risk_phrases(b)
             if not any(k in (user_input or "") for k in hph):
@@ -2062,6 +2428,14 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                 "response": "已执行每日复盘总结并写入记忆" if ok else "每日复盘总结执行失败",
                 "timestamp": datetime.now().isoformat(),
             }
+        if alias == "plugin_list":
+            return await self._plugin_list()
+        if alias == "plugin_reload":
+            return await self._plugin_reload(params)
+        if alias == "plugin_load":
+            return await self._plugin_load(params)
+        if alias == "plugin_unload":
+            return await self._plugin_unload(params)
         return None
 
     async def _run_system_inspection(self) -> Dict[str, Any]:
@@ -2139,6 +2513,80 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         except Exception as e:
             return {"success": False, "response": f"系统巡检失败: {e}"}
 
+    async def _plugin_list(self) -> Dict[str, Any]:
+        mc = self.main_controller
+        if not mc:
+            return {"success": False, "response": "主控制器不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            info = mc.get_all_plugin_info() if hasattr(mc, "get_all_plugin_info") else {}
+            items = []
+            for name, meta in (info or {}).items():
+                if isinstance(meta, dict):
+                    items.append(
+                        f"- {name}: enabled={meta.get('enabled')} version={meta.get('version', '')} desc={meta.get('description', '')}"
+                    )
+                else:
+                    items.append(f"- {name}")
+            txt = "插件列表：\n" + ("\n".join(items) if items else "（当前无已加载插件）")
+            return {"success": True, "response": txt, "data": {"plugins": info}, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "response": f"读取插件列表失败: {e}", "timestamp": datetime.now().isoformat()}
+
+    async def _plugin_reload(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mc = self.main_controller
+        name = str((params or {}).get("plugin_name") or (params or {}).get("name") or "").strip()
+        if not mc or not name:
+            return {"success": False, "response": "需要 plugin_name", "timestamp": datetime.now().isoformat()}
+        try:
+            ok = await mc.reload_plugin(name) if hasattr(mc, "reload_plugin") else False
+            return {
+                "success": bool(ok),
+                "response": f"插件重载{'成功' if ok else '失败'}: {name}",
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "response": f"插件重载失败: {e}", "timestamp": datetime.now().isoformat()}
+
+    async def _plugin_unload(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mc = self.main_controller
+        name = str((params or {}).get("plugin_name") or (params or {}).get("name") or "").strip()
+        if not mc or not name:
+            return {"success": False, "response": "需要 plugin_name", "timestamp": datetime.now().isoformat()}
+        try:
+            ok = await mc.unload_plugin(name) if hasattr(mc, "unload_plugin") else False
+            return {
+                "success": bool(ok),
+                "response": f"插件卸载{'成功' if ok else '失败'}: {name}",
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "response": f"插件卸载失败: {e}", "timestamp": datetime.now().isoformat()}
+
+    async def _plugin_load(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mc = self.main_controller
+        if not mc:
+            return {"success": False, "response": "主控制器不可用", "timestamp": datetime.now().isoformat()}
+        name = str((params or {}).get("plugin_name") or (params or {}).get("name") or "").strip()
+        cfg = (params or {}).get("plugin_config") or (params or {}).get("config") or {}
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except Exception:
+                cfg = {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if not name:
+            return {"success": False, "response": "需要 plugin_name", "timestamp": datetime.now().isoformat()}
+        try:
+            ok = await mc.load_plugin(name, cfg) if hasattr(mc, "load_plugin") else False
+            return {
+                "success": bool(ok),
+                "response": f"插件加载{'成功' if ok else '失败'}: {name}",
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "response": f"插件加载失败: {e}", "timestamp": datetime.now().isoformat()}
+
     async def _get_sltp_status(self) -> Dict[str, Any]:
         mc = self.main_controller
         if not mc or not hasattr(mc, "stop_loss_manager") or not mc.stop_loss_manager:
@@ -2161,6 +2609,9 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
     
     async def start_autonomous_work(self) -> None:
         """启动自主工作循环"""
+        if self._is_minimal_free_mode():
+            logger.info("极简自由模式开启：跳过自主工作循环")
+            return
         if self._autonomous_running:
             return
         

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,23 +19,12 @@ logger = logging.getLogger(__name__)
 
 # --- 启动期：只读 workspace 人格/职责文件（顺序 meaningful）---
 DEFAULT_STARTUP_WORKSPACE_FILES: Tuple[str, ...] = (
-    "IDENTITY.md",
-    "SOUL.md",
-    "INSTRUCTIONS.md",
-    "TRADING.md",
-    "USER.md",
-    "LESSONS_ESSENCE.md",
+    "COMMANDER_PROFILE.md",
 )
 
 # 运行期允许通过 API/网关读写的治理文件（与 MemoryGateway.ALLOWED 对齐）
 GOVERNANCE_WORKSPACE_FILES: Tuple[str, ...] = (
-    "SOUL.md",
-    "IDENTITY.md",
-    "USER.md",
-    "INSTRUCTIONS.md",
-    "TRADING.md",
-    "MEMORY.md",
-    "LESSONS_ESSENCE.md",
+    "COMMANDER_PROFILE.md",
 )
 
 # 默认对话注入（可被 memory.context_policy 覆盖）
@@ -192,11 +182,39 @@ def load_startup_workspace_bundle(
         parts.append(block)
         used += len(block)
     if not parts:
-        return ""
-    return (
-        "【Workspace 人格与职责摘要（启动加载，勿当实时行情）】\n"
+        base = ""
+    else:
+        base = (
+        "【Workspace 人格与职责摘要（启动时读入；叙述型偏好，非实时行情数字）】\n"
         + "\n\n".join(parts)
-    )
+        )
+
+    # Also include short daily memory snippets (today + yesterday), mirroring
+    # the reference system's startup behavior without turning it into rigid rules.
+    daily_parts: List[str] = []
+    daily_dir = workspace_path / "memory" / "daily"
+    if daily_dir.is_dir():
+        for d in (0, 1):
+            date_key = (datetime.now() - timedelta(days=d)).strftime("%Y-%m-%d")
+            p = daily_dir / f"{date_key}.md"
+            if not p.is_file():
+                continue
+            try:
+                raw = p.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            snippet = raw[-1400:] if len(raw) > 1400 else raw
+            daily_parts.append(f"### daily/{date_key}.md\n{snippet}")
+
+    if daily_parts:
+        daily_block = "【近期日记忆片段（today+yesterday）】\n" + "\n\n".join(daily_parts)
+        if base:
+            return (base + "\n\n" + daily_block).strip()
+        return daily_block
+
+    return base
 
 
 def task_memory_config(intent_action: str, config_manager: Any = None) -> Optional[Dict[str, Any]]:

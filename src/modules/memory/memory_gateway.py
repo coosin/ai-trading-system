@@ -58,15 +58,8 @@ class MemoryGateway:
     """
 
     DEFAULT_SCOPE = "global"
-    ALLOWED_WORKSPACE_FILES = {
-        "SOUL.md",
-        "IDENTITY.md",
-        "USER.md",
-        "INSTRUCTIONS.md",
-        "TRADING.md",
-        "MEMORY.md",
-        "LESSONS_ESSENCE.md",
-    }
+    ALLOWED_WORKSPACE_FILES = {"COMMANDER_PROFILE.md"}
+    ENV_ALLOW_ALL_WORKSPACE_FILES = "OPENCLAW_COMMANDER_ALLOW_ALL_WORKSPACE_FILES"
 
     def __init__(
         self,
@@ -135,7 +128,7 @@ class MemoryGateway:
             return exist
         mapped_category = self._map_category(category)
         mapped_layer = self._map_layer(category)
-        return await self.memory_backend.remember(
+        memory_id = await self.memory_backend.remember(
             content=content,
             category=mapped_category,
             layer=mapped_layer,
@@ -143,6 +136,48 @@ class MemoryGateway:
             tags={f"scope:{md['scope']}", f"cat:{category}"},
             metadata=md,
         )
+        # Lightweight markdown journaling (OpenClaw-style):
+        # keep a human-readable daily trail alongside structured memory.
+        try:
+            self._append_daily_markdown_entry(
+                content=content,
+                category=str(category),
+                importance=float(importance),
+                metadata=md,
+            )
+        except Exception as e:
+            logger.debug(f"append daily markdown skipped: {e}")
+        return memory_id
+
+    def _append_daily_markdown_entry(
+        self,
+        *,
+        content: str,
+        category: str,
+        importance: float,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        text = str(content or "").strip()
+        if len(text) < 2:
+            return
+        now = datetime.now()
+        daily_dir = self.workspace_path / "memory" / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        daily_path = daily_dir / f"{now.strftime('%Y-%m-%d')}.md"
+        scope = str((metadata or {}).get("scope", self.DEFAULT_SCOPE))
+        line = (
+            f"- {now.strftime('%H:%M:%S')} | cat={category} | scope={scope} "
+            f"| imp={float(importance):.2f} | {text[:500]}\n"
+        )
+        if not daily_path.exists():
+            header = (
+                f"# Daily Memory {now.strftime('%Y-%m-%d')}\n\n"
+                "Auto-generated journal from MemoryGateway.store.\n\n"
+            )
+            daily_path.write_text(header + line, encoding="utf-8")
+            return
+        with daily_path.open("a", encoding="utf-8") as f:
+            f.write(line)
 
     async def recall(
         self,
@@ -506,11 +541,75 @@ class MemoryGateway:
         ]
         return "\n".join(lines)
 
+    # ---------- hierarchical/unified legacy compatibility ----------
+    async def save_daily_memory(self, content: str) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        await self.store(
+            content=content or "",
+            category="daily_summary",
+            importance=0.6,
+            metadata={"kind": "daily_summary", "date": today, "source": "memory_gateway"},
+        )
+
+    async def load_recent_memories(self, days: int = 2) -> List[str]:
+        cutoff = datetime.now() - timedelta(days=max(1, int(days or 1)))
+        entries = await self.memory_backend.recall(
+            query="",
+            category=MemoryCategory.DAILY_SUMMARY,
+            limit=max(8, int(days or 2) * 8),
+        )
+        out: List[str] = []
+        for e in sorted(entries, key=lambda x: x.created_at, reverse=True):
+            try:
+                if e.created_at >= cutoff:
+                    txt = str(getattr(e, "content", "") or "").strip()
+                    if txt:
+                        out.append(txt)
+            except Exception:
+                continue
+        return out
+
+    async def save_lesson_learned(self, lesson_type: str, lesson: str, context: str) -> None:
+        payload = f"[{lesson_type}] {lesson}\n上下文: {context}".strip()
+        await self.store(
+            content=payload,
+            category="lesson_learned",
+            importance=0.75,
+            metadata={"lesson_type": lesson_type, "context": context, "source": "memory_gateway"},
+        )
+
+    async def consolidate_memories(self) -> None:
+        if hasattr(self.memory_backend, "cleanup_expired"):
+            try:
+                await self.memory_backend.cleanup_expired()
+            except Exception:
+                pass
+
     def get_workspace_memory(self, filename: Optional[str] = None) -> Dict[str, str]:
-        files = [filename] if filename else sorted(self.ALLOWED_WORKSPACE_FILES)
+        allow_all = False
+        try:
+            env = __import__("os").environ
+            v = str((env.get(self.ENV_ALLOW_ALL_WORKSPACE_FILES, "") or "")).strip()
+            unrestricted = str((env.get("OPENCLAW_COMMANDER_UNRESTRICTED", "1") or "")).strip().lower() not in {
+                "0", "false", "no", "off"
+            }
+            allow_all = (v in {
+                "1",
+                "true",
+                "True",
+                "yes",
+                "YES",
+            }) or unrestricted
+        except Exception:
+            allow_all = False
+
+        if allow_all:
+            files = [filename] if filename else sorted([p.name for p in self.workspace_path.glob("*.md")])
+        else:
+            files = [filename] if filename else sorted(self.ALLOWED_WORKSPACE_FILES)
         result: Dict[str, str] = {}
         for name in files:
-            if name not in self.ALLOWED_WORKSPACE_FILES:
+            if not allow_all and name not in self.ALLOWED_WORKSPACE_FILES:
                 continue
             path = self.workspace_path / name
             if path.exists():
@@ -521,7 +620,23 @@ class MemoryGateway:
         return result
 
     async def update_workspace_memory(self, filename: str, content: str, notify_user: bool = True) -> bool:
-        if filename not in self.ALLOWED_WORKSPACE_FILES:
+        allow_all = False
+        try:
+            env = __import__("os").environ
+            v = str((env.get(self.ENV_ALLOW_ALL_WORKSPACE_FILES, "") or "")).strip()
+            unrestricted = str((env.get("OPENCLAW_COMMANDER_UNRESTRICTED", "1") or "")).strip().lower() not in {
+                "0", "false", "no", "off"
+            }
+            allow_all = (v in {
+                "1",
+                "true",
+                "True",
+                "yes",
+                "YES",
+            }) or unrestricted
+        except Exception:
+            allow_all = False
+        if not allow_all and filename not in self.ALLOWED_WORKSPACE_FILES:
             return False
         try:
             path = self.workspace_path / filename

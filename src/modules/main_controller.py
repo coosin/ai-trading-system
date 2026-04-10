@@ -13,6 +13,7 @@
 import asyncio
 import json
 import logging
+import os
 import traceback
 import uuid
 import pandas as pd
@@ -81,7 +82,6 @@ from src.modules.core.dynamic_symbol_selector import (
 )
 
 # 导入智能系统组件
-from src.modules.core.hierarchical_memory import HierarchicalMemoryManager
 from src.modules.skills import (
     SkillManager,
     SystemDiagnosisSkill,
@@ -109,6 +109,7 @@ from src.modules.core.smart_notification import SmartNotificationSystem
 # 导入统一信息收集分析管理器
 from src.modules.data.unified_info_collector import UnifiedInfoCollector, InfoCollectorConfig
 from src.modules.memory.memory_gateway import MemoryGateway
+from src.modules.commander_agent import CommanderAgentRuntime, commander_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -402,6 +403,10 @@ class MainController:
     def get_memory_gateway(self):
         return getattr(self, "memory_gateway", None)
 
+    def get_commander_capabilities(self) -> Dict[str, Any]:
+        """司令部能力清单（委托 commander_agent.runtime，与 OpenClaw 回路/子智能体说明对齐）。"""
+        return commander_capabilities(self)
+
     async def get_primary_ai_brain(self):
         """Return the current primary AI brain controller instance."""
         policy = await self._get_ai_brain_policy()
@@ -418,93 +423,14 @@ class MainController:
 
     async def process_user_command(self, command: str, source: str = "system") -> Dict[str, Any]:
         """
-        Unified communication entrypoint.
+        Unified communication entrypoint — 委托 `CommanderAgentRuntime`（OpenClaw agent-loop 阶段对齐）。
 
-        重要：必须先走「指令执行器」再回退核心大脑。
-        若先走 ai_core.process_user_command，其内部多为纯 LLM 闲聊，会永远 return，
-        导致策略/交易/分析等真实执行链路（AICommandExecutor）从未被调用。
+        重要：主链路须先走「指令执行器」再回退核心大脑；显式子智能体见
+        `/司令部子任务:<id>:<正文>`（如 research / chat / executor）。
         """
-        # Always capture the incoming message as conversation memory (scope by channel).
-        if getattr(self, "memory_gateway", None):
-            try:
-                await self.memory_gateway.add_memory(
-                    memory_type="conversation",
-                    content=f"[user@{source}] {command}",
-                    metadata={"scope": f"channel:{source}", "role": "user"},
-                    source_module="main_controller",
-                    importance=0.35,
-                    tags=["conversation"],
-                )
-            except Exception:
-                pass
-
-        # Build a recency-first short context block for primary brain to reduce
-        # "immediate amnesia" when semantic retrieval misses.
-        command_with_context = command
-        if getattr(self, "memory_gateway", None):
-            try:
-                recent = await self.memory_gateway.recent_conversation(scope=f"channel:{source}", limit=6)
-                if recent:
-                    ctx = "\n".join([f"- {m.content}" for m in recent[-4:]])
-                    command_with_context = f"{command}\n\n[最近对话上下文]\n{ctx}"
-            except Exception:
-                command_with_context = command
-
-        async def _store_assistant_reply(result_dict: Dict[str, Any]) -> None:
-            if not getattr(self, "memory_gateway", None) or not isinstance(result_dict, dict):
-                return
-            try:
-                resp_text = result_dict.get("response") or result_dict.get("message") or ""
-                if not resp_text:
-                    return
-                src = str(result_dict.get("source") or "assistant")
-                await self.memory_gateway.add_memory(
-                    memory_type="conversation",
-                    content=f"[assistant@{src}] {resp_text}",
-                    metadata={"scope": f"channel:{source}", "role": "assistant"},
-                    source_module="main_controller",
-                    importance=0.35,
-                    tags=["conversation"],
-                )
-            except Exception:
-                pass
-
-        # 1) 优先：意图解析 + 可执行动作（交易/策略/行情/持仓等）
-        if getattr(self, "ai_command_executor", None):
-            try:
-                result = await self.ai_command_executor.process_input(command, source=source)
-                if isinstance(result, dict):
-                    result.setdefault("source", "ai_command_executor")
-                    await _store_assistant_reply(result)
-                    return result
-                return {"success": True, "response": str(result), "source": "ai_command_executor"}
-            except Exception as e:
-                logger.error(f"指令执行器处理失败(source={source}): {e}")
-
-        # 2) 回退：核心大脑（纯对话/状态拼装，易「只说不做」——仅作补充）
-        brain = await self.get_primary_ai_brain()
-        if brain and hasattr(brain, "process_user_command"):
-            try:
-                result = await brain.process_user_command(command_with_context)
-                if isinstance(result, dict):
-                    result.setdefault("source", getattr(brain, "__class__", type(brain)).__name__)
-                    await _store_assistant_reply(result)
-                    return result
-                return {"success": True, "response": str(result)}
-            except Exception as e:
-                logger.error(f"核心大脑处理失败(source={source}): {e}")
-
-        if getattr(self, "natural_language_interface", None):
-            result = await self.natural_language_interface.process_and_respond(command, {"source": source})
-            if isinstance(result, dict):
-                result.setdefault("source", "natural_language_interface")
-                await _store_assistant_reply(result)
-                return result
-            out = {"success": True, "response": str(result), "source": "natural_language_interface"}
-            await _store_assistant_reply(out)
-            return out
-
-        return {"success": False, "response": "核心大脑未就绪", "source": "none"}
+        if not hasattr(self, "_commander_agent_runtime"):
+            self._commander_agent_runtime = CommanderAgentRuntime()
+        return await self._commander_agent_runtime.run(self, command, source=source)
 
     def _deep_merge_dict(self, base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(base or {})
@@ -645,8 +571,8 @@ class MainController:
         self.enhanced_llm_manager = EnhancedLLMManager()
         await self.enhanced_llm_manager.initialize(llm_config)
         
-        # 初始化统一记忆系统（整合所有记忆功能）
-        from src.modules.core.unified_memory_system import UnifiedMemorySystem
+        # 初始化唯一记忆后端（OptimizedMemorySystem）
+        from src.modules.core.optimized_memory_system import get_memory_system
         import os
 
         # Prefer centralized config paths; fallback to env/default.
@@ -658,22 +584,22 @@ class MainController:
 
         workspace_path = cfg_workspace_path or os.environ.get("WORKSPACE_PATH", "/app/workspace")
         
-        self.unified_memory = UnifiedMemorySystem(workspace_path=workspace_path)
-        await self.unified_memory.initialize()
-        logger.info("✅ 统一记忆系统初始化完成")
+        optimized_memory = await get_memory_system(workspace_path=workspace_path)
+        logger.info("✅ 优化记忆系统初始化完成（唯一后端）")
 
         # 统一记忆网关（单入口）：结构化记忆可召回，workspace markdown 作为日志层
         self.memory_gateway = await MemoryGateway.create(
-            memory_backend=self.unified_memory.get_ai_memory(),
+            memory_backend=optimized_memory,
             workspace_path=workspace_path,
             config_manager=self.config_manager,
         )
 
-        # 保留现有接口名称，实际指向统一网关
+        # 保留现有接口名称，统一指向 MemoryGateway（唯一入口）
+        self.unified_memory = self.memory_gateway
         self.ai_memory_manager = self.memory_gateway
-        self.hierarchical_memory = self.unified_memory.get_hierarchical_memory()
-        self.memory_optimizer = self.unified_memory.get_memory_optimizer()
-        logger.info("✅ 记忆系统接口已统一到MemoryGateway（向后兼容）")
+        self.hierarchical_memory = self.memory_gateway
+        self.memory_optimizer = optimized_memory
+        logger.info("✅ 记忆系统已统一：MemoryGateway + OptimizedMemorySystem")
         
         # 初始化统一交易历史服务（新增）
         try:
@@ -1096,6 +1022,32 @@ class MainController:
             logger.warning(f"⚠️ 统一数据源中心初始化失败: {e}")
             self.data_source_hub = None
 
+        # 初始化第三方数据集成器（社交/新闻/恐慌贪婪等）
+        try:
+            from src.modules.data.third_party_data_integrator import ThirdPartyDataIntegrator
+            self.third_party_data_integrator = ThirdPartyDataIntegrator()
+            logger.info("✅ 第三方数据集成器已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ 第三方数据集成器初始化失败: {e}")
+            self.third_party_data_integrator = None
+
+        # 初始化外部数据集成（多源冗余/健康报告；供主动性系统与司令部引用）
+        try:
+            from src.modules.data.data_integration import DataIntegration
+            self.data_integration = DataIntegration(
+                config={},
+                third_party_integrator=getattr(self, "third_party_data_integrator", None),
+            )
+            # Best-effort: no required sources, but allow future registration.
+            try:
+                await self.data_integration.initialize_all()
+            except Exception:
+                pass
+            logger.info("✅ DataIntegration 已初始化")
+        except Exception as e:
+            logger.warning(f"⚠️ DataIntegration 初始化失败: {e}")
+            self.data_integration = None
+
         # 初始化市场情报汇总引擎（只读：汇总行情/信号，供 ai_core/风控/前端复用）
         try:
             from src.modules.core.market_intelligence_engine import MarketIntelligenceEngine
@@ -1108,10 +1060,13 @@ class MainController:
             self.market_intelligence = MarketIntelligenceEngine(self, mi_cfg)
             await self.market_intelligence.initialize()
             await self.market_intelligence.start()
+            # Alias for callers expecting market_intelligence_engine name.
+            self.market_intelligence_engine = self.market_intelligence
             logger.info("✅ MarketIntelligenceEngine 已启动")
         except Exception as e:
             logger.warning("⚠️ MarketIntelligenceEngine 初始化失败: %s", e)
             self.market_intelligence = None
+            self.market_intelligence_engine = None
         
         # 初始化缓存管理器
         try:
@@ -4978,7 +4933,7 @@ async def example_usage():
         controller.register_module("data_pipeline", MockModule())
         controller.register_module("cache_manager", MockModule(), dependencies=["data_pipeline"])
         controller.register_module(
-            "trade_engine", MockModule(), dependencies=["data_pipeline", "cache_manager"]
+            "trading_execution", MockModule(), dependencies=["data_pipeline", "cache_manager"]
         )
 
         # 注册事件处理器

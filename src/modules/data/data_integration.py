@@ -214,10 +214,12 @@ class CoinGeckoDataSource(DataSourceBase):
 class DataIntegration:
     """数据集成器"""
     
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, config: Optional[Dict] = None, third_party_integrator: Any = None):
         self.config = config or {}
         self._sources: Dict[str, DataSourceBase] = {}
         self._source_health: Dict[str, Dict[str, Any]] = {}
+        # Optional bridge to ThirdPartyDataIntegrator for “news” style data.
+        self._third_party_integrator = third_party_integrator
     
     def register_source(self, name: str, source: DataSourceBase):
         """注册数据源"""
@@ -299,6 +301,50 @@ class DataIntegration:
             "healthy": len(degraded) == 0,
             "sources": self._source_health,
         }
+
+    async def get_crypto_news(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Compatibility API for ProactiveAIOrchestrator.
+        Returns a simplified list of news items (best-effort).
+        """
+        items: List[Dict[str, Any]] = []
+        tpi = self._third_party_integrator
+        if not tpi:
+            return items
+        # Try using NEWS provider directly to obtain articles.
+        try:
+            prov = getattr(tpi, "providers", {}) or {}
+            news_provider = None
+            # avoid importing DataSource Enum here; locate by value string
+            for k, v in prov.items():
+                if str(getattr(k, "value", k)).lower() in {"news", "cryptocompare", "cointelegraph"}:
+                    news_provider = v
+                    break
+            if not news_provider:
+                # fallback: tpi.get_news_sentiment exists but returns aggregated dict
+                if hasattr(tpi, "get_news_sentiment"):
+                    agg = await tpi.get_news_sentiment("BTC", hours=24)
+                    return [{"title": "news_sentiment", "data": agg}]
+                return items
+            data = await news_provider.fetch_data("BTC", limit=max(1, int(limit or 10)))
+            arts = (data or {}).get("articles") if isinstance(data, dict) else None
+            for a in (arts or [])[: max(1, int(limit or 10))]:
+                try:
+                    items.append(
+                        {
+                            "title": getattr(a, "title", "") or "",
+                            "source": getattr(a, "source", "") or "",
+                            "url": getattr(a, "url", "") or "",
+                            "timestamp": str(getattr(a, "timestamp", "") or ""),
+                            "sentiment": float(getattr(a, "sentiment", 0.0) or 0.0),
+                            "relevance": float(getattr(a, "relevance", 0.0) or 0.0),
+                        }
+                    )
+                except Exception:
+                    continue
+            return items
+        except Exception:
+            return items
     
     async def close_all(self):
         """关闭所有数据源"""

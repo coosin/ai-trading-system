@@ -25,6 +25,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+import httpx
+
 from src.modules.api.strategy_api import router as strategy_router
 from src.modules.core.enhanced_llm_manager import TaskType
 from src.modules.data.data_source_hub import DataSourceHub
@@ -316,6 +318,11 @@ class APIServer:
             "avg_response_time_ms": 0.0,
         }
 
+        # Uvicorn runtime handles (to keep API responsive even if the main event loop
+        # is temporarily busy during startup tasks).
+        self._uvicorn_server = None
+        self._uvicorn_thread = None
+
         # 任务和锁
         self._tasks: List[asyncio.Task] = []
         self._lock = asyncio.Lock()
@@ -443,6 +450,7 @@ class APIServer:
                 )
                 
                 server = uvicorn.Server(config)
+                self._uvicorn_server = server
                 
                 async def run_server():
                     try:
@@ -466,6 +474,23 @@ class APIServer:
                         return True
                     if server_task.done():
                         break
+
+                # Fallback: if the event loop is busy (startup tasks), serve in a daemon thread
+                # so /health and control plane stay responsive.
+                try:
+                    if not is_port_in_use(self.port):
+                        logger.warning("API端口未及时监听，启用线程模式启动以避免主循环阻塞")
+                        t = threading.Thread(target=server.run, daemon=True)
+                        t.start()
+                        self._uvicorn_thread = t
+                        for _ in range(30):
+                            await asyncio.sleep(0.2)
+                            if is_port_in_use(self.port):
+                                self._running = True
+                                logger.info(f"✅ API服务器已启动（线程模式），访问 http://{self.host}:{self.port}/docs 查看文档")
+                                return True
+                except Exception as e:
+                    logger.warning(f"线程模式启动API失败: {e}")
 
                 # 测试场景下，如果任务仍在运行也认为启动成功（端口探测可能受环境影响）
                 if not server_task.done():
@@ -496,6 +521,11 @@ class APIServer:
 
         try:
             self._running = False
+            try:
+                if self._uvicorn_server is not None:
+                    setattr(self._uvicorn_server, "should_exit", True)
+            except Exception:
+                pass
             await self.cleanup()
 
             logger.info("API服务器已停止")
@@ -1953,6 +1983,30 @@ class APIServer:
                 message = chat_data.get("message", "")
                 model_id = chat_data.get("model_id")
                 
+                def _safe_json(obj: Any, depth: int = 0) -> Any:
+                    """
+                    Make result.data JSON-serializable to avoid FastAPI encoder crashes.
+                    We intentionally keep it conservative: dict/list/primitive pass through,
+                    everything else becomes a short string.
+                    """
+                    if depth > 5:
+                        return str(obj)
+                    if obj is None or isinstance(obj, (str, int, float, bool)):
+                        return obj
+                    if isinstance(obj, dict):
+                        out: Dict[str, Any] = {}
+                        for k, v in obj.items():
+                            out[str(k)] = _safe_json(v, depth + 1)
+                        return out
+                    if isinstance(obj, (list, tuple, set)):
+                        return [_safe_json(x, depth + 1) for x in list(obj)]
+                    # asyncio.Future / coroutine / pydantic / dataclass etc.
+                    try:
+                        name = type(obj).__name__
+                        return f"<{name}> {str(obj)[:300]}"
+                    except Exception:
+                        return "<non-serializable>"
+                
                 if not message:
                     return {
                         "status": "error",
@@ -1971,7 +2025,7 @@ class APIServer:
                             "message": "AI响应成功",
                             "data": {
                                 "response": result.get("response", ""),
-                                "data": result.get("data"),
+                                "data": _safe_json(result.get("data")),
                                 "source": result.get("source", "core_brain_router")
                             },
                             "timestamp": datetime.now().isoformat()
@@ -1994,7 +2048,7 @@ class APIServer:
                             "message": "AI响应成功",
                             "data": {
                                 "response": result.get("response", ""),
-                                "data": result.get("data"),
+                                "data": _safe_json(result.get("data")),
                                 "source": "ai_command_executor"
                             },
                             "timestamp": datetime.now().isoformat()
@@ -2712,6 +2766,145 @@ class APIServer:
                 "data": history,
                 "timestamp": datetime.now().isoformat()
             }
+
+        # ------------------------------------------------------------
+        # Commander mirror: a 1:1 facade for the frontend API surface.
+        # It forwards /api/v1/commander/<path> → /api/v1/<path>.
+        #
+        # Design goal: keep existing modules and routes unchanged;
+        # Commander is “your management channel” (AI/TG) with the same
+        # read/control capabilities as the frontend, exposed under a
+        # dedicated namespace.
+        # ------------------------------------------------------------
+
+        def _filter_forward_headers(h: Dict[str, str]) -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            for k, v in (h or {}).items():
+                lk = str(k).lower()
+                if lk in ("host", "content-length", "connection", "keep-alive", "proxy-authenticate",
+                          "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"):
+                    continue
+                out[str(k)] = str(v)
+            return out
+
+        async def _forward_commander_request(request: Request, path: str) -> Response:
+            # Prevent accidental recursion
+            if str(path or "").lstrip("/").startswith("commander/"):
+                raise HTTPException(status_code=400, detail="invalid commander mirror path")
+
+            base = str(request.base_url).rstrip("/")
+            target_url = f"{base}/api/v1/{path.lstrip('/')}"
+            body = await request.body()
+            headers = _filter_forward_headers(dict(request.headers))
+            params = dict(request.query_params)
+            method = str(request.method or "GET").upper()
+
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    resp = await client.request(
+                        method=method,
+                        url=target_url,
+                        params=params,
+                        content=body if body else None,
+                        headers=headers,
+                    )
+            except httpx.RequestError as e:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "success": False,
+                        "message": f"司令部转发失败: {type(e).__name__}",
+                        "detail": str(e),
+                        "target": target_url,
+                        "timestamp": datetime.now().isoformat(),
+                    },
+                )
+
+            # Pass through content-type if present, otherwise default to JSON
+            content_type = resp.headers.get("content-type") or "application/json; charset=utf-8"
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                media_type=content_type.split(";")[0].strip() if content_type else None,
+                headers={"content-type": content_type} if content_type else None,
+            )
+
+        @api_v1_router.get("/commander/_audit", tags=["commander"])
+        async def commander_mirror_audit():
+            """
+            司令部镜像自检：验证镜像前缀是否可用，并对关键前端接口做轻量探测。
+            注意：不触发下单、不触发外部昂贵AI推理，仅做 HTTP 可达性检查。
+            """
+            base = "http://127.0.0.1"
+            # Prefer configured port if available
+            try:
+                port = int(getattr(self, "port", 8000) or 8000)
+            except Exception:
+                port = 8000
+            base = f"{base}:{port}/api/v1"
+
+            probes: List[Dict[str, Any]] = [
+                {"name": "system.status", "method": "GET", "path": "/system/status"},
+                {"name": "system.health", "method": "GET", "path": "/system/health"},
+                {"name": "market.symbols", "method": "GET", "path": "/market/symbols"},
+                {"name": "risk.metrics", "method": "GET", "path": "/risk/metrics"},
+                {"name": "control_center.state", "method": "GET", "path": "/control-center/state?limit=5"},
+                {"name": "modules.commander.audit", "method": "GET", "path": "/modules/commander/audit"},
+                {"name": "monitoring.logs", "method": "GET", "path": "/monitoring/logs?limit=5"},
+            ]
+            results: List[Dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                for p in probes:
+                    url = f"{base}{p['path']}"
+                    try:
+                        r = await client.request(p["method"], url)
+                        ok = r.status_code < 500
+                        results.append(
+                            {
+                                "name": p["name"],
+                                "status_code": r.status_code,
+                                "ok": ok,
+                                "hint": "" if ok else "server_error",
+                            }
+                        )
+                    except Exception as e:
+                        results.append(
+                            {
+                                "name": p["name"],
+                                "status_code": None,
+                                "ok": False,
+                                "hint": f"{type(e).__name__}",
+                            }
+                        )
+
+            return {
+                "success": True,
+                "mirror_prefix": "/api/v1/commander/<path>  ->  /api/v1/<path>",
+                "example": {
+                    "frontend_call": "/api/v1/market/symbols",
+                    "commander_call": "/api/v1/commander/market/symbols",
+                },
+                "probe_base": base,
+                "results": results,
+                "all_ok": all(x.get("ok") for x in results),
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        @api_v1_router.api_route(
+            "/commander",
+            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+            tags=["commander"],
+        )
+        async def commander_mirror_root(request: Request):
+            return await _forward_commander_request(request, "")
+
+        @api_v1_router.api_route(
+            "/commander/{path:path}",
+            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+            tags=["commander"],
+        )
+        async def commander_mirror(request: Request, path: str):
+            return await _forward_commander_request(request, path)
 
         # 添加API路由到应用
         api_router.include_router(api_v1_router)

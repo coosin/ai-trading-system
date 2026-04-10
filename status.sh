@@ -117,9 +117,7 @@ check_ws_file() {
 }
 
 echo "  交易系统工作空间 ($TRADING_WS):"
-check_ws_file "$TRADING_WS" "SOUL.md" "身份文件"
-check_ws_file "$TRADING_WS" "AGENTS.md" "工作空间配置"
-check_ws_file "$TRADING_WS" "TOOLS.md" "工具配置"
+check_ws_file "$TRADING_WS" "COMMANDER_PROFILE.md" "司令部唯一配置"
 check_ws_file "$TRADING_WS" "scripts/market_monitor.py" "市场监控脚本"
 
 echo ""

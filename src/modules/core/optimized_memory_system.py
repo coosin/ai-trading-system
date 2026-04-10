@@ -326,11 +326,7 @@ class OptimizedMemorySystem:
     async def _load_core_memories(self):
         """加载核心记忆（永久保留）"""
         core_files = [
-            ("IDENTITY.md", MemoryCategory.IDENTITY),
-            ("USER.md", MemoryCategory.USER_PREFERENCE),
-            ("TRADING.md", MemoryCategory.TRADING_RULE),
-            ("SOUL.md", MemoryCategory.IDENTITY),
-            ("INSTRUCTIONS.md", MemoryCategory.TRADING_RULE)
+            ("COMMANDER_PROFILE.md", MemoryCategory.IDENTITY),
         ]
         
         for filename, category in core_files:

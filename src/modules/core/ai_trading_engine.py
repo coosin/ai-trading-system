@@ -377,14 +377,8 @@ class AITradingEngine:
             logger.warning(f"⚠️ 自动恢复系统初始化失败: {e}")
             self.auto_recovery = None
         
-        # 初始化增强风险控制器
-        try:
-            from src.modules.core.enhanced_risk_controller import EnhancedRiskController
-            self.enhanced_risk = EnhancedRiskController()
-            logger.info("✅ 增强风险控制器已初始化")
-        except Exception as e:
-            logger.warning(f"⚠️ 增强风险控制器初始化失败: {e}")
-            self.enhanced_risk = None
+        # 增强风险控制器已退役（保留主风险链路: risk_manager + account_risk_monitor）
+        self.enhanced_risk = None
         
         # 加载配置
         if self.main_controller and self.main_controller.config_manager:
@@ -910,18 +904,7 @@ class AITradingEngine:
                 except Exception as e:
                     logger.warning(f"强化学习优化失败: {e}")
             
-            # 风险评估（增强版）
-            if hasattr(self, 'enhanced_risk') and self.enhanced_risk:
-                try:
-                    risk_assessment = await self.enhanced_risk.check_pre_trade_risk(
-                        symbol=symbol,
-                        action="buy",
-                        quantity=0,
-                        price=market_data["ticker"].get("last", 0)
-                    )
-                    analysis_data["enhanced_risk"] = risk_assessment
-                except Exception as e:
-                    logger.warning(f"增强风险评估失败: {e}")
+            # 风险评估（增强版）已退役，避免双风险链路造成重复判断
             
             # 使用AI进行深度分析
             ai_analysis = await self.llm_integration.analyze_market(analysis_data)

@@ -100,61 +100,55 @@ async def test_trade_history_service():
 
 
 async def test_memory_integration(service):
-    """测试2: 记忆系统集成"""
+    """测试2: 记忆系统集成（TradeHistoryService 所需最小记忆接口；已迁移离 HierarchicalMemoryManager）。"""
     print("\n" + "="*60)
     print("🧪 测试2: 记忆系统集成")
     print("="*60)
-    
+
+    class StubTradeMemory:
+        """实现 trade_history_service._sync_to_memory 所依赖的异步接口。"""
+
+        def __init__(self):
+            self._chunks: list = []
+
+        async def load_recent_memories(self, days=1):
+            return [self._chunks[-1]] if self._chunks else []
+
+        async def save_daily_memory(self, content: str):
+            self._chunks.append(content)
+
+        async def save_lesson_learned(self, **kwargs):
+            pass
+
     try:
-        from src.modules.core.hierarchical_memory import HierarchicalMemoryManager
-        
-        # 初始化记忆管理器
-        memory = HierarchicalMemoryManager(base_path="/tmp/test_memory")
-        
-        # 连接到服务
+        memory = StubTradeMemory()
         await service.set_memory_manager(memory)
-        print("✅ 记忆系统已连接到服务")
-        
-        # 测试保存开仓记录
-        await memory.save_trade_open(
-            symbol="SOL/USDT",
-            side="long",
-            price=150.0,
-            quantity=10.0,
-            reason="突破阻力位",
-            stop_loss=145.0,
-            take_profit=165.0,
-            strategy="趋势跟踪"
+        print("✅ 记忆 stub 已连接到服务")
+
+        ok = await service.record_trade_dict(
+            {
+                "trade_id": "mem_int_1",
+                "symbol": "SOL/USDT",
+                "side": "buy",
+                "order_type": "market",
+                "quantity": 10.0,
+                "price": 150.0,
+                "pnl": 10.0,
+                "reasoning": "记忆集成测试",
+                "strategy": "趋势跟踪",
+            }
         )
-        print("✅ 开仓记录已保存到记忆系统")
-        
-        # 测试保存平仓记录
-        await memory.save_trade_close(
-            symbol="SOL/USDT",
-            side="long",
-            open_price=150.0,
-            close_price=160.0,
-            quantity=10.0,
-            pnl=100.0,
-            pnl_percent=6.67,
-            reason="达到止盈目标"
-        )
-        print("✅ 平仓记录已保存到记忆系统")
-        
-        # 测试获取交易摘要
-        summary = await memory.get_trade_history_summary(days=1)
-        assert "SOL/USDT" in summary or "交易" in summary, "交易摘要生成失败"
-        print("✅ 交易历史摘要生成成功")
-        print(f"\n📝 摘要预览:\n{summary[:200]}...")
-        
-        # 测试为对话生成上下文
+        assert ok, "带记忆同步的记录应成功"
+        assert memory._chunks, "应写入每日记忆"
+        print("✅ 交易记录已触发记忆同步")
+
         context = await service.get_trade_context_for_conversation(limit=5)
         assert "最近交易概览" in context or "暂无" in context, "对话上下文生成失败"
         print("✅ 对话上下文生成成功")
-        
+
         print("\n✨ 测试2通过！记忆系统集成正常\n")
         return True
-        
+
     except Exception as e:
         print(f"\n❌ 测试2失败: {e}")
         import traceback

@@ -396,13 +396,12 @@ class TelegramBot:
     def _load_ai_commander_profile(self) -> str:
         """
         读取“司令部人格/边界/任务”记忆：
-        - 优先: workspace/memory/core/AI_COMMANDER_PROFILE.md
-        - 其次: /app/data/memory/core/AI_COMMANDER_PROFILE.md
+        - 优先: workspace/COMMANDER_PROFILE.md
+        - 其次: /app/workspace/COMMANDER_PROFILE.md
         """
         candidates = [
-            Path.cwd() / "workspace" / "memory" / "core" / "AI_COMMANDER_PROFILE.md",
-            Path("/app/data/memory/core/AI_COMMANDER_PROFILE.md"),
-            Path("/app/workspace/memory/core/AI_COMMANDER_PROFILE.md"),
+            Path.cwd() / "workspace" / "COMMANDER_PROFILE.md",
+            Path("/app/workspace/COMMANDER_PROFILE.md"),
         ]
         for p in candidates:
             try:
@@ -605,21 +604,34 @@ class TelegramBot:
                 "disable_web_page_preview": True
             }
             
-            # 不使用parse_mode，避免Markdown解析错误
+            # 支持 parse_mode（可选）。默认依然不启用，避免 Markdown 解析失败导致回传中断。
+            if response.parse_mode:
+                payload["parse_mode"] = response.parse_mode
             
             if response.reply_to_message_id:
                 payload["reply_to_message_id"] = response.reply_to_message_id
-            
-            async with self.session.post(url, json=payload, proxy=self.proxy) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("ok"):
-                        logger.info(f"✅ 消息已发送")
-                    else:
-                        logger.error(f"发送消息失败: {data}")
-                else:
-                    error_text = await resp.text()
-                    logger.error(f"发送消息失败: {resp.status} - {error_text}")
+
+            # 先用代理（若配置），失败则降级直连，避免 TG 回传“卡死”
+            for proxy in (self.proxy, None):
+                try:
+                    async with self.session.post(url, json=payload, proxy=proxy) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("ok"):
+                                logger.info("✅ 消息已发送")
+                                return
+                            logger.error(f"发送消息失败: {data}")
+                            return
+                        # 429/5xx：换线路再试
+                        if resp.status in (429, 500, 502, 503, 504):
+                            logger.warning(f"发送消息失败(resp={resp.status})，尝试切换 proxy={proxy}")
+                            continue
+                        error_text = await resp.text()
+                        logger.error(f"发送消息失败: {resp.status} - {error_text}")
+                        return
+                except Exception as e:
+                    logger.debug(f"发送消息异常(proxy={proxy}): {e}")
+                    continue
         except Exception as e:
             logger.error(f"发送单条消息失败: {e}")
 

@@ -2,7 +2,7 @@
 主控制器集成脚本 - 将新功能集成到主控制器
 
 这个脚本展示了如何在主控制器中集成：
-1. 层次化记忆管理器
+1. 统一记忆网关 MemoryGateway（替代已移除的 HierarchicalMemoryManager）
 2. 技能管理器
 3. 心跳监控器
 4. 智能通知系统
@@ -10,7 +10,7 @@
 
 # 在主控制器的导入部分添加：
 """
-from src.modules.core.hierarchical_memory import HierarchicalMemoryManager
+from src.modules.memory.memory_gateway import MemoryGateway
 from src.modules.skills import (
     SkillManager, 
     SystemDiagnosisSkill,
@@ -28,8 +28,8 @@ from src.modules.core.smart_notification import SmartNotificationSystem
 def __init__(self, config_manager=None):
     # ... 现有代码 ...
     
-    # 新增：智能系统组件
-    self.memory_manager = HierarchicalMemoryManager()
+    # 新增：智能系统组件（记忆请走 MemoryGateway / main_controller.memory_gateway）
+    self.memory_manager = None  # 或 MemoryGateway(...)
     self.skill_manager = SkillManager()
     self.smart_notification = SmartNotificationSystem(
         send_func=self._send_notification

@@ -211,14 +211,9 @@ class NaturalLanguageInterface:
     def _load_personality_files(self):
         personality_parts = []
         
-        # 合并为一套 system_prompt：顺序即优先级（越靠后越可覆盖语气）。
-        # AGENTS.md：工作空间规则/流程说明（与 IDENTITY 人设互补，非重复「第二套人格」）。
+        # 合并为一套 system_prompt：仅保留单一人格/规则入口。
         personality_files = [
-            "workspace/SOUL.md",
-            "workspace/IDENTITY.md",
-            "workspace/AGENTS.md",
-            "workspace/USER.md",
-            "workspace/TRADING.md",
+            "workspace/COMMANDER_PROFILE.md",
         ]
         
         cm = getattr(self, "config_manager", None)
