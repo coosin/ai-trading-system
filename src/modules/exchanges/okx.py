@@ -554,11 +554,18 @@ class OKXExchange(ExchangeBase):
             retry_delay = float(profile.get("retry_delay", 1.0) or 1.0)
             retry_backoff = float(profile.get("retry_backoff", 1.6) or 1.6)
             
-            proxy = getattr(self, '_proxy_url', None)
-            if proxy and not self._proxy_temporarily_disabled():
-                logger.debug(f"📤 使用代理: {proxy}")
+            # 强制走代理（交易 OKX 全链路）：在直连不稳定/被劫持环境里，任何漏网直连都会导致随机失败。
+            proxy = getattr(self, "_proxy_url", None)
+            if self._proxy_only:
+                if not proxy:
+                    raise RuntimeError("OPENCLAW_OKX_PROXY_ONLY=1 but proxy url is missing")
+                # proxy-only 模式下忽略临时禁用标志：不允许降级直连
+                logger.debug("📤 OKX(proxy-only) 使用代理: %s", proxy)
             else:
-                proxy = None
+                if proxy and not self._proxy_temporarily_disabled():
+                    logger.debug("📤 使用代理: %s", proxy)
+                else:
+                    proxy = None
             
             for attempt in range(max_retries + 1):
                 try:
