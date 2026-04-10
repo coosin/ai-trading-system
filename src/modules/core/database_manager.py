@@ -9,6 +9,8 @@
 5. 事务管理（原子性和一致性）
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json

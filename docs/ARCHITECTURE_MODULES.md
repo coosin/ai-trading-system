@@ -51,6 +51,13 @@
 - `GET /api/v1/modules/reserved/{domain}/ping` — 占位响应（`implemented: false`）。
 - 注册表中 `status: reserved` 的路径为后续实现预留，**勿依赖当前行为**。
 
+## 全量测试（全链路烟测）
+
+- **单元 + E2E**：在项目根执行 `./scripts/run_full_test_suite.sh`（创建 `.venv_test`、安装测试依赖、运行 `pytest tests/ --no-cov`）。
+- **E2E 范围**：`tests/e2e/test_api_surface_commander_chain.py` 覆盖 Surface 注册表、`commander/dispatch`、`commander/audit`、`s1/verify` 等 HTTP 链（Mock `MainController`，不连交易所）。
+- **覆盖率**：需要 HTML/终端覆盖率时，在已激活 venv 下执行  
+  `PYTEST_ADDOPTS='' python -m pytest tests/`（使用 `pyproject.toml` 默认 `--cov=src`）。
+
 ## 相关文档
 
 - 记忆库使用：`docs/memory/MEMORY_LIBRARY_GUIDE.md`

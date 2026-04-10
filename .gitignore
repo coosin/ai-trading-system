@@ -91,6 +91,7 @@ Desktop.ini
 
 # CI/local venv (not committed)
 .ci_venv/
+.venv_test/
 
 # Local reference clone (large; optional)
 _reference_openclaw/
