@@ -14,6 +14,7 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 from .timing_constants import SLEEP_2S, SLEEP_5S, SLEEP_10S, SLEEP_60S, SLEEP_1H
+from .stop_loss_take_profit import StopLossTakeProfitStatus
 from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
 
 
@@ -45,7 +46,9 @@ class ActiveTrader:
     1. 自动扫描市场寻找机会
     2. 真正调用交易所API执行交易
     3. 自动创建和运行策略
-    4. 实时监控持仓并执行止盈止损
+    4. 实时监控持仓（止盈止损优先由全局 StopLossTakeProfitManager 执行，避免与本模块重复平仓）
+
+    实盘下单：优先经 MainController.execution_gateway（source=system），与 S1 一致。
     """
     
     def __init__(self, main_controller=None):
@@ -444,29 +447,45 @@ class ActiveTrader:
             return False
         
         try:
-            leverage_set = await self.exchange.set_leverage(
-                symbol=opportunity.symbol.replace('/', '-'),
-                leverage=opportunity.leverage,
-                margin_mode=self.contract_config["margin_mode"]
-            )
-            logger.info(f"✅ 设置杠杆: {opportunity.leverage}x")
-            logger.info(f"📤 杠杆设置请求: symbol={opportunity.symbol}, leverage={opportunity.leverage}, margin_mode={self.contract_config['margin_mode']}")
-            logger.debug(f"📥 杠杆设置详情: {leverage_set}")
-            
-            if opportunity.side == "long":
-                order = await self.exchange.open_swap_position(
-                    symbol=opportunity.symbol.replace('/', '-'),
-                    side="long",
-                    size=opportunity.quantity,
-                    leverage=opportunity.leverage
+            gw = None
+            if self.main_controller:
+                gw = getattr(self.main_controller, "execution_gateway", None)
+
+            if gw:
+                order = await gw.open_swap(
+                    opportunity.symbol,
+                    opportunity.side,
+                    float(opportunity.quantity),
+                    int(opportunity.leverage),
+                    "system",
+                    f"active_trader:{opportunity.reason[:120]}",
+                    margin_mode=self.contract_config["margin_mode"],
+                    price=None,
                 )
             else:
-                order = await self.exchange.open_swap_position(
+                leverage_set = await self.exchange.set_leverage(
                     symbol=opportunity.symbol.replace('/', '-'),
-                    side="short",
-                    size=opportunity.quantity,
-                    leverage=opportunity.leverage
+                    leverage=opportunity.leverage,
+                    margin_mode=self.contract_config["margin_mode"]
                 )
+                logger.info(f"✅ 设置杠杆: {opportunity.leverage}x")
+                logger.info(f"📤 杠杆设置请求: symbol={opportunity.symbol}, leverage={opportunity.leverage}, margin_mode={self.contract_config['margin_mode']}")
+                logger.debug(f"📥 杠杆设置详情: {leverage_set}")
+
+                if opportunity.side == "long":
+                    order = await self.exchange.open_swap_position(
+                        symbol=opportunity.symbol.replace('/', '-'),
+                        side="long",
+                        size=opportunity.quantity,
+                        leverage=opportunity.leverage
+                    )
+                else:
+                    order = await self.exchange.open_swap_position(
+                        symbol=opportunity.symbol.replace('/', '-'),
+                        side="short",
+                        size=opportunity.quantity,
+                        leverage=opportunity.leverage
+                    )
             
             if order and order.get("success"):
                 logger.info(f"✅ 订单执行成功: {order.get('orderId', 'N/A')}")
@@ -552,6 +571,22 @@ class ActiveTrader:
                                     close_reason = "触发止盈"
                             
                             if should_close:
+                                slm = (
+                                    getattr(self.main_controller, "stop_loss_manager", None)
+                                    if self.main_controller
+                                    else None
+                                )
+                                if slm:
+                                    sl_o = await slm.get_order(symbol)
+                                    if (
+                                        sl_o is not None
+                                        and sl_o.status == StopLossTakeProfitStatus.ACTIVE
+                                    ):
+                                        logger.debug(
+                                            "ActiveTrader: %s 已有 StopLossTakeProfit 单，跳过本地止盈止损平仓",
+                                            symbol,
+                                        )
+                                        continue
                                 logger.info(f"🎯 {symbol} {close_reason}，执行平仓")
                                 await self._close_position(symbol, close_reason)
                 
@@ -571,15 +606,26 @@ class ActiveTrader:
         logger.info(f"🔒 平仓: {symbol} {pos_info['side']} - {reason}")
         
         try:
-            close_side = "sell" if pos_info["side"] == "long" else "buy"
+            gw = None
+            if self.main_controller:
+                gw = getattr(self.main_controller, "execution_gateway", None)
+
+            if gw:
+                order = await gw.close_swap(
+                    symbol,
+                    pos_info["side"],
+                    float(pos_info["quantity"]),
+                    "system",
+                    f"active_trader:{reason}",
+                )
+            else:
+                order = await self.exchange.close_swap_position(
+                    symbol=symbol.replace('/', '-'),
+                    side=pos_info["side"],
+                    size=pos_info["quantity"]
+                )
             
-            order = await self.exchange.close_swap_position(
-                symbol=symbol.replace('/', '-'),
-                side=pos_info["side"],
-                size=pos_info["quantity"]
-            )
-            
-            if order:
+            if order and (order.get("success") if isinstance(order, dict) else order):
                 logger.info(f"✅ 平仓成功: {order.get('orderId', 'N/A')}")
                 
                 del self.active_positions[symbol]

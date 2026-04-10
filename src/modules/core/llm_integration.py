@@ -25,46 +25,114 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+def _repair_loose_json(text: str) -> str:
+    """修复模型常见非标准 JSON：尾随逗号等。"""
+    if not text:
+        return text
+    t = text.strip()
+    # 连续应用以处理嵌套尾随逗号
+    for _ in range(4):
+        n = re.sub(r",\s*([}\]])", r"\1", t)
+        if n == t:
+            break
+        t = n
+    return t
+
+
+def extract_first_balanced_json_object(text: str) -> Optional[str]:
+    """从文本中提取第一个花括号平衡的 JSON 对象子串（忽略字符串内的括号）。"""
+    if not text:
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
 def safe_json_parse(content: str) -> Dict[str, Any]:
-    """安全解析JSON，支持从markdown代码块中提取"""
+    """安全解析JSON，支持从markdown代码块、平衡括号与宽松修复中提取"""
     if not content:
         return {"error": "内容为空"}
-    
+
     content = content.strip()
-    
-    # 尝试直接解析
-    try:
-        return json.loads(content)
-    except Exception as e:
-        logger.debug(f"直接JSON解析失败，尝试后备解析: {e}")
-    
-    # 尝试从markdown代码块中提取
-    json_block_patterns = [
-        r'```json\s*([\s\S]*?)\s*```',
-        r'```\s*([\s\S]*?)\s*```',
-        r'\{[\s\S]*\}',
-    ]
-    
-    for pattern in json_block_patterns:
-        match = re.search(pattern, content)
-        if match:
+
+    candidates: List[str] = []
+
+    def _try_parse(raw: str) -> Optional[Dict[str, Any]]:
+        raw = raw.strip()
+        if not raw:
+            return None
+        for attempt in (raw, _repair_loose_json(raw)):
             try:
-                json_str = match.group(1) if '```' in pattern else match.group(0)
-                return json.loads(json_str.strip())
-            except Exception as e:
-                logger.debug(f"正则提取JSON解析失败: {e}")
+                val = json.loads(attempt)
+                if isinstance(val, dict):
+                    return val
+            except Exception:
                 continue
-    
-    # 尝试找到第一个 { 和最后一个 }
+        return None
+
+    direct = _try_parse(content)
+    if direct is not None:
+        return direct
+
+    # fenced ```json ... ```
+    for m in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", content, re.IGNORECASE):
+        chunk = (m.group(1) or "").strip()
+        parsed = _try_parse(chunk)
+        if parsed is not None:
+            return parsed
+
+    balanced = extract_first_balanced_json_object(content)
+    if balanced:
+        parsed = _try_parse(balanced)
+        if parsed is not None:
+            return parsed
+
+    # 最后：首 { 到末 }（可能跨度过大，仅作兜底）
     try:
-        start = content.find('{')
-        end = content.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            return json.loads(content[start:end+1])
-    except Exception as e:
-        logger.debug(f"括号范围JSON解析失败: {e}")
-    
+        s, e = content.find("{"), content.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            parsed = _try_parse(content[s : e + 1])
+            if parsed is not None:
+                return parsed
+    except Exception as ex:
+        logger.debug("括号范围JSON解析失败: %s", ex)
+
     return {"error": "JSON解析失败", "raw_content": content[:500]}
+
+
+def trading_signal_parse_fallback(raw_content: str) -> Dict[str, Any]:
+    """解析失败时的模块化降级：返回与 AITradingEngine 兼容的观望结构。"""
+    return {
+        "signal": "hold",
+        "confidence": 0.0,
+        "reasoning": "模型输出无法解析为有效 JSON，已降级为观望",
+        "risk_level": "medium",
+        "parse_failed": True,
+        "raw_excerpt": (raw_content or "")[:400],
+    }
 
 
 class LLMProvider(ABC):
@@ -715,16 +783,37 @@ class EnhancedLLMIntegration:
         response = await self.generate(prompt, provider, temperature=0.5, max_tokens=1000, is_user_input=False)
         
         try:
-            signal = safe_json_parse(response.content)
+            raw = getattr(response, "content", None) or ""
+            signal = safe_json_parse(raw)
             if "error" in signal and "raw_content" in signal:
-                logger.error(f"解析交易信号失败: {signal.get('error')}")
-                return {"error": "信号生成失败", "detail": signal.get("error")}
+                logger.warning(
+                    "解析交易信号失败，已使用观望降级: %s",
+                    signal.get("error"),
+                )
+                fb = trading_signal_parse_fallback(signal.get("raw_content", raw))
+                fb["timestamp"] = datetime.now().isoformat()
+                fb["provider"] = (
+                    response.provider.value
+                    if response.provider
+                    else provider or self.llm_manager.default_model
+                )
+                return fb
             signal["timestamp"] = datetime.now().isoformat()
             signal["provider"] = response.provider.value if response.provider else provider or self.llm_manager.default_model
             return signal
         except Exception as e:
-            logger.error(f"解析交易信号失败: {e}")
-            return {"error": "信号生成失败"}
+            logger.warning("解析交易信号异常，已使用观望降级: %s", e)
+            fb = trading_signal_parse_fallback("")
+            fb["timestamp"] = datetime.now().isoformat()
+            try:
+                fb["provider"] = (
+                    response.provider.value
+                    if response.provider
+                    else provider or self.llm_manager.default_model
+                )
+            except Exception:
+                fb["provider"] = provider or "unknown"
+            return fb
 
 
 # 使用示例

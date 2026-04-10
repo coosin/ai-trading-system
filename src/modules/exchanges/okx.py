@@ -89,6 +89,10 @@ class OKXExchange(ExchangeBase):
         self._proxy_url: Optional[str] = None
         self._proxy_from_env: bool = False
         self._proxy_disabled_until: float = 0.0
+        # 仅走代理模式：开启后不再降级直连（适用于直连不稳定/被重置环境）
+        self._proxy_only: bool = str(
+            os.getenv("OPENCLAW_OKX_PROXY_ONLY", "1")
+        ).strip().lower() not in ("0", "false", "no", "off")
         self._session_recreate_lock = asyncio.Lock()
         # 网络自愈：连续失败后主动重建会话/切换代理源
         self._network_consecutive_failures: int = 0
@@ -206,6 +210,9 @@ class OKXExchange(ExchangeBase):
         代理链路异常时切换为直连会话。
         说明：不要求用户改配置；只在运行时降级，尽量保证 OKX API 可达。
         """
+        if self._proxy_only:
+            logger.warning("⚠️ 已启用 OPENCLAW_OKX_PROXY_ONLY，跳过直连降级: %s", reason)
+            return
         async with self._session_recreate_lock:
             # 双重检查，避免重复重建
             if self._proxy_mode == "direct":
@@ -213,7 +220,8 @@ class OKXExchange(ExchangeBase):
             logger.warning("⚠️ OKX代理链路异常，切换为直连: %s (mode=%s url=%s)", reason, self._proxy_mode, self._proxy_url)
             self._proxy_disabled_until = time.time() + 300  # 5 分钟内不再尝试代理
             self._proxy_mode = "direct"
-            self._proxy_url = None
+            # 仅“临时禁用代理”，不要清空代理地址；冷却到期后自动恢复走代理。
+            # 否则在直连不可达的网络环境里会永久停在直连失败循环。
 
             try:
                 ssl_context = self._build_ssl_context()
@@ -449,7 +457,20 @@ class OKXExchange(ExchangeBase):
             "interval_multiplier": 1.0,
         }
 
-        if ep.startswith("/api/v5/trade/") or ep in (
+        if ep == "/api/v5/trade/order":
+            profile.update(
+                {
+                    "name": "order_path_hardened",
+                    "max_retries": float(max(self._request_max_retries + 2, 5)),
+                    "timeout_total": min(float(self._timeout_total), 16.0),
+                    "timeout_connect": min(float(self._timeout_connect), 4.0),
+                    "timeout_sock_read": min(float(self._timeout_sock_read), 8.0),
+                    "retry_delay": 0.5,
+                    "retry_backoff": 1.35,
+                    "interval_multiplier": 1.0,
+                }
+            )
+        elif ep.startswith("/api/v5/trade/") or ep in (
             "/api/v5/account/positions",
             "/api/v5/account/balance",
             "/api/v5/account/config",
@@ -610,6 +631,8 @@ class OKXExchange(ExchangeBase):
                 except asyncio.TimeoutError as e:
                     await self._mark_request_failure(f"timeout {method} {endpoint}")
                     if attempt < max_retries:
+                        if endpoint == "/api/v5/trade/order":
+                            await self._rebuild_session("order timeout fast-rebuild")
                         logger.warning(f"⚠️ OKX API 超时 (尝试 {attempt + 1}/{max_retries + 1}): {method} {endpoint}")
                         await asyncio.sleep(retry_delay)
                         retry_delay *= max(1.2, retry_backoff - 0.2)
@@ -621,6 +644,8 @@ class OKXExchange(ExchangeBase):
                 except aiohttp.ClientConnectorError as e:
                     await self._mark_request_failure(f"connector {method} {endpoint}: {e}")
                     if attempt < max_retries:
+                        if endpoint == "/api/v5/trade/order":
+                            await self._rebuild_session("order connector fast-rebuild")
                         logger.warning(f"⚠️ OKX API 连接失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
                         await asyncio.sleep(retry_delay)
                         retry_delay *= retry_backoff
@@ -644,12 +669,18 @@ class OKXExchange(ExchangeBase):
                             "connect call failed",
                         )
                     )
-                    if proxy_related and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None)):
+                    if (
+                        (not self._proxy_only)
+                        and proxy_related
+                        and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None))
+                    ):
                         if attempt < max_retries:
                             await self._switch_to_direct_session(f"{type(e).__name__}: {err_s}")
                             proxy = None
                             await asyncio.sleep(min(1.0, retry_delay))
                             continue
+                    if endpoint == "/api/v5/trade/order" and attempt < max_retries:
+                        await self._rebuild_session("order client-error fast-rebuild")
                     if attempt < max_retries and "SSL" in err_s:
                         logger.warning(f"⚠️ OKX API SSL错误 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
                         await asyncio.sleep(retry_delay)
@@ -663,7 +694,11 @@ class OKXExchange(ExchangeBase):
                     await self._mark_request_failure(f"unknown {method} {endpoint}: {e}")
                     error_str = str(e)
                     # 代理链路导致的“全失败”常见报错，自动降级直连再试
-                    if "All operations failed" in error_str and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None)):
+                    if (
+                        (not self._proxy_only)
+                        and "All operations failed" in error_str
+                        and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None))
+                    ):
                         if attempt < max_retries:
                             await self._switch_to_direct_session(error_str)
                             proxy = None
@@ -672,6 +707,8 @@ class OKXExchange(ExchangeBase):
                     if "51001" in error_str or "doesn't exist" in error_str:
                         logger.debug(f"OKX API交易对不存在: {method} {endpoint}")
                     else:
+                        if endpoint == "/api/v5/trade/order" and attempt < max_retries:
+                            await self._rebuild_session("order unknown-error fast-rebuild")
                         logger.error(f"OKX API请求失败: {method} {endpoint} - {type(e).__name__}: {e}")
                     raise
     
@@ -732,12 +769,16 @@ class OKXExchange(ExchangeBase):
                             self._proxy_mode = "http"
                             self._proxy_from_env = False
                     else:
+                        if self._proxy_only:
+                            raise RuntimeError("OPENCLAW_OKX_PROXY_ONLY=1 but no proxy is available")
                         logger.warning("⚠️ 未找到可用代理，使用直连")
                         ssl_context = self._build_ssl_context()
                         connector = aiohttp.TCPConnector(ssl=ssl_context)
                         self._proxy_mode = "direct"
                         self._proxy_from_env = False
             except Exception as proxy_error:
+                if self._proxy_only:
+                    raise
                 logger.warning(f"⚠️ 加载代理配置失败: {proxy_error}，使用直连")
                 import traceback
                 traceback.print_exc()
@@ -1192,6 +1233,10 @@ class OKXExchange(ExchangeBase):
             size_abs = abs(pos_val)
             entry = float(pos_data.get("avgPx", 0) or 0)
             mark_px = float(pos_data.get("markPx", 0) or 0)
+            notional_usd = float(pos_data.get("notionalUsd", 0) or 0)
+            notional = float(pos_data.get("notional", 0) or 0)
+            upl = float(pos_data.get("upl", 0) or 0)
+            upl_ratio = float(pos_data.get("uplRatio", 0) or 0)
             return {
                 "instId": inst_id,
                 "symbol": inst_id.replace("-", "/") if inst_id else "",
@@ -1201,7 +1246,11 @@ class OKXExchange(ExchangeBase):
                 "size": size_abs,
                 "entry_price": entry,
                 "mark_px": mark_px,
-                "unrealized_pnl": float(pos_data.get("upl", 0) or 0),
+                # 统一字段：下游使用 mark_price / unrealized_pnl_ratio / notional_value
+                "mark_price": mark_px,
+                "unrealized_pnl": upl,
+                "unrealized_pnl_ratio": upl_ratio,
+                "notional_value": abs(notional_usd) if abs(notional_usd) > 0 else abs(notional),
                 "leverage": float(pos_data.get("lever", 1) or 1),
                 "margin": float(pos_data.get("margin", 0) or 0),
                 "liquidation_price": float(pos_data.get("liqPx", 0) or 0),

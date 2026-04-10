@@ -52,8 +52,10 @@ def enforce_clash_config(apply: bool) -> Dict[str, Any]:
     dns["fake-ip-range"] = dns.get("fake-ip-range", "198.18.0.1/16")
     dns["listen"] = dns.get("listen", "0.0.0.0:1053")
 
+    # Prefer 1.1.1.1 first: CN/ISP resolvers often return awscn.okpool.top -> 169.254.0.2 for OKX,
+    # which breaks TLS/routing; Cloudflare DNS returns the real Cloudflare CDN chain.
     nameserver = dns.get("nameserver") or []
-    for ns in ["119.29.29.29", "223.5.5.5", "1.1.1.1", "8.8.8.8"]:
+    for ns in ["1.1.1.1", "8.8.8.8", "119.29.29.29", "223.5.5.5"]:
         if ns not in nameserver:
             nameserver.append(ns)
     dns["nameserver"] = nameserver
@@ -76,8 +78,9 @@ def enforce_clash_config(apply: bool) -> Dict[str, Any]:
     dns["fake-ip-filter"] = fake_filter
 
     nsp = dns.get("nameserver-policy") or {}
-    nsp["+.okx.com"] = "119.29.29.29"
-    nsp["+.okex.com"] = "119.29.29.29"
+    # Do not use 119/223/114 for OKX: many return poisoned/hijacked records in CN networks.
+    nsp["+.okx.com"] = "1.1.1.1"
+    nsp["+.okex.com"] = "1.1.1.1"
     dns["nameserver-policy"] = nsp
     cfg["dns"] = dns
 

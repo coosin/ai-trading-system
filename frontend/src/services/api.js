@@ -137,6 +137,12 @@ export const api = {
       request('/modules/ai/frequency-profile', { method: 'POST', body: JSON.stringify({ profile }) }),
     updateAiGuards: (data) =>
       request('/modules/ai/guards', { method: 'POST', body: JSON.stringify(data || {}) }),
+    getRiskStatus: () =>
+      request('/modules/risk/status'),
+    getRiskConfig: () =>
+      request('/modules/risk/config'),
+    updateRiskConfig: (data) =>
+      request('/modules/risk/config', { method: 'POST', body: JSON.stringify(data || {}) }),
   },
   monitoring: {
     /** 若后端未实现则返回 404，总控会降级为空列表 */

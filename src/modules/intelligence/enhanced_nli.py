@@ -220,33 +220,49 @@ class EnhancedNaturalLanguageInterface:
         return None
     
     async def _execute_trade(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """执行交易"""
+        """执行交易（S1：ExecutionGateway.open_swap，source=system）"""
         try:
             if not self.main_controller:
                 return {"success": False, "message": "系统未初始化"}
-            
+
             symbol = params.get("symbol", "BTC/USDT")
-            side = params.get("side", "long")
-            quantity = params.get("quantity", 0.01)
-            leverage = params.get("leverage", 20)
-            
-            if hasattr(self.main_controller, 'okx_exchange'):
-                okx = self.main_controller.okx_exchange
-                
-                if hasattr(okx, 'open_swap_position'):
-                    result = await okx.open_swap_position(
-                        symbol=symbol,
-                        side=side,
-                        size=quantity,
-                        leverage=leverage
-                    )
-                    return {
-                        "success": result.get("success", False),
-                        "message": f"{symbol} {side} {quantity} @ {leverage}x"
-                    }
-            
+            side = str(params.get("side", "long")).lower()
+            quantity = float(params.get("quantity", 0.01))
+            leverage = int(params.get("leverage", 20))
+
+            gw = getattr(self.main_controller, "execution_gateway", None)
+            if gw:
+                result = await gw.open_swap(
+                    symbol,
+                    side,
+                    quantity,
+                    leverage,
+                    "system",
+                    "enhanced_nli_trade",
+                    margin_mode="cross",
+                    price=None,
+                )
+                return {
+                    "success": bool(result.get("success")),
+                    "message": f"{symbol} {side} {quantity} @ {leverage}x",
+                    "detail": result,
+                }
+
+            okx = getattr(self.main_controller, "okx_exchange", None)
+            if okx and hasattr(okx, "open_swap_position"):
+                result = await okx.open_swap_position(
+                    symbol=symbol,
+                    side=side,
+                    size=quantity,
+                    leverage=leverage,
+                )
+                return {
+                    "success": result.get("success", False),
+                    "message": f"{symbol} {side} {quantity} @ {leverage}x",
+                }
+
             return {"success": False, "message": "交易所未连接"}
-            
+
         except Exception as e:
             return {"success": False, "message": str(e)}
     

@@ -70,6 +70,12 @@ class AICoreDecisionEngine:
     4. 交易决策权 - AI全权决定开仓、平仓、止损止盈
     5. 风险控制权 - AI自主评估和控制风险
     6. 资金管理权 - AI自主分配资金和仓位
+
+    实盘开平仓（S1，与 config ai_brain / ExecutionGateway 一致）：
+    - 主路径：execute_command(write_source=ai_core) → ExecutionVerifier → ExecutionGateway
+    - 回退：ExecutionGateway(open_swap/close_swap, source=ai_core)
+    - 仅当无 ExecutionGateway 时允许交易所直连兜底
+    - 风控/用户指令平仓：经 _s1_close_swap（Gateway 优先，来源如 ai_core / manual）
     """
     
     def __init__(self, main_controller=None):
@@ -113,6 +119,12 @@ class AICoreDecisionEngine:
             "max_spread_bps_to_trade": 40.0,
             "max_abs_depth_imbalance_to_trade": 0.92,
             "degraded_data_quantity_factor": 0.68,
+            # 低余额仍允许小额开仓（可经 ai_core_runtime 热更新）
+            "min_available_usdt_to_open": 1.0,
+            "low_balance_usdt_threshold": 25.0,
+            "default_max_margin_fraction": 0.30,
+            "low_balance_margin_fraction": 0.55,
+            "open_fee_buffer_usdt": 0.35,
             "boost_on_low_risk": True,
             "low_risk_rr_multiplier": 0.96,
             "low_risk_spread_multiplier": 1.08,
@@ -152,6 +164,19 @@ class AICoreDecisionEngine:
             "risk_check_interval": 30,
             "auto_reduce_on_high_risk": True,
             "emergency_close_on_critical": True,
+            # AI 主观平仓防抖（仅作用于主决策循环里的 LLM close；SLTP/紧急风控/用户指令平仓不走此逻辑）
+            "ai_core_discretionary_close_enabled": True,
+            "ai_core_discretionary_close_cooldown_sec": 2700,
+            "ai_core_min_confidence_to_close": 0.84,
+            "ai_core_discretionary_close_confirmations": 2,
+            "ai_core_discretionary_close_confirm_window_sec": 1200,
+            "ai_core_min_position_age_sec_before_discretionary_close": 600,
+            # 决策理由若包含以下子串，禁止主观平仓（模型常一边写「多周期矛盾」一边给 100% confidence close）
+            "ai_core_close_reason_veto_substrings": [
+                "多周期矛盾",
+                "multi-timeframe contradiction",
+                "timeframes contradict",
+            ],
             # 策略研究任务限流（避免挤占交易/API主路径）；手动 API 不受持仓/冷却限制
             "research_enabled": True,
             "research_cooldown_seconds": 7200,
@@ -176,6 +201,7 @@ class AICoreDecisionEngine:
             "rr_rejected": 0,
             "spread_rejected": 0,
             "depth_imbalance_rejected": 0,
+            "discretionary_close_suppressed": 0,
         }
         self._adaptive_guard_profile: Dict[str, Any] = {
             "profile": "normal",
@@ -193,6 +219,10 @@ class AICoreDecisionEngine:
         self._last_research_at: Optional[datetime] = None
         self._frequency_profile: str = "balanced"
         self._last_frequency_profile_switch_at: Optional[datetime] = None
+        # (symbol_base, side) -> 最近一次由主循环执行的「主观平仓」成功时间
+        self._last_ai_discretionary_close_at: Dict[str, datetime] = {}
+        # key -> (consecutive_close_signals, first_signal_at)
+        self._discretionary_close_streak: Dict[str, tuple] = {}
         
         logger.info("🧠 AI核心决策引擎初始化（完整控制权版本）")
     
@@ -1089,8 +1119,24 @@ class AICoreDecisionEngine:
             }
         
         perf = self._strategy_performance[strategy_id]
+        perf.setdefault("total_trades", 0)
+        perf.setdefault("wins", 0)
+        perf.setdefault("losses", 0)
+        perf.setdefault("total_pnl", 0.0)
+        perf.setdefault("trades", [])
         perf["total_trades"] += 1
         perf["trades"].append(trade_analysis)
+        res = trade_analysis.get("result") if isinstance(trade_analysis, dict) else None
+        if isinstance(res, dict) and res.get("pnl") is not None:
+            try:
+                pnl_f = float(res["pnl"])
+                if pnl_f > 0:
+                    perf["wins"] += 1
+                elif pnl_f < 0:
+                    perf["losses"] += 1
+                perf["total_pnl"] = float(perf.get("total_pnl", 0) or 0) + pnl_f
+            except (TypeError, ValueError):
+                pass
         
         # 只保留最近50笔交易
         if len(perf["trades"]) > 50:
@@ -1143,12 +1189,23 @@ class AICoreDecisionEngine:
     async def _check_and_optimize_underperforming_strategies(self) -> None:
         """检查并优化表现不佳的策略"""
         for strategy_id, perf in self._strategy_performance.items():
-            if perf["total_trades"] >= 5:  # 至少5笔交易才评估
-                win_rate = perf["wins"] / perf["total_trades"] if perf["total_trades"] > 0 else 0
-                
-                if win_rate < 0.4:  # 胜率低于40%
-                    logger.info(f"🔧 策略 {strategy_id} 胜率过低 ({win_rate:.1%})，需要优化")
-                    await self._optimize_strategy(strategy_id)
+            if not isinstance(perf, dict):
+                continue
+            total = int(perf.get("total_trades", perf.get("trade_count", 0)) or 0)
+            if total < 5:
+                continue
+            wr = perf.get("win_rate")
+            if wr is not None:
+                try:
+                    win_rate = float(wr)
+                except (TypeError, ValueError):
+                    win_rate = 0.0
+            else:
+                wins = int(perf.get("wins", 0) or 0)
+                win_rate = wins / total if total > 0 else 0.0
+            if win_rate < 0.4:
+                logger.info(f"🔧 策略 {strategy_id} 胜率过低 ({win_rate:.1%})，需要优化")
+                await self._optimize_strategy(strategy_id)
     
     async def _learn_from_memory(self) -> None:
         """从记忆系统学习历史经验"""
@@ -1260,6 +1317,38 @@ class AICoreDecisionEngine:
                 logger.error(f"风险监控循环错误: {e}")
                 await asyncio.sleep(SLEEP_30S)
     
+    async def _s1_close_swap(
+        self,
+        symbol: str,
+        side: str,
+        size: Optional[float],
+        source: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """
+        S1 平仓：优先 ExecutionGateway（尊重 single_write_owner / 辅助来源规则），
+        无 Gateway 时再走交易所 close_swap_position / close_position。
+        """
+        mc = getattr(self, "main_controller", None)
+        gw = getattr(mc, "execution_gateway", None) if mc else None
+        if gw:
+            return await gw.close_swap(symbol, side, size, source, reason)
+        if not self.exchange:
+            return {"success": False, "error": "no_exchange"}
+        try:
+            close_fn = getattr(self.exchange, "close_swap_position", None) or getattr(
+                self.exchange, "close_position", None
+            )
+            if callable(close_fn):
+                res = await close_fn(symbol, side, size)
+                if isinstance(res, dict):
+                    return res
+                return {"success": bool(res), "raw": res}
+        except Exception as e:
+            logger.exception("S1 直连平仓异常: %s", e)
+            return {"success": False, "error": str(e)}
+        return {"success": False, "error": "no_close_method"}
+    
     async def _handle_high_risk(self, risk_data) -> None:
         """AI处理高风险情况 - 主动平仓黑名单持仓"""
         logger.warning(f"🚨 AI检测到高风险: {risk_data.risk_level.value}")
@@ -1283,13 +1372,27 @@ class AICoreDecisionEngine:
                 if pnl_ratio < -0.1:
                     logger.warning(f"🚨 AI自动平仓 {symbol} 亏损过大: {pnl_ratio:.2%}")
                     try:
-                        result = await self.exchange.close_position(symbol, pos_side)
-                        logger.info(f"✅ AI已平仓亏损持仓: {symbol}, 结果: {result}")
-                        
-                        if self.telegram_bot and self.telegram_bot.chat_ids:
+                        result = await self._s1_close_swap(
+                            symbol,
+                            pos_side,
+                            None,
+                            "ai_core",
+                            "high_risk_upl_ratio",
+                        )
+                        ok = bool(isinstance(result, dict) and result.get("success"))
+                        logger.info(
+                            "✅ AI已平仓亏损持仓: %s, 结果: %s" if ok else "⚠️ AI平仓未成功: %s, 结果: %s",
+                            symbol,
+                            result,
+                        )
+                        if (
+                            ok
+                            and self.telegram_bot
+                            and self.telegram_bot.chat_ids
+                        ):
                             await self.telegram_bot.send_message(
                                 chat_id=self.telegram_bot.chat_ids[0],
-                                text=f"🚨 AI风险控制: 自动平仓 {symbol}，亏损 {pnl_ratio:.2%}"
+                                text=f"🚨 AI风险控制: 自动平仓 {symbol}，亏损 {pnl_ratio:.2%}",
                             )
                     except Exception as e:
                         logger.error(f"平仓失败: {e}")
@@ -1563,7 +1666,15 @@ class AICoreDecisionEngine:
                     result = await self._run_backtest(strategy_id)
                     
                     if result:
-                        self._strategy_performance[strategy_id] = result
+                        # 回测结果含 trade_count 等字段；与实盘统计字典并存，避免缺少 total_trades/trades 导致 KeyError
+                        self._strategy_performance[strategy_id] = {
+                            "total_trades": 0,
+                            "wins": 0,
+                            "losses": 0,
+                            "total_pnl": 0.0,
+                            "trades": [],
+                            **result,
+                        }
                         logger.info(f"✅ 回测完成: {result.get('total_return', 0):.2%} 收益")
         
         except Exception as e:
@@ -2684,6 +2795,8 @@ class AICoreDecisionEngine:
 - 默认杠杆: {self.config['default_leverage']}x
 - 最大持仓数: {self.config['max_positions']}
 - 最小交易置信度: {self.config.get('min_confidence_to_trade', 0.6)}
+- 主观平仓要求: 仅在「多周期趋势已实质反转」或风险不可接受时 action=close；不要因单根K线、短时反弹/回踩或单一指标抖动平仓；若证据不足请 hold。
+- 重要: 若在理由中写出「多周期矛盾」「大周期与短周期方向不一致」等，则 **必须 action=hold**，由 SLTP 管理出场；不得同时写矛盾又输出 close，也不得把「可用余额为 0」单独作为平仓主因（平仓不会创造可用保证金逻辑）。
 
 【决策要求】
 你必须综合分析以上所有数据，做出交易决策。特别注意：
@@ -2691,6 +2804,8 @@ class AICoreDecisionEngine:
 2. 第三方数据的情绪是否支持你的判断
 3. 风险评估等级是否允许开仓
 4. 历史经验中是否有类似情况的教训
+5. 已有持仓时：优先让交易所侧止盈止损（SLTP）管理价位平仓；除非趋势明确反转，否则避免频繁 close
+6. confidence 应反映真实不确定性：存在周期冲突时 confidence 不得超过 0.75，且 action 应为 hold
 
 请做出交易决策，返回JSON格式：
 
@@ -2777,8 +2892,118 @@ class AICoreDecisionEngine:
         except Exception as e:
             logger.error(f"处理AI决策失败: {e}")
             return None
+
+    @staticmethod
+    def _position_row_age_sec(pos: Dict[str, Any]) -> Optional[float]:
+        """OKX 持仓 cTime/timestamp（多为毫秒）-> 已持仓秒数；无法解析则 None。"""
+        try:
+            raw = pos.get("cTime") or pos.get("timestamp") or pos.get("uTime") or 0
+            t = float(raw or 0)
+            if t <= 0:
+                return None
+            if t > 1e15:
+                t = t / 1e6
+            elif t > 1e12:
+                t = t / 1e3
+            from time import time as _now
+
+            return max(0.0, float(_now()) - t)
+        except Exception:
+            return None
+
+    async def _matching_position_age_sec(self, symbol: str, side: str) -> Optional[float]:
+        """当前决策品种+方向在交易所的持仓已开时长（秒）。"""
+        if not self.exchange or not hasattr(self.exchange, "get_positions"):
+            return None
+        try:
+            rows = await self.exchange.get_positions()
+        except Exception:
+            return None
+        base = (symbol.split("/")[0] if "/" in symbol else symbol).strip().upper()
+        want = str(side or "").strip().lower()
+        best: Optional[float] = None
+        for p in rows or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                sz = float(p.get("size", 0) or 0)
+            except (TypeError, ValueError):
+                sz = 0.0
+            if abs(sz) < 1e-12:
+                continue
+            iid = str(p.get("instId") or "").upper()
+            sym = str(p.get("symbol") or "").upper()
+            if base and base not in iid and base not in sym:
+                continue
+            ps = str(p.get("side") or p.get("posSide") or "").strip().lower()
+            if want and ps and want not in ps:
+                continue
+            age = self._position_row_age_sec(p)
+            if age is None:
+                continue
+            best = age if best is None else max(best, age)
+        return best
+
+    async def _discretionary_close_passes(self, decision: TradeDecision) -> tuple[bool, str]:
+        """
+        主循环中的 LLM 主观平仓防抖：冷却、更高置信度、连续确认、最短持仓时间。
+        SLTP / _handle_high_risk / 用户平仓指令不经过此函数。
+        """
+        if not bool(self.config.get("ai_core_discretionary_close_enabled", True)):
+            return False, "discretionary_close_disabled"
+
+        key = f"{decision.symbol}|{str(decision.side or '').lower()}"
+        min_age = float(self.config.get("ai_core_min_position_age_sec_before_discretionary_close", 0) or 0)
+        if min_age > 0:
+            age = await self._matching_position_age_sec(decision.symbol, decision.side)
+            if age is not None and age < min_age:
+                return False, f"position_too_young_{age:.0f}s_lt_{min_age:.0f}s"
+
+        reason_text = str(decision.reasoning or "")
+        vetoes = self.config.get("ai_core_close_reason_veto_substrings")
+        if vetoes is None:
+            vetoes = ["多周期矛盾"]
+        elif isinstance(vetoes, str):
+            vetoes = [vetoes]
+        for sub in vetoes:
+            sub_s = str(sub or "").strip()
+            if sub_s and sub_s in reason_text:
+                self._discretionary_close_streak.pop(key, None)
+                return False, f"close_reason_veto:{sub_s[:40]}"
+
+        min_c = float(self.config.get("ai_core_min_confidence_to_close", 0.84))
+        if float(decision.confidence or 0) < min_c:
+            self._discretionary_close_streak.pop(key, None)
+            return False, f"close_confidence_{float(decision.confidence or 0):.2f}_lt_{min_c}"
+
+        cd = float(self.config.get("ai_core_discretionary_close_cooldown_sec", 2700))
+        last = self._last_ai_discretionary_close_at.get(key)
+        if last and (datetime.now() - last).total_seconds() < cd:
+            self._discretionary_close_streak.pop(key, None)
+            return False, f"cooldown_{int(cd)}s"
+
+        need = max(1, int(self.config.get("ai_core_discretionary_close_confirmations", 2)))
+        win = float(self.config.get("ai_core_discretionary_close_confirm_window_sec", 1200))
+        if need <= 1:
+            return True, "ok"
+
+        now = datetime.now()
+        st = self._discretionary_close_streak.get(key)
+        if st is None:
+            self._discretionary_close_streak[key] = (1, now)
+            return False, f"need_{need}_close_signals_now_1"
+        cnt, t0 = st
+        if (now - t0).total_seconds() > win:
+            self._discretionary_close_streak[key] = (1, now)
+            return False, f"confirm_window_reset_need_1_of_{need}"
+        cnt += 1
+        self._discretionary_close_streak[key] = (cnt, t0)
+        if cnt < need:
+            return False, f"need_{need}_close_signals_now_{cnt}"
+        self._discretionary_close_streak.pop(key, None)
+        return True, "ok"
     
-    async def _execute_decision(self, decision: TradeDecision) -> bool:
+    async def _execute_decision(self, decision: TradeDecision, *, bypass_discretionary_close_gates: bool = False) -> bool:
         """执行AI决策 - 带余额检查"""
         if decision.action == 'hold':
             return True
@@ -2798,10 +3023,32 @@ class AICoreDecisionEngine:
             available = float(usdt_balance.get('free', 0) if isinstance(usdt_balance, dict) else usdt_balance)
             
             logger.info(f"💰 账户可用余额: {available:.2f} USDT")
-            
-            if available < 10:  # 最低10 USDT
-                logger.warning(f"⚠️ 余额不足 ({available:.2f} USDT)，无法开仓")
-                return False
+
+            is_close = decision.action == "close"
+            is_open = decision.action in ("buy", "sell")
+
+            if is_close and not bypass_discretionary_close_gates:
+                ok_dc, why_dc = await self._discretionary_close_passes(decision)
+                if not ok_dc:
+                    self._execution_guards_stats["discretionary_close_suppressed"] = (
+                        int(self._execution_guards_stats.get("discretionary_close_suppressed", 0)) + 1
+                    )
+                    logger.info("🧷 AI主观平仓暂缓: %s %s — %s", decision.symbol, decision.side, why_dc)
+                    return False
+
+            # 开仓：仅要求「可用 + 手续费缓冲」高于可配置下限；平仓不因低 USDT 阻塞
+            if is_open:
+                min_avail = float(self.config.get("min_available_usdt_to_open") or 1.0)
+                min_avail = max(0.5, min_avail)
+                fee_buf = float(self.config.get("open_fee_buffer_usdt") or 0.35)
+                if available < min_avail + fee_buf:
+                    logger.warning(
+                        "⚠️ 可用 USDT 过低 (%.2f < %.2f 开仓门槛+手续费缓冲)，跳过开仓: %s",
+                        available,
+                        min_avail + fee_buf,
+                        decision.symbol,
+                    )
+                    return False
             
             # 2. 获取当前价格
             ticker = await self.exchange.get_ticker(decision.symbol.replace('/', '-'))
@@ -2813,21 +3060,37 @@ class AICoreDecisionEngine:
             
             decision.entry_price = current_price
             
-            # 3. 根据余额动态调整数量
-            # 计算最大可开仓数量（考虑杠杆）
-            max_margin = available * 0.3  # 只用30%的余额
             leverage = min(decision.leverage, self.config['leverage_max'])
-            max_position_value = max_margin * leverage
-            max_quantity = int(max_position_value / current_price)
-            
-            # 调整数量
-            if decision.quantity > max_quantity:
-                logger.info(f"📊 调整数量: {decision.quantity} -> {max_quantity} (根据余额)")
-                decision.quantity = max(1, max_quantity)
+            low_thr = float(self.config.get("low_balance_usdt_threshold") or 25.0)
+            if is_open:
+                # 3. 根据余额动态调整数量：低余额时允许用更高比例的可用作保证金（仍受杠杆上限约束）
+                if available < low_thr:
+                    margin_frac = float(self.config.get("low_balance_margin_fraction") or 0.55)
+                else:
+                    margin_frac = float(self.config.get("default_max_margin_fraction") or 0.30)
+                margin_frac = max(0.05, min(0.92, margin_frac))
+                max_margin = available * margin_frac
+                max_position_value = max_margin * leverage
+                max_quantity = int(max_position_value / max(current_price, 1e-9))
+                logger.info(
+                    "📊 资金预算: available=%.2f margin_frac=%.2f margin=%.2f lev=%s max_qty=%s (低余额阈值=%.2f)",
+                    available,
+                    margin_frac,
+                    max_margin,
+                    leverage,
+                    max_quantity,
+                    low_thr,
+                )
 
-            # 3.1 动态仓位/组合风险预算（波动率/相关性/总仓位比例）
+                if decision.quantity > max_quantity:
+                    capped = max(1, max_quantity) if max_quantity > 0 else 1
+                    logger.info(f"📊 调整数量: {decision.quantity} -> {capped} (根据余额)")
+                    decision.quantity = capped
+                decision.quantity = max(1, int(decision.quantity or 1))
+
+            # 3.1 动态仓位/组合风险预算（波动率/相关性/总仓位比例）— 仅开仓
             try:
-                if self.main_controller and hasattr(self.main_controller, "get_dynamic_position_manager"):
+                if is_open and self.main_controller and hasattr(self.main_controller, "get_dynamic_position_manager"):
                     dpm = self.main_controller.get_dynamic_position_manager()
                 else:
                     dpm = None
@@ -2859,49 +3122,67 @@ class AICoreDecisionEngine:
                 logger.debug(f"动态仓位调整失败: {e}")
             
             decision.leverage = leverage
-            
-            # 4. 设置止损止盈
-            atr = current_price * 0.02
-            if decision.side == 'long':
-                decision.stop_loss = current_price - 2 * atr
-                decision.take_profit = current_price + 3 * atr
-            else:
-                decision.stop_loss = current_price + 2 * atr
-                decision.take_profit = current_price - 3 * atr
-            
-            # 3.2 数据退化时自动降仓（避免单点数据故障造成激进下单）
-            if "data_quality_guard" in str(decision.reasoning or ""):
-                logger.warning("⚠️ 数据质量保护触发，跳过执行")
-                return True
-            if "degraded=" in str(decision.reasoning or ""):
-                try:
-                    q_factor = float(self.config.get("degraded_data_quantity_factor", 0.6) or 0.6)
-                    new_qty = max(1, int(float(decision.quantity) * q_factor))
-                    if new_qty < decision.quantity:
-                        self._execution_guards_stats["degraded_quantity_reduced"] += 1
-                        logger.info("📉 数据退化降仓: %s -> %s", decision.quantity, new_qty)
-                        decision.quantity = new_qty
-                except Exception:
-                    pass
 
-            # 3.3 执行前二次确认门：最小盈亏比 + 盘口价差 + 深度失衡
             rr = 0.0
-            try:
-                risk = abs(float(decision.entry_price) - float(decision.stop_loss))
-                reward = abs(float(decision.take_profit) - float(decision.entry_price))
-                rr = reward / max(1e-9, risk)
-            except Exception:
-                rr = 0.0
-            symbol_group = self._symbol_group_key(decision.symbol)
-            session_group = self._market_session_key(datetime.utcnow())
-            composite_group = f"{symbol_group}@{session_group}"
-            gcfg = self._symbol_group_guard_overrides.get(composite_group) or self._symbol_group_guard_overrides.get(symbol_group, {})
-            min_rr = float(gcfg.get("min_rr_to_trade", self.config.get("min_rr_to_trade", 1.2)) or 1.2)
-            max_spread_bps = float(gcfg.get("max_spread_bps_to_trade", self.config.get("max_spread_bps_to_trade", 35.0)) or 35.0)
-            max_abs_imb = float(self.config.get("max_abs_depth_imbalance_to_trade", 0.92) or 0.92)
+            spread_bps = None
+            depth_imbalance = None
+            min_rr = 0.0
+
+            if is_close:
+                # 平仓：不套用开仓盈亏比/盘口门控（避免低余额+止损结构导致无法平仓）
+                self._adaptive_guard_profile = {
+                    "profile": "close",
+                    "symbol_group": self._symbol_group_key(decision.symbol),
+                    "session_group": self._market_session_key(datetime.utcnow()),
+                    "composite_group": "",
+                    "atr_pct_1h": 0.0,
+                    "effective_min_rr": 0.0,
+                    "effective_max_spread_bps": 0.0,
+                    "effective_max_abs_depth_imbalance": 0.0,
+                }
+                logger.info("🎯 平仓路径：跳过开仓专用 RR/盘口/深度门控")
+            else:
+                # 4. 设置止损止盈（开仓）
+                atr = current_price * 0.02
+                if decision.side == 'long':
+                    decision.stop_loss = current_price - 2 * atr
+                    decision.take_profit = current_price + 3 * atr
+                else:
+                    decision.stop_loss = current_price + 2 * atr
+                    decision.take_profit = current_price - 3 * atr
+                
+                # 3.2 数据退化时自动降仓（避免单点数据故障造成激进下单）
+                if "data_quality_guard" in str(decision.reasoning or ""):
+                    logger.warning("⚠️ 数据质量保护触发，跳过执行")
+                    return True
+                if "degraded=" in str(decision.reasoning or ""):
+                    try:
+                        q_factor = float(self.config.get("degraded_data_quantity_factor", 0.6) or 0.6)
+                        new_qty = max(1, int(float(decision.quantity) * q_factor))
+                        if new_qty < decision.quantity:
+                            self._execution_guards_stats["degraded_quantity_reduced"] += 1
+                            logger.info("📉 数据退化降仓: %s -> %s", decision.quantity, new_qty)
+                            decision.quantity = new_qty
+                    except Exception:
+                        pass
+
+                # 3.3 执行前二次确认门：最小盈亏比 + 盘口价差 + 深度失衡
+                try:
+                    risk = abs(float(decision.entry_price) - float(decision.stop_loss))
+                    reward = abs(float(decision.take_profit) - float(decision.entry_price))
+                    rr = reward / max(1e-9, risk)
+                except Exception:
+                    rr = 0.0
+                symbol_group = self._symbol_group_key(decision.symbol)
+                session_group = self._market_session_key(datetime.utcnow())
+                composite_group = f"{symbol_group}@{session_group}"
+                gcfg = self._symbol_group_guard_overrides.get(composite_group) or self._symbol_group_guard_overrides.get(symbol_group, {})
+                min_rr = float(gcfg.get("min_rr_to_trade", self.config.get("min_rr_to_trade", 1.2)) or 1.2)
+                max_spread_bps = float(gcfg.get("max_spread_bps_to_trade", self.config.get("max_spread_bps_to_trade", 35.0)) or 35.0)
+                max_abs_imb = float(self.config.get("max_abs_depth_imbalance_to_trade", 0.92) or 0.92)
 
             # 3.3.1 自适应门控阈值：波动低 -> 收紧；波动高 -> 适度放宽。
-            if bool(self.config.get("auto_adaptive_guards", True)):
+            if (not is_close) and bool(self.config.get("auto_adaptive_guards", True)):
                 try:
                     tech = await self._get_technical_indicators(decision.symbol)
                     price_ref = float(tech.get("price", decision.entry_price) or decision.entry_price or 0)
@@ -2953,40 +3234,39 @@ class AICoreDecisionEngine:
                 except Exception as e:
                     logger.debug(f"自适应门控计算失败: {e}")
 
-            if rr < min_rr:
-                self._execution_guards_stats["rr_rejected"] += 1
-                logger.warning("⚠️ 执行门控拒绝: RR过低 rr=%.2f < %.2f symbol=%s", rr, min_rr, decision.symbol)
-                return False
+            if not is_close:
+                if rr < min_rr:
+                    self._execution_guards_stats["rr_rejected"] += 1
+                    logger.warning("⚠️ 执行门控拒绝: RR过低 rr=%.2f < %.2f symbol=%s", rr, min_rr, decision.symbol)
+                    return False
 
-            spread_bps = None
-            depth_imbalance = None
-            try:
-                if hasattr(self.exchange, "get_order_book"):
-                    ob = await self.exchange.get_order_book(decision.symbol, depth=10)
-                    if ob and getattr(ob, "bids", None) and getattr(ob, "asks", None):
-                        best_bid = float(ob.bids[0][0])
-                        best_ask = float(ob.asks[0][0])
-                        bid_vol = sum(float(x[1]) for x in ob.bids[:5])
-                        ask_vol = sum(float(x[1]) for x in ob.asks[:5])
-                        spread_bps = ((best_ask - best_bid) / max(1e-9, best_bid)) * 10000.0
-                        depth_imbalance = (bid_vol - ask_vol) / max(1e-9, bid_vol + ask_vol)
-            except Exception as e:
-                logger.debug(f"执行前订单簿检查失败: {e}")
+                try:
+                    if hasattr(self.exchange, "get_order_book"):
+                        ob = await self.exchange.get_order_book(decision.symbol, depth=10)
+                        if ob and getattr(ob, "bids", None) and getattr(ob, "asks", None):
+                            best_bid = float(ob.bids[0][0])
+                            best_ask = float(ob.asks[0][0])
+                            bid_vol = sum(float(x[1]) for x in ob.bids[:5])
+                            ask_vol = sum(float(x[1]) for x in ob.asks[:5])
+                            spread_bps = ((best_ask - best_bid) / max(1e-9, best_bid)) * 10000.0
+                            depth_imbalance = (bid_vol - ask_vol) / max(1e-9, bid_vol + ask_vol)
+                except Exception as e:
+                    logger.debug(f"执行前订单簿检查失败: {e}")
 
-            if spread_bps is not None and spread_bps > max_spread_bps:
-                self._execution_guards_stats["spread_rejected"] += 1
-                logger.warning(
-                    "⚠️ 执行门控拒绝: 盘口价差过大 spread=%.2fbps > %.2f symbol=%s",
-                    spread_bps, max_spread_bps, decision.symbol
-                )
-                return False
-            if depth_imbalance is not None and abs(depth_imbalance) > max_abs_imb:
-                self._execution_guards_stats["depth_imbalance_rejected"] += 1
-                logger.warning(
-                    "⚠️ 执行门控拒绝: 深度失衡过大 imbalance=%.3f > %.3f symbol=%s",
-                    abs(depth_imbalance), max_abs_imb, decision.symbol
-                )
-                return False
+                if spread_bps is not None and spread_bps > max_spread_bps:
+                    self._execution_guards_stats["spread_rejected"] += 1
+                    logger.warning(
+                        "⚠️ 执行门控拒绝: 盘口价差过大 spread=%.2fbps > %.2f symbol=%s",
+                        spread_bps, max_spread_bps, decision.symbol
+                    )
+                    return False
+                if depth_imbalance is not None and abs(depth_imbalance) > max_abs_imb:
+                    self._execution_guards_stats["depth_imbalance_rejected"] += 1
+                    logger.warning(
+                        "⚠️ 执行门控拒绝: 深度失衡过大 imbalance=%.3f > %.3f symbol=%s",
+                        abs(depth_imbalance), max_abs_imb, decision.symbol
+                    )
+                    return False
 
             logger.info(f"🎯 执行AI决策: {decision.symbol} {decision.action} {decision.side}")
             logger.info(f"   入场价: {decision.entry_price}")
@@ -3023,6 +3303,7 @@ class AICoreDecisionEngine:
                             "entry_price": decision.entry_price,
                             "stop_loss": decision.stop_loss,
                             "take_profit": decision.take_profit,
+                            "write_source": "ai_core",
                         },
                     )
                     if exec_result and getattr(exec_result, "status", None) and exec_result.status.value == "success":
@@ -3046,7 +3327,7 @@ class AICoreDecisionEngine:
                 except Exception as e:
                     logger.warning(f"执行验证网关调用失败，回退交易所直连: {e}")
 
-            # 回退：优先 ExecutionGateway（S1 窄出口），再直连交易所
+            # 回退：ExecutionGateway（S1）；无 Gateway 时再直连交易所（避免在有 S1 时绕过策略双写）
             if order is None:
                 gw = (
                     getattr(self.main_controller, "execution_gateway", None)
@@ -3062,6 +3343,12 @@ class AICoreDecisionEngine:
                                 None,
                                 "ai_core",
                                 "ai_decision_close",
+                                context={
+                                    "strategy_used": getattr(decision, "strategy_used", None),
+                                    "decision_reasoning": getattr(decision, "reasoning", None),
+                                    "confidence": getattr(decision, "confidence", None),
+                                    "risk_level": getattr(decision, "risk_level", None),
+                                },
                             )
                         else:
                             order = await gw.open_swap(
@@ -3073,12 +3360,22 @@ class AICoreDecisionEngine:
                                 "ai_decision_open",
                                 margin_mode="cross",
                                 price=None,
+                                context={
+                                    "strategy_used": getattr(decision, "strategy_used", None),
+                                    "decision_reasoning": getattr(decision, "reasoning", None),
+                                    "confidence": getattr(decision, "confidence", None),
+                                    "risk_level": getattr(decision, "risk_level", None),
+                                    "rr": rr,
+                                    "spread_bps": spread_bps,
+                                    "depth_imbalance": depth_imbalance,
+                                    "guard_profile": getattr(self, "_adaptive_guard_profile", None),
+                                },
                             )
                     except Exception as e:
-                        logger.warning(f"ExecutionGateway 执行失败，尝试交易所直连: {e}")
+                        logger.warning(f"ExecutionGateway 执行失败: {e}")
                         order = None
 
-                if order is None:
+                if order is None and not gw:
                     if decision.action == 'close':
                         order = await self.exchange.close_position(
                             symbol=decision.symbol.replace('/', '-'),
@@ -3096,9 +3393,19 @@ class AICoreDecisionEngine:
                             size=decision.quantity,
                             leverage=decision.leverage
                         )
+                elif order is None and gw:
+                    logger.error(
+                        "S1: ExecutionGateway 未成功下单且 Gateway 已启用，已跳过交易所直连兜底 symbol=%s",
+                        decision.symbol,
+                    )
             
             if order and order.get('success'):
                 logger.info(f"✅ AI决策执行成功: {order.get('orderId')}")
+
+                if decision.action == "close":
+                    ck = f"{decision.symbol}|{str(decision.side or '').lower()}"
+                    self._last_ai_discretionary_close_at[ck] = datetime.now()
+                    self._discretionary_close_streak.pop(ck, None)
 
                 # 开仓成功后，立即同步创建/更新仓位跟踪止盈止损单（使用当前动态门控信息）
                 if decision.action != "close":
@@ -3377,6 +3684,11 @@ class AICoreDecisionEngine:
                 "low_risk_spread_multiplier",
                 "high_risk_rr_multiplier",
                 "high_risk_spread_multiplier",
+                "min_available_usdt_to_open",
+                "low_balance_usdt_threshold",
+                "default_max_margin_fraction",
+                "low_balance_margin_fraction",
+                "open_fee_buffer_usdt",
                 "auto_frequency_profile_switch",
                 "frequency_profile_switch_telegram_notify",
                 "frequency_profile_cooldown_seconds",
@@ -3416,7 +3728,15 @@ class AICoreDecisionEngine:
                         "frequency_profile_switch_telegram_notify",
                     ):
                         self.config[k] = bool(overrides[k])
-                    elif k in ("auto_tune_group_step_rr", "auto_tune_group_step_spread_bps"):
+                    elif k in (
+                        "auto_tune_group_step_rr",
+                        "auto_tune_group_step_spread_bps",
+                        "min_available_usdt_to_open",
+                        "low_balance_usdt_threshold",
+                        "default_max_margin_fraction",
+                        "low_balance_margin_fraction",
+                        "open_fee_buffer_usdt",
+                    ):
                         v = overrides[k]
                         self.config[k] = None if v == "" or v == "null" else float(v)
                     else:
@@ -3765,7 +4085,7 @@ class AICoreDecisionEngine:
         decision = await self._ai_analyze_and_decide(symbol)
         
         if decision and decision.action != "hold":
-            success = await self._execute_decision(decision)
+            success = await self._execute_decision(decision, bypass_discretionary_close_gates=True)
             if success:
                 return {
                     "success": True,
@@ -3786,9 +4106,22 @@ class AICoreDecisionEngine:
             for pos in positions:
                 symbol = pos.get('instId', '')
                 side = pos.get('posSide', 'long')
-                
-                await self.exchange.close_position(symbol, side)
-                closed.append(f"{symbol} {side}")
+                res = await self._s1_close_swap(
+                    symbol,
+                    side,
+                    None,
+                    "manual",
+                    "user_close_all_command",
+                )
+                if res.get("success"):
+                    closed.append(f"{symbol} {side}")
+                else:
+                    logger.error(
+                        "平仓失败 %s %s: %s",
+                        symbol,
+                        side,
+                        res.get("error"),
+                    )
             
             if closed:
                 return {"success": True, "response": f"✅ AI已平仓: {', '.join(closed)}"}

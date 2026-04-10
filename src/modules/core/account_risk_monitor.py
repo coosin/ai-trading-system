@@ -192,13 +192,29 @@ class AccountRiskMonitor:
                 return None
             
             entry_price = float(pos.get("entry_price", 0) or 0)
-            current_price = float(pos.get("mark_price", entry_price) or entry_price)
+            current_price = float(
+                pos.get("mark_price", pos.get("mark_px", entry_price)) or entry_price
+            )
             unrealized_pnl = float(pos.get("unrealized_pnl", 0) or 0)
             leverage = float(pos.get("leverage", 1) or 1)
             margin = float(pos.get("margin", 0) or 0)
             liquidation_price = float(pos.get("liquidation_price", 0) or 0)
-            
-            unrealized_pnl_percent = (unrealized_pnl / (entry_price * size)) * 100 if entry_price > 0 and size > 0 else 0
+
+            # 优先使用交易所原生 uplRatio（OKX），避免合约“张数”口径导致的百分比失真。
+            upl_ratio = pos.get("unrealized_pnl_ratio")
+            if upl_ratio is not None:
+                try:
+                    unrealized_pnl_percent = float(upl_ratio) * 100.0
+                except Exception:
+                    unrealized_pnl_percent = 0.0
+            else:
+                notional_value = float(pos.get("notional_value", 0) or 0)
+                if notional_value > 0:
+                    unrealized_pnl_percent = (unrealized_pnl / notional_value) * 100.0
+                elif entry_price > 0 and size > 0:
+                    unrealized_pnl_percent = (unrealized_pnl / (entry_price * size)) * 100.0
+                else:
+                    unrealized_pnl_percent = 0.0
             
             distance_to_liquidation = 0
             if liquidation_price > 0 and current_price > 0:
@@ -207,7 +223,13 @@ class AccountRiskMonitor:
                 else:
                     distance_to_liquidation = (liquidation_price - current_price) / current_price
             
-            margin_ratio = margin / (entry_price * size / leverage) if entry_price > 0 and size > 0 else 0
+            notional_value = float(pos.get("notional_value", 0) or 0)
+            if margin > 0 and notional_value > 0:
+                margin_ratio = margin / notional_value
+            elif entry_price > 0 and size > 0 and leverage > 0:
+                margin_ratio = margin / (entry_price * size / leverage)
+            else:
+                margin_ratio = 0.0
             
             position_risk = PositionRisk(
                 symbol=symbol,

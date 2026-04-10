@@ -376,14 +376,16 @@ class OnChainDataIntegrator:
     async def get_whale_activities(
         self,
         symbol: str,
-        min_amount: float = 1000000
+        min_amount: float = 1000000,
+        limit: int = 5,
     ) -> List[WhaleActivity]:
         """获取巨鲸活动"""
         
         # 模拟数据
         activities = []
         
-        for i in range(5):
+        count = max(1, int(limit or 5))
+        for i in range(count):
             import random
             
             amount = random.uniform(min_amount, min_amount * 10)

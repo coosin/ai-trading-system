@@ -1009,17 +1009,80 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     "response": f"{symbol} 在您的黑名单中，我只提供行情信息，不进行交易操作。"
                 }
             
+            # 优先使用统一数据源中心（主/备通道 + 质量评分）
+            hub = getattr(self.main_controller, "data_source_hub", None) if self.main_controller else None
+            if hub:
+                try:
+                    snapshot = await hub.get_unified_snapshot(symbol)
+                    ticker = (
+                        ((snapshot or {}).get("渠道A_交易所实时执行数据") or {}).get("ticker")
+                        if isinstance(snapshot, dict)
+                        else None
+                    ) or {}
+                    price = float(ticker.get("last") or ticker.get("price") or 0.0)
+                    if price > 0:
+                        quality = ((snapshot or {}).get("数据质量评估") or {}).get("score", 0.0)
+                        trend = ((snapshot or {}).get("统一分析判断") or {}).get("overall_sentiment", "unknown")
+                        if self.llm_integration:
+                            prompt = f"""分析以下市场数据：
+
+交易对: {symbol}
+当前价格: {price}
+24h最高: {ticker.get('high', 0)}
+24h最低: {ticker.get('low', 0)}
+24h成交量: {ticker.get('volume', 0)}
+数据质量评分: {quality}
+当前趋势标签: {trend}
+
+请提供简洁的市场分析，包括：
+1. 趋势判断
+2. 关键价位
+3. 操作建议"""
+                            response = await self.llm_integration.generate(prompt, is_user_input=False)
+                            if response:
+                                return {
+                                    "success": True,
+                                    "response": f"{symbol} 市场分析\n\n{response.content}",
+                                    "data": {"symbol": symbol, "ticker": ticker, "quality": quality, "trend": trend},
+                                }
+                        # LLM 降级时，仍返回结构化行情分析，避免“数据获取失败”
+                        return {
+                            "success": True,
+                            "response": (
+                                f"{symbol} 市场分析（降级）\n\n"
+                                f"价格: {price}\n"
+                                f"24h高/低: {ticker.get('high', 0)} / {ticker.get('low', 0)}\n"
+                                f"24h量: {ticker.get('volume', 0)}\n"
+                                f"趋势: {trend}\n"
+                                f"数据质量: {quality}"
+                            ),
+                            "data": {"symbol": symbol, "ticker": ticker, "snapshot": snapshot},
+                        }
+                except Exception as hub_e:
+                    logger.debug(f"DataSourceHub 市场分析降级: {hub_e}")
+
+            # 回退到交易所 ticker，兼容不同 symbol 格式
             if self.main_controller and hasattr(self.main_controller, 'ai_trading_engine'):
                 engine = self.main_controller.ai_trading_engine
-                
-                if engine.exchange:
-                    ticker = await engine.exchange.get_ticker(symbol.replace('/', '-'))
-                    
-                    if self.llm_integration and ticker:
+                if engine and getattr(engine, "exchange", None):
+                    exchange = engine.exchange
+                    candidates = [symbol, symbol.replace("/", "-")]
+                    if "/SWAP" not in symbol and not symbol.endswith("SWAP"):
+                        candidates.append(f"{symbol}/SWAP")
+                    ticker = {}
+                    for candidate in candidates:
+                        try:
+                            ticker = await exchange.get_ticker(candidate)
+                        except Exception:
+                            ticker = {}
+                        if isinstance(ticker, dict) and float(ticker.get("last") or ticker.get("price") or 0.0) > 0:
+                            break
+
+                    if self.llm_integration and ticker and float(ticker.get("last") or ticker.get("price") or 0.0) > 0:
                         prompt = f"""分析以下市场数据：
 
 交易对: {symbol}
-当前价格: {ticker.get('last', 0)}
+当前价格: {ticker.get('last', ticker.get('price', 0))}
 24h最高: {ticker.get('high', 0)}
 24h最低: {ticker.get('low', 0)}
 24h成交量: {ticker.get('volume', 0)}
@@ -1028,16 +1091,18 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
 1. 趋势判断
 2. 关键价位
 3. 操作建议"""
-
                         response = await self.llm_integration.generate(prompt, is_user_input=False)
                         if response:
                             return {
                                 "success": True,
                                 "response": f"{symbol} 市场分析\n\n{response.content}",
-                                "data": {"symbol": symbol, "ticker": ticker}
+                                "data": {"symbol": symbol, "ticker": ticker},
                             }
-            
-            return {"success": False, "response": "市场分析失败：数据获取失败"}
+
+            return {
+                "success": False,
+                "response": f"市场分析失败：数据获取失败（{symbol}）。建议先执行“排查数据源情况”，系统将返回ETH数据探针与降级源详情。"
+            }
             
         except Exception as e:
             return {"success": False, "response": f"市场分析失败: {str(e)}"}
@@ -1287,8 +1352,20 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     })
             
             # 2. 检查第三方数据集成器
-            if self.main_controller and hasattr(self.main_controller, 'third_party_integrator'):
-                integrator = self.main_controller.third_party_integrator
+            if self.main_controller and (
+                hasattr(self.main_controller, 'third_party_integrator')
+                or hasattr(self.main_controller, 'third_party_data_integrator')
+            ):
+                integrator = (
+                    getattr(self.main_controller, "third_party_data_integrator", None)
+                    or getattr(self.main_controller, "third_party_integrator", None)
+                )
+                if (
+                    not integrator
+                    and hasattr(self.main_controller, "ai_trading_engine")
+                    and self.main_controller.ai_trading_engine
+                ):
+                    integrator = getattr(self.main_controller.ai_trading_engine, "third_party_data", None)
                 if integrator:
                     data_sources.append({
                         'name': '第三方数据集成器',
@@ -1311,6 +1388,33 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                                 'status': 'running' if info.get('enabled', False) else 'stopped',
                             })
             
+            # 4. 数据源健康与 ETH 探针（优先读 DataIntegration / DataSourceHub）
+            try:
+                if self.main_controller and hasattr(self.main_controller, "get_data_integration"):
+                    di = self.main_controller.get_data_integration()
+                    if di and hasattr(di, "get_source_health_report"):
+                        health = di.get_source_health_report()
+                        degraded = (health or {}).get("degraded_sources") or []
+                        response += "\n【外部数据源健康】\n"
+                        response += f"状态: {'退化' if degraded else '正常'}\n"
+                        if degraded:
+                            response += f"退化源: {', '.join(degraded[:6])}\n"
+            except Exception as e:
+                logger.debug(f"第三方数据健康检查失败: {e}")
+
+            try:
+                hub = getattr(self.main_controller, "data_source_hub", None) if self.main_controller else None
+                if hub:
+                    eth_ticker = await hub.get_ticker("ETH/USDT")
+                    eth_price = float((eth_ticker or {}).get("last") or (eth_ticker or {}).get("price") or 0.0)
+                    response += "\n【ETH数据探针】\n"
+                    if eth_price > 0:
+                        response += f"状态: 正常 | 价格: {eth_price}\n"
+                    else:
+                        response += "状态: 异常（未拿到有效价格）\n"
+            except Exception as e:
+                logger.debug(f"ETH 数据探针失败: {e}")
+
             if data_sources:
                 for source in data_sources:
                     status = "🟢" if source.get('status') == 'running' else "🔴"

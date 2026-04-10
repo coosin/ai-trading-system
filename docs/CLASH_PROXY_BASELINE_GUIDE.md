@@ -18,7 +18,7 @@
   - `enhanced-mode: fake-ip`
   - `listen: 0.0.0.0:1053`（避免 53 端口冲突）
   - `fake-ip-filter` 含 `+.okx.com`、`+.okex.com`
-  - `nameserver-policy` 对 `+.okx.com`、`+.okex.com` 指定稳定解析器
+  - `nameserver-policy` 对 `+.okx.com`、`+.okex.com` 使用 **1.1.1.1**（或同等可信 DoH），**不要**用 119/223/114/8.8.8.8 单独作为 OKX 策略：在部分网络会解析到 `awscn.okpool.top` → `169.254.0.2`，导致握手异常、Cloudflare `530` / `error code: 1016`
 
 ### 1.2 容器代理环境基线（docker-compose）
 

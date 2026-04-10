@@ -48,6 +48,19 @@ async def test_open_denied_when_source_not_swo():
 
 
 @pytest.mark.asyncio
+async def test_open_denied_for_legacy_execution_verifier_tag():
+    """write_source 必须显式为 SWO（如 ai_core），不再放行裸 execution_verifier。"""
+    ex = MagicMock()
+    ex.set_leverage = AsyncMock(return_value={"success": True})
+    ex.open_swap_position = AsyncMock(return_value={"success": True})
+    gw = ExecutionGateway(_mc_with_exchange(ex, swo="ai_core"))
+    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "execution_verifier", "t")
+    assert res["success"] is False
+    assert "open_policy_denied" in res.get("error", "")
+    ex.open_swap_position.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_open_allowed_for_ai_core():
     ex = MagicMock()
     ex.set_leverage = AsyncMock(return_value={"success": True})

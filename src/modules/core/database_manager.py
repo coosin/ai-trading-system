@@ -1092,7 +1092,20 @@ class DatabaseManager:
             backups = list(backup_dir.glob("backup_*.sql")) + list(backup_dir.glob("backup_*.dump"))
 
             for backup in backups:
-                backup_time = datetime.strptime(backup.stem.split("_")[1], "%Y%m%d_%H%M%S")
+                stem = backup.stem
+                if not stem.startswith("backup_"):
+                    continue
+                rest = stem[len("backup_") :]
+                backup_time = None
+                for fmt in ("%Y%m%d_%H%M%S", "%Y%m%d"):
+                    try:
+                        backup_time = datetime.strptime(rest, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if backup_time is None:
+                    logger.debug("跳过无法解析时间的备份文件: %s", backup.name)
+                    continue
                 if backup_time < cutoff_time:
                     backup.unlink()
                     logger.info(f"清理旧备份: {backup}")

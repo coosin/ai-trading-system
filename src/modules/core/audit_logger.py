@@ -28,6 +28,7 @@ class AuditEventType(Enum):
     ORDER_CREATE = "order_create"
     ORDER_CANCEL = "order_cancel"
     POSITION_UPDATE = "position_update"
+    POSITION_QUERY = "position_query"
     RISK_ALERT = "risk_alert"
     SYSTEM_START = "system_start"
     SYSTEM_STOP = "system_stop"
@@ -35,6 +36,7 @@ class AuditEventType(Enum):
     STRATEGY_LOAD = "strategy_load"
     STRATEGY_UNLOAD = "strategy_unload"
     API_CALL = "api_call"
+    SYSTEM_ACTION = "system_action"
     ERROR = "error"
     SECURITY = "security"
 

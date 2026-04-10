@@ -116,6 +116,68 @@ class ProactiveMarketScanner:
             "insights_generated": 0,
         }
 
+        # 主动性下单节流：减少突破类重复开仓与同品种高频触发
+        self._last_proactive_trade_at: Dict[str, datetime] = {}
+        self._proactive_symbol_cooldown_sec = float(
+            self.config.get("proactive_symbol_trade_cooldown_sec", 180)
+        )
+        self._breakout_trade_cooldown_sec = float(
+            self.config.get("breakout_trade_cooldown_sec", 600)
+        )
+        self._skip_breakout_if_same_side = bool(
+            self.config.get("proactive_skip_breakout_if_same_side_position", True)
+        )
+
+    @staticmethod
+    def _norm_symbol_key(symbol: str) -> str:
+        return str(symbol or "").replace(" ", "").upper()
+
+    @staticmethod
+    def _breakout_sl_tp(
+        direction: str, entry: float, low_24h: float, high_24h: float
+    ) -> tuple:
+        """突破单：止损必须在入场正确一侧（多下、空上），避免 24h 极值与现价错位时传错绝对价。"""
+        e, lo, hi = float(entry), float(low_24h), float(high_24h)
+        sl_buf, tp_buf = 0.02, 0.05
+        if direction == "long":
+            sl = min(lo, e * (1 - sl_buf))
+            if sl >= e:
+                sl = e * (1 - sl_buf)
+            tp = max(e * (1 + tp_buf), e * 1.05)
+        else:
+            sl = max(hi, e * (1 + sl_buf))
+            if sl <= e:
+                sl = e * (1 + sl_buf)
+            tp = min(e * (1 - tp_buf), e * 0.95)
+        return sl, tp
+
+    async def _has_same_side_position(self, symbol: str, direction: str) -> bool:
+        if not self.exchange or not hasattr(self.exchange, "get_positions"):
+            return False
+        want = str(direction or "").strip().lower()
+        if want not in ("long", "short"):
+            return False
+        base = str(symbol or "").split("/")[0].strip().upper()
+        if not base:
+            return False
+        try:
+            rows = await self.exchange.get_positions()
+        except Exception:
+            return False
+        for p in rows or []:
+            if not isinstance(p, dict):
+                continue
+            sz = float(p.get("size", 0) or 0)
+            if sz <= 1e-12:
+                continue
+            if str(p.get("side", "")).lower() != want:
+                continue
+            iid = str(p.get("instId", "")).upper()
+            sym = str(p.get("symbol", "")).upper().replace("-", "/")
+            if base in iid or (base + "/") in sym or sym.startswith(base + "/"):
+                return True
+        return False
+
     @staticmethod
     def _zh_direction(v: str) -> str:
         m = {"long": "做多", "short": "做空", "neutral": "中性"}
@@ -345,14 +407,17 @@ class ProactiveMarketScanner:
                         current_price = closes[-1]
                         
                         if current_price >= high_24h * 0.98:
+                            sl, tp = self._breakout_sl_tp(
+                                "long", current_price, low_24h, high_24h
+                            )
                             return MarketOpportunity(
                                 symbol=symbol,
                                 opportunity_type=OpportunityType.BREAKOUT,
                                 direction="long",
                                 confidence=0.75,
                                 entry_price=current_price,
-                                stop_loss=low_24h,
-                                take_profit=current_price * 1.05,
+                                stop_loss=sl,
+                                take_profit=tp,
                                 reasoning=f"突破24小时高点，当前价格接近高点 {high_24h:.4f}",
                                 data_sources=["ticker", "klines"],
                                 priority=7,
@@ -360,14 +425,17 @@ class ProactiveMarketScanner:
                             )
                         
                         elif current_price <= low_24h * 1.02:
+                            sl, tp = self._breakout_sl_tp(
+                                "short", current_price, low_24h, high_24h
+                            )
                             return MarketOpportunity(
                                 symbol=symbol,
                                 opportunity_type=OpportunityType.BREAKOUT,
                                 direction="short",
                                 confidence=0.75,
                                 entry_price=current_price,
-                                stop_loss=high_24h,
-                                take_profit=current_price * 0.95,
+                                stop_loss=sl,
+                                take_profit=tp,
                                 reasoning=f"跌破24小时低点，当前价格接近低点 {low_24h:.4f}",
                                 data_sources=["ticker", "klines"],
                                 priority=7,
@@ -574,6 +642,36 @@ class ProactiveMarketScanner:
     async def _evaluate_and_execute(self, opportunity: MarketOpportunity) -> bool:
         """评估并执行机会"""
         logger.info(f"⚡ 评估机会: {opportunity.symbol} {self._zh_direction(opportunity.direction)}")
+
+        sym_key = self._norm_symbol_key(opportunity.symbol)
+        now = datetime.now()
+        last_any = self._last_proactive_trade_at.get(f"sym:{sym_key}")
+        if last_any and (now - last_any).total_seconds() < self._proactive_symbol_cooldown_sec:
+            logger.info(
+                "⏳ 跳过机会(同品种冷却 %ds): %s",
+                int(self._proactive_symbol_cooldown_sec),
+                sym_key,
+            )
+            return False
+        if opportunity.opportunity_type == OpportunityType.BREAKOUT:
+            last_bo = self._last_proactive_trade_at.get(f"breakout:{sym_key}")
+            if last_bo and (now - last_bo).total_seconds() < self._breakout_trade_cooldown_sec:
+                logger.info(
+                    "⏳ 跳过机会(突破冷却 %ds): %s",
+                    int(self._breakout_trade_cooldown_sec),
+                    sym_key,
+                )
+                return False
+            if self._skip_breakout_if_same_side:
+                if await self._has_same_side_position(
+                    opportunity.symbol, opportunity.direction
+                ):
+                    logger.info(
+                        "⏳ 跳过突破机会(已有同向持仓): %s %s",
+                        sym_key,
+                        opportunity.direction,
+                    )
+                    return False
         
         insight = self._insights.get(opportunity.symbol)
         
@@ -600,6 +698,10 @@ class ProactiveMarketScanner:
                     )
                     if result:
                         self._stats["actions_taken"] += 1
+                        ts = datetime.now()
+                        self._last_proactive_trade_at[f"sym:{sym_key}"] = ts
+                        if opportunity.opportunity_type == OpportunityType.BREAKOUT:
+                            self._last_proactive_trade_at[f"breakout:{sym_key}"] = ts
                         logger.info(f"✅ 执行机会成功: {opportunity.symbol}")
                         return True
                 except Exception as e:
@@ -1097,21 +1199,36 @@ class ProactiveActionTrigger:
             return False
     
     async def _execute_close_position(self, action: Dict) -> bool:
-        """执行平仓"""
+        """执行平仓（S1：ExecutionGateway，source=system）"""
         if not self.main_controller:
             return False
-        
-        exchange = getattr(self.main_controller, 'okx_exchange', None) or \
-                   getattr(self.main_controller, 'exchange', None)
-        if not exchange:
-            return False
-        
-        try:
-            result = await exchange.close_position(
-                action.get('symbol'),
-                action.get('side', 'long')
+
+        gw = getattr(self.main_controller, "execution_gateway", None)
+        if not gw:
+            exchange = getattr(self.main_controller, "okx_exchange", None) or getattr(
+                self.main_controller, "exchange", None
             )
-            return True
+            if not exchange:
+                return False
+            try:
+                res = await exchange.close_position(
+                    action.get("symbol"),
+                    action.get("side", "long"),
+                )
+                return bool(res.get("success") if isinstance(res, dict) else res)
+            except Exception as e:
+                logger.error("平仓执行失败: %s", e)
+                return False
+
+        try:
+            res = await gw.close_swap(
+                action.get("symbol"),
+                str(action.get("side", "long")).lower(),
+                None,
+                "system",
+                "proactive_ai_close",
+            )
+            return bool(isinstance(res, dict) and res.get("success"))
         except Exception as e:
             logger.error(f"平仓执行失败: {e}")
             return False

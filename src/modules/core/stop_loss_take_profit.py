@@ -160,6 +160,7 @@ class StopLossTakeProfitConfig:
     breakeven_trigger: float = 0.02
     enable_partial_tp: bool = True
     check_interval: int = 5
+    # 仅限制「活跃跟踪」数量；已触发/已取消的历史单不计入（否则会误伤 sync_open_positions）
     max_orders: int = 100
     persist_file: str = "data/stop_loss_orders.json"
     sync_exchange_positions_on_startup: bool = True
@@ -380,6 +381,73 @@ class StopLossTakeProfitManager:
             )
         return self._index_key_lookup_variants(order.symbol, order.side)
 
+    def _count_active_orders(self) -> int:
+        return sum(1 for o in self.orders.values() if o.status == StopLossTakeProfitStatus.ACTIVE)
+
+    def _reprice_sl_tp_from_order(self, order: StopLossTakeProfitOrder) -> None:
+        """入场价变化后按订单内保存的 SL/TP 类型与比例重算价格。"""
+        slc = StopLossConfig(
+            stop_type=order.stop_loss_type,
+            stop_value=float(order.stop_loss_value or 0.03),
+            trailing_offset=float(order.trailing_stop_offset or 0.02),
+        )
+        tpc = TakeProfitConfig(
+            tp_type=order.take_profit_type,
+            tp_value=float(order.take_profit_value or 0.06),
+        )
+        order.stop_loss_price = self._calculate_stop_loss_price(order.entry_price, order.side, slc)
+        order.take_profit_price = self._calculate_take_profit_price(order.entry_price, order.side, tpc)
+
+    def _refresh_active_order_from_exchange_position(
+        self,
+        order: StopLossTakeProfitOrder,
+        p: Dict[str, Any],
+        sym: str,
+        side: str,
+    ) -> bool:
+        """
+        交易所侧持仓与本地 ACTIVE 跟踪对齐：数量、均价变化时更新，并维持 SL/TP 与跟踪边界合理。
+        这样在周期性 sync 时不仅「不重复建单」，还能持续「接管」真实仓位。
+        """
+        changed = False
+        new_sz = abs(float(p.get("size", 0) or 0))
+        if new_sz > 1e-12:
+            if abs(float(order.quantity or 0) - new_sz) > 1e-12 or abs(float(order.remaining_quantity or 0) - new_sz) > 1e-12:
+                order.quantity = new_sz
+                order.remaining_quantity = new_sz
+                changed = True
+
+        entry = float(p.get("entry_price", 0) or 0)
+        if entry <= 0:
+            entry = float(p.get("mark_px", 0) or 0)
+        if entry > 0:
+            rel = abs(order.entry_price - entry) / max(abs(entry), 1e-12)
+            if rel > 1e-7:
+                order.entry_price = entry
+                self._reprice_sl_tp_from_order(order)
+                changed = True
+                try:
+                    if order.side == "long":
+                        hp = float(order.highest_price or 0)
+                        order.highest_price = max(hp, entry) if hp > 0 else entry
+                    else:
+                        lp = float(order.lowest_price) if order.lowest_price is not None else float("inf")
+                        if not math.isfinite(lp) or lp <= 0:
+                            order.lowest_price = entry
+                        else:
+                            order.lowest_price = min(lp, entry)
+                except Exception:
+                    pass
+
+        if changed:
+            order.updated_at = datetime.now()
+            meta = dict(order.metadata or {})
+            meta["last_exchange_sync"] = datetime.now().isoformat()
+            meta["exchange_sync_symbol"] = sym
+            order.metadata = meta
+
+        return changed
+
     async def sync_open_positions_from_exchange(self) -> Dict[str, Any]:
         """
         将交易所当前净持仓登记到本地止盈止损跟踪（解决「仓位在交易所但本模块未建单」的问题）。
@@ -401,6 +469,7 @@ class StopLossTakeProfitManager:
 
         synced = 0
         skipped = 0
+        refreshed = 0
         stale_cancelled = 0
         live_index_keys = set()
         raw_row_count = len(positions or [])
@@ -464,6 +533,11 @@ class StopLossTakeProfitManager:
                 if oid:
                     existing = self.orders.get(oid)
                     if existing and existing.status == StopLossTakeProfitStatus.ACTIVE:
+                        try:
+                            if self._refresh_active_order_from_exchange_position(existing, p, sym, side):
+                                refreshed += 1
+                        except Exception as e:
+                            logger.debug("sync_open_positions: 刷新本地跟踪失败 %s: %s", index_key, e)
                         skipped += 1
                         continue
 
@@ -478,8 +552,15 @@ class StopLossTakeProfitManager:
                     logger.warning(f"sync_open_positions: 跳过 {index_key}（无有效入场价/标记价）")
                     continue
 
-                if len(self.orders) >= self.config.max_orders:
-                    logger.warning("sync_open_positions: 已达 max_orders，停止同步")
+                # max_orders 表示「活跃 SLTP 跟踪」上限；历史 triggered/cancelled 仍留在 self.orders 供统计，
+                # 若用 len(self.orders) 会误报已满并拒绝为当前持仓登记跟踪。
+                active_n = self._count_active_orders()
+                if active_n >= self.config.max_orders:
+                    logger.warning(
+                        "sync_open_positions: 已达 max_orders（仅统计 ACTIVE=%s，总记录=%s），停止新建同步",
+                        active_n,
+                        len(self.orders),
+                    )
                     break
 
                 await self.create_order(
@@ -496,15 +577,16 @@ class StopLossTakeProfitManager:
             except Exception as e:
                 logger.warning(f"sync_open_positions: 处理单条持仓失败: {e}")
 
-        if stale_cancelled > 0:
+        if stale_cancelled > 0 or refreshed > 0:
             await self._save_orders()
         logger.info(
-            f"📌 交易所持仓→止盈止损跟踪: 新建 {synced}，已存在跳过 {skipped}，清理陈旧 {stale_cancelled}，"
-            f"live_keys={len(live_index_keys)} raw_rows={raw_row_count}"
+            f"📌 交易所持仓→止盈止损跟踪: 新建 {synced}，已存在跳过 {skipped}（其中已对齐刷新 {refreshed}），"
+            f"清理陈旧 {stale_cancelled}，live_keys={len(live_index_keys)} raw_rows={raw_row_count}"
         )
         return {
             "synced": synced,
             "skipped": skipped,
+            "refreshed": refreshed,
             "stale_cancelled": stale_cancelled,
             "live_index_keys": sorted(live_index_keys),
             "raw_row_count": raw_row_count,
@@ -564,6 +646,10 @@ class StopLossTakeProfitManager:
         take_profit_price = self._calculate_take_profit_price(
             entry_price, side, tp_config
         )
+
+        stop_loss_price, take_profit_price = self._sanitize_sl_tp_vs_entry(
+            entry_price, side, stop_loss_price, take_profit_price, sl_config, tp_config
+        )
         
         time_limit = None
         if sl_config.time_limit_hours > 0:
@@ -597,8 +683,14 @@ class StopLossTakeProfitManager:
         
         logger.info(f"✅ 创建止盈止损订单: {symbol} {side}")
         logger.info(f"   入场价: {entry_price:.4f}")
-        logger.info(f"   止损价: {stop_loss_price:.4f} ({sl_config.stop_value*100:.1f}%)")
-        logger.info(f"   止盈价: {take_profit_price:.4f} ({tp_config.tp_value*100:.1f}%)")
+        if sl_config.stop_type == StopType.PERCENTAGE:
+            logger.info(f"   止损价: {stop_loss_price:.4f} ({sl_config.stop_value*100:.1f}%)")
+        else:
+            logger.info(f"   止损价: {stop_loss_price:.4f} ({sl_config.stop_type.value})")
+        if tp_config.tp_type == TakeProfitType.PERCENTAGE:
+            logger.info(f"   止盈价: {take_profit_price:.4f} ({tp_config.tp_value*100:.1f}%)")
+        else:
+            logger.info(f"   止盈价: {take_profit_price:.4f} ({tp_config.tp_type.value})")
         
         if self._audit_logger:
             from .audit_logger import AuditEventType, AuditSeverity
@@ -618,6 +710,62 @@ class StopLossTakeProfitManager:
             )
         
         return order
+
+    def _sanitize_sl_tp_vs_entry(
+        self,
+        entry_price: float,
+        side: str,
+        stop_loss_price: float,
+        take_profit_price: float,
+        sl_config: StopLossConfig,
+        tp_config: TakeProfitConfig,
+    ) -> Tuple[float, float]:
+        """
+        强制止损/止盈相对入场方向正确：
+        - 多：止损 < 入场 < 止盈
+        - 空：止盈 < 入场 < 止损
+        外部若传入 FIXED 绝对价错误（常见于突破策略误用），按默认百分比回退。
+        """
+        ep = float(entry_price or 0)
+        side_l = str(side or "").lower()
+        if ep <= 0 or not math.isfinite(ep):
+            return stop_loss_price, take_profit_price
+        sl = float(stop_loss_price)
+        tp = float(take_profit_price)
+        eps = max(ep * 1e-7, 1e-9)
+        # FIXED 时 stop_value/tp_value 为绝对价，不能当百分比用
+        if sl_config.stop_type == StopType.PERCENTAGE:
+            sl_pct = min(0.25, max(0.003, float(sl_config.stop_value or 0.03)))
+        else:
+            sl_pct = 0.03
+        if tp_config.tp_type == TakeProfitType.PERCENTAGE:
+            tp_pct = min(0.35, max(0.005, float(tp_config.tp_value or 0.06)))
+        else:
+            tp_pct = 0.06
+        fixed = False
+        if side_l == "long":
+            if (not math.isfinite(sl)) or sl >= ep - eps:
+                sl = ep * (1 - sl_pct)
+                fixed = True
+            if (not math.isfinite(tp)) or tp <= ep + eps:
+                tp = ep * (1 + tp_pct)
+                fixed = True
+        elif side_l == "short":
+            if (not math.isfinite(sl)) or sl <= ep + eps:
+                sl = ep * (1 + sl_pct)
+                fixed = True
+            if (not math.isfinite(tp)) or tp >= ep - eps:
+                tp = ep * (1 - tp_pct)
+                fixed = True
+        if fixed:
+            logger.warning(
+                "SLTP: 止损/止盈与方向不一致已按百分比修正 side=%s entry=%.8g sl->%.8g tp->%.8g",
+                side_l,
+                ep,
+                sl,
+                tp,
+            )
+        return sl, tp
     
     def _calculate_stop_loss_price(
         self,

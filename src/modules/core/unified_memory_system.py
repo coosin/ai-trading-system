@@ -236,8 +236,12 @@ class UnifiedMemorySystem:
         return self._optimized_memory
     
     def get_hierarchical_memory(self):
-        """获取层次化记忆管理器（保留现有接口）"""
-        return self._optimized_memory
+        """获取层次化记忆管理器（保留现有接口）
+
+        返回 UnifiedMemorySystem 自身：对外提供与 HierarchicalMemoryManager 相同的心智模型
+        （save_daily_memory / load_recent_memories / consolidate_memories 等），底层仍走 OptimizedMemorySystem。
+        """
+        return self
     
     def get_memory_optimizer(self):
         """获取内存优化器（保留现有接口）"""
@@ -323,6 +327,81 @@ class UnifiedMemorySystem:
         """保存风险事件"""
         if self._optimized_memory:
             await self._optimized_memory.save_risk_event(event, level)
+
+    async def load_recent_memories(self, days: int = 2) -> List[str]:
+        """按天加载近期每日摘要（与 HierarchicalMemoryManager 行为对齐：仅返回有内容的日期）。"""
+        if not self._optimized_memory:
+            return []
+        memories: List[str] = []
+        for i in range(max(1, int(days))):
+            date = datetime.now() - timedelta(days=i)
+            date_str = date.strftime("%Y-%m-%d")
+            entries = await self._optimized_memory.recall(
+                query="",
+                category=MemoryCategory.DAILY_SUMMARY,
+                tags={date_str, "daily"},
+                limit=20,
+            )
+            if entries:
+                entries.sort(key=lambda e: e.created_at, reverse=True)
+                memories.append("\n\n".join(e.content for e in entries))
+        return memories
+
+    async def save_lesson_learned(self, lesson_type: str, lesson: str, context: str) -> None:
+        """保存经验教训（文件式层次记忆的优化存储等价实现）。"""
+        if not self._optimized_memory:
+            return
+        content = f"[{lesson_type}] {lesson}\n上下文: {context}".strip()
+        await self._optimized_memory.remember(
+            content=content,
+            category=MemoryCategory.LESSON_LEARNED,
+            layer=MemoryLayer.EXPERIENCE,
+            importance=0.78,
+            tags={lesson_type, "lesson"},
+            metadata={"lesson_type": lesson_type, "context": context},
+        )
+        self._sync_stats()
+
+    @staticmethod
+    def _extract_lessons_from_text(content: str) -> List[tuple]:
+        keywords = {
+            "trading_mistakes": ["错误", "失败", "亏损", "止损"],
+            "successful_patterns": ["成功", "盈利", "正确", "机会"],
+            "risk_management": ["风险", "强平", "爆仓", "仓位"],
+            "market_patterns": ["规律", "模式", "趋势", "周期"],
+        }
+        lessons: List[tuple] = []
+        lines = content.split("\n")
+        for i, line in enumerate(lines):
+            for lesson_type, words in keywords.items():
+                if any(word in line for word in words):
+                    context_start = max(0, i - 2)
+                    context_end = min(len(lines), i + 3)
+                    context = "\n".join(lines[context_start:context_end])
+                    lessons.append((lesson_type, line, context))
+                    break
+        return lessons
+
+    async def consolidate_memories(self) -> None:
+        """整理记忆：过期清理 + 从近期每日摘要提炼经验教训。"""
+        logger.info("开始整理记忆...")
+        if not self._optimized_memory:
+            return
+        try:
+            await self._optimized_memory.cleanup_expired()
+            self._sync_stats()
+        except Exception as e:
+            logger.warning("记忆过期清理失败: %s", e)
+
+        recent = await self.load_recent_memories(7)
+        if not recent:
+            logger.info("没有近期记忆需要整理")
+            return
+        all_content = "\n\n---\n\n".join(recent)
+        lessons = self._extract_lessons_from_text(all_content)
+        for lesson_type, lesson, context in lessons:
+            await self.save_lesson_learned(lesson_type, lesson, context)
+        logger.info("记忆整理完成，提取了 %s 条经验教训", len(lessons))
     
     async def get_trade_history(self, days: int = 7) -> List[Dict]:
         """获取交易历史"""

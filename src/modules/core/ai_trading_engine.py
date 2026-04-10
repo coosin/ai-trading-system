@@ -174,6 +174,10 @@ class AITradingEngine:
             "trade_mode": "real",
             "auto_risk_management": True,
             "critical_risk_auto_close": True,
+            # 自动强平保护闸：默认仅在“非常接近强平”时自动平仓，避免把普通浮亏当成强制平仓。
+            "critical_risk_auto_close_liq_only": True,
+            "critical_risk_auto_close_max_liq_distance": 0.02,
+            "critical_risk_auto_close_min_loss_pct": 25.0,
             "max_loss_per_position": 0.05,
             "daily_loss_limit": 0.10,
             "max_drawdown_limit": 0.15,
@@ -420,12 +424,15 @@ class AITradingEngine:
         """
         S1：当 single_write_owner 为 ai_core 时，本引擎不得并行跑自主开平仓循环，
         避免与 AICoreDecisionEngine 争夺实盘写入权。
+        若 ai_brain.enable_secondary_controller=true，则显式允许并行主循环（用户手动开启双控）。
         """
         mc = self.main_controller
         if not mc or not hasattr(mc, "get_ai_managed_config"):
             return True
         try:
             policy = await mc.get_ai_managed_config("ai_brain", {})
+            if bool(policy.get("enable_secondary_controller", False)):
+                return True
             swo = str(
                 policy.get("single_write_owner") or policy.get("primary_controller") or "ai_core"
             ).strip().lower()
@@ -1576,9 +1583,11 @@ class AITradingEngine:
                     swo = str(
                         policy.get("single_write_owner") or policy.get("primary_controller") or "ai_core"
                     ).strip().lower()
-                    if swo == "ai_core" and not meta.get("auto_close"):
+                    enable_secondary = bool(policy.get("enable_secondary_controller", False))
+                    if swo == "ai_core" and not meta.get("auto_close") and not enable_secondary:
                         logger.warning(
-                            "AITradingEngine: 跳过执行（single_write_owner=ai_core，仅保留风险自动平仓）"
+                            "AITradingEngine: 跳过执行（single_write_owner=ai_core，仅保留风险自动平仓；"
+                            "若需双控请设置 ai_brain.enable_secondary_controller=true）"
                         )
                         return False
                 except Exception:
@@ -1612,29 +1621,80 @@ class AITradingEngine:
                 "market_route": (decision.metadata or {}).get("market_context", {}).get("metadata", {}).get("market_route", {}),
             }
 
-            # 兼容不同交易所接口：优先 place_order，其次 create_order（测试 mock 使用此接口）
+            # S1：优先经 ExecutionGateway，与 ai_core 策略一致；无 Gateway 时再直连交易所
             result = None
-            place_order = getattr(self.exchange, "place_order", None)
-            create_order = getattr(self.exchange, "create_order", None)
-            place_is_async = callable(place_order) and (
-                asyncio.iscoroutinefunction(place_order) or place_order.__class__.__name__ == "AsyncMock"
-            )
+            gw = getattr(mc, "execution_gateway", None) if mc else None
+            lev = int(self.contract_config.get("default_leverage", 20))
+            if gw:
+                try:
+                    if is_close:
+                        result = await gw.close_swap(
+                            decision.symbol,
+                            pos_side,
+                            None,
+                            "ai_trading_engine",
+                            "aitrading_close",
+                            context={
+                                "decision_reasoning": getattr(decision, "reasoning", None),
+                                "confidence": getattr(decision, "confidence", None),
+                                "risk_level": getattr(decision, "risk_level", None),
+                                "metadata": getattr(decision, "metadata", None),
+                            },
+                        )
+                    else:
+                        result = await gw.open_swap(
+                            decision.symbol,
+                            pos_side,
+                            float(decision.quantity),
+                            lev,
+                            "ai_trading_engine",
+                            "aitrading_open",
+                            margin_mode="cross",
+                            price=None,
+                            context={
+                                "decision_reasoning": getattr(decision, "reasoning", None),
+                                "confidence": getattr(decision, "confidence", None),
+                                "risk_level": getattr(decision, "risk_level", None),
+                                "metadata": getattr(decision, "metadata", None),
+                            },
+                        )
+                except Exception as e:
+                    logger.warning("AITradingEngine: ExecutionGateway 执行异常: %s", e)
+                    result = None
+                if isinstance(result, dict):
+                    err = str(result.get("error") or "")
+                    if "policy_denied" in err or "open_policy_denied" in err:
+                        logger.warning("AITradingEngine: S1 策略拒绝: %s", err)
+                        return False
 
-            if place_is_async:
-                result = await place_order(order)
-            elif callable(create_order):
-                side = "buy" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "sell"
-                maybe = create_order(
-                    decision.symbol,
-                    side,
-                    "market",
-                    decision.quantity,
-                    decision.price,
+            if (result is None or not self._is_order_result_success(result)) and not gw:
+                place_order = getattr(self.exchange, "place_order", None)
+                create_order = getattr(self.exchange, "create_order", None)
+                place_is_async = callable(place_order) and (
+                    asyncio.iscoroutinefunction(place_order) or place_order.__class__.__name__ == "AsyncMock"
                 )
-                if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
-                    result = await maybe
-                else:
-                    result = maybe
+
+                if place_is_async:
+                    result = await place_order(order)
+                elif callable(create_order):
+                    side = "buy" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "sell"
+                    maybe = create_order(
+                        decision.symbol,
+                        side,
+                        "market",
+                        decision.quantity,
+                        decision.price,
+                    )
+                    if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
+                        result = await maybe
+                    else:
+                        result = maybe
+            elif result is None or not self._is_order_result_success(result):
+                logger.error(
+                    "AITradingEngine: Gateway 已启用但下单未成功，已跳过直连兜底 symbol=%s",
+                    decision.symbol,
+                )
+                return False
             
             if self._is_order_result_success(result):
                 order_id = ""
@@ -1945,6 +2005,83 @@ class AITradingEngine:
         except Exception as e:
             logger.error(f"创建止损止盈订单失败: {e}")
             return False
+
+    async def execute_trade(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        reasoning: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        外部模块（主动性扫描、ProactiveActionTrigger 等）统一开仓入口。
+        经 ExecutionGateway、source=system，与 S1 一致；成功后可注册 StopLossTakeProfitManager。
+        """
+        mc = self.main_controller
+        gw = getattr(mc, "execution_gateway", None) if mc else None
+        if not gw or not self.exchange:
+            logger.warning("execute_trade: 无 ExecutionGateway 或交易所，跳过")
+            return None
+        s = str(side or "long").strip().lower()
+        if s in ("buy", "b"):
+            s = "long"
+        if s in ("sell", "s"):
+            s = "short"
+        qty = float(quantity or 0.01)
+        lev = int(self.contract_config.get("default_leverage", 20))
+        res = await gw.open_swap(
+            symbol,
+            s,
+            qty,
+            lev,
+            "system",
+            reasoning or "execute_trade",
+            margin_mode="cross",
+            price=None,
+            context={
+                "requested_stop_loss": stop_loss,
+                "requested_take_profit": take_profit,
+                "reasoning": reasoning,
+            },
+        )
+        if not res.get("success"):
+            return res
+        if (
+            mc
+            and stop_loss is not None
+            and take_profit is not None
+            and getattr(mc, "stop_loss_manager", None)
+        ):
+            try:
+                from .stop_loss_take_profit import (
+                    StopLossConfig,
+                    TakeProfitConfig,
+                    StopType,
+                    TakeProfitType,
+                )
+
+                t = await self.exchange.get_ticker(
+                    symbol if "/" in str(symbol) else str(symbol).replace("-", "/")
+                )
+                entry = float((t or {}).get("last") or (t or {}).get("close") or 0)
+                if entry <= 0:
+                    return res
+                sl_c = StopLossConfig(stop_type=StopType.FIXED, stop_value=float(stop_loss))
+                tp_c = TakeProfitConfig(tp_type=TakeProfitType.FIXED, tp_value=float(take_profit))
+                await mc.stop_loss_manager.create_order(
+                    symbol=symbol if "/" in str(symbol) else str(symbol).replace("-", "/"),
+                    side=s,
+                    entry_price=entry,
+                    quantity=qty,
+                    stop_loss_config=sl_c,
+                    take_profit_config=tp_c,
+                    metadata={"source": "execute_trade", "reasoning": reasoning},
+                )
+            except Exception as e:
+                logger.warning("execute_trade: 止盈止损注册失败（不影响成交）: %s", e)
+        return res
     
     async def _update_positions(self) -> None:
         """更新持仓信息 - 从交易所实时获取"""
@@ -2433,8 +2570,47 @@ class AITradingEngine:
                     )
                     
                     if self.ai_config.get("critical_risk_auto_close", False):
-                        logger.critical(f"🤖 自动风险处理: 平仓 {pos_risk.symbol}")
-                        await self._auto_close_position(pos_risk.symbol)
+                        risk_cfg = {}
+                        if self.risk_monitor and hasattr(self.risk_monitor, "risk_config"):
+                            risk_cfg = getattr(self.risk_monitor, "risk_config", {}) or {}
+                        liq_dist = float(getattr(pos_risk, "distance_to_liquidation", 0) or 0)
+                        loss_pct = abs(min(float(getattr(pos_risk, "unrealized_pnl_percent", 0) or 0), 0.0))
+
+                        liq_critical = float(risk_cfg.get("liquidation_distance_critical", 0.08) or 0.08)
+                        liq_auto_close_max = float(
+                            self.ai_config.get(
+                                "critical_risk_auto_close_max_liq_distance",
+                                min(liq_critical, 0.04),
+                            ) or min(liq_critical, 0.04)
+                        )
+                        near_liq = liq_dist > 0 and liq_dist <= liq_auto_close_max
+
+                        margin_critical = float(risk_cfg.get("margin_ratio_critical", 0.9) or 0.9)
+                        margin_emergency = margin_critical > 0 and float(getattr(account_risk, "margin_ratio", 0) or 0) >= margin_critical
+
+                        liq_only = bool(self.ai_config.get("critical_risk_auto_close_liq_only", True))
+                        min_loss_pct = float(self.ai_config.get("critical_risk_auto_close_min_loss_pct", 25.0) or 25.0)
+                        severe_loss = loss_pct >= min_loss_pct
+
+                        should_auto_close = margin_emergency or (near_liq if liq_only else (near_liq or severe_loss))
+                        if should_auto_close:
+                            logger.critical(
+                                "🤖 自动风险处理: 平仓 %s (liq_dist=%.3f, loss=%.1f%%, margin=%.3f)",
+                                pos_risk.symbol,
+                                liq_dist,
+                                loss_pct,
+                                float(getattr(account_risk, "margin_ratio", 0) or 0),
+                            )
+                            await self._auto_close_position(pos_risk.symbol)
+                        else:
+                            logger.warning(
+                                "🛡️ 跳过自动强平 %s：未命中强平闸门 (liq_dist=%.3f > %.3f, loss=%.1f%%, liq_only=%s)",
+                                pos_risk.symbol,
+                                liq_dist,
+                                liq_auto_close_max,
+                                loss_pct,
+                                liq_only,
+                            )
         
         elif account_risk.risk_level == RiskLevel.HIGH:
             for warning in account_risk.warnings:
@@ -2449,57 +2625,82 @@ class AITradingEngine:
             )
     
     async def _auto_close_position(self, symbol: str) -> bool:
-        """自动平仓（风险控制）- 带冷却机制避免重复平仓"""
+        """账户风控强平：经 ExecutionGateway、source=account_risk_monitor（与 SLTP 分源，避免策略混写）。"""
         try:
             import time
-            
-            # 检查冷却时间
+
             current_time = time.time()
             if symbol in self._auto_close_attempts:
                 last_attempt_time = self._auto_close_attempts[symbol]
                 if current_time - last_attempt_time < self._auto_close_cooldown:
-                    logger.warning(f"⏸️ {symbol} 自动平仓在冷却期内，跳过（距上次 {current_time - last_attempt_time:.1f}秒）")
+                    logger.warning(
+                        "⏸️ %s 自动平仓在冷却期内，跳过（距上次 %.1f 秒）",
+                        symbol,
+                        current_time - last_attempt_time,
+                    )
                     return False
-            
+
             position = self.positions.get(symbol)
             if not position:
-                logger.warning(f"⚠️ 未找到持仓 {symbol}")
+                logger.warning("⚠️ 未找到持仓 %s", symbol)
                 return False
-            
+
             if isinstance(position, dict):
-                logger.error(f"❌ 持仓数据格式错误: {symbol}")
+                logger.error("❌ 持仓数据格式错误: %s", symbol)
                 return False
-            
-            # 记录平仓尝试时间
+
             self._auto_close_attempts[symbol] = current_time
-            
-            logger.critical(f"🚨 执行自动平仓: {symbol} {position.side} {position.quantity}")
-            
-            decision = AIDecision(
-                action=TradeAction.CLOSE_LONG if position.side == "long" else TradeAction.CLOSE_SHORT,
-                symbol=symbol,
-                price=position.current_price,
-                quantity=position.quantity,
-                confidence=1.0,
-                reasoning="风险控制自动平仓",
-                risk_level="high",
-                metadata={"auto_close": True, "reason": "critical_risk"}
+            logger.critical(
+                "🚨 执行自动平仓(风控): %s %s %s",
+                symbol,
+                position.side,
+                position.quantity,
             )
-            
-            result = await self._execute_decision(decision)
-            
-            if result:
-                logger.critical(f"✅ 自动平仓成功: {symbol}")
-                # 平仓成功后，从持仓列表中移除
+
+            mc = self.main_controller
+            gw = getattr(mc, "execution_gateway", None) if mc else None
+            if gw:
+                res = await gw.close_swap(
+                    symbol,
+                    position.side,
+                    None,
+                    "account_risk_monitor",
+                    "critical_risk_auto_close",
+                    context={
+                        "reasoning": "critical_risk_auto_close",
+                        "position_side": position.side,
+                        "position_qty": position.quantity,
+                    },
+                )
+                ok = bool(isinstance(res, dict) and res.get("success"))
+            else:
+                decision = AIDecision(
+                    action=(
+                        TradeAction.CLOSE_LONG
+                        if position.side == "long"
+                        else TradeAction.CLOSE_SHORT
+                    ),
+                    symbol=symbol,
+                    price=position.current_price,
+                    quantity=position.quantity,
+                    confidence=1.0,
+                    reasoning="风险控制自动平仓",
+                    risk_level="high",
+                    metadata={"auto_close": True, "reason": "critical_risk"},
+                )
+                ok = await self._execute_decision(decision)
+
+            if ok:
+                logger.critical("✅ 自动平仓成功: %s", symbol)
                 if symbol in self.positions:
                     del self.positions[symbol]
             else:
-                logger.error(f"❌ 自动平仓失败: {symbol}")
-            
-            return result
-            
+                logger.error("❌ 自动平仓失败: %s", symbol)
+
+            return ok
+
         except Exception as e:
-            logger.error(f"自动平仓失败: {e}")
+            logger.error("自动平仓失败: %s", e)
             return False
     
     async def _save_risk_event_to_memory(self, event_type: str, symbol: str,

@@ -61,7 +61,9 @@ class TelegramBot:
         if config.get("chat_ids_env"):
             chat_id_str = os.environ.get(config["chat_ids_env"], "")
             logger.info(f"📱 从环境变量 {config['chat_ids_env']} 读取 chat_ids: {chat_id_str}")
-            self.chat_ids = [int(x.strip()) for x in chat_id_str.split(",") if x.strip()]
+            parsed = [int(x.strip()) for x in chat_id_str.split(",") if x.strip()]
+            # 兼容：若环境变量存在但为空，则回退到配置文件的 chat_ids（避免“空值覆盖”导致无法推送）
+            self.chat_ids = parsed if parsed else (config.get("chat_ids", []) or [])
         else:
             self.chat_ids = config.get("chat_ids", [])
         
@@ -690,7 +692,9 @@ class TelegramBot:
                 resolved_chat_id = int(self.chat_ids[0]) if self.chat_ids else None
 
         if resolved_chat_id is None:
-            raise ValueError("No chat_id available for Telegram message delivery")
+            # 可选渠道：未配置 chat_id 时不抛异常，避免核心路径（止盈止损、心跳）反复 ERROR
+            logger.debug("跳过 Telegram 发送：未配置 chat_id")
+            return
         if not resolved_text:
             return
 

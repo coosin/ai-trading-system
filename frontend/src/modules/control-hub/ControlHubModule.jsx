@@ -26,6 +26,7 @@ function ControlHubModule() {
   const [guards, setGuards] = useState(null);
   const [sltpStats, setSltpStats] = useState(null);
   const [tradeHistory, setTradeHistory] = useState([]);
+  const [executionEvents, setExecutionEvents] = useState([]);
   const [monitorLogs, setMonitorLogs] = useState([]);
   const [marketData, setMarketData] = useState({});
   const [monitoringSummary, setMonitoringSummary] = useState(null);
@@ -46,6 +47,14 @@ function ControlHubModule() {
   const [aiDataAnalysis, setAiDataAnalysis] = useState(null);
   const [proactiveStatus, setProactiveStatus] = useState(null);
   const [riskMetrics, setRiskMetrics] = useState(null);
+  const [riskStatus, setRiskStatus] = useState(null);
+  const [riskConfigForm, setRiskConfigForm] = useState({
+    unrealized_loss_warning: -0.10,
+    unrealized_loss_critical: -0.16,
+    liquidation_distance_warning: 0.12,
+    liquidation_distance_critical: 0.07,
+    monitor_interval: 10,
+  });
   const [opportunities, setOpportunities] = useState([]);
   const [anomalies, setAnomalies] = useState([]);
   const [alertsHistory, setAlertsHistory] = useState([]);
@@ -178,6 +187,7 @@ function ControlHubModule() {
         setGuards(center.ai?.guards || null);
         setSltpStats(center.trading?.sltp_stats || null);
         setTradeHistory(Array.isArray(center.trading?.trade_history) ? center.trading.trade_history : []);
+        setExecutionEvents(Array.isArray(center.trading?.execution_events) ? center.trading.execution_events : []);
         setMonitorLogs(Array.isArray(center.observability?.logs) ? center.observability.logs : []);
         setMarketData(center.market?.market_data || {});
         setMonitoringSummary(center.market?.monitoring_summary || null);
@@ -207,6 +217,14 @@ function ControlHubModule() {
       setS1(s1Res);
       setGuards(guardsRes);
       setFrequencyProfile(freqRes);
+      const riskRes = await api.modules.getRiskStatus().catch(() => null);
+      setRiskStatus(riskRes || null);
+      if (riskRes?.config) {
+        setRiskConfigForm((prev) => ({
+          ...prev,
+          ...riskRes.config,
+        }));
+      }
       setSltpStats(sltpRes);
       setTradeHistory(Array.isArray(histRes?.data) ? histRes.data : Array.isArray(histRes) ? histRes : []);
       setMonitorLogs(Array.isArray(logsRes?.data) ? logsRes.data : Array.isArray(logsRes) ? logsRes : []);
@@ -270,6 +288,27 @@ function ControlHubModule() {
       showNotice(`更新切档Telegram通知开关失败：${e.message || e}`, 'error');
     } finally {
       setFrequencyBusy(false);
+    }
+  };
+
+  const applyRiskConfig = async () => {
+    setManualBusy(true);
+    try {
+      const payload = {
+        unrealized_loss_warning: Number(riskConfigForm.unrealized_loss_warning),
+        unrealized_loss_critical: Number(riskConfigForm.unrealized_loss_critical),
+        liquidation_distance_warning: Number(riskConfigForm.liquidation_distance_warning),
+        liquidation_distance_critical: Number(riskConfigForm.liquidation_distance_critical),
+        monitor_interval: Number(riskConfigForm.monitor_interval),
+      };
+      const res = await api.modules.updateRiskConfig(payload);
+      if (!res?.success) throw new Error(res?.message || '风险阈值更新失败');
+      showNotice('风险阈值已更新（运行期生效）');
+      await refresh();
+    } catch (e) {
+      showNotice(`风险阈值更新失败：${e.message || e}`, 'error');
+    } finally {
+      setManualBusy(false);
     }
   };
 
@@ -771,6 +810,31 @@ function ControlHubModule() {
                 <div className="market-stat-value">{riskMetrics?.leverage_used ?? '-'}</div>
               </div>
             </div>
+            <div style={{ marginBottom: 12, border: '1px solid var(--border-light)', borderRadius: 8, padding: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>
+                风控阈值（实时生效） · 监控状态 {riskStatus?.monitor_running ? '运行中' : '未运行'}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(120px,1fr))', gap: 8 }}>
+                <input className="form-input" type="number" step="0.01" value={riskConfigForm.unrealized_loss_warning}
+                  onChange={(e) => setRiskConfigForm((p) => ({ ...p, unrealized_loss_warning: e.target.value }))} placeholder="浮亏预警阈值" />
+                <input className="form-input" type="number" step="0.01" value={riskConfigForm.unrealized_loss_critical}
+                  onChange={(e) => setRiskConfigForm((p) => ({ ...p, unrealized_loss_critical: e.target.value }))} placeholder="浮亏严重阈值" />
+                <input className="form-input" type="number" step="0.01" value={riskConfigForm.liquidation_distance_warning}
+                  onChange={(e) => setRiskConfigForm((p) => ({ ...p, liquidation_distance_warning: e.target.value }))} placeholder="强平距离预警" />
+                <input className="form-input" type="number" step="0.01" value={riskConfigForm.liquidation_distance_critical}
+                  onChange={(e) => setRiskConfigForm((p) => ({ ...p, liquidation_distance_critical: e.target.value }))} placeholder="强平距离严重" />
+                <input className="form-input" type="number" step="1" value={riskConfigForm.monitor_interval}
+                  onChange={(e) => setRiskConfigForm((p) => ({ ...p, monitor_interval: e.target.value }))} placeholder="监控间隔秒" />
+              </div>
+              <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <button type="button" className="btn btn-sm btn-primary" disabled={manualBusy} onClick={applyRiskConfig}>
+                  {manualBusy ? '应用中…' : '应用风控阈值'}
+                </button>
+                <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+                  当前告警：{Array.isArray((riskStatus?.last_check || {}).warnings) ? (riskStatus.last_check.warnings.join('；') || '无') : '无'}
+                </span>
+              </div>
+            </div>
             <div style={{ fontWeight: 600, marginBottom: 8 }}>异常事件 ({anomalies.length})</div>
             <div style={{ maxHeight: 220, overflow: 'auto', border: '1px solid var(--border-light)', borderRadius: 8 }}>
               {anomalies.slice(0, 12).map((a, i) => (
@@ -1039,9 +1103,40 @@ function ControlHubModule() {
       {activeTab === 'execution' && (
         <div className="panel" style={{ marginTop: 16 }}>
           <div className="panel-header">
-            <div className="panel-title">最近执行（中文化）</div>
+            <div className="panel-title">最近开平仓原因（S1 执行出口）</div>
           </div>
           <div className="panel-body">
+            {(executionEvents || []).slice(0, 10).map((e, i) => (
+              <div key={`evt-${i}`} style={{ padding: '10px 0', borderBottom: '1px solid var(--border-light)' }}>
+                <div style={{ fontWeight: 700 }}>
+                  {(e.op || '-').toUpperCase()} · {e.symbol || '-'} · {toCnSignal(e.side)} ·{' '}
+                  {e.success ? '✅' : '❌'}
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
+                  来源: {e.source || '-'} · 原因: {translateReasoning(e.reason || '')}
+                </div>
+                {!!(e.context && (e.context.strategy_used || e.context.strategy || e.context.decision_reasoning || e.context.reasoning)) && (
+                  <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
+                    {(e.context.strategy_used || e.context.strategy) ? (
+                      <>
+                        策略: {toCnStrategy(e.context.strategy_used || e.context.strategy)} ·{' '}
+                      </>
+                    ) : null}
+                    逻辑: {translateReasoning(e.context.decision_reasoning || e.context.reasoning || '')}
+                  </div>
+                )}
+                {!e.success && e.detail && (
+                  <div style={{ fontSize: 12, color: 'var(--danger)', marginTop: 4 }}>
+                    错误: {String(e.detail)}
+                  </div>
+                )}
+              </div>
+            ))}
+            {!executionEvents?.length && (
+              <div style={{ color: 'var(--text-tertiary)', marginBottom: 12 }}>暂无 S1 执行事件</div>
+            )}
+
+            <div style={{ marginTop: 14, fontWeight: 700 }}>交易历史（来自交易历史服务）</div>
             {(tradeHistory || []).slice(0, 10).map((t, i) => (
               <div key={i} style={{ padding: '8px 0', borderBottom: '1px solid var(--border-light)' }}>
                 <div style={{ fontWeight: 600 }}>

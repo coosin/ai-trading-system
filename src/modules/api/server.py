@@ -1441,11 +1441,19 @@ class APIServer:
         @api_v1_router.get("/control-center/state", tags=["control-center"])
         async def get_control_center_state(limit: int = 20):
             """单模块总控中心聚合状态接口"""
-            status_payload = await get_status()
-            health_payload = await system_health_v1()
+            # 总控接口必须“快返回”：避免因交易所/数据源抖动导致前端长时间无响应
+            try:
+                status_payload = await asyncio.wait_for(get_status(), timeout=2.5)
+            except Exception:
+                status_payload = {"status": "degraded", "system_status": "degraded", "timestamp": datetime.now().isoformat()}
+            try:
+                health_payload = await asyncio.wait_for(system_health_v1(), timeout=1.5)
+            except Exception:
+                health_payload = {"status": "degraded", "overall": "degraded", "timestamp": datetime.now().isoformat()}
             s1_payload: Dict[str, Any] = {}
             guards_payload: Dict[str, Any] = {}
             sltp_payload: Dict[str, Any] = {}
+            execution_events_payload: List[Dict[str, Any]] = []
             strategy_opt_payload: Dict[str, Any] = {}
             strategies_payload: List[Dict[str, Any]] = []
             monitoring_summary: Dict[str, Any] = {}
@@ -1460,8 +1468,14 @@ class APIServer:
             alerts_history_payload: List[Dict[str, Any]] = []
             trade_statistics_payload: Dict[str, Any] = {}
             trade_review_payload: Dict[str, Any] = {}
-            trade_history_payload = await get_trading_history_compat(limit=limit)
-            logs_payload = await get_monitoring_logs(limit=limit)
+            try:
+                trade_history_payload = await asyncio.wait_for(get_trading_history_compat(limit=limit), timeout=2.5)
+            except Exception:
+                trade_history_payload = {"success": False, "data": [], "error": "timeout"}
+            try:
+                logs_payload = await asyncio.wait_for(get_monitoring_logs(limit=limit), timeout=2.0)
+            except Exception:
+                logs_payload = {"success": False, "data": [], "error": "timeout"}
 
             mc = self.main_controller
             if mc:
@@ -1482,6 +1496,16 @@ class APIServer:
                         health_payload = {**health_payload, **health_res}
                 except Exception as e:
                     logger.debug(f"总控聚合: module_control_api 获取失败: {e}")
+
+                try:
+                    gw = getattr(mc, "execution_gateway", None)
+                    if gw and hasattr(gw, "get_recent_events"):
+                        execution_events_payload = await asyncio.wait_for(
+                            gw.get_recent_events(limit=limit),
+                            timeout=2.0,
+                        )
+                except Exception as e:
+                    logger.debug(f"总控聚合: execution events 获取失败: {e}")
 
                 try:
                     if hasattr(mc, "strategy_manager") and mc.strategy_manager:
@@ -1549,6 +1573,7 @@ class APIServer:
                 "trading": {
                     "trade_history": trade_history_payload.get("data", []),
                     "sltp_stats": sltp_payload,
+                    "execution_events": execution_events_payload,
                     "strategies": strategies_payload,
                     "strategy_optimization": strategy_opt_payload.get("data", strategy_opt_payload),
                     "strategy_performance": strategy_perf_payload,
@@ -2501,22 +2526,64 @@ class APIServer:
         @api_v1_router.get("/data-hub/unified-snapshot", tags=["data-hub"])
         async def data_hub_unified_snapshot(symbol: str = "BTC/USDT"):
             """统一双渠道数据快照（中文模块化输出）。"""
-            data = await data_source_hub.get_unified_snapshot(symbol)
-            return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+            try:
+                data = await asyncio.wait_for(data_source_hub.get_unified_snapshot(symbol), timeout=6.0)
+                return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+            except asyncio.TimeoutError:
+                return {
+                    "status": "degraded",
+                    "data": {
+                        "symbol": symbol,
+                        "message": "获取 unified-snapshot 超时（可能为交易所网络抖动）",
+                    },
+                    "timestamp": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                return {
+                    "status": "degraded",
+                    "data": {"symbol": symbol, "message": f"获取 unified-snapshot 失败: {e}"},
+                    "timestamp": datetime.now().isoformat(),
+                }
 
         @api_v1_router.get("/data-hub/quality-advice", tags=["data-hub"])
         async def data_hub_quality_advice(symbol: str = "BTC/USDT"):
             """数据质量与作用评分建议（插件化能力输出）。"""
-            data = await data_source_hub.get_unified_snapshot(symbol)
-            advice = data.get("数据质量与作用评分", {})
-            return {"status": "success", "data": advice, "timestamp": datetime.now().isoformat()}
+            try:
+                data = await asyncio.wait_for(data_source_hub.get_unified_snapshot(symbol), timeout=6.0)
+                advice = data.get("数据质量与作用评分", {})
+                return {"status": "success", "data": advice, "timestamp": datetime.now().isoformat()}
+            except asyncio.TimeoutError:
+                return {
+                    "status": "degraded",
+                    "data": {"symbol": symbol, "message": "quality-advice 超时"},
+                    "timestamp": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                return {
+                    "status": "degraded",
+                    "data": {"symbol": symbol, "message": f"quality-advice 失败: {e}"},
+                    "timestamp": datetime.now().isoformat(),
+                }
 
         @api_v1_router.get("/data-hub/ai-analysis", tags=["data-hub"])
         async def data_hub_ai_analysis(symbol: str = "BTC/USDT"):
             """统一数据快照的 AI 智能分析结果。"""
-            snapshot = await data_source_hub.get_unified_snapshot(symbol)
-            ai_out = snapshot.get("AI智能分析", {})
-            return {"status": "success", "data": ai_out, "timestamp": datetime.now().isoformat()}
+            try:
+                snapshot = await asyncio.wait_for(data_source_hub.get_unified_snapshot(symbol), timeout=6.0)
+                ai_out = snapshot.get("AI智能分析", {})
+                return {"status": "success", "data": ai_out, "timestamp": datetime.now().isoformat()}
+            except asyncio.TimeoutError:
+                return {
+                    "status": "degraded",
+                    "data": {"symbol": symbol, "message": "ai-analysis 超时"},
+                    "timestamp": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                return {
+                    "status": "degraded",
+                    "data": {"symbol": symbol, "message": f"ai-analysis 失败: {e}"},
+                    "timestamp": datetime.now().isoformat(),
+                }
 
         # 多源数据融合数据源API - 支持 /api/v1/data-fusion/sources
         @api_v1_router.get("/data-fusion/sources", tags=["data-fusion"])

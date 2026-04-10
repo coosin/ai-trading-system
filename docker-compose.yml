@@ -13,6 +13,8 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
+      # 挂载源码：修改 src/ 后执行 `docker compose restart trading-system` 即可加载（无需 rebuild）
+      - ./src:/app/src
       - ./data:/app/data
       - ./logs:/app/logs
       - ./workspace:/app/workspace
@@ -22,21 +24,22 @@ services:
     environment:
       - MODE=${MODE:-simulation}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      # 避免宿主机 HTTP(S)_PROXY 意外污染容器；如需代理请用 OPENCLAW_HTTP_PROXY/OPENCLAW_HTTPS_PROXY
-      - HTTP_PROXY=
-      - HTTPS_PROXY=
-      - ALL_PROXY=
-      - http_proxy=
-      - https_proxy=
-      - all_proxy=
+      # 固定代理：容器内统一走 Clash，避免出现“部分链路直连”导致抖动
+      - HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-http://host.docker.internal:7890}
+      - HTTPS_PROXY=${OPENCLAW_HTTPS_PROXY:-http://host.docker.internal:7890}
+      - ALL_PROXY=${OPENCLAW_ALL_PROXY:-http://host.docker.internal:7890}
+      - http_proxy=${OPENCLAW_HTTP_PROXY:-http://host.docker.internal:7890}
+      - https_proxy=${OPENCLAW_HTTPS_PROXY:-http://host.docker.internal:7890}
+      - all_proxy=${OPENCLAW_ALL_PROXY:-http://host.docker.internal:7890}
       # 容器内访问宿主机 Clash：host.docker.internal -> host-gateway（见 extra_hosts）
       - OPENCLAW_HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-http://host.docker.internal:7890}
       - OPENCLAW_HTTPS_PROXY=${OPENCLAW_HTTPS_PROXY:-http://host.docker.internal:7890}
       - OPENCLAW_ALL_PROXY=${OPENCLAW_ALL_PROXY:-http://host.docker.internal:7890}
       # OKX 高频请求稳态参数（由专项压测确定）
-      - OPENCLAW_OKX_MAX_CONCURRENCY=${OPENCLAW_OKX_MAX_CONCURRENCY:-4}
-      - OPENCLAW_OKX_MIN_REQUEST_INTERVAL=${OPENCLAW_OKX_MIN_REQUEST_INTERVAL:-0.2}
+      - OPENCLAW_OKX_MAX_CONCURRENCY=${OPENCLAW_OKX_MAX_CONCURRENCY:-2}
+      - OPENCLAW_OKX_MIN_REQUEST_INTERVAL=${OPENCLAW_OKX_MIN_REQUEST_INTERVAL:-0.1}
       - OPENCLAW_OKX_MAX_RETRIES=${OPENCLAW_OKX_MAX_RETRIES:-3}
+      - OPENCLAW_OKX_PROXY_ONLY=${OPENCLAW_OKX_PROXY_ONLY:-1}
       # 避免对容器内部地址走代理
       - NO_PROXY=localhost,127.0.0.1,redis
       - no_proxy=localhost,127.0.0.1,redis

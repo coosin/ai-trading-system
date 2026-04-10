@@ -139,6 +139,22 @@ class ExecutionVerifier:
     
     确保AI命令真正执行，提供可验证的执行结果
     """
+
+    @staticmethod
+    def _resolve_writable_log_dir(preferred: Path) -> Path:
+        """与 AuditLogger 一致：宿主机挂载权限异常时选用可写目录。"""
+        for d in (preferred, Path("data/executions"), Path("/tmp/openclaw_executions")):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                probe = d / ".exec_write_probe"
+                probe.write_bytes(b"")
+                probe.unlink()
+                if d.resolve() != preferred.resolve():
+                    logger.warning("执行记录目录 %s 不可写，已改用: %s", preferred, d)
+                return d
+            except OSError:
+                continue
+        return preferred
     
     def __init__(self, config: Optional[ExecutionConfig] = None):
         self.config = config or ExecutionConfig()
@@ -149,8 +165,7 @@ class ExecutionVerifier:
         self._executors: Dict[CommandType, Callable] = {}
         self._verifiers: Dict[CommandType, Callable] = {}
         
-        self._log_path = Path(self.config.log_dir)
-        self._log_path.mkdir(parents=True, exist_ok=True)
+        self._log_path = self._resolve_writable_log_dir(Path(self.config.log_dir))
         
         self._stats = {
             "total_executions": 0,
@@ -162,8 +177,13 @@ class ExecutionVerifier:
         self._exchange = None
         self._audit_logger = None
         self._stop_loss_manager = None
+        self._main_controller = None
         
         logger.info("执行验证器初始化完成")
+    
+    def set_main_controller(self, main_controller: Any) -> None:
+        """注入主控制器，用于 S1（ExecutionGateway）统一开平仓出口。"""
+        self._main_controller = main_controller
     
     def set_exchange(self, exchange):
         """设置交易所实例"""
@@ -184,7 +204,22 @@ class ExecutionVerifier:
     def register_verifier(self, command_type: CommandType, verifier: Callable):
         """注册验证器"""
         self._verifiers[command_type] = verifier
-    
+
+    @staticmethod
+    def _normalize_swap_side(raw: Any) -> Optional[str]:
+        if raw is None:
+            return None
+        s = str(raw).strip().lower()
+        if s in ("long", "buy", "b"):
+            return "long"
+        if s in ("short", "sell", "s"):
+            return "short"
+        return None
+
+    def _policy_denied_error(self, err: str) -> bool:
+        e = (err or "").lower()
+        return "policy_denied" in e or "open_policy_denied" in e
+
     async def execute(
         self,
         command_type: CommandType,
@@ -353,58 +388,122 @@ class ExecutionVerifier:
         symbol: Optional[str],
         params: Dict[str, Any]
     ) -> ExecutionResult:
-        """执行开仓"""
+        """执行开仓（优先经 ExecutionGateway / S1，失败再回退 create_order）。"""
         if not self._exchange:
             result.status = ExecutionStatus.FAILED
             result.error_message = "交易所未连接"
             self._stats["failed"] += 1
             return result
-        
+
+        params = params or {}
+        sym = symbol or params.get("symbol")
+        write_source = str(
+            params.get("write_source") or params.get("source") or "ai_core"
+        ).strip().lower()
+        side = self._normalize_swap_side(params.get("side", "long")) or "long"
+        quantity = float(params.get("quantity", 0) or 0)
+        price = params.get("price")
+        order_type = params.get("order_type", "market")
+        leverage = int(params.get("leverage") or 20)
+
+        gw = None
+        if self._main_controller is not None:
+            gw = getattr(self._main_controller, "execution_gateway", None)
+
+        if gw and sym:
+            try:
+                gres = await gw.open_swap(
+                    sym,
+                    side,
+                    quantity,
+                    leverage,
+                    write_source,
+                    "execution_verifier_open",
+                    margin_mode="cross",
+                    price=price,
+                    context={
+                        "write_source": write_source,
+                        "symbol": sym,
+                        "side": side,
+                        "quantity": quantity,
+                        "leverage": leverage,
+                        "entry_price": params.get("entry_price"),
+                        "stop_loss": params.get("stop_loss"),
+                        "take_profit": params.get("take_profit"),
+                    },
+                )
+                if gres.get("success"):
+                    result.status = ExecutionStatus.SUCCESS
+                    result.details = {
+                        "order_id": (gres.get("orderId") or gres.get("order_id") or gres.get("id")),
+                        "symbol": sym,
+                        "side": side,
+                        "quantity": quantity,
+                        "price": gres.get("average", price),
+                        "status": "filled",
+                        "gateway": True,
+                    }
+                    self._stats["successful"] += 1
+                    if self._stop_loss_manager and params.get("stop_loss"):
+                        await self._stop_loss_manager.create_order(
+                            symbol=sym,
+                            side=side,
+                            entry_price=gres.get("average", price),
+                            quantity=quantity,
+                            stop_loss_config=params.get("stop_loss_config"),
+                            take_profit_config=params.get("take_profit_config"),
+                        )
+                    return result
+                err = str(gres.get("error") or "")
+                if self._policy_denied_error(err):
+                    result.status = ExecutionStatus.FAILED
+                    result.error_message = err or "policy_denied"
+                    self._stats["failed"] += 1
+                    return result
+            except Exception as e:
+                logger.warning("ExecutionVerifier: Gateway 开仓失败，回退 create_order: %s", e)
+
         try:
-            side = params.get("side", "long")
-            quantity = params.get("quantity", 0)
-            price = params.get("price")
-            order_type = params.get("order_type", "market")
-            
             order_result = await self._exchange.create_order(
-                symbol=symbol,
+                symbol=sym,
                 type=order_type,
                 side="buy" if side == "long" else "sell",
                 amount=quantity,
-                price=price
+                price=price,
             )
-            
+
             if order_result:
                 result.status = ExecutionStatus.SUCCESS
                 result.details = {
                     "order_id": order_result.get("id"),
-                    "symbol": symbol,
+                    "symbol": sym,
                     "side": side,
                     "quantity": quantity,
                     "price": order_result.get("average", price),
-                    "status": order_result.get("status")
+                    "status": order_result.get("status"),
+                    "gateway": False,
                 }
                 self._stats["successful"] += 1
-                
+
                 if self._stop_loss_manager and params.get("stop_loss"):
                     await self._stop_loss_manager.create_order(
-                        symbol=symbol,
+                        symbol=sym,
                         side=side,
                         entry_price=order_result.get("average", price),
                         quantity=quantity,
                         stop_loss_config=params.get("stop_loss_config"),
-                        take_profit_config=params.get("take_profit_config")
+                        take_profit_config=params.get("take_profit_config"),
                     )
             else:
                 result.status = ExecutionStatus.FAILED
                 result.error_message = "订单创建失败"
                 self._stats["failed"] += 1
-                
+
         except Exception as e:
             result.status = ExecutionStatus.FAILED
             result.error_message = str(e)
             self._stats["failed"] += 1
-        
+
         return result
     
     async def _execute_close_position(
@@ -413,60 +512,136 @@ class ExecutionVerifier:
         symbol: Optional[str],
         params: Dict[str, Any]
     ) -> ExecutionResult:
-        """执行平仓"""
+        """执行平仓（优先经 ExecutionGateway / S1）。"""
         if not self._exchange:
             result.status = ExecutionStatus.FAILED
             result.error_message = "交易所未连接"
             self._stats["failed"] += 1
             return result
-        
+
+        params = params or {}
+        sym = symbol or params.get("symbol")
+        write_source = str(
+            params.get("write_source") or params.get("source") or "ai_core"
+        ).strip().lower()
+        quantity = params.get("quantity")
+
+        gw = None
+        if self._main_controller is not None:
+            gw = getattr(self._main_controller, "execution_gateway", None)
+
+        pos_side: Optional[str] = self._normalize_swap_side(params.get("side"))
+        if not pos_side and sym:
+            try:
+                positions = await self._exchange.fetch_positions([sym])
+                position = next((p for p in positions if p.get("symbol") == sym), None)
+                if position:
+                    pos_side = self._normalize_swap_side(
+                        position.get("posSide") or position.get("side")
+                    )
+                    if not pos_side and position.get("contracts") is not None:
+                        c = float(position.get("contracts", 0) or 0)
+                        pos_side = "long" if c > 0 else "short" if c < 0 else None
+            except Exception as e:
+                logger.debug("fetch_positions for close: %s", e)
+
+        if not sym or not pos_side:
+            result.status = ExecutionStatus.FAILED
+            result.error_message = f"无法解析平仓方向或交易对: {sym}"
+            self._stats["failed"] += 1
+            return result
+
+        if quantity is None and sym:
+            try:
+                positions = await self._exchange.fetch_positions([sym])
+                position = next((p for p in positions if p.get("symbol") == sym), None)
+                if position:
+                    quantity = abs(float(position.get("contracts", 0)))
+            except Exception:
+                pass
+
+        if gw:
+            try:
+                gres = await gw.close_swap(
+                    sym,
+                    pos_side,
+                    float(quantity) if quantity is not None else None,
+                    write_source,
+                    "execution_verifier_close",
+                    context={
+                        "write_source": write_source,
+                        "symbol": sym,
+                        "side": pos_side,
+                        "quantity": quantity,
+                        "pnl": params.get("pnl", 0),
+                    },
+                )
+                if gres.get("success"):
+                    result.status = ExecutionStatus.SUCCESS
+                    result.details = {
+                        "order_id": (gres.get("orderId") or gres.get("order_id") or gres.get("id")),
+                        "symbol": sym,
+                        "quantity": quantity,
+                        "price": gres.get("average"),
+                        "pnl": params.get("pnl", 0),
+                        "gateway": True,
+                    }
+                    self._stats["successful"] += 1
+                    if self._stop_loss_manager:
+                        await self._stop_loss_manager.cancel_order(sym)
+                    return result
+                err = str(gres.get("error") or "")
+                if self._policy_denied_error(err):
+                    result.status = ExecutionStatus.FAILED
+                    result.error_message = err or "policy_denied"
+                    self._stats["failed"] += 1
+                    return result
+            except Exception as e:
+                logger.warning("ExecutionVerifier: Gateway 平仓失败，回退 create_order: %s", e)
+
         try:
-            quantity = params.get("quantity")
-            
-            positions = await self._exchange.fetch_positions([symbol])
-            position = next((p for p in positions if p.get("symbol") == symbol), None)
-            
-            if not position:
-                result.status = ExecutionStatus.FAILED
-                result.error_message = f"未找到 {symbol} 持仓"
-                self._stats["failed"] += 1
-                return result
-            
             if quantity is None:
+                positions = await self._exchange.fetch_positions([sym])
+                position = next((p for p in positions if p.get("symbol") == sym), None)
+                if not position:
+                    result.status = ExecutionStatus.FAILED
+                    result.error_message = f"未找到 {sym} 持仓"
+                    self._stats["failed"] += 1
+                    return result
                 quantity = abs(float(position.get("contracts", 0)))
-            
-            side = "sell" if float(position.get("side", 0)) > 0 else "buy"
-            
+
+            spot_side = "sell" if pos_side == "long" else "buy"
             order_result = await self._exchange.create_order(
-                symbol=symbol,
+                symbol=sym,
                 type="market",
-                side=side,
-                amount=quantity
+                side=spot_side,
+                amount=quantity,
             )
-            
+
             if order_result:
                 result.status = ExecutionStatus.SUCCESS
                 result.details = {
                     "order_id": order_result.get("id"),
-                    "symbol": symbol,
+                    "symbol": sym,
                     "quantity": quantity,
                     "price": order_result.get("average"),
-                    "pnl": params.get("pnl", 0)
+                    "pnl": params.get("pnl", 0),
+                    "gateway": False,
                 }
                 self._stats["successful"] += 1
-                
+
                 if self._stop_loss_manager:
-                    await self._stop_loss_manager.cancel_order(symbol)
+                    await self._stop_loss_manager.cancel_order(sym)
             else:
                 result.status = ExecutionStatus.FAILED
                 result.error_message = "平仓订单创建失败"
                 self._stats["failed"] += 1
-                
+
         except Exception as e:
             result.status = ExecutionStatus.FAILED
             result.error_message = str(e)
             self._stats["failed"] += 1
-        
+
         return result
     
     async def _execute_set_stop_loss(

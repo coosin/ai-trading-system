@@ -1,0 +1,19 @@
+version: 1
+enabled: true
+defaults:
+  market_symbol: "ETH/USDT"
+  prefer_primary_channel: true
+  fallback_to_exchange_ticker: true
+sources:
+  okx_primary:
+    type: exchange
+    provider: okx
+    enabled: true
+  okx_fallback:
+    type: exchange
+    provider: okx
+    enabled: true
+    mode: ticker_only
+notes:
+  - "This file is optional runtime metadata for diagnostics."
+  - "Core runtime uses in-code and config_manager defaults when absent."

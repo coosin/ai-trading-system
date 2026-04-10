@@ -447,18 +447,23 @@ def init_module_control_api(app, main_controller):
             "current_drawdown": 0.0,
             "risk_level": "low"
         }
-        
-        if main_controller:
-            monitor = None
+
+        def _resolve_risk_monitor():
+            if not main_controller:
+                return None
             if hasattr(main_controller, 'risk_monitor') and main_controller.risk_monitor:
-                monitor = main_controller.risk_monitor
-            elif (
+                return main_controller.risk_monitor
+            if (
                 hasattr(main_controller, 'ai_trading_engine')
                 and main_controller.ai_trading_engine
                 and hasattr(main_controller.ai_trading_engine, 'risk_monitor')
                 and main_controller.ai_trading_engine.risk_monitor
             ):
-                monitor = main_controller.ai_trading_engine.risk_monitor
+                return main_controller.ai_trading_engine.risk_monitor
+            return None
+
+        if main_controller:
+            monitor = _resolve_risk_monitor()
 
             if monitor:
                 status = monitor.get_status() if hasattr(monitor, "get_status") else {}
@@ -475,6 +480,70 @@ def init_module_control_api(app, main_controller):
                     risk_data["risk_level"] = risk_status.get("trading_state", {}).get("daily_trades", 0) > 15 and "medium" or "low"
         
         return risk_data
+
+    @router.get("/risk/config")
+    async def get_risk_config():
+        """读取账户风险监控阈值配置"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        monitor = None
+        if hasattr(main_controller, 'risk_monitor') and main_controller.risk_monitor:
+            monitor = main_controller.risk_monitor
+        elif (
+            hasattr(main_controller, 'ai_trading_engine')
+            and main_controller.ai_trading_engine
+            and hasattr(main_controller.ai_trading_engine, 'risk_monitor')
+            and main_controller.ai_trading_engine.risk_monitor
+        ):
+            monitor = main_controller.ai_trading_engine.risk_monitor
+        if not monitor:
+            return {"success": False, "message": "风险监控未初始化"}
+        return {
+            "success": True,
+            "config": dict(getattr(monitor, "risk_config", {}) or {}),
+            "running": bool(getattr(monitor, "_running", False)),
+        }
+
+    @router.post("/risk/config")
+    async def update_risk_config(payload: Dict[str, Any]):
+        """更新账户风险监控阈值（运行期生效）"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        monitor = None
+        if hasattr(main_controller, 'risk_monitor') and main_controller.risk_monitor:
+            monitor = main_controller.risk_monitor
+        elif (
+            hasattr(main_controller, 'ai_trading_engine')
+            and main_controller.ai_trading_engine
+            and hasattr(main_controller.ai_trading_engine, 'risk_monitor')
+            and main_controller.ai_trading_engine.risk_monitor
+        ):
+            monitor = main_controller.ai_trading_engine.risk_monitor
+        if not monitor:
+            return {"success": False, "message": "风险监控未初始化"}
+
+        allowed = {
+            "margin_ratio_warning",
+            "margin_ratio_critical",
+            "unrealized_loss_warning",
+            "unrealized_loss_critical",
+            "liquidation_distance_warning",
+            "liquidation_distance_critical",
+            "monitor_interval",
+        }
+        applied: Dict[str, Any] = {}
+        for k, v in (payload or {}).items():
+            if k not in allowed or v is None:
+                continue
+            try:
+                if k == "monitor_interval":
+                    monitor.risk_config[k] = max(2, int(float(v)))
+                else:
+                    monitor.risk_config[k] = float(v)
+                applied[k] = monitor.risk_config[k]
+            except Exception:
+                continue
+        return {"success": True, "applied": applied, "config": dict(monitor.risk_config)}
     
     @router.post("/risk/reset")
     async def reset_risk_counters():
@@ -553,6 +622,10 @@ def init_module_control_api(app, main_controller):
             "auto_tune_sltp_cooldown_seconds",
             "auto_tune_sltp_step_tighten",
             "auto_tune_sltp_step_extend",
+            "critical_risk_auto_close",
+            "critical_risk_auto_close_liq_only",
+            "critical_risk_auto_close_max_liq_distance",
+            "critical_risk_auto_close_min_loss_pct",
         }
         applied: Dict[str, Any] = {}
         for k, v in (config or {}).items():

@@ -1355,6 +1355,7 @@ class MainController:
                 self.execution_verifier.set_audit_logger(self.audit_logger)
             if self.stop_loss_manager:
                 self.execution_verifier.set_stop_loss_manager(self.stop_loss_manager)
+            self.execution_verifier.set_main_controller(self)
             
             logger.info("✅ 执行验证器已初始化")
         except Exception as e:
@@ -4817,8 +4818,15 @@ class MainController:
 
         if getattr(self, "execution_gateway", None):
             try:
+                tick_src = "execution_verifier"
+                if params and isinstance(params, dict):
+                    tick_src = str(
+                        params.get("write_source")
+                        or params.get("source")
+                        or "execution_verifier"
+                    ).strip() or "execution_verifier"
                 self.execution_gateway.record_tick(
-                    "execution_verifier",
+                    tick_src,
                     f"{command_type.value}:{action}",
                 )
             except Exception:
