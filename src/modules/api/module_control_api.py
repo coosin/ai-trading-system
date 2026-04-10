@@ -1456,6 +1456,8 @@ def init_module_control_api(app, main_controller):
         add("commander.dispatch", hasattr(mc, "process_user_command"), "process_user_command")
         add("commander.capabilities", hasattr(mc, "get_commander_capabilities"), "get_commander_capabilities")
         add("surface.registry", True, "GET /api/v1/modules/surface/registry")
+        add("surface.data_integration_health", True, "GET /api/v1/modules/data/integration/health")
+        add("surface.plugins_status", True, "GET /api/v1/modules/plugins/status")
         add("message.telegram", bool(getattr(mc, "telegram_bot", None)), "telegram_bot")
         add("notification.unified", hasattr(mc, "_send_notification_handler"), "_send_notification_handler")
         add("memory.gateway", bool(getattr(mc, "memory_gateway", None)), "memory_gateway")
