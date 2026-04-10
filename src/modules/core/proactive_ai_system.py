@@ -127,6 +127,37 @@ class ProactiveMarketScanner:
         self._skip_breakout_if_same_side = bool(
             self.config.get("proactive_skip_breakout_if_same_side_position", True)
         )
+        # 执行门槛：默认高于 0.7，减少「略靠近极值就开仓」
+        self._execute_min_confidence = float(
+            self.config.get("proactive_execute_min_confidence", 0.78)
+        )
+        # 均值回归：24h 涨跌幅绝对值低于此则不生成机会（原 5% 过易触发）
+        self._mean_reversion_min_abs_change = float(
+            self.config.get("mean_reversion_min_abs_change", 0.08)
+        )
+        # 突破：最后一根成交量需 >= 前 N 根均量 × 该比例；0 表示不检查成交量
+        self._breakout_min_vol_ratio = float(
+            self.config.get("breakout_min_volume_vs_prior_avg", 0) or 0
+        )
+        # False：掃描器不直接開倉，只把機會交給 ai_core 在決策循環中研判
+        self._auto_execute_opportunities = bool(
+            self.config.get("proactive_auto_execute_opportunities", False)
+        )
+        self._ai_core_forward_cooldown_sec = float(
+            self.config.get("proactive_ai_core_forward_cooldown_sec", 180)
+        )
+        self._last_ai_core_hint_at: Dict[str, datetime] = {}
+        self._opportunity_gate: Any = None
+
+    def _upsert_opportunity(self, opportunity: MarketOpportunity) -> None:
+        """同品种+类型+方向只保留最新一条，避免列表堆满重复机会每 10s 反复尝试。"""
+        key = (opportunity.symbol, opportunity.opportunity_type, opportunity.direction)
+        self._opportunities = [
+            o
+            for o in self._opportunities
+            if (o.symbol, o.opportunity_type, o.direction) != key
+        ]
+        self._opportunities.append(opportunity)
 
     @staticmethod
     def _norm_symbol_key(symbol: str) -> str:
@@ -230,6 +261,34 @@ class ProactiveMarketScanner:
 
             self._scan_interval = self.config.get("scan_interval", self._scan_interval)
             self._deep_scan_interval = self.config.get("deep_scan_interval", self._deep_scan_interval)
+            self._execute_min_confidence = float(
+                self.config.get("proactive_execute_min_confidence", self._execute_min_confidence)
+            )
+            self._mean_reversion_min_abs_change = float(
+                self.config.get("mean_reversion_min_abs_change", self._mean_reversion_min_abs_change)
+            )
+            self._breakout_min_vol_ratio = float(
+                self.config.get("breakout_min_volume_vs_prior_avg", self._breakout_min_vol_ratio)
+                or 0
+            )
+            self._proactive_symbol_cooldown_sec = float(
+                self.config.get("proactive_symbol_trade_cooldown_sec", self._proactive_symbol_cooldown_sec)
+            )
+            self._breakout_trade_cooldown_sec = float(
+                self.config.get("breakout_trade_cooldown_sec", self._breakout_trade_cooldown_sec)
+            )
+            self._skip_breakout_if_same_side = bool(
+                self.config.get("proactive_skip_breakout_if_same_side_position", self._skip_breakout_if_same_side)
+            )
+            self._auto_execute_opportunities = bool(
+                self.config.get("proactive_auto_execute_opportunities", self._auto_execute_opportunities)
+            )
+            self._ai_core_forward_cooldown_sec = float(
+                self.config.get(
+                    "proactive_ai_core_forward_cooldown_sec",
+                    self._ai_core_forward_cooldown_sec,
+                )
+            )
 
             self.exchange = getattr(self.main_controller, 'okx_exchange', None) or \
                            getattr(self.main_controller, 'exchange', None)
@@ -237,6 +296,17 @@ class ProactiveMarketScanner:
             self.data_integration = getattr(self.main_controller, 'data_integration', None)
             self.memory = getattr(self.main_controller, 'memory', None)
             self.telegram_bot = getattr(self.main_controller, 'telegram_bot', None)
+
+            try:
+                from src.modules.core.scanner_opportunity_gate import ScannerOpportunityGate
+
+                gc = self.config.get("scanner_opportunity_gate") or {}
+                self._opportunity_gate = (
+                    ScannerOpportunityGate(self.exchange, gc) if self.exchange else None
+                )
+            except Exception as e:
+                logger.debug("ScannerOpportunityGate 初始化跳过: %s", e)
+                self._opportunity_gate = None
         
         logger.info("✅ 主动性市场扫描器初始化完成")
         return True
@@ -271,7 +341,7 @@ class ProactiveMarketScanner:
                     try:
                         opportunity = await self._quick_scan_symbol(symbol)
                         if opportunity:
-                            self._opportunities.append(opportunity)
+                            self._upsert_opportunity(opportunity)
                             self._stats["opportunities_found"] += 1
                             
                             await self._notify_opportunity(opportunity)
@@ -324,8 +394,11 @@ class ProactiveMarketScanner:
                     )
                     
                     for opp in sorted_opportunities[:3]:
-                        if opp.confidence >= 0.7:
-                            await self._evaluate_and_execute(opp)
+                        if opp.confidence >= self._execute_min_confidence:
+                            if self._auto_execute_opportunities:
+                                await self._evaluate_and_execute(opp)
+                            else:
+                                await self._forward_opportunity_to_ai_core(opp)
                 
                 await asyncio.sleep(SLEEP_10S)
                 
@@ -379,7 +452,7 @@ class ProactiveMarketScanner:
             change_24h = float(ticker.get('change24h', 0) or ticker.get('change', 0))
             volume = float(ticker.get('volume', 0) or 0)
             
-            if abs(change_24h) > 0.05:
+            if abs(change_24h) > self._mean_reversion_min_abs_change:
                 direction = "short" if change_24h > 0 else "long"
                 confidence = min(0.9, abs(change_24h) * 10)
                 
@@ -402,11 +475,31 @@ class ProactiveMarketScanner:
                     klines = await self.exchange.get_klines(symbol.replace('/', '-'), '1h', limit=24)
                     if klines and len(klines) >= 20:
                         closes = self._extract_kline_values(klines, "close")
+                        volumes = self._extract_kline_values(klines, "volume")
+                        if len(closes) < 6:
+                            return None
+                        current_price = closes[-1]
+                        prior = closes[:-1]
+                        prior_high = max(prior)
+                        prior_low = min(prior)
                         high_24h = max(closes)
                         low_24h = min(closes)
-                        current_price = closes[-1]
-                        
-                        if current_price >= high_24h * 0.98:
+
+                        def _vol_ok() -> bool:
+                            r = self._breakout_min_vol_ratio
+                            if r <= 0 or len(volumes) < len(closes):
+                                return True
+                            if len(volumes) < 6:
+                                return True
+                            last_v = float(volumes[-1] or 0)
+                            prev = [float(volumes[i] or 0) for i in range(-6, -1)]
+                            avg_v = sum(prev) / max(1, len(prev))
+                            if avg_v <= 0:
+                                return True
+                            return last_v >= avg_v * r
+
+                        # 须「当前收盘」真正创出前 23 根内新高/新低，而非仅贴近 24h 收盘区间上沿
+                        if current_price > prior_high and _vol_ok():
                             sl, tp = self._breakout_sl_tp(
                                 "long", current_price, low_24h, high_24h
                             )
@@ -414,17 +507,20 @@ class ProactiveMarketScanner:
                                 symbol=symbol,
                                 opportunity_type=OpportunityType.BREAKOUT,
                                 direction="long",
-                                confidence=0.75,
+                                confidence=0.82,
                                 entry_price=current_price,
                                 stop_loss=sl,
                                 take_profit=tp,
-                                reasoning=f"突破24小时高点，当前价格接近高点 {high_24h:.4f}",
+                                reasoning=(
+                                    f"突破前23根收盘区间高点 "
+                                    f"(前高 {prior_high:.4f} → 收盘 {current_price:.4f})"
+                                ),
                                 data_sources=["ticker", "klines"],
                                 priority=7,
                                 expires_at=datetime.now() + timedelta(hours=2)
                             )
-                        
-                        elif current_price <= low_24h * 1.02:
+
+                        if current_price < prior_low and _vol_ok():
                             sl, tp = self._breakout_sl_tp(
                                 "short", current_price, low_24h, high_24h
                             )
@@ -432,11 +528,14 @@ class ProactiveMarketScanner:
                                 symbol=symbol,
                                 opportunity_type=OpportunityType.BREAKOUT,
                                 direction="short",
-                                confidence=0.75,
+                                confidence=0.82,
                                 entry_price=current_price,
                                 stop_loss=sl,
                                 take_profit=tp,
-                                reasoning=f"跌破24小时低点，当前价格接近低点 {low_24h:.4f}",
+                                reasoning=(
+                                    f"跌破前23根收盘区间低点 "
+                                    f"(前低 {prior_low:.4f} → 收盘 {current_price:.4f})"
+                                ),
                                 data_sources=["ticker", "klines"],
                                 priority=7,
                                 expires_at=datetime.now() + timedelta(hours=2)
@@ -639,8 +738,69 @@ class ProactiveMarketScanner:
             except Exception as e:
                 logger.error(f"机会通知回调失败: {e}")
     
+    async def _forward_opportunity_to_ai_core(self, opportunity: MarketOpportunity) -> None:
+        """將掃描到的機會交給 ai_core（寫入決策上下文），不經掃描器下單。"""
+        mc = self.main_controller
+        if not mc:
+            return
+        core = getattr(mc, "ai_core", None)
+        if not core or not hasattr(core, "ingest_scanner_opportunity"):
+            logger.debug("未找到 ai_core.ingest_scanner_opportunity，跳過掃描機會轉發")
+            return
+        fk = (
+            f"aicore:{self._norm_symbol_key(opportunity.symbol)}:"
+            f"{opportunity.opportunity_type.value}:{opportunity.direction}"
+        )
+        now = datetime.now()
+        last = self._last_ai_core_hint_at.get(fk)
+        if last and (now - last).total_seconds() < self._ai_core_forward_cooldown_sec:
+            return
+
+        gate_metrics: Dict[str, Any] = {}
+        gate_reason = ""
+        if self._opportunity_gate:
+            gr = await self._opportunity_gate.evaluate(
+                opportunity, self._insights.get(opportunity.symbol)
+            )
+            if not gr.passed:
+                logger.info(
+                    "⛔ 实时数据预检未通过，不报 ai_core: %s — %s",
+                    opportunity.symbol,
+                    gr.reason,
+                )
+                return
+            gate_reason = gr.reason
+            gate_metrics = dict(gr.metrics or {})
+
+        self._last_ai_core_hint_at[fk] = now
+        payload = {
+            "symbol": opportunity.symbol,
+            "direction": opportunity.direction,
+            "opportunity_type": opportunity.opportunity_type.value,
+            "confidence": opportunity.confidence,
+            "entry_price": opportunity.entry_price,
+            "stop_loss": opportunity.stop_loss,
+            "take_profit": opportunity.take_profit,
+            "reasoning": opportunity.reasoning,
+            "priority": opportunity.priority,
+            "data_sources": list(opportunity.data_sources or []),
+        }
+        if gate_metrics:
+            payload["gate_pass_reason"] = gate_reason
+            payload["gate_metrics"] = gate_metrics
+        try:
+            core.ingest_scanner_opportunity(payload)
+            logger.info(
+                "📨 掃描機會已交給 ai_core 研判（掃描器不自動開倉）: %s %s %s",
+                opportunity.symbol,
+                self._zh_direction(opportunity.direction),
+                self._zh_opp_type(opportunity.opportunity_type.value),
+            )
+        except Exception as e:
+            logger.warning("掃描機會轉發 ai_core 失敗: %s", e)
+
     async def _evaluate_and_execute(self, opportunity: MarketOpportunity) -> bool:
-        """评估并执行机会"""
+        """评估并执行机会（僅在 proactive_auto_execute_opportunities=true 時由監控迴圈調用）"""
         logger.info(f"⚡ 评估机会: {opportunity.symbol} {self._zh_direction(opportunity.direction)}")
 
         sym_key = self._norm_symbol_key(opportunity.symbol)
@@ -682,6 +842,16 @@ class ProactiveMarketScanner:
             
             if opportunity.direction == "short" and insight.trend == "bullish" and insight.trend_strength > 0.05:
                 logger.info(f"❌ 跳过机会: {opportunity.symbol} 做空信号与上涨趋势冲突")
+                return False
+
+        if self._opportunity_gate:
+            gr = await self._opportunity_gate.evaluate(opportunity, insight)
+            if not gr.passed:
+                logger.info(
+                    "⛔ 实时数据预检未通过，跳过自动开仓: %s — %s",
+                    opportunity.symbol,
+                    gr.reason,
+                )
                 return False
         
         if self.main_controller and hasattr(self.main_controller, 'ai_trading_engine'):

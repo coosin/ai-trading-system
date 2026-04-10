@@ -444,15 +444,29 @@ class ExecutionVerifier:
                         "gateway": True,
                     }
                     self._stats["successful"] += 1
-                    if self._stop_loss_manager and params.get("stop_loss"):
-                        await self._stop_loss_manager.create_order(
-                            symbol=sym,
-                            side=side,
-                            entry_price=gres.get("average", price),
-                            quantity=quantity,
-                            stop_loss_config=params.get("stop_loss_config"),
-                            take_profit_config=params.get("take_profit_config"),
+                    # 僅在明確傳入 SL/TP 配置時註冊，避免僅有數字 stop_loss 時誤用默認百分比，
+                    # 與 ai_core 開倉後 _sync_dynamic_sltp_after_open 重複掛單（雙 index、雙平倉風險）。
+                    if (
+                        self._stop_loss_manager
+                        and params.get("stop_loss_config") is not None
+                        and params.get("take_profit_config") is not None
+                    ):
+                        ep = float(
+                            gres.get("average")
+                            or params.get("entry_price")
+                            or price
+                            or 0
                         )
+                        if ep > 0:
+                            await self._stop_loss_manager.create_order(
+                                symbol=sym,
+                                side=side,
+                                entry_price=ep,
+                                quantity=quantity,
+                                stop_loss_config=params.get("stop_loss_config"),
+                                take_profit_config=params.get("take_profit_config"),
+                                metadata=params.get("sltp_metadata"),
+                            )
                     return result
                 err = str(gres.get("error") or "")
                 if self._policy_denied_error(err):
@@ -485,15 +499,27 @@ class ExecutionVerifier:
                 }
                 self._stats["successful"] += 1
 
-                if self._stop_loss_manager and params.get("stop_loss"):
-                    await self._stop_loss_manager.create_order(
-                        symbol=sym,
-                        side=side,
-                        entry_price=order_result.get("average", price),
-                        quantity=quantity,
-                        stop_loss_config=params.get("stop_loss_config"),
-                        take_profit_config=params.get("take_profit_config"),
+                if (
+                    self._stop_loss_manager
+                    and params.get("stop_loss_config") is not None
+                    and params.get("take_profit_config") is not None
+                ):
+                    ep = float(
+                        order_result.get("average")
+                        or params.get("entry_price")
+                        or price
+                        or 0
                     )
+                    if ep > 0:
+                        await self._stop_loss_manager.create_order(
+                            symbol=sym,
+                            side=side,
+                            entry_price=ep,
+                            quantity=quantity,
+                            stop_loss_config=params.get("stop_loss_config"),
+                            take_profit_config=params.get("take_profit_config"),
+                            metadata=params.get("sltp_metadata"),
+                        )
             else:
                 result.status = ExecutionStatus.FAILED
                 result.error_message = "订单创建失败"

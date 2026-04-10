@@ -87,6 +87,20 @@ class ExecutionGateway:
         self._idempotent_recent: Dict[str, float] = {}
         self._idempotent_ttl_sec = 8.0
         self._recent_events_limit = 30
+        self._policy_metrics: Dict[str, int] = {
+            "open_policy_denied": 0,
+            "close_policy_denied": 0,
+            "open_ok": 0,
+            "open_fail": 0,
+            "close_ok": 0,
+            "close_fail": 0,
+        }
+
+    def _metric_inc(self, key: str) -> None:
+        self._policy_metrics[key] = int(self._policy_metrics.get(key, 0)) + 1
+
+    def get_policy_metrics(self) -> Dict[str, int]:
+        return dict(self._policy_metrics)
 
     def _push_recent_event(self, event: Dict[str, Any]) -> None:
         try:
@@ -206,6 +220,7 @@ class ExecutionGateway:
         self._snapshot.single_write_owner = swo
 
         if not force and not self._allow_discretionary(source, swo):
+            self._metric_inc("close_policy_denied")
             msg = f"policy_denied source={source} swo={swo}"
             logger.error("ExecutionGateway.close_swap: %s", msg)
             self._record_order(source, "close", False, msg, symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
@@ -240,6 +255,7 @@ class ExecutionGateway:
                 detail = str(res.get("error") if isinstance(res, dict) else res)[:500]
                 self._record_order(source, "close", ok, detail or "ok", symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
                 if ok:
+                    self._metric_inc("close_ok")
                     logger.info(
                         "ExecutionGateway: close_swap ok symbol=%s side=%s source=%s reason=%s",
                         symbol,
@@ -266,6 +282,7 @@ class ExecutionGateway:
                         f"✅ 平仓\n交易对: {symbol}\n方向: {side}\n来源: {source}\n原因: {reason}"
                     )
                 else:
+                    self._metric_inc("close_fail")
                     logger.error(
                         "ExecutionGateway: close_swap failed symbol=%s source=%s err=%s",
                         symbol,
@@ -289,6 +306,7 @@ class ExecutionGateway:
                     )
                 return res if isinstance(res, dict) else {"success": ok, "raw": res}
             except Exception as e:
+                self._metric_inc("close_fail")
                 self._record_order(source, "close", False, str(e), symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
                 logger.exception("ExecutionGateway.close_swap: %s", e)
                 return {"success": False, "error": str(e)}
@@ -310,6 +328,7 @@ class ExecutionGateway:
         self._snapshot.single_write_owner = swo
 
         if not self._allow_open(source, swo):
+            self._metric_inc("open_policy_denied")
             msg = f"open_policy_denied source={source} swo={swo}"
             logger.error("ExecutionGateway.open_swap: %s", msg)
             self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context)
@@ -318,6 +337,7 @@ class ExecutionGateway:
         ex = self._exchange()
         self._snapshot.exchange_connected = ex is not None
         if not ex:
+            self._metric_inc("open_fail")
             self._record_order(source, "open", False, "no_exchange")
             return {"success": False, "error": "no_exchange"}
 
@@ -344,11 +364,13 @@ class ExecutionGateway:
                         if lot_sz > 0:
                             adj = math.ceil(adj / lot_sz) * lot_sz
                         if max_sz > 0 and adj > max_sz:
+                            self._metric_inc("open_fail")
                             err = f"preflight_denied size>{max_sz} (requested={size} adjusted={adj})"
                             self._record_order(source, "open", False, err, symbol=sym, side=side, size=size, leverage=lev, reason=reason, context=context)
                             return {"success": False, "error": err}
 
                         if adj <= 0:
+                            self._metric_inc("open_fail")
                             err = f"preflight_denied invalid_size (requested={size} adjusted={adj})"
                             self._record_order(source, "open", False, err, symbol=sym, side=side, size=size, leverage=lev, reason=reason, context=context)
                             return {"success": False, "error": err}
@@ -371,6 +393,7 @@ class ExecutionGateway:
 
                 opn = getattr(ex, "open_swap_position", None)
                 if not callable(opn):
+                    self._metric_inc("open_fail")
                     err = "exchange has no open_swap_position"
                     self._record_order(source, "open", False, err, symbol=sym, side=side, size=size, leverage=lev, reason=reason, context=context)
                     return {"success": False, "error": err}
@@ -387,6 +410,7 @@ class ExecutionGateway:
                 detail = str(res.get("error") if isinstance(res, dict) else res)[:500]
                 self._record_order(source, "open", ok, detail or "ok", symbol=symbol, side=side, size=size, leverage=lev, reason=reason, context=context)
                 if ok:
+                    self._metric_inc("open_ok")
                     logger.info(
                         "ExecutionGateway: open_swap ok symbol=%s side=%s source=%s reason=%s",
                         symbol,
@@ -424,6 +448,7 @@ class ExecutionGateway:
                         f"✅ 开仓\n交易对: {symbol}\n方向: {side}\n数量: {size}\n杠杆: {lev}x\n来源: {source}\n原因: {reason}{extra}"
                     )
                 else:
+                    self._metric_inc("open_fail")
                     logger.error(
                         "ExecutionGateway: open_swap failed symbol=%s source=%s err=%s",
                         symbol,
@@ -447,6 +472,7 @@ class ExecutionGateway:
                     )
                 return res if isinstance(res, dict) else {"success": ok, "raw": res}
             except Exception as e:
+                self._metric_inc("open_fail")
                 self._record_order(source, "open", False, str(e), symbol=symbol, side=side, size=size, leverage=lev, reason=reason, context=context)
                 logger.exception("ExecutionGateway.open_swap: %s", e)
                 return {"success": False, "error": str(e)}
@@ -498,4 +524,6 @@ class ExecutionGateway:
         self._snapshot.single_write_owner = swo
         ex = self._exchange()
         self._snapshot.exchange_connected = ex is not None
-        return self._snapshot.to_dict()
+        out = self._snapshot.to_dict()
+        out["policy_metrics"] = dict(self._policy_metrics)
+        return out

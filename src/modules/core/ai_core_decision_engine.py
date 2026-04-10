@@ -11,6 +11,7 @@ import logging
 import json
 import re
 import math
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
@@ -223,7 +224,10 @@ class AICoreDecisionEngine:
         self._last_ai_discretionary_close_at: Dict[str, datetime] = {}
         # key -> (consecutive_close_signals, first_signal_at)
         self._discretionary_close_streak: Dict[str, tuple] = {}
-        
+        # 主动性扫描器推送的机会（默认不自动开仓，仅进入本引擎决策上下文）
+        self._scanner_hints: Dict[str, Dict[str, Any]] = {}
+        self._scanner_hint_ttl_sec: float = 5400.0
+
         logger.info("🧠 AI核心决策引擎初始化（完整控制权版本）")
     
     async def initialize(self) -> None:
@@ -289,7 +293,101 @@ class AICoreDecisionEngine:
         await self._load_user_rules()
         
         logger.info("✅ AI核心决策引擎初始化完成 - AI拥有完整控制权")
-    
+
+    def _scanner_hint_key(self, symbol: str) -> str:
+        return str(symbol or "").replace(" ", "").upper()
+
+    def _prune_scanner_hints(self) -> None:
+        if not self._scanner_hints:
+            return
+        now = datetime.now()
+        ttl = float(self._scanner_hint_ttl_sec or 5400.0)
+        stale = []
+        for k, p in self._scanner_hints.items():
+            try:
+                raw = str(p.get("received_at", "") or "").replace("Z", "+00:00")
+                ts = datetime.fromisoformat(raw)
+                if ts.tzinfo is not None:
+                    ts = ts.replace(tzinfo=None)
+                if (now - ts).total_seconds() > ttl:
+                    stale.append(k)
+            except Exception:
+                continue
+        for k in stale:
+            self._scanner_hints.pop(k, None)
+
+    def ingest_scanner_opportunity(self, payload: Dict[str, Any]) -> None:
+        """
+        接收 ProactiveMarketScanner 的「机会提示」。
+        仅供 _build_decision_prompt 与币种优先级参考，不是已执行订单，也不代替风控。
+        """
+        try:
+            sym = str(payload.get("symbol") or "").strip()
+            if not sym:
+                return
+            key = self._scanner_hint_key(sym)
+            row = dict(payload)
+            row["received_at"] = datetime.now().isoformat()
+            self._scanner_hints[key] = row
+            logger.info("📥 ai_core 已接收扫描机会提示: %s %s", key, row.get("opportunity_type"))
+        except Exception as e:
+            logger.debug("ingest_scanner_opportunity failed: %s", e)
+
+    def _scanner_hint_payload_for_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        self._prune_scanner_hints()
+        key = self._scanner_hint_key(symbol)
+        if key in self._scanner_hints:
+            return self._scanner_hints[key]
+        base = symbol.split("/")[0].upper() if "/" in symbol else ""
+        if not base:
+            return None
+        for hk, pv in self._scanner_hints.items():
+            if hk.startswith(base + "/"):
+                return pv
+        return None
+
+    def _format_scanner_hint_block(self, symbol: str) -> str:
+        p = self._scanner_hint_payload_for_symbol(symbol)
+        if not p:
+            return ""
+        ds = p.get("data_sources") or []
+        ds_s = ", ".join(str(x) for x in ds) if isinstance(ds, list) else str(ds)
+        conf = float(p.get("confidence") or 0)
+        gm = p.get("gate_metrics") if isinstance(p.get("gate_metrics"), dict) else {}
+        gr = p.get("gate_pass_reason") or ""
+        gate_extra = ""
+        if gm:
+            gate_extra = (
+                f"\n- 实时数据预检: {gr or 'ok'} | spread_bps={gm.get('spread_bps')} | "
+                f"atr_pct_1h={gm.get('atr_pct_1h')} | risk_reward={gm.get('risk_reward')} | "
+                f"vol/均量={gm.get('volume_vs_avg_ratio')} | 24h涨跌={gm.get('change_24h')}\n"
+            )
+        return f"""
+【主动性扫描发现（仅供参考：不是已成交订单，也不是绕过风控的指令）】
+- 机会类型: {p.get('opportunity_type')}
+- 建议方向: {p.get('direction')}
+- 扫描置信度: {conf:.0%}
+- 参考 入场/止损/止盈: {p.get('entry_price')} / {p.get('stop_loss')} / {p.get('take_profit')}
+- 扫描理由: {p.get('reasoning')}
+- 数据来源: {ds_s}
+- 提示接收时间: {p.get('received_at')}{gate_extra}
+你必须用技术指标、多源融合、风险与持仓情况独立复核；与上述方向矛盾或证据不足时 action 必须为 hold。
+禁止仅因本段文字下单或放宽系统最小置信度要求；若开仓须在 reasoning 中说明如何与扫描结论一致或为何不采纳。
+"""
+
+    def _merge_scanner_priority_symbols(self, symbols: List[str], *, limit: int = 8) -> List[str]:
+        """将仍有未过期扫描提示的交易对优先排在前面，便于 ai_core 尽快研判。"""
+        self._prune_scanner_hints()
+        prioritized = list(self._scanner_hints.keys())
+        out: List[str] = []
+        seen = set()
+        for s in prioritized + (symbols or []):
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out[:limit]
+
     async def _load_user_rules(self) -> None:
         """从记忆加载用户规则"""
         if not self.memory:
@@ -507,7 +605,7 @@ class AICoreDecisionEngine:
         available_symbols = all_symbols
         
         if not self.exchange:
-            return available_symbols[:5]
+            return self._merge_scanner_priority_symbols(available_symbols[:5], limit=8)
         
         try:
             # 获取市场数据，选择波动大的币种
@@ -530,13 +628,14 @@ class AICoreDecisionEngine:
             selected = [s[0] for s in sorted_symbols[:5]]
             
             if selected:
-                logger.info(f"📊 AI自主选择交易币种: {selected}")
-                return selected
+                merged = self._merge_scanner_priority_symbols(selected, limit=8)
+                logger.info(f"📊 AI自主选择交易币种: {merged}")
+                return merged
             
         except Exception as e:
             logger.error(f"AI选择币种失败: {e}")
         
-        return available_symbols[:5]
+        return self._merge_scanner_priority_symbols(available_symbols[:5], limit=8)
 
     async def _sync_active_strategies_from_manager(self) -> None:
         """将 StrategyManager 中已启用策略同步到 _active_strategies（与「仅 AI 自建」脱钩）。"""
@@ -2726,6 +2825,8 @@ class AICoreDecisionEngine:
             positions_detail = ""
             for pos in current_positions:
                 positions_detail += f"  - {pos.get('symbol', '')}: {pos.get('side', '')} {pos.get('size', 0)} | 入场价: {pos.get('entry_price', 0):.4f} | 盈亏: ${pos.get('pnl', 0):+.2f}\n"
+
+        scanner_hint_block = self._format_scanner_hint_block(symbol)
         
         prompt = f"""你是一个拥有完整控制权的量化交易AI，正在24小时不间断运行。
 
@@ -2744,7 +2845,7 @@ class AICoreDecisionEngine:
 {aggressive_note}
 
 【交易对】{symbol}
-
+{scanner_hint_block}
 【市场数据 - 实时】
 - 当前价格: {market_data.get('price', 0)}
 - 24h最高: {market_data.get('high', 0)}
@@ -3284,6 +3385,7 @@ class AICoreDecisionEngine:
             logger.info(f"   策略: {decision.strategy_used}")
             
             order = None
+            trace_id = str(uuid.uuid4())
 
             # 优先走主控制器执行验证网关，避免直接裸下单
             if self.main_controller and hasattr(self.main_controller, "execute_command"):
@@ -3304,6 +3406,7 @@ class AICoreDecisionEngine:
                             "stop_loss": decision.stop_loss,
                             "take_profit": decision.take_profit,
                             "write_source": "ai_core",
+                            "trace_id": trace_id,
                         },
                     )
                     if exec_result and getattr(exec_result, "status", None) and exec_result.status.value == "success":
@@ -3311,6 +3414,7 @@ class AICoreDecisionEngine:
                             "success": True,
                             "orderId": exec_result.execution_id,
                             "details": exec_result.details,
+                            "trace_id": trace_id,
                         }
                     else:
                         # 关键：execution_verifier 可能因为交易所缺失 create_order 等原因失败，
@@ -3348,6 +3452,7 @@ class AICoreDecisionEngine:
                                     "decision_reasoning": getattr(decision, "reasoning", None),
                                     "confidence": getattr(decision, "confidence", None),
                                     "risk_level": getattr(decision, "risk_level", None),
+                                    "trace_id": trace_id,
                                 },
                             )
                         else:
@@ -3369,6 +3474,7 @@ class AICoreDecisionEngine:
                                     "spread_bps": spread_bps,
                                     "depth_imbalance": depth_imbalance,
                                     "guard_profile": getattr(self, "_adaptive_guard_profile", None),
+                                    "trace_id": trace_id,
                                 },
                             )
                     except Exception as e:
@@ -3398,6 +3504,9 @@ class AICoreDecisionEngine:
                         "S1: ExecutionGateway 未成功下单且 Gateway 已启用，已跳过交易所直连兜底 symbol=%s",
                         decision.symbol,
                     )
+
+            if order and isinstance(order, dict):
+                order.setdefault("trace_id", trace_id)
             
             if order and order.get('success'):
                 logger.info(f"✅ AI决策执行成功: {order.get('orderId')}")
@@ -3415,6 +3524,8 @@ class AICoreDecisionEngine:
                             min_rr=min_rr if 'min_rr' in locals() else float(self.config.get("min_rr_to_trade", 1.2) or 1.2),
                             spread_bps=spread_bps if 'spread_bps' in locals() else None,
                             depth_imbalance=depth_imbalance if 'depth_imbalance' in locals() else None,
+                            order_result=order if isinstance(order, dict) else None,
+                            trace_id=trace_id,
                         )
                     except Exception as e:
                         logger.warning(f"同步止盈止损跟踪失败（不影响开仓成功）: {e}")
@@ -3434,19 +3545,87 @@ class AICoreDecisionEngine:
             logger.error(f"执行AI决策失败: {e}")
             return False
 
+    async def _resolve_entry_qty_after_open(
+        self,
+        decision: TradeDecision,
+        order_result: Optional[Dict[str, Any]],
+    ) -> tuple[float, float]:
+        """优先使用成交/验证详情中的价格，其次 ticker；数量尽量对齐交易所持仓。"""
+        entry = float(decision.entry_price or 0)
+        qty = float(decision.quantity or 0)
+        details: Dict[str, Any] = {}
+        if order_result:
+            d = order_result.get("details")
+            if isinstance(d, dict):
+                details = d
+            for key in ("price", "average", "avgPx", "fillPx"):
+                v = None
+                if details:
+                    v = details.get(key)
+                if v is None:
+                    v = order_result.get(key)
+                try:
+                    if v is not None and float(v) > 0:
+                        entry = float(v)
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if self.exchange:
+            try:
+                t = await self.exchange.get_ticker(str(decision.symbol).replace("/", "-"))
+                last = float((t or {}).get("last") or 0)
+                if last > 0:
+                    if entry <= 0:
+                        entry = last
+                    else:
+                        rel = abs(entry - last) / max(last, 1e-9)
+                        if rel > 0.025:
+                            logger.info(
+                                "SLTP entry 校准: 决策/成交=%.6g 与 last=%.6g 偏离 %.2f%%，采用 last",
+                                entry,
+                                last,
+                                rel * 100.0,
+                            )
+                            entry = last
+            except Exception as e:
+                logger.debug("SLTP ticker 校准跳过: %s", e)
+        if self.exchange and qty > 0:
+            try:
+                rows = await self.exchange.get_positions()
+                want = str(decision.side or "").lower()
+                base = decision.symbol.split("/")[0].upper()
+                for p in rows or []:
+                    if not isinstance(p, dict):
+                        continue
+                    if str(p.get("side", "")).lower() != want:
+                        continue
+                    iid = str(p.get("instId", "")).upper()
+                    if base and base in iid:
+                        sz = abs(float(p.get("size", 0) or 0))
+                        if sz > 1e-12:
+                            qty = sz
+                            break
+            except Exception:
+                pass
+        return entry, qty
+
     async def _sync_dynamic_sltp_after_open(
         self,
         decision: TradeDecision,
         min_rr: float,
         spread_bps: Optional[float],
         depth_imbalance: Optional[float],
+        order_result: Optional[Dict[str, Any]] = None,
+        trace_id: Optional[str] = None,
     ) -> None:
         """开仓成功后将自适应门控结果应用到仓位跟踪止盈止损。"""
         if not self.main_controller or not hasattr(self.main_controller, "create_stop_loss_order"):
             return
-        entry = float(decision.entry_price or 0)
+        entry, qty = await self._resolve_entry_qty_after_open(decision, order_result)
         if entry <= 0:
             return
+        if qty <= 0:
+            qty = float(decision.quantity or 0)
 
         risk_pct = abs(float(decision.stop_loss or 0) - entry) / max(1e-9, entry)
         tp_pct = abs(float(decision.take_profit or 0) - entry) / max(1e-9, entry)
@@ -3480,7 +3659,7 @@ class AICoreDecisionEngine:
             symbol=decision.symbol,
             side=decision.side,
             entry_price=entry,
-            quantity=float(decision.quantity),
+            quantity=float(qty),
             stop_loss_percent=float(risk_pct),
             take_profit_percent=float(tp_pct),
             enable_trailing=True,
@@ -3494,6 +3673,7 @@ class AICoreDecisionEngine:
                 "dynamic_tighten_ratio": float(dyn_tighten),
                 "dynamic_tp_extend_ratio": float(dyn_extend),
                 "sltp_adaptive_group": composite_group if composite_group in self._sltp_group_adaptive else symbol_group,
+                "trace_id": trace_id,
             },
         )
     

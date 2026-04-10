@@ -240,6 +240,62 @@ class StopLossTakeProfitManager:
         """用于访问 ExecutionGateway 与统一 exchange。"""
         self._main_controller = main_controller
 
+    async def _cancel_active_orders_for_index_key(self, index_key: str) -> None:
+        """同一 symbol|side 仅保留一条 ACTIVE：新建前取消旧单，避免重复平仓。"""
+        nk = self._normalize_index_key(index_key)
+        candidates = [nk]
+        if "|" in nk:
+            sp, sd = nk.rsplit("|", 1)
+            candidates.extend(self._index_key_lookup_variants(sp.strip(), sd.strip()))
+        oid: Optional[str] = None
+        for c in dict.fromkeys(candidates):
+            oid = self.order_index.get(c)
+            if oid:
+                break
+        if not oid:
+            return
+        order = self.orders.get(oid)
+        if not order or order.status != StopLossTakeProfitStatus.ACTIVE:
+            return
+        order.status = StopLossTakeProfitStatus.CANCELLED
+        order.updated_at = datetime.now()
+        order.trigger_reason = "replaced_by_new_sltp"
+        for k in list(self.order_index.keys()):
+            if self.order_index.get(k) == oid:
+                del self.order_index[k]
+        logger.info("SLTP: 已取消同 index 旧 ACTIVE 单以便重建 order_id=%s key=%s", oid, nk)
+        await self._save_orders()
+
+    async def _fetch_live_position_size(self, symbol: str, side: str) -> Optional[float]:
+        """平仓前从交易所拉取当前张数，减少 residual。"""
+        ex = self._exchange
+        mc = self._main_controller
+        if not ex and mc and hasattr(mc, "get_exchange"):
+            try:
+                ex = mc.get_exchange()
+            except Exception:
+                ex = None
+        if not ex or not hasattr(ex, "get_positions"):
+            return None
+        try:
+            rows = await ex.get_positions()
+        except Exception:
+            return None
+        want = str(side or "").lower()
+        base = str(symbol or "").split("/")[0].strip().upper()
+        for p in rows or []:
+            if not isinstance(p, dict):
+                continue
+            if str(p.get("side", "")).lower() != want:
+                continue
+            iid = str(p.get("instId", "")).upper()
+            sym = str(p.get("symbol", "")).upper().replace("-", "/")
+            if base and (base in iid or (base + "/") in sym or sym.startswith(base + "/")):
+                sz = abs(float(p.get("size", 0) or 0))
+                if sz > 1e-12:
+                    return sz
+        return None
+
     async def _execute_exchange_close_on_trigger(
         self,
         order: StopLossTakeProfitOrder,
@@ -259,12 +315,19 @@ class StopLossTakeProfitManager:
             return
 
         gw = getattr(mc, "execution_gateway", None) if mc else None
+        close_sz: Optional[float] = None
+        try:
+            close_sz = await self._fetch_live_position_size(order.symbol, order.side)
+        except Exception:
+            close_sz = None
+        if close_sz is None or close_sz <= 0:
+            close_sz = float(order.remaining_quantity or order.quantity or 0) or None
         try:
             if gw:
                 res = await gw.close_swap(
                     symbol=order.symbol,
                     side=order.side,
-                    size=float(order.remaining_quantity or order.quantity or 0) or None,
+                    size=close_sz,
                     source="stop_loss_take_profit",
                     reason=reason,
                 )
@@ -276,7 +339,7 @@ class StopLossTakeProfitManager:
                 res = await close_fn(
                     order.symbol,
                     order.side,
-                    float(order.remaining_quantity or order.quantity or 0) or None,
+                    close_sz,
                 )
             ok = bool(isinstance(res, dict) and res.get("success"))
             if ok:
@@ -633,6 +696,8 @@ class StopLossTakeProfitManager:
         """
         meta = dict(metadata or {})
         index_key = meta.get("index_key") or symbol
+
+        await self._cancel_active_orders_for_index_key(index_key)
 
         order_id = self._generate_order_id(index_key)
         
@@ -1420,7 +1485,8 @@ class StopLossTakeProfitManager:
         return {
             **self._stats,
             "active_orders": len([o for o in self.orders.values() if o.status == StopLossTakeProfitStatus.ACTIVE]),
-            "total_orders_tracked": len(self.orders)
+            "total_orders_tracked": len(self.orders),
+            "single_active_per_index": True,
         }
     
     async def _monitor_loop(self) -> None:

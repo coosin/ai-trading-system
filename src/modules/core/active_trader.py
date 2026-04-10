@@ -273,7 +273,7 @@ class ActiveTrader:
             
             analysis = self._analyze_market_data(klines, current_price)
             
-            if analysis["confidence"] >= 0.65:
+            if analysis["confidence"] >= 0.72:
                 return TradeOpportunity(
                     symbol=symbol,
                     action=analysis["action"],
@@ -335,25 +335,25 @@ class ActiveTrader:
         trend_up = ma5 > ma20 > ma50
         trend_down = ma5 < ma20 < ma50
         
-        if trend_up and rsi < 70:
+        if trend_up and rsi < 62:
             action = "buy"
             side = "long"
-            confidence = 0.7
+            confidence = 0.74
             reason = f"上升趋势: MA5({ma5:.2f}) > MA20({ma20:.2f}), RSI={rsi:.1f}"
-        elif trend_down and rsi > 30:
+        elif trend_down and rsi > 38:
             action = "sell"
             side = "short"
-            confidence = 0.7
+            confidence = 0.74
             reason = f"下降趋势: MA5({ma5:.2f}) < MA20({ma20:.2f}), RSI={rsi:.1f}"
-        elif rsi < 25:
+        elif rsi < 22:
             action = "buy"
             side = "long"
-            confidence = 0.65
+            confidence = 0.72
             reason = f"超卖反弹: RSI={rsi:.1f}"
-        elif rsi > 75:
+        elif rsi > 78:
             action = "sell"
             side = "short"
-            confidence = 0.65
+            confidence = 0.72
             reason = f"超买回调: RSI={rsi:.1f}"
         
         if action == "hold":
