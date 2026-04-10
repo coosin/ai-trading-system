@@ -148,6 +148,8 @@ class ProactiveMarketScanner:
         )
         self._last_ai_core_hint_at: Dict[str, datetime] = {}
         self._opportunity_gate: Any = None
+        self._last_opportunity_log_at: Dict[str, datetime] = {}
+        self._opportunity_log_cooldown_sec: float = float(self.config.get("opportunity_log_cooldown_sec", 120) or 120)
 
     def _upsert_opportunity(self, opportunity: MarketOpportunity) -> None:
         """同品种+类型+方向只保留最新一条，避免列表堆满重复机会每 10s 反复尝试。"""
@@ -721,13 +723,18 @@ class ProactiveMarketScanner:
     
     async def _notify_opportunity(self, opportunity: MarketOpportunity) -> None:
         """通知发现的机会"""
-        logger.info(
-            "🎯 发现交易机会: %s %s (置信度: %.0f%%, 类型: %s)",
-            opportunity.symbol,
-            self._zh_direction(opportunity.direction),
-            opportunity.confidence * 100,
-            self._zh_opp_type(opportunity.opportunity_type.value),
-        )
+        # 注意：机会发现属于高频事件，默认不写 INFO（否则会刷爆 app.log）。
+        # 需要观测时可通过 market.update / 前端事件流查看。
+        try:
+            logger.debug(
+                "发现交易机会(已降级为debug): %s %s conf=%.0f%% type=%s",
+                opportunity.symbol,
+                opportunity.direction,
+                opportunity.confidence * 100,
+                opportunity.opportunity_type.value,
+            )
+        except Exception:
+            pass
         
         for callback in self._alert_callbacks:
             try:
@@ -739,13 +746,16 @@ class ProactiveMarketScanner:
                 logger.error(f"机会通知回调失败: {e}")
     
     async def _forward_opportunity_to_ai_core(self, opportunity: MarketOpportunity) -> None:
-        """將掃描到的機會交給 ai_core（寫入決策上下文），不經掃描器下單。"""
+        """
+        將掃描到的機會交給「统一行情分析层」二次分析后再推送：
+        扫描器只负责发现+初筛，不直接影响 ai_core 的决策上下文。
+        """
         mc = self.main_controller
         if not mc:
             return
-        core = getattr(mc, "ai_core", None)
-        if not core or not hasattr(core, "ingest_scanner_opportunity"):
-            logger.debug("未找到 ai_core.ingest_scanner_opportunity，跳過掃描機會轉發")
+        mi = getattr(mc, "market_intelligence", None)
+        if not mi or not hasattr(mi, "ingest_scanner_opportunity"):
+            logger.debug("未找到 market_intelligence.ingest_scanner_opportunity，跳過掃描機會轉發")
             return
         fk = (
             f"aicore:{self._norm_symbol_key(opportunity.symbol)}:"
@@ -789,15 +799,15 @@ class ProactiveMarketScanner:
             payload["gate_pass_reason"] = gate_reason
             payload["gate_metrics"] = gate_metrics
         try:
-            core.ingest_scanner_opportunity(payload)
+            await mi.ingest_scanner_opportunity(payload)
             logger.info(
-                "📨 掃描機會已交給 ai_core 研判（掃描器不自動開倉）: %s %s %s",
+                "📨 掃描機會已交給统一行情分析层二次研判并推送: %s %s %s",
                 opportunity.symbol,
                 self._zh_direction(opportunity.direction),
                 self._zh_opp_type(opportunity.opportunity_type.value),
             )
         except Exception as e:
-            logger.warning("掃描機會轉發 ai_core 失敗: %s", e)
+            logger.warning("掃描機會轉發分析层失敗: %s", e)
 
     async def _evaluate_and_execute(self, opportunity: MarketOpportunity) -> bool:
         """评估并执行机会（僅在 proactive_auto_execute_opportunities=true 時由監控迴圈調用）"""
@@ -916,11 +926,11 @@ class ProactiveMarketScanner:
         report = "\n".join(report_lines)
         logger.info(report)
         
-        if self.telegram_bot and self._stats["total_scans"] % 10 == 0:
+        if self.main_controller and hasattr(self.main_controller, "_send_notification_handler") and self._stats["total_scans"] % 10 == 0:
             try:
-                await self.telegram_bot.send_message(report)
-            except Exception as e:
-                logger.debug(f"发送扫描报告到Telegram失败: {e}")
+                await self.main_controller._send_notification_handler("扫描报告", report, priority="low")
+            except Exception:
+                pass
     
     def add_alert_callback(self, callback: Callable) -> None:
         """添加告警回调"""

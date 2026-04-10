@@ -46,6 +46,7 @@ class TakeProfitType(Enum):
 class StopLossTakeProfitStatus(Enum):
     """止盈止损状态"""
     ACTIVE = "active"               # 激活中
+    PENDING_CLOSE = "pending_close" # 已触发，等待/重试真实平仓确认
     TRIGGERED = "triggered"         # 已触发
     CANCELLED = "cancelled"         # 已取消
     MODIFIED = "modified"           # 已修改
@@ -180,6 +181,10 @@ class StopLossTakeProfitConfig:
     trend_extend_threshold: float = 0.005
     min_trailing_offset: float = 0.006
     max_trailing_offset: float = 0.03
+    # SLTP trigger close confirmation / retry
+    pending_close_max_retries: int = 6
+    pending_close_backoff_base_sec: float = 2.0
+    pending_close_backoff_cap_sec: float = 120.0
 
 
 class StopLossTakeProfitManager:
@@ -241,16 +246,128 @@ class StopLossTakeProfitManager:
         """用于访问 ExecutionGateway 与统一 exchange。"""
         self._main_controller = main_controller
 
+    _POSKEY_PREFIX = "pos:"
+
+    @classmethod
+    def _build_pos_key(cls, inst_id: str, pos_side: str) -> str:
+        inst = str(inst_id or "").strip().upper()
+        sd = str(pos_side or "").strip().lower()
+        if sd not in ("long", "short"):
+            sd = "long"
+        return f"{cls._POSKEY_PREFIX}{inst}|{sd}"
+
+    @classmethod
+    def _is_pos_key(cls, key: str) -> bool:
+        return str(key or "").strip().lower().startswith(cls._POSKEY_PREFIX)
+
+    @classmethod
+    def _normalize_any_key(cls, key: str) -> str:
+        """
+        Normalize both:
+        - legacy `symbol|side`
+        - canonical `pos:<instId>|<posSide>`
+        """
+        k = str(key or "").strip()
+        if not k:
+            return k
+        if cls._is_pos_key(k):
+            raw = k[len(cls._POSKEY_PREFIX) :]
+            if "|" not in raw:
+                return f"{cls._POSKEY_PREFIX}{raw.strip().upper()}|long"
+            inst, sd = raw.rsplit("|", 1)
+            inst = inst.strip().upper()
+            sd = sd.strip().lower()
+            if sd not in ("long", "short"):
+                sd = "long"
+            return f"{cls._POSKEY_PREFIX}{inst}|{sd}"
+        return cls._normalize_index_key(k)
+
+    async def _resolve_pos_key_from_exchange(self, symbol: str, side: str) -> Optional[str]:
+        if not self._exchange or not hasattr(self._exchange, "get_positions"):
+            return None
+        sym = str(symbol or "").strip()
+        sd = str(side or "").strip().lower()
+        if not sym or sd not in ("long", "short"):
+            return None
+        try:
+            positions = await self._exchange.get_positions()
+        except Exception:
+            return None
+        base = self._normalize_index_key(f"{sym}|{sd}").split("|", 1)[0]
+        for p in positions or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                sz = float(p.get("size", 0) or 0)
+            except Exception:
+                continue
+            if abs(sz) < 1e-12:
+                continue
+            if self._resolved_side_from_position(p) != sd:
+                continue
+            psym = self._canonical_symbol_from_position(p)
+            if not psym:
+                continue
+            if self._normalize_index_key(f"{psym}|{sd}").split("|", 1)[0] != base:
+                continue
+            inst_id = str(p.get("instId") or "").strip()
+            if inst_id:
+                return self._build_pos_key(inst_id, sd)
+        return None
+
+    def _key_variants_for(self, *, symbol: str, side: str, pos_key: Optional[str] = None) -> List[str]:
+        keys: List[str] = []
+        if pos_key:
+            keys.append(self._normalize_any_key(pos_key))
+        for k in self._index_key_lookup_variants(symbol, side):
+            keys.append(self._normalize_any_key(k))
+        return list(dict.fromkeys([k for k in keys if k]))
+
+    async def _resolve_canonical_and_variants(
+        self, *, symbol: str, side: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, List[str], Dict[str, Any]]:
+        meta = dict(metadata or {})
+        sd = str(side or "").strip().lower()
+        if sd not in ("long", "short"):
+            sd = "long"
+
+        pos_key: Optional[str] = None
+        pk = meta.get("position_key") or meta.get("pos_key") or meta.get("posKey")
+        if pk and self._is_pos_key(str(pk)):
+            pos_key = self._normalize_any_key(str(pk))
+
+        if not pos_key:
+            inst_id = meta.get("instId") or meta.get("inst_id") or meta.get("instrument_id")
+            if inst_id:
+                pos_key = self._build_pos_key(str(inst_id), meta.get("posSide") or meta.get("pos_side") or sd)
+
+        idx = meta.get("index_key")
+        if not pos_key and idx and self._is_pos_key(str(idx)):
+            pos_key = self._normalize_any_key(str(idx))
+
+        if not pos_key:
+            pos_key = await self._resolve_pos_key_from_exchange(symbol, sd)
+
+        canonical = self._normalize_any_key(pos_key) if pos_key else self._normalize_any_key(f"{symbol}|{sd}")
+        variants = self._key_variants_for(symbol=symbol, side=sd, pos_key=pos_key)
+
+        meta["index_key"] = canonical
+        if pos_key:
+            meta["position_key"] = self._normalize_any_key(pos_key)
+        meta.setdefault("legacy_symbol_key", self._normalize_index_key(f"{symbol}|{sd}"))
+        return canonical, variants, meta
+
     async def _cancel_active_orders_for_index_key(self, index_key: str) -> None:
-        """同一 symbol|side 仅保留一条 ACTIVE：新建前取消旧单，避免重复平仓。"""
-        nk = self._normalize_index_key(index_key)
+        """同一 canonical key（优先 pos:<instId>|<posSide>）仅保留一条 ACTIVE：新建前取消旧单，避免重复平仓。"""
+        nk = self._normalize_any_key(index_key)
         candidates = [nk]
-        if "|" in nk:
+        # legacy fallback: if given a symbol|side key, include its dash/slash variants
+        if not self._is_pos_key(nk) and "|" in nk:
             sp, sd = nk.rsplit("|", 1)
             candidates.extend(self._index_key_lookup_variants(sp.strip(), sd.strip()))
         oid: Optional[str] = None
         for c in dict.fromkeys(candidates):
-            oid = self.order_index.get(c)
+            oid = self.order_index.get(self._normalize_any_key(c))
             if oid:
                 break
         if not oid:
@@ -301,9 +418,9 @@ class StopLossTakeProfitManager:
         self,
         order: StopLossTakeProfitOrder,
         reason: str,
-    ) -> None:
+    ) -> bool:
         if not getattr(self.config, "execute_exchange_on_trigger", True):
-            return
+            return True
         ex = self._exchange
         mc = self._main_controller
         if not ex and mc and hasattr(mc, "get_exchange"):
@@ -313,7 +430,7 @@ class StopLossTakeProfitManager:
                 ex = None
         if not ex:
             logger.warning("止盈止损触发但无交易所连接，跳过实盘平仓: %s", order.symbol)
-            return
+            return False
 
         gw = getattr(mc, "execution_gateway", None) if mc else None
         close_sz: Optional[float] = None
@@ -331,12 +448,19 @@ class StopLossTakeProfitManager:
                     size=close_sz,
                     source="stop_loss_take_profit",
                     reason=reason,
+                    context={
+                        "trace_id": (order.metadata or {}).get("trace_id") or (order.metadata or {}).get("traceId"),
+                        "index_key": (order.metadata or {}).get("index_key"),
+                        "position_key": (order.metadata or {}).get("position_key"),
+                        "sltp_reason": reason,
+                        "sltp_order_id": getattr(order, "order_id", None),
+                    },
                 )
             else:
                 close_fn = getattr(ex, "close_swap_position", None) or getattr(ex, "close_position", None)
                 if not callable(close_fn):
                     logger.error("交易所缺少 close_swap_position/close_position，无法实盘平仓")
-                    return
+                    return False
                 res = await close_fn(
                     order.symbol,
                     order.side,
@@ -346,17 +470,20 @@ class StopLossTakeProfitManager:
             if ok:
                 logger.info("✅ 止盈止损实盘平仓已提交: %s reason=%s", order.symbol, reason)
                 try:
-                    idx = (order.metadata or {}).get("index_key") or order.symbol
-                    if idx in self.order_index:
-                        del self.order_index[idx]
+                    for k in self._order_index_keys_to_clear(order):
+                        if self.order_index.get(k) == order.order_id:
+                            del self.order_index[k]
                     await self._save_orders()
                 except Exception:
                     pass
+                return True
             else:
                 err = res.get("error", res) if isinstance(res, dict) else res
                 logger.error("❌ 止盈止损实盘平仓失败: %s err=%s", order.symbol, err)
+                return False
         except Exception as e:
             logger.exception("止盈止损实盘平仓异常: %s", e)
+            return False
     
     def set_audit_logger(self, audit_logger):
         """设置审计日志记录器"""
@@ -438,12 +565,19 @@ class StopLossTakeProfitManager:
         return keys
 
     def _order_index_keys_to_clear(self, order: "StopLossTakeProfitOrder") -> List[str]:
-        mk = (order.metadata or {}).get("index_key")
-        if mk:
-            return list(
-                dict.fromkeys([mk, self._normalize_index_key(mk), self._normalize_index_key(f"{order.symbol}|{order.side}")])
-            )
-        return self._index_key_lookup_variants(order.symbol, order.side)
+        meta = order.metadata or {}
+        keys: List[str] = []
+        for k in (
+            meta.get("index_key"),
+            meta.get("position_key"),
+            meta.get("legacy_symbol_key"),
+            f"{order.symbol}|{order.side}",
+        ):
+            if k:
+                keys.append(self._normalize_any_key(str(k)))
+        for k in self._index_key_lookup_variants(order.symbol, order.side):
+            keys.append(self._normalize_any_key(k))
+        return list(dict.fromkeys([k for k in keys if k]))
 
     def _count_active_orders(self) -> int:
         return sum(1 for o in self.orders.values() if o.status == StopLossTakeProfitStatus.ACTIVE)
@@ -549,11 +683,15 @@ class StopLossTakeProfitManager:
                 if not sym:
                     continue
                 side = self._resolved_side_from_position(p)
-                live_index_keys.add(f"{sym}|{side}")
+                inst_id = str(p.get("instId") or "").strip()
+                if inst_id:
+                    live_index_keys.add(self._build_pos_key(inst_id, side))
+                else:
+                    live_index_keys.add(self._normalize_any_key(f"{sym}|{side}"))
             except Exception:
                 continue
 
-        live_norm = {self._normalize_index_key(k) for k in live_index_keys}
+        live_norm = {self._normalize_any_key(k) for k in live_index_keys}
 
         # 清理本地已不存在于交易所的活动跟踪单，避免历史脏数据长期残留。
         for oid, order in list(self.orders.items()):
@@ -561,7 +699,7 @@ class StopLossTakeProfitManager:
                 if order.status != StopLossTakeProfitStatus.ACTIVE:
                     continue
                 idx_key = (order.metadata or {}).get("index_key") or f"{order.symbol}|{order.side}"
-                idx_key = self._normalize_index_key(idx_key)
+                idx_key = self._normalize_any_key(idx_key)
                 if idx_key not in live_norm:
                     order.status = StopLossTakeProfitStatus.CANCELLED
                     order.trigger_reason = "stale_not_in_exchange"
@@ -587,11 +725,16 @@ class StopLossTakeProfitManager:
                 entry = float(p.get("entry_price", 0) or 0)
                 if entry <= 0:
                     entry = float(p.get("mark_px", 0) or 0)
-                index_key = self._normalize_index_key(f"{sym}|{side}")
+                inst_id = str(p.get("instId") or "").strip()
+                canonical, variants, meta = await self._resolve_canonical_and_variants(
+                    symbol=sym,
+                    side=side,
+                    metadata={"source": "exchange_sync", "instId": inst_id, "posSide": side},
+                )
 
                 oid = None
-                for cand in self._index_key_lookup_variants(sym, side):
-                    oid = self.order_index.get(cand)
+                for cand in variants + [canonical]:
+                    oid = self.order_index.get(self._normalize_any_key(cand))
                     if oid:
                         break
                 if oid:
@@ -601,7 +744,7 @@ class StopLossTakeProfitManager:
                             if self._refresh_active_order_from_exchange_position(existing, p, sym, side):
                                 refreshed += 1
                         except Exception as e:
-                            logger.debug("sync_open_positions: 刷新本地跟踪失败 %s: %s", index_key, e)
+                            logger.debug("sync_open_positions: 刷新本地跟踪失败 %s: %s", canonical, e)
                         skipped += 1
                         continue
 
@@ -613,7 +756,7 @@ class StopLossTakeProfitManager:
                     except Exception:
                         pass
                 if entry <= 0:
-                    logger.warning(f"sync_open_positions: 跳过 {index_key}（无有效入场价/标记价）")
+                    logger.warning(f"sync_open_positions: 跳过 {canonical}（无有效入场价/标记价）")
                     continue
 
                 # max_orders 表示「活跃 SLTP 跟踪」上限；历史 triggered/cancelled 仍留在 self.orders 供统计，
@@ -632,10 +775,7 @@ class StopLossTakeProfitManager:
                     side,
                     entry,
                     abs(sz),
-                    metadata={
-                        "index_key": index_key,
-                        "source": "exchange_sync",
-                    },
+                    metadata=meta,
                 )
                 synced += 1
             except Exception as e:
@@ -695,12 +835,15 @@ class StopLossTakeProfitManager:
         Returns:
             止盈止损订单
         """
-        meta = dict(metadata or {})
-        index_key = meta.get("index_key") or symbol
+        canonical, variants, meta = await self._resolve_canonical_and_variants(
+            symbol=symbol,
+            side=side,
+            metadata=metadata,
+        )
 
-        await self._cancel_active_orders_for_index_key(index_key)
+        await self._cancel_active_orders_for_index_key(canonical)
 
-        order_id = self._generate_order_id(index_key)
+        order_id = self._generate_order_id(canonical)
         
         sl_config = stop_loss_config or StopLossConfig()
         tp_config = take_profit_config or TakeProfitConfig()
@@ -742,7 +885,8 @@ class StopLossTakeProfitManager:
         )
         
         self.orders[order_id] = order
-        self.order_index[index_key] = order_id
+        for k in variants + [canonical]:
+            self.order_index[self._normalize_any_key(k)] = order_id
         self._stats["total_orders"] += 1
         
         await self._save_orders()
@@ -760,7 +904,7 @@ class StopLossTakeProfitManager:
                     side=str(side),
                     kind="sltp.create",
                     data={
-                        "index_key": meta.get("index_key") or index_key,
+                        "index_key": meta.get("index_key") or canonical,
                         "order_id": order_id,
                         "entry_price": float(entry_price),
                         "stop_loss_price": float(stop_loss_price),
@@ -918,8 +1062,17 @@ class StopLossTakeProfitManager:
         Returns:
             如果触发止盈止损，返回订单；否则返回None
         """
-        key = index_key or symbol
+        key = self._normalize_any_key(index_key or symbol)
         order_id = self.order_index.get(key)
+        if not order_id and key and (not self._is_pos_key(key)) and "|" not in key:
+            # legacy fallback: symbol only
+            for sd in ("long", "short"):
+                for cand in self._index_key_lookup_variants(key, sd):
+                    order_id = self.order_index.get(self._normalize_any_key(cand))
+                    if order_id:
+                        break
+                if order_id:
+                    break
         if not order_id:
             return None
         
@@ -1233,6 +1386,43 @@ class StopLossTakeProfitManager:
             return await self._trigger_take_profit(order, current_price)
         
         return None
+
+    def _pending_close_due(self, order: StopLossTakeProfitOrder) -> bool:
+        if order.status != StopLossTakeProfitStatus.PENDING_CLOSE:
+            return False
+        meta = order.metadata or {}
+        ts = meta.get("pending_close_next_ts")
+        try:
+            tsf = float(ts) if ts is not None else 0.0
+        except Exception:
+            tsf = 0.0
+        return time.time() >= tsf
+
+    def _schedule_pending_close_retry(self, order: StopLossTakeProfitOrder, *, error: str = "") -> None:
+        meta = dict(order.metadata or {})
+        attempts = int(meta.get("pending_close_attempts", 0) or 0) + 1
+        meta["pending_close_attempts"] = attempts
+        base = float(getattr(self.config, "pending_close_backoff_base_sec", 2.0) or 2.0)
+        cap = float(getattr(self.config, "pending_close_backoff_cap_sec", 120.0) or 120.0)
+        delay = min(cap, base * (2 ** max(0, attempts - 1)))
+        meta["pending_close_next_ts"] = time.time() + float(delay)
+        if error:
+            meta["pending_close_last_error"] = str(error)[:500]
+        order.metadata = meta
+        order.updated_at = datetime.now()
+
+    async def _attempt_pending_close(self, order: StopLossTakeProfitOrder, reason: str) -> bool:
+        ok = await self._execute_exchange_close_on_trigger(order, reason)
+        if ok:
+            order.status = StopLossTakeProfitStatus.TRIGGERED
+            order.updated_at = datetime.now()
+            meta = dict(order.metadata or {})
+            meta["pending_close_done"] = True
+            meta.pop("pending_close_next_ts", None)
+            order.metadata = meta
+            return True
+        self._schedule_pending_close_retry(order, error="close_failed")
+        return False
     
     async def _trigger_stop_loss(
         self,
@@ -1240,7 +1430,7 @@ class StopLossTakeProfitManager:
         current_price: float
     ) -> StopLossTakeProfitOrder:
         """触发止损"""
-        order.status = StopLossTakeProfitStatus.TRIGGERED
+        order.status = StopLossTakeProfitStatus.PENDING_CLOSE
         order.triggered_at = datetime.now()
         order.trigger_reason = "stop_loss"
         self._stats["stop_loss_triggered"] += 1
@@ -1335,7 +1525,7 @@ class StopLossTakeProfitManager:
         except Exception as e:
             logger.debug(f"写入止损触发记忆失败: {e}")
 
-        await self._execute_exchange_close_on_trigger(order, "stop_loss")
+        await self._attempt_pending_close(order, "stop_loss")
         
         await self._save_orders()
         
@@ -1350,26 +1540,35 @@ class StopLossTakeProfitManager:
         pnl_percent = self._calculate_pnl_percent(order, current_price)
         
         if self.config.enable_partial_tp and order.take_profit_type == TakeProfitType.PARTIAL:
-            partial_executed = False
-            for level_percent, level_ratio in order.metadata.get("partial_levels", []):
-                if pnl_percent >= level_percent and not any(
-                    p[0] == level_percent for p in order.partial_tp_executed
-                ):
-                    partial_quantity = order.quantity * level_ratio
-                    order.remaining_quantity -= partial_quantity
-                    order.partial_tp_executed.append((level_percent, partial_quantity))
-                    self._stats["partial_tp_executed"] += 1
-                    partial_executed = True
-                    
-                    logger.info(f"🎯 {order.symbol} 分批止盈: {level_percent*100:.1f}% 平仓 {level_ratio*100:.0f}%")
-                    
-                    await self._notify_callbacks("on_partial_tp", order, level_percent, partial_quantity)
-            
-            if partial_executed and order.remaining_quantity > 0:
-                await self._save_orders()
-                return order
+            # Real partial TP requires a real partial close on exchange (via S1). The legacy behavior only
+            # mutates local remaining_quantity and can drift from real positions, so we disable it in live.
+            if getattr(self.config, "execute_exchange_on_trigger", True):
+                logger.warning(
+                    "⚠️ %s PARTIAL TP is disabled in live mode (execute_exchange_on_trigger=true); falling back to full TP close to avoid drift",
+                    order.symbol,
+                )
+            else:
+                partial_executed = False
+                for level_percent, level_ratio in order.metadata.get("partial_levels", []):
+                    if pnl_percent >= level_percent and not any(
+                        p[0] == level_percent for p in order.partial_tp_executed
+                    ):
+                        partial_quantity = order.quantity * level_ratio
+                        order.remaining_quantity -= partial_quantity
+                        order.partial_tp_executed.append((level_percent, partial_quantity))
+                        self._stats["partial_tp_executed"] += 1
+                        partial_executed = True
+
+                        logger.info(f"🎯 {order.symbol} 分批止盈: {level_percent*100:.1f}% 平仓 {level_ratio*100:.0f}%")
+
+                        await self._notify_callbacks("on_partial_tp", order, level_percent, partial_quantity)
+
+                if partial_executed and order.remaining_quantity > 0:
+                    await self._save_orders()
+                    return order
+            # if execute_exchange_on_trigger=false and partials depleted the position, continue to full close below.
         
-        order.status = StopLossTakeProfitStatus.TRIGGERED
+        order.status = StopLossTakeProfitStatus.PENDING_CLOSE
         order.triggered_at = datetime.now()
         order.trigger_reason = "take_profit"
         self._stats["take_profit_triggered"] += 1
@@ -1462,7 +1661,7 @@ class StopLossTakeProfitManager:
         except Exception as e:
             logger.debug(f"写入止盈触发记忆失败: {e}")
 
-        await self._execute_exchange_close_on_trigger(order, "take_profit")
+        await self._attempt_pending_close(order, "take_profit")
         
         await self._save_orders()
         
@@ -1474,7 +1673,7 @@ class StopLossTakeProfitManager:
             return
         
         if datetime.now() >= order.time_limit:
-            order.status = StopLossTakeProfitStatus.TRIGGERED
+            order.status = StopLossTakeProfitStatus.PENDING_CLOSE
             order.triggered_at = datetime.now()
             order.trigger_reason = "time_stop"
             self._stats["time_stop_triggered"] += 1
@@ -1483,7 +1682,7 @@ class StopLossTakeProfitManager:
             
             await self._notify_callbacks("on_time_stop", order)
 
-            await self._execute_exchange_close_on_trigger(order, "time_stop")
+            await self._attempt_pending_close(order, "time_stop")
             
             await self._save_orders()
     
@@ -1501,7 +1700,18 @@ class StopLossTakeProfitManager:
         new_take_profit: Optional[float] = None
     ) -> Optional[StopLossTakeProfitOrder]:
         """修改止盈止损订单"""
-        order_id = self.order_index.get(symbol)
+        order_id = None
+        key = str(symbol or "").strip()
+        if self._is_pos_key(key) or "|" in key:
+            order_id = self.order_index.get(self._normalize_any_key(key))
+        if not order_id and key:
+            for sd in ("long", "short"):
+                for cand in self._index_key_lookup_variants(key, sd):
+                    order_id = self.order_index.get(self._normalize_any_key(cand))
+                    if order_id:
+                        break
+                if order_id:
+                    break
         if not order_id:
             return None
         
@@ -1528,7 +1738,18 @@ class StopLossTakeProfitManager:
     
     async def cancel_order(self, symbol: str) -> bool:
         """取消止盈止损订单"""
-        order_id = self.order_index.get(symbol)
+        order_id = None
+        key = str(symbol or "").strip()
+        if self._is_pos_key(key) or "|" in key:
+            order_id = self.order_index.get(self._normalize_any_key(key))
+        if not order_id and key:
+            for sd in ("long", "short"):
+                for cand in self._index_key_lookup_variants(key, sd):
+                    order_id = self.order_index.get(self._normalize_any_key(cand))
+                    if order_id:
+                        break
+                if order_id:
+                    break
         if not order_id:
             return False
         
@@ -1540,6 +1761,10 @@ class StopLossTakeProfitManager:
         order.updated_at = datetime.now()
         
         logger.info(f"❌ 取消止盈止损订单: {symbol}")
+
+        for k in self._order_index_keys_to_clear(order):
+            if self.order_index.get(k) == order_id:
+                del self.order_index[k]
         
         await self._save_orders()
         
@@ -1547,7 +1772,18 @@ class StopLossTakeProfitManager:
     
     async def get_order(self, symbol: str) -> Optional[StopLossTakeProfitOrder]:
         """获取止盈止损订单"""
-        order_id = self.order_index.get(symbol)
+        order_id = None
+        key = str(symbol or "").strip()
+        if self._is_pos_key(key) or "|" in key:
+            order_id = self.order_index.get(self._normalize_any_key(key))
+        if not order_id and key:
+            for sd in ("long", "short"):
+                for cand in self._index_key_lookup_variants(key, sd):
+                    order_id = self.order_index.get(self._normalize_any_key(cand))
+                    if order_id:
+                        break
+                if order_id:
+                    break
         if not order_id:
             return None
         return self.orders.get(order_id)
@@ -1597,6 +1833,34 @@ class StopLossTakeProfitManager:
                         logger.warning(f"周期持仓再同步失败: {e}")
 
                 active_orders = await self.get_all_active_orders()
+
+                # Retry pending-close orders (close-confirmation state machine)
+                pending = [
+                    o for o in self.orders.values()
+                    if o.status == StopLossTakeProfitStatus.PENDING_CLOSE
+                ]
+                for order in pending:
+                    try:
+                        if not self._pending_close_due(order):
+                            continue
+                        attempts = int((order.metadata or {}).get("pending_close_attempts", 0) or 0)
+                        max_r = int(getattr(self.config, "pending_close_max_retries", 6) or 6)
+                        if attempts >= max_r:
+                            logger.error(
+                                "🚨 SLTP pending close exceeded max retries: %s %s order_id=%s attempts=%s",
+                                order.symbol,
+                                order.side,
+                                getattr(order, "order_id", None),
+                                attempts,
+                            )
+                            # keep scheduling with a long backoff to avoid tight loops
+                            self._schedule_pending_close_retry(order, error="max_retries_exceeded")
+                            await self._save_orders()
+                            continue
+                        await self._attempt_pending_close(order, str(order.trigger_reason or "pending_close"))
+                        await self._save_orders()
+                    except Exception as e:
+                        logger.warning("SLTP pending close retry failed: %s", e)
                 
                 for order in active_orders:
                     try:
@@ -1686,8 +1950,21 @@ class StopLossTakeProfitManager:
                 )
                 
                 self.orders[oid] = order
-                idx_key = (order.metadata or {}).get("index_key") or order.symbol
-                self.order_index[idx_key] = oid
+                try:
+                    meta = dict(order.metadata or {})
+                    canonical = self._normalize_any_key(
+                        meta.get("index_key")
+                        or meta.get("position_key")
+                        or f"{order.symbol}|{order.side}"
+                    )
+                    meta["index_key"] = canonical
+                    meta.setdefault("legacy_symbol_key", self._normalize_index_key(f"{order.symbol}|{order.side}"))
+                    order.metadata = meta
+                    for k in self._order_index_keys_to_clear(order):
+                        self.order_index[self._normalize_any_key(k)] = oid
+                except Exception:
+                    idx_key = self._normalize_any_key((order.metadata or {}).get("index_key") or f"{order.symbol}|{order.side}")
+                    self.order_index[idx_key] = oid
             
             self._stats.update(data.get("stats", {}))
             

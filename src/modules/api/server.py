@@ -157,7 +157,20 @@ class WebSocketConnection:
 
     def is_subscribed(self, channel: str) -> bool:
         """检查是否订阅了频道"""
-        return channel in self.subscriptions
+        ch = str(channel or "").strip()
+        if not ch:
+            return False
+        subs = list(self.subscriptions or [])
+        if "*" in subs:
+            return True
+        if ch in subs:
+            return True
+        # prefix wildcard: e.g. "trade.*" matches "trade.intent"/"trade.fill"/"trade.position"
+        for s in subs:
+            ss = str(s or "").strip()
+            if ss.endswith(".*") and ch.startswith(ss[:-2]):
+                return True
+        return False
 
     def update_activity(self) -> None:
         """更新活动时间"""

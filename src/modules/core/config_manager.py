@@ -110,6 +110,13 @@ class ConfigManager:
             "enable_secondary_controller": False,
             # enable autonomous executor supervision loop by default
             "enable_autonomous_executor": True,
+            # execution spine policy toggles (must be explicit to avoid "omission == privilege")
+            "policy": {
+                # allow internal system tools to open positions (default: false; ai_core is the only intended source)
+                "allow_system_open": False,
+                # whether S1 should call exchange.set_leverage before open (default: false; OKX adapter already sets)
+                "gateway_sets_leverage": False,
+            },
         },
         "api": {
             "host": "0.0.0.0",

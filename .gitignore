@@ -98,6 +98,8 @@ data/memory/*.json
 data/strategy_optimization.json
 agents/*/sessions/*.json
 agents/*/sessions/*.jsonl
+agents/*/sessions/*.jsonl.lock
+*.lock
 agents/*/agent/models.json
 backups/*.tar.gz
 backups/*.zip

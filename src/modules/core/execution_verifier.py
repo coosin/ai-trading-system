@@ -388,7 +388,7 @@ class ExecutionVerifier:
         symbol: Optional[str],
         params: Dict[str, Any]
     ) -> ExecutionResult:
-        """执行开仓（优先经 ExecutionGateway / S1，失败再回退 create_order）。"""
+        """执行开仓（强制经 ExecutionGateway / S1；禁止直连交易所回退）。"""
         if not self._exchange:
             result.status = ExecutionStatus.FAILED
             result.error_message = "交易所未连接"
@@ -397,9 +397,8 @@ class ExecutionVerifier:
 
         params = params or {}
         sym = symbol or params.get("symbol")
-        write_source = str(
-            params.get("write_source") or params.get("source") or "ai_core"
-        ).strip().lower()
+        # CRITICAL: 不允许“省略即特权”。write_source 缺失则视为 unknown，交由 S1 policy 决定是否放行。
+        write_source = str(params.get("write_source") or params.get("source") or "unknown").strip().lower()
         side = self._normalize_swap_side(params.get("side", "long")) or "long"
         quantity = float(params.get("quantity", 0) or 0)
         price = params.get("price")
@@ -410,126 +409,77 @@ class ExecutionVerifier:
         if self._main_controller is not None:
             gw = getattr(self._main_controller, "execution_gateway", None)
 
-        if gw and sym:
-            try:
-                gres = await gw.open_swap(
-                    sym,
-                    side,
-                    quantity,
-                    leverage,
-                    write_source,
-                    "execution_verifier_open",
-                    margin_mode="cross",
-                    price=price,
-                    context={
-                        "write_source": write_source,
-                        "symbol": sym,
-                        "side": side,
-                        "quantity": quantity,
-                        "leverage": leverage,
-                        "entry_price": params.get("entry_price"),
-                        "stop_loss": params.get("stop_loss"),
-                        "take_profit": params.get("take_profit"),
-                    },
-                )
-                if gres.get("success"):
-                    result.status = ExecutionStatus.SUCCESS
-                    result.details = {
-                        "order_id": (gres.get("orderId") or gres.get("order_id") or gres.get("id")),
-                        "symbol": sym,
-                        "side": side,
-                        "quantity": quantity,
-                        "price": gres.get("average", price),
-                        "status": "filled",
-                        "gateway": True,
-                    }
-                    self._stats["successful"] += 1
-                    # 僅在明確傳入 SL/TP 配置時註冊，避免僅有數字 stop_loss 時誤用默認百分比，
-                    # 與 ai_core 開倉後 _sync_dynamic_sltp_after_open 重複掛單（雙 index、雙平倉風險）。
-                    if (
-                        self._stop_loss_manager
-                        and params.get("stop_loss_config") is not None
-                        and params.get("take_profit_config") is not None
-                    ):
-                        ep = float(
-                            gres.get("average")
-                            or params.get("entry_price")
-                            or price
-                            or 0
-                        )
-                        if ep > 0:
-                            await self._stop_loss_manager.create_order(
-                                symbol=sym,
-                                side=side,
-                                entry_price=ep,
-                                quantity=quantity,
-                                stop_loss_config=params.get("stop_loss_config"),
-                                take_profit_config=params.get("take_profit_config"),
-                                metadata=params.get("sltp_metadata"),
-                            )
-                    return result
-                err = str(gres.get("error") or "")
-                if self._policy_denied_error(err):
-                    result.status = ExecutionStatus.FAILED
-                    result.error_message = err or "policy_denied"
-                    self._stats["failed"] += 1
-                    return result
-            except Exception as e:
-                logger.warning("ExecutionVerifier: Gateway 开仓失败，回退 create_order: %s", e)
+        if not gw or not sym:
+            result.status = ExecutionStatus.FAILED
+            result.error_message = "execution_gateway_not_ready"
+            self._stats["failed"] += 1
+            return result
 
         try:
-            order_result = await self._exchange.create_order(
-                symbol=sym,
-                type=order_type,
-                side="buy" if side == "long" else "sell",
-                amount=quantity,
+            gres = await gw.open_swap(
+                sym,
+                side,
+                quantity,
+                leverage,
+                write_source,
+                "execution_verifier_open",
+                margin_mode="cross",
                 price=price,
-            )
-
-            if order_result:
-                result.status = ExecutionStatus.SUCCESS
-                result.details = {
-                    "order_id": order_result.get("id"),
+                context={
+                    "write_source": write_source,
                     "symbol": sym,
                     "side": side,
                     "quantity": quantity,
-                    "price": order_result.get("average", price),
-                    "status": order_result.get("status"),
-                    "gateway": False,
-                }
-                self._stats["successful"] += 1
-
-                if (
-                    self._stop_loss_manager
-                    and params.get("stop_loss_config") is not None
-                    and params.get("take_profit_config") is not None
-                ):
-                    ep = float(
-                        order_result.get("average")
-                        or params.get("entry_price")
-                        or price
-                        or 0
-                    )
-                    if ep > 0:
-                        await self._stop_loss_manager.create_order(
-                            symbol=sym,
-                            side=side,
-                            entry_price=ep,
-                            quantity=quantity,
-                            stop_loss_config=params.get("stop_loss_config"),
-                            take_profit_config=params.get("take_profit_config"),
-                            metadata=params.get("sltp_metadata"),
-                        )
-            else:
-                result.status = ExecutionStatus.FAILED
-                result.error_message = "订单创建失败"
-                self._stats["failed"] += 1
-
+                    "leverage": leverage,
+                    "entry_price": params.get("entry_price"),
+                    "stop_loss": params.get("stop_loss"),
+                    "take_profit": params.get("take_profit"),
+                    "trace_id": params.get("trace_id"),
+                },
+            )
         except Exception as e:
             result.status = ExecutionStatus.FAILED
             result.error_message = str(e)
             self._stats["failed"] += 1
+            return result
 
+        if gres.get("success"):
+            result.status = ExecutionStatus.SUCCESS
+            result.details = {
+                "order_id": (gres.get("orderId") or gres.get("order_id") or gres.get("id")),
+                "symbol": sym,
+                "side": side,
+                "quantity": quantity,
+                "price": gres.get("average", price),
+                "status": "filled",
+                "gateway": True,
+                "trace_id": gres.get("trace_id") or params.get("trace_id"),
+            }
+            self._stats["successful"] += 1
+            # 僅在明確傳入 SL/TP 配置時註冊，避免僅有數字 stop_loss 時誤用默認百分比，
+            # 與 ai_core 開倉後 _sync_dynamic_sltp_after_open 重複掛單（雙 index、雙平倉風險）。
+            if (
+                self._stop_loss_manager
+                and params.get("stop_loss_config") is not None
+                and params.get("take_profit_config") is not None
+            ):
+                ep = float(gres.get("average") or params.get("entry_price") or price or 0)
+                if ep > 0:
+                    await self._stop_loss_manager.create_order(
+                        symbol=sym,
+                        side=side,
+                        entry_price=ep,
+                        quantity=quantity,
+                        stop_loss_config=params.get("stop_loss_config"),
+                        take_profit_config=params.get("take_profit_config"),
+                        metadata=params.get("sltp_metadata"),
+                    )
+            return result
+
+        err = str(gres.get("error") or "")
+        result.status = ExecutionStatus.FAILED
+        result.error_message = err or "open_failed"
+        self._stats["failed"] += 1
         return result
     
     async def _execute_close_position(
@@ -547,9 +497,8 @@ class ExecutionVerifier:
 
         params = params or {}
         sym = symbol or params.get("symbol")
-        write_source = str(
-            params.get("write_source") or params.get("source") or "ai_core"
-        ).strip().lower()
+        # CRITICAL: 不允许“省略即特权”。write_source 缺失则视为 unknown，交由 S1 policy 决定是否放行。
+        write_source = str(params.get("write_source") or params.get("source") or "unknown").strip().lower()
         quantity = params.get("quantity")
 
         gw = None
@@ -586,88 +535,55 @@ class ExecutionVerifier:
             except Exception:
                 pass
 
-        if gw:
-            try:
-                gres = await gw.close_swap(
-                    sym,
-                    pos_side,
-                    float(quantity) if quantity is not None else None,
-                    write_source,
-                    "execution_verifier_close",
-                    context={
-                        "write_source": write_source,
-                        "symbol": sym,
-                        "side": pos_side,
-                        "quantity": quantity,
-                        "pnl": params.get("pnl", 0),
-                    },
-                )
-                if gres.get("success"):
-                    result.status = ExecutionStatus.SUCCESS
-                    result.details = {
-                        "order_id": (gres.get("orderId") or gres.get("order_id") or gres.get("id")),
-                        "symbol": sym,
-                        "quantity": quantity,
-                        "price": gres.get("average"),
-                        "pnl": params.get("pnl", 0),
-                        "gateway": True,
-                    }
-                    self._stats["successful"] += 1
-                    if self._stop_loss_manager:
-                        await self._stop_loss_manager.cancel_order(sym)
-                    return result
-                err = str(gres.get("error") or "")
-                if self._policy_denied_error(err):
-                    result.status = ExecutionStatus.FAILED
-                    result.error_message = err or "policy_denied"
-                    self._stats["failed"] += 1
-                    return result
-            except Exception as e:
-                logger.warning("ExecutionVerifier: Gateway 平仓失败，回退 create_order: %s", e)
+        if not gw:
+            result.status = ExecutionStatus.FAILED
+            result.error_message = "execution_gateway_not_ready"
+            self._stats["failed"] += 1
+            return result
 
         try:
-            if quantity is None:
-                positions = await self._exchange.fetch_positions([sym])
-                position = next((p for p in positions if p.get("symbol") == sym), None)
-                if not position:
-                    result.status = ExecutionStatus.FAILED
-                    result.error_message = f"未找到 {sym} 持仓"
-                    self._stats["failed"] += 1
-                    return result
-                quantity = abs(float(position.get("contracts", 0)))
-
-            spot_side = "sell" if pos_side == "long" else "buy"
-            order_result = await self._exchange.create_order(
-                symbol=sym,
-                type="market",
-                side=spot_side,
-                amount=quantity,
-            )
-
-            if order_result:
-                result.status = ExecutionStatus.SUCCESS
-                result.details = {
-                    "order_id": order_result.get("id"),
+            gres = await gw.close_swap(
+                sym,
+                pos_side,
+                float(quantity) if quantity is not None else None,
+                write_source,
+                "execution_verifier_close",
+                context={
+                    "write_source": write_source,
                     "symbol": sym,
+                    "side": pos_side,
                     "quantity": quantity,
-                    "price": order_result.get("average"),
                     "pnl": params.get("pnl", 0),
-                    "gateway": False,
-                }
-                self._stats["successful"] += 1
-
-                if self._stop_loss_manager:
-                    await self._stop_loss_manager.cancel_order(sym)
-            else:
-                result.status = ExecutionStatus.FAILED
-                result.error_message = "平仓订单创建失败"
-                self._stats["failed"] += 1
-
+                    "trace_id": params.get("trace_id"),
+                },
+            )
         except Exception as e:
             result.status = ExecutionStatus.FAILED
             result.error_message = str(e)
             self._stats["failed"] += 1
+            return result
 
+        if gres.get("success"):
+            result.status = ExecutionStatus.SUCCESS
+            result.details = {
+                "order_id": (gres.get("orderId") or gres.get("order_id") or gres.get("id")),
+                "symbol": sym,
+                "quantity": quantity,
+                "price": gres.get("average"),
+                "pnl": params.get("pnl", 0),
+                "gateway": True,
+                "skipped": bool(gres.get("skipped")),
+                "trace_id": gres.get("trace_id") or params.get("trace_id"),
+            }
+            self._stats["successful"] += 1
+            if self._stop_loss_manager:
+                await self._stop_loss_manager.cancel_order(sym)
+            return result
+
+        err = str(gres.get("error") or "")
+        result.status = ExecutionStatus.FAILED
+        result.error_message = err or "close_failed"
+        self._stats["failed"] += 1
         return result
     
     async def _execute_set_stop_loss(

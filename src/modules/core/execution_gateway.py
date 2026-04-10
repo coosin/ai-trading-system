@@ -91,6 +91,7 @@ class ExecutionGateway:
         self._policy_metrics: Dict[str, int] = {
             "open_policy_denied": 0,
             "close_policy_denied": 0,
+            "close_skipped": 0,
             "open_ok": 0,
             "open_fail": 0,
             "close_ok": 0,
@@ -111,11 +112,9 @@ class ExecutionGateway:
             pass
 
     async def _notify_telegram(self, text: str) -> None:
-        bot = getattr(self._mc, "telegram_bot", None) if self._mc else None
-        if not bot or not hasattr(bot, "send_message"):
-            return
         try:
-            await bot.send_message(text)
+            if self._mc and hasattr(self._mc, "_send_notification_handler"):
+                await self._mc._send_notification_handler("交易执行", str(text), priority="medium")
         except Exception:
             pass
 
@@ -149,9 +148,25 @@ class ExecutionGateway:
     def _allow_open(self, source: str, swo: str) -> bool:
         """开仓仅允许 SWO 或显式人工/指令执行链路，防止辅环误开仓。"""
         src = (source or "").strip().lower()
-        # manual/system：运维/系统指令；实盘策略须带真实 write_source（如 ai_core），不再放行匿名 execution_verifier
-        if src in ("manual", "system"):
+        # manual：人工显式触发允许开仓（用于运维/人工测试）。
+        if src == "manual":
             return True
+        # system：默认不允许开仓，避免“遗漏即特权”；仅在策略显式配置打开时放行。
+        if src == "system":
+            try:
+                pol = {}
+                if self._mc and hasattr(self._mc, "config_manager") and self._mc.config_manager:
+                    pol = self._mc.config_manager.get_config_sync("ai_brain", {}) or {}
+                if isinstance(pol, dict):
+                    allow = (
+                        (pol.get("policy") or {}).get("allow_system_open", False)
+                        if isinstance(pol.get("policy"), dict)
+                        else bool(pol.get("allow_system_open", False))
+                    )
+                    return bool(allow)
+            except Exception:
+                return False
+            return False
         # 用户显式开启双控时，允许 ai_core 与 ai_trading_engine 并行开仓。
         # 这是一个受配置开关控制的特例，默认关闭。
         try:
@@ -188,8 +203,41 @@ class ExecutionGateway:
             self._locks[key] = asyncio.Lock()
         return self._locks[key]
 
-    def _idempotent_key(self, symbol: str, side: str, op: str) -> str:
+    def _idempotent_key(self, symbol: str, side: str, op: str, extra: str = "") -> str:
+        extra = str(extra or "").strip()
+        if extra:
+            return f"{op}:{symbol}:{side}:{extra}"
         return f"{op}:{symbol}:{side}"
+
+    @staticmethod
+    def _fmt_size_for_key(size: Optional[float]) -> str:
+        if size is None:
+            return "all"
+        try:
+            v = float(size)
+        except Exception:
+            return "all"
+        # 保守去抖：避免浮点噪声造成 key 爆炸
+        return f"{v:.8f}".rstrip("0").rstrip(".") or "0"
+
+    @staticmethod
+    def _trace_id_from_context(context: Optional[Dict[str, Any]]) -> str:
+        if not context or not isinstance(context, dict):
+            return ""
+        tid = context.get("trace_id") or context.get("TraceId") or context.get("traceId")
+        return str(tid or "").strip()
+
+    def _close_idempotent_key(self, symbol: str, side: str, size: Optional[float], context: Optional[Dict[str, Any]]) -> str:
+        """
+        close 幂等粒度：
+        - close_all (size=None) 维持粗粒度，避免多次 close_all 重入
+        - partial close 带 size（规避“部分平仓被粗 key 吃掉”）
+        - 若有 trace_id，则纳入 key（允许同 symbol/side 的不同链路并行）
+        """
+        tid = self._trace_id_from_context(context)
+        sz = self._fmt_size_for_key(size)
+        extra = f"{tid}:{sz}" if tid else sz
+        return self._idempotent_key(symbol, side, "close", extra=extra)
 
     def _should_skip_idempotent(self, key: str) -> bool:
         now = time.time()
@@ -261,10 +309,35 @@ class ExecutionGateway:
             self._record_order(source, "close", False, "no_exchange")
             return {"success": False, "error": "no_exchange"}
 
-        key = self._idempotent_key(symbol, side, "close")
+        key = self._close_idempotent_key(symbol, side, size, context)
         if self._should_skip_idempotent(key):
             logger.info("ExecutionGateway: skip duplicate close %s", key)
-            return {"success": True, "skipped": True, "reason": "idempotent"}
+            self._metric_inc("close_skipped")
+            # best-effort fill event so front-end/ops can see the skip
+            try:
+                hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
+                trace_id = self._trace_id_from_context(context) or str(uuid.uuid4())
+                if hub and hasattr(hub, "publish_fill"):
+                    from src.modules.core.trade_event_hub import TradeFill
+
+                    await hub.publish_fill(
+                        TradeFill(
+                            trace_id=str(trace_id),
+                            source=str(source or "gateway"),
+                            symbol=str(symbol),
+                            side=str(side),
+                            action="close",
+                            success=True,
+                            order_id=None,
+                            price=None,
+                            quantity=float(size) if size is not None else None,
+                            detail="idempotent_skip",
+                            raw={"skipped": True, "reason": "idempotent", "idempotent_key": key},
+                        )
+                    )
+            except Exception:
+                pass
+            return {"success": True, "skipped": True, "reason": "idempotent", "idempotent_key": key, "trace_id": self._trace_id_from_context(context)}
 
         async with self._symbol_lock(symbol):
             try:
@@ -494,9 +567,24 @@ class ExecutionGateway:
                         size = float(adj)
                 except Exception as e:
                     logger.debug("ExecutionGateway: preflight check skipped: %s", e)
-                set_lv = getattr(ex, "set_leverage", None)
-                if callable(set_lv):
-                    await set_lv(sym, lev, margin_mode)
+                # 杠杆设置职责：默认交由交易所适配器（例如 OKX 的 open_swap_position 内已设置杠杆），避免重复调用。
+                # 如需在 S1 统一设置，可在 ai_brain.policy.gateway_sets_leverage=true 显式开启。
+                try:
+                    pol = {}
+                    if self._mc and hasattr(self._mc, "config_manager") and self._mc.config_manager:
+                        pol = self._mc.config_manager.get_config_sync("ai_brain", {}) or {}
+                    gateway_sets = False
+                    if isinstance(pol, dict):
+                        if isinstance(pol.get("policy"), dict):
+                            gateway_sets = bool(pol.get("policy", {}).get("gateway_sets_leverage", False))
+                        else:
+                            gateway_sets = bool(pol.get("gateway_sets_leverage", False))
+                    if gateway_sets:
+                        set_lv = getattr(ex, "set_leverage", None)
+                        if callable(set_lv):
+                            await set_lv(sym, lev, margin_mode)
+                except Exception:
+                    pass
 
                 opn = getattr(ex, "open_swap_position", None)
                 if not callable(opn):

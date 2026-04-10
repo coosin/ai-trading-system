@@ -131,6 +131,9 @@ class OKXExchange(ExchangeBase):
             "order": ["ordId", "instId", "side", "ordType", "state", "accFillSz"],
             "account-balance": ["details", "ccy", "eq", "availEq"],
         }
+        # log dedup: avoid spamming "positions count" every call
+        self._last_positions_log_ts: float = 0.0
+        self._last_positions_nonzero_count: Optional[int] = None
 
     def _build_ssl_context(self) -> ssl.SSLContext:
         """
@@ -1281,7 +1284,18 @@ class OKXExchange(ExchangeBase):
             data = await self._make_request("GET", endpoint, params={"instType": "SWAP"})
             _ingest_rows(data, swap_bucket)
             out = list(swap_bucket.values())
-            logger.info("OKX 持仓(SWAP 权威): 非零 %d 条", len(out))
+            try:
+                now = time.time()
+                n = len(out)
+                # only log when count changes or every 60s
+                if self._last_positions_nonzero_count != n or (now - float(self._last_positions_log_ts or 0.0)) >= 60.0:
+                    self._last_positions_nonzero_count = n
+                    self._last_positions_log_ts = now
+                    logger.info("OKX 持仓(SWAP 权威): 非零 %d 条", n)
+                else:
+                    logger.debug("OKX 持仓(SWAP 权威): 非零 %d 条 (log dedup)", n)
+            except Exception:
+                pass
             return out
         except Exception as e:
             last_error = e

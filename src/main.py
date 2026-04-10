@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+import logging.handlers
 import signal
 import sys
 from pathlib import Path
@@ -66,7 +67,13 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(_resolve_app_log_path(), encoding="utf-8"),
+        # IMPORTANT: use rotation to avoid filling disk
+        logging.handlers.RotatingFileHandler(
+            _resolve_app_log_path(),
+            encoding="utf-8",
+            maxBytes=int(20 * 1024 * 1024),  # 20MB per file
+            backupCount=10,
+        ),
     ],
 )
 

@@ -104,6 +104,7 @@ class TradeEventHub:
         *,
         api_server: Any = None,
         telegram_bot: Any = None,
+        notify_fn: Any = None,
         buffer_size: int = 500,
         tg_enabled: bool = True,
         tg_min_interval_sec: float = 2.0,
@@ -111,9 +112,11 @@ class TradeEventHub:
         self._es = event_system
         self._api = api_server
         self._tg = telegram_bot
+        self._notify_fn = notify_fn
         self._buffer_size = int(max(50, buffer_size))
         self._ring: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
+        self._seq: int = 0
         self._tg_enabled = bool(tg_enabled)
         self._tg_min_interval_sec = float(max(0.0, tg_min_interval_sec))
         self._last_tg_at: float = 0.0
@@ -121,6 +124,44 @@ class TradeEventHub:
     def get_recent(self, limit: int = 100) -> List[Dict[str, Any]]:
         lim = int(max(1, min(limit or 100, self._buffer_size)))
         return list(self._ring[-lim:])
+
+    def query_recent(
+        self,
+        *,
+        limit: int = 200,
+        cursor: Optional[int] = None,
+        event_type: Optional[str] = None,
+        symbol: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Query ring buffer with lightweight filtering + cursor pagination.
+
+        - cursor: return events with seq < cursor (exclusive). None means "latest".
+        - event_type: matches payload["type"] (e.g. trade.fill / market.update)
+        """
+        lim = int(max(1, min(limit or 200, self._buffer_size)))
+        et = str(event_type).strip() if event_type else None
+        sym = str(symbol).strip() if symbol else None
+        tid = str(trace_id).strip() if trace_id else None
+
+        rows = list(self._ring)
+        if cursor is not None:
+            try:
+                cur = int(cursor)
+                rows = [r for r in rows if int(r.get("seq", 0) or 0) < cur]
+            except Exception:
+                pass
+        if et:
+            rows = [r for r in rows if str(r.get("type") or "") == et]
+        if sym:
+            rows = [r for r in rows if str(r.get("symbol") or "") == sym]
+        if tid:
+            rows = [r for r in rows if str(r.get("trace_id") or "") == tid]
+
+        out = rows[-lim:]
+        next_cursor = int(out[0].get("seq")) if out else (int(cursor) if cursor is not None else None)
+        return {"events": out, "next_cursor": next_cursor, "count": len(out)}
 
     async def _publish_event(self, ev: Event, *, persist: bool = True) -> None:
         """
@@ -139,6 +180,9 @@ class TradeEventHub:
 
     async def _append_ring(self, payload: Dict[str, Any]) -> None:
         async with self._lock:
+            self._seq += 1
+            if "seq" not in payload:
+                payload["seq"] = int(self._seq)
             self._ring.append(payload)
             if len(self._ring) > self._buffer_size:
                 self._ring = self._ring[-self._buffer_size :]
@@ -152,12 +196,29 @@ class TradeEventHub:
             except Exception as e:
                 logger.debug("TradeEventHub websocket fanout failed: %s", e)
 
+        # 即时消息渠道统一走“司令部”（notify_fn），避免各模块直接发 TG 造成多头与节流不一致
+        if self._notify_fn and callable(self._notify_fn):
+            now = time.time()
+            if now - self._last_tg_at >= self._tg_min_interval_sec:
+                self._last_tg_at = now
+                try:
+                    msg = payload.get("tg_message")
+                    if msg:
+                        await self._notify_fn(
+                            f"即时消息({channel})",
+                            str(msg)[:3500],
+                            priority="medium",
+                        )
+                except Exception as e:
+                    logger.debug("TradeEventHub commander fanout failed: %s", e)
+            return
+
+        # Backward-compatible direct TG (legacy)
         if self._tg_enabled and self._tg and hasattr(self._tg, "send_message"):
             now = time.time()
             if now - self._last_tg_at >= self._tg_min_interval_sec:
                 self._last_tg_at = now
                 try:
-                    # Keep short; full details stay in API ring buffer.
                     msg = payload.get("tg_message")
                     if msg:
                         await self._tg.send_message(str(msg)[:3500])
@@ -178,6 +239,7 @@ class TradeEventHub:
             {
                 "type": "trade.intent",
                 **intent.to_dict(),
+                "timestamp": intent.created_at,
                 "tg_message": f"🧭 意图 {intent.action}\n{intent.symbol} {intent.side}\ntrace_id={intent.trace_id}",
             },
         )
@@ -197,6 +259,7 @@ class TradeEventHub:
             {
                 "type": "trade.fill",
                 **fill.to_dict(),
+                "timestamp": fill.filled_at,
                 "tg_message": (
                     f"{status} 成交 {fill.action}\n{fill.symbol} {fill.side}\n"
                     f"qty={fill.quantity} px={fill.price}\ntrace_id={fill.trace_id}"

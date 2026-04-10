@@ -335,7 +335,15 @@ class AccountRiskMonitor:
         now = datetime.now()
         
         for warning in account_risk.warnings:
-            warning_key = warning.split()[0] if warning else ""
+            # 抑制粒度：按「告警类型 + 标的」去重，避免不同标的互相覆盖导致刷屏
+            # 示例： "⚠️ BTC/USDT/SWAP 距离强平价格较近: 10.7%"
+            try:
+                parts = (warning or "").split()
+                sev = parts[0] if parts else ""
+                sym = parts[1] if len(parts) > 1 else ""
+                warning_key = f"{sev}:{sym}" if sev or sym else (warning or "")[:40]
+            except Exception:
+                warning_key = warning.split()[0] if warning else ""
             
             if warning_key in self._last_warning_time:
                 time_since_last = (now - self._last_warning_time[warning_key]).total_seconds()

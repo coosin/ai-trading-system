@@ -115,6 +115,8 @@ class AICoreDecisionEngine:
             "aggressive_mode": False,
             "auto_create_strategy": True,
             "min_confidence_to_trade": 0.72,
+            # Explicit open gate: avoid low-confidence churn
+            "ai_core_min_confidence_to_open": 0.78,
             "min_data_quality_to_trade": 0.55,
             "min_rr_to_trade": 1.15,
             "max_spread_bps_to_trade": 40.0,
@@ -184,11 +186,18 @@ class AICoreDecisionEngine:
             "research_max_symbols": 4,
             "research_lookback_days": 28,
             "research_timeout_seconds": 420,
+            # hold_avoidance_override hardening (reduce churn in choppy markets)
+            "hold_avoidance_override_enabled": True,
+            "hold_avoidance_override_cooldown_sec": 1200,
+            "hold_avoidance_override_min_abs_sentiment": 0.06,
+            "hold_avoidance_override_min_mi_quality_score": 0.62,
+            "hold_avoidance_override_require_mi_trend_alignment": True,
         }
         
         # 状态
         self._running = False
         self._last_decision_time: Dict[str, datetime] = {}
+        self._last_hold_override_at: Dict[str, datetime] = {}
         self._last_strategy_check: Optional[datetime] = None
         self._pending_decisions: List[TradeDecision] = []
         # 与 StrategyManager 中已启用策略同步的镜像；用于状态与提示词排序
@@ -2241,7 +2250,7 @@ class AICoreDecisionEngine:
             # 兜底：LLM 可能过度保守长期返回 hold。
             # 在多源融合置信度高且技术趋势一致时，把 hold 变更为可执行的 buy/sell，
             # 交由后续 ExecutionGateway 统一走 S1 单写入所有权。
-            if decision and decision.action == "hold":
+            if decision and decision.action == "hold" and bool(self.config.get("hold_avoidance_override_enabled", True)):
                 try:
                     fusion_conf = float(multi_source_analysis.get("confidence", 0) or 0)
                     fusion_sent = multi_source_analysis.get("sentiment", 0)
@@ -2249,6 +2258,20 @@ class AICoreDecisionEngine:
                     risk_level = risk_assessment.get("level", "unknown")
                     tech_trend_1h = technical.get("trend_1h", "unknown")
                     min_conf = float(self.config.get("min_confidence_to_trade", 0.6))
+                    min_abs_sent = float(self.config.get("hold_avoidance_override_min_abs_sentiment", 0.06) or 0.06)
+                    mi_q_min = float(self.config.get("hold_avoidance_override_min_mi_quality_score", 0.62) or 0.62)
+                    require_mi_align = bool(self.config.get("hold_avoidance_override_require_mi_trend_alignment", True))
+                    cooldown = float(self.config.get("hold_avoidance_override_cooldown_sec", 1200) or 1200)
+
+                    mi_trend = getattr(mi_view, "trend", None) if mi_view else None
+                    mi_q = getattr(mi_view, "quality_score", None) if mi_view else None
+                    mi_conf = getattr(mi_view, "confidence", None) if mi_view else None
+                    try:
+                        mi_qf = float(mi_q) if mi_q is not None else 0.0
+                    except Exception:
+                        mi_qf = 0.0
+
+                    now = datetime.now()
 
                     if (
                         self.authorization.get("full_authorization")
@@ -2256,8 +2279,18 @@ class AICoreDecisionEngine:
                         and strat_count > 0
                         and fusion_conf >= min_conf
                         and isinstance(fusion_sent, (int, float))
+                        and abs(float(fusion_sent)) >= min_abs_sent
+                        and mi_qf >= mi_q_min
                     ):
+                        # rate limit per symbol-side
+                        key = f"{symbol}:{'long' if float(fusion_sent) > 0 else 'short'}"
+                        last = self._last_hold_override_at.get(key)
+                        if last and (now - last).total_seconds() < cooldown:
+                            raise RuntimeError("hold_avoidance_override cooldown")
+
                         if tech_trend_1h == "bearish" and fusion_sent < -0.05:
+                            if require_mi_align and str(mi_trend or "").lower() not in ("bearish", "down", "short"):
+                                raise RuntimeError("hold_avoidance_override mi trend mismatch")
                             decision.action = "sell"
                             decision.side = "short"
                             decision.quantity = max(1, int(decision.quantity or 1))
@@ -2268,7 +2301,10 @@ class AICoreDecisionEngine:
                                 f"tech_trend_1h=bearish"
                             )
                             decision.strategy_used = decision.strategy_used or "s1_fusion_override"
+                            self._last_hold_override_at[key] = now
                         elif tech_trend_1h == "bullish" and fusion_sent > 0.05:
+                            if require_mi_align and str(mi_trend or "").lower() not in ("bullish", "up", "long"):
+                                raise RuntimeError("hold_avoidance_override mi trend mismatch")
                             decision.action = "buy"
                             decision.side = "long"
                             decision.quantity = max(1, int(decision.quantity or 1))
@@ -2279,6 +2315,7 @@ class AICoreDecisionEngine:
                                 f"tech_trend_1h=bullish"
                             )
                             decision.strategy_used = decision.strategy_used or "s1_fusion_override"
+                            self._last_hold_override_at[key] = now
                 except Exception as e:
                     logger.debug(f"hold override skipped: {e}")
             
@@ -3381,6 +3418,30 @@ class AICoreDecisionEngine:
                     logger.debug(f"自适应门控计算失败: {e}")
 
             if not is_close:
+                # Explicit open-confidence gate: prevent low-confidence churn before any exchange interaction.
+                try:
+                    conf = float(getattr(decision, "confidence", 0) or 0)
+                except Exception:
+                    conf = 0.0
+                min_open_c = float(
+                    self.config.get(
+                        "ai_core_min_confidence_to_open",
+                        self.config.get("min_confidence_to_trade", 0.72),
+                    )
+                    or 0.72
+                )
+                if conf < min_open_c:
+                    self._execution_guards_stats["confidence_open_rejected"] = int(
+                        self._execution_guards_stats.get("confidence_open_rejected", 0)
+                    ) + 1
+                    logger.warning(
+                        "⚠️ 执行门控拒绝: open 置信度过低 conf=%.3f < %.3f symbol=%s",
+                        conf,
+                        min_open_c,
+                        decision.symbol,
+                    )
+                    return False
+
                 if rr < min_rr:
                     self._execution_guards_stats["rr_rejected"] += 1
                     logger.warning("⚠️ 执行门控拒绝: RR过低 rr=%.2f < %.2f symbol=%s", rr, min_rr, decision.symbol)
@@ -3832,14 +3893,12 @@ class AICoreDecisionEngine:
 """
         logger.info(message)
         
-        if self.telegram_bot and hasattr(self.telegram_bot, 'send_message') and self.telegram_bot.chat_ids:
+        # 即时消息统一由“司令部”转发给用户（避免模块直发 TG）
+        if self.main_controller and hasattr(self.main_controller, "_send_notification_handler"):
             try:
-                await self.telegram_bot.send_message(
-                    chat_id=self.telegram_bot.chat_ids[0],
-                    text=message
-                )
-            except Exception as e:
-                logger.error(f"发送Telegram消息失败: {e}")
+                await self.main_controller._send_notification_handler("AI决策", message, priority="medium")
+            except Exception:
+                pass
     
     def get_status(self) -> Dict:
         """获取状态"""
@@ -3884,6 +3943,7 @@ class AICoreDecisionEngine:
                 "config": {
                     "min_trade_interval": self.config.get("min_trade_interval"),
                     "min_confidence_to_trade": self.config.get("min_confidence_to_trade"),
+                    "ai_core_min_confidence_to_open": self.config.get("ai_core_min_confidence_to_open"),
                     "min_data_quality_to_trade": self.config.get("min_data_quality_to_trade"),
                     "min_rr_to_trade": self.config.get("min_rr_to_trade"),
                     "max_spread_bps_to_trade": self.config.get("max_spread_bps_to_trade"),
@@ -3918,6 +3978,11 @@ class AICoreDecisionEngine:
                     "auto_tune_sltp_cooldown_seconds": self.config.get("auto_tune_sltp_cooldown_seconds"),
                     "auto_tune_sltp_step_tighten": self.config.get("auto_tune_sltp_step_tighten"),
                     "auto_tune_sltp_step_extend": self.config.get("auto_tune_sltp_step_extend"),
+                    "hold_avoidance_override_enabled": self.config.get("hold_avoidance_override_enabled"),
+                    "hold_avoidance_override_cooldown_sec": self.config.get("hold_avoidance_override_cooldown_sec"),
+                    "hold_avoidance_override_min_abs_sentiment": self.config.get("hold_avoidance_override_min_abs_sentiment"),
+                    "hold_avoidance_override_min_mi_quality_score": self.config.get("hold_avoidance_override_min_mi_quality_score"),
+                    "hold_avoidance_override_require_mi_trend_alignment": self.config.get("hold_avoidance_override_require_mi_trend_alignment"),
                 },
                 "adaptive_profile": dict(self._adaptive_guard_profile),
                 "group_overrides": dict(self._symbol_group_guard_overrides),

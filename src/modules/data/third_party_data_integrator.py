@@ -118,7 +118,24 @@ class BaseDataProvider(ABC):
                         await asyncio.sleep(wait_time)
                         continue
                     elif response.status == 403:
-                        logger.warning(f"API access denied (403) for {self.__class__.__name__} - skipping this provider")
+                        # dedup noisy 403 logs (common for reddit without auth)
+                        try:
+                            now = time.time()
+                            key = f"{self.__class__.__name__}:403"
+                            if not hasattr(self, "_warn_dedup"):
+                                self._warn_dedup = {}
+                            last = self._warn_dedup.get(key)
+                            if not last or (now - float(last)) >= 900.0:
+                                self._warn_dedup[key] = now
+                                logger.warning(
+                                    f"API access denied (403) for {self.__class__.__name__} - skipping this provider (dedup 15m)"
+                                )
+                            else:
+                                logger.debug(
+                                    f"API access denied (403) for {self.__class__.__name__} - skipping (dedup)"
+                                )
+                        except Exception:
+                            logger.warning(f"API access denied (403) for {self.__class__.__name__} - skipping this provider")
                         return None
                     elif response.status == 401:
                         logger.warning(f"API unauthorized (401) for {self.__class__.__name__} - check API key")

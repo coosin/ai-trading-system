@@ -7,6 +7,7 @@
 import logging
 import asyncio
 import aiohttp
+import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -191,7 +192,17 @@ class CoinGeckoDataSource(DataSourceBase):
                             source="coingecko"
                         )
         except Exception as e:
-            logger.warning(f"CoinGecko获取市场数据失败: {e}")
+            # 去重：CoinGecko 在某些网络/限流环境下会持续失败，避免刷爆日志
+            try:
+                now = time.time()
+                last = float(getattr(self, "_warn_last_ts", 0.0) or 0.0)
+                if now - last >= 900.0:
+                    self._warn_last_ts = now
+                    logger.warning(f"CoinGecko获取市场数据失败(去重15m): {e}")
+                else:
+                    logger.debug(f"CoinGecko获取市场数据失败(去重): {e}")
+            except Exception:
+                logger.warning(f"CoinGecko获取市场数据失败: {e}")
         
         return None
     

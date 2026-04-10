@@ -1421,7 +1421,8 @@ class MainController:
                 self.trade_event_hub = TradeEventHub(
                     self.event_system,
                     api_server=self.api_server,
-                    telegram_bot=getattr(self, "telegram_bot", None),
+                    telegram_bot=None,
+                    notify_fn=self._send_notification_handler,
                     buffer_size=800,
                     tg_enabled=True,
                     tg_min_interval_sec=2.0,

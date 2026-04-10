@@ -344,6 +344,72 @@ class MarketIntelligenceEngine:
                 or f"🧠 行情汇总 {view.symbol}\n趋势={view.trend} 倾向={view.action_bias} 置信={view.confidence}\n质量={view.quality_score} spread={view.spread_bps}\n{view.summary[:160]}",
             )
 
+    async def ingest_scanner_opportunity(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        接收「机会扫描」初筛后的机会提示，做二次分析/补充证据，然后：
+        - 发布到 market.update（前端/TG 可见）
+        - 转发给 ai_core 作为决策提示（不等于下单指令）
+        """
+        raw = dict(payload or {})
+        sym = str(raw.get("symbol") or "").strip()
+        if not sym:
+            return {"ok": False, "message": "missing_symbol"}
+
+        # 二次分析：复用 MI 的统一行情视图，补充质量分/趋势/倾向/执行 guard 等
+        view = None
+        try:
+            view = await self.get_symbol_view(sym, include_snapshot=False)
+        except Exception:
+            view = None
+
+        mi_block: Dict[str, Any] = {}
+        if view:
+            vd = view.to_dict()
+            mi_block = {
+                "mi_timestamp": vd.get("timestamp"),
+                "mi_quality_score": vd.get("quality_score"),
+                "mi_trend": vd.get("trend"),
+                "mi_action_bias": vd.get("action_bias"),
+                "mi_confidence": vd.get("confidence"),
+                "mi_summary": vd.get("summary"),
+                "mi_execution_guards": (vd.get("execution_support") or {}).get("guards") if isinstance(vd.get("execution_support"), dict) else {},
+            }
+
+        enriched = {
+            **raw,
+            "enriched_at": _utc_iso(),
+            "analysis_layer": "market_intelligence",
+            **mi_block,
+        }
+
+        # 对外推送（前端/电报）
+        try:
+            th = self._trade_hub()
+            if th and hasattr(th, "publish_market_update"):
+                direction = str(enriched.get("direction") or "")
+                opp_t = str(enriched.get("opportunity_type") or "")
+                q = enriched.get("mi_quality_score")
+                trend = enriched.get("mi_trend")
+                tg = (
+                    f"📡 扫描机会（二次分析后）\n"
+                    f"{sym} 方向={direction} 类型={opp_t}\n"
+                    f"趋势={trend} 质量={q}\n"
+                    f"{str(enriched.get('mi_summary') or '')[:160]}"
+                )
+                await th.publish_market_update(kind="scanner.opportunity", payload=enriched, tg_message=tg)
+        except Exception:
+            pass
+
+        # 转发给 ai_core（只做提示，不开仓）
+        try:
+            core = getattr(self._mc, "ai_core", None) if self._mc else None
+            if core and hasattr(core, "ingest_scanner_opportunity"):
+                core.ingest_scanner_opportunity(enriched)
+        except Exception:
+            pass
+
+        return {"ok": True, "symbol": sym, "enriched": enriched}
+
     async def get_market_state(self, symbols: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         聚合市场状态（多 symbol 汇总）。用于前端面板/风控开关/日报。

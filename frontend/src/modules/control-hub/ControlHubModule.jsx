@@ -68,6 +68,15 @@ function ControlHubModule() {
   const [commanderReply, setCommanderReply] = useState('');
   const [frequencyProfile, setFrequencyProfile] = useState(null);
   const [frequencyBusy, setFrequencyBusy] = useState(false);
+  const [aiGuardForm, setAiGuardForm] = useState({
+    ai_core_min_confidence_to_open: 0.78,
+    hold_avoidance_override_enabled: true,
+    hold_avoidance_override_cooldown_sec: 1200,
+    hold_avoidance_override_min_abs_sentiment: 0.06,
+    hold_avoidance_override_min_mi_quality_score: 0.62,
+    hold_avoidance_override_require_mi_trend_alignment: true,
+  });
+  const [aiGuardBusy, setAiGuardBusy] = useState(false);
 
   const [strategies, setStrategies] = useState([]);
   const [strategyOpt, setStrategyOpt] = useState(null);
@@ -217,6 +226,12 @@ function ControlHubModule() {
       setS1(s1Res);
       setGuards(guardsRes);
       setFrequencyProfile(freqRes);
+      if (guardsRes?.config) {
+        setAiGuardForm((prev) => ({
+          ...prev,
+          ...guardsRes.config,
+        }));
+      }
       const riskRes = await api.modules.getRiskStatus().catch(() => null);
       setRiskStatus(riskRes || null);
       if (riskRes?.config) {
@@ -271,6 +286,29 @@ function ControlHubModule() {
       showNotice(`更新自动切档开关失败：${e.message || e}`, 'error');
     } finally {
       setFrequencyBusy(false);
+    }
+  };
+
+  const applyAiGuardForm = async () => {
+    setAiGuardBusy(true);
+    try {
+      const payload = {
+        ...aiGuardForm,
+        ai_core_min_confidence_to_open: Number(aiGuardForm.ai_core_min_confidence_to_open),
+        hold_avoidance_override_enabled: Boolean(aiGuardForm.hold_avoidance_override_enabled),
+        hold_avoidance_override_cooldown_sec: Number(aiGuardForm.hold_avoidance_override_cooldown_sec),
+        hold_avoidance_override_min_abs_sentiment: Number(aiGuardForm.hold_avoidance_override_min_abs_sentiment),
+        hold_avoidance_override_min_mi_quality_score: Number(aiGuardForm.hold_avoidance_override_min_mi_quality_score),
+        hold_avoidance_override_require_mi_trend_alignment: Boolean(aiGuardForm.hold_avoidance_override_require_mi_trend_alignment),
+      };
+      const res = await api.modules.updateAiGuards(payload);
+      if (!res?.success) throw new Error(res?.message || '更新失败');
+      showNotice('AI开单标准已更新（实时生效）');
+      await refresh();
+    } catch (e) {
+      showNotice(`更新AI开单标准失败：${e.message || e}`, 'error');
+    } finally {
+      setAiGuardBusy(false);
     }
   };
 
@@ -780,6 +818,82 @@ function ControlHubModule() {
                 <button type="button" className="btn btn-sm btn-outline" disabled={frequencyBusy} onClick={toggleFrequencyTelegramNotify}>
                   {guards?.config?.frequency_profile_switch_telegram_notify ? '关闭切档Telegram通知' : '开启切档Telegram通知'}
                 </button>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 12, border: '1px solid var(--border-light)', borderRadius: 8, padding: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>AI开单标准（可视化 / 可操控，实时生效）</div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 8 }}>
+                作用：控制“开仓最低信心门槛”、以及“长期观望强制开仓”的触发条件（已加限频与质量对齐）。
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(140px,1fr))', gap: 8 }}>
+                <input
+                  className="form-input"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1"
+                  value={aiGuardForm.ai_core_min_confidence_to_open}
+                  onChange={(e) => setAiGuardForm((p) => ({ ...p, ai_core_min_confidence_to_open: e.target.value }))}
+                  placeholder="开仓最低信心"
+                  title="开仓最低信心（低于此值直接不执行开仓）"
+                />
+                <input
+                  className="form-input"
+                  type="number"
+                  step="10"
+                  min="0"
+                  value={aiGuardForm.hold_avoidance_override_cooldown_sec}
+                  onChange={(e) => setAiGuardForm((p) => ({ ...p, hold_avoidance_override_cooldown_sec: e.target.value }))}
+                  placeholder="观望转开仓冷却(秒)"
+                  title="观望→强制开仓：同方向同标的最小间隔（秒）"
+                />
+                <input
+                  className="form-input"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1"
+                  value={aiGuardForm.hold_avoidance_override_min_abs_sentiment}
+                  onChange={(e) => setAiGuardForm((p) => ({ ...p, hold_avoidance_override_min_abs_sentiment: e.target.value }))}
+                  placeholder="情绪绝对值门槛"
+                  title="观望→强制开仓：情绪强度至少达到该阈值"
+                />
+                <input
+                  className="form-input"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1"
+                  value={aiGuardForm.hold_avoidance_override_min_mi_quality_score}
+                  onChange={(e) => setAiGuardForm((p) => ({ ...p, hold_avoidance_override_min_mi_quality_score: e.target.value }))}
+                  placeholder="分析质量门槛"
+                  title="观望→强制开仓：统一行情分析质量分至少达到该阈值"
+                />
+                <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12 }}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(aiGuardForm.hold_avoidance_override_enabled)}
+                    onChange={(e) => setAiGuardForm((p) => ({ ...p, hold_avoidance_override_enabled: e.target.checked }))}
+                  />
+                  启用观望转开仓
+                </label>
+                <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12 }}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(aiGuardForm.hold_avoidance_override_require_mi_trend_alignment)}
+                    onChange={(e) => setAiGuardForm((p) => ({ ...p, hold_avoidance_override_require_mi_trend_alignment: e.target.checked }))}
+                  />
+                  要求趋势一致
+                </label>
+              </div>
+              <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <button type="button" className="btn btn-sm btn-primary" disabled={aiGuardBusy} onClick={applyAiGuardForm}>
+                  {aiGuardBusy ? '应用中…' : '应用AI开单标准'}
+                </button>
+                <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+                  当前开仓最低信心：{guards?.config?.ai_core_min_confidence_to_open ?? '-'}
+                </span>
               </div>
             </div>
           </div>

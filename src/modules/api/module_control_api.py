@@ -122,16 +122,25 @@ def init_module_control_api(app, main_controller):
             )
 
     @trade_router.get("/events")
-    async def get_trade_events(limit: int = 200) -> Dict[str, Any]:
+    async def get_trade_events(
+        limit: int = 200,
+        cursor: Optional[int] = None,
+        type: Optional[str] = None,  # noqa: A002 (fastapi query param)
+        symbol: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         获取最近交易域事件（Intent/Fill/Position）。
-        前端可轮询或配合 WebSocket 订阅 channel=trade.*。
+        前端可轮询或配合 WebSocket 订阅 channel=trade.*（支持前缀通配符）。
         """
         mc = main_controller
         hub = getattr(mc, "trade_event_hub", None) if mc else None
-        if not hub or not hasattr(hub, "get_recent"):
+        if not hub or not (hasattr(hub, "query_recent") or hasattr(hub, "get_recent")):
             return {"ok": False, "events": [], "message": "TradeEventHub unavailable"}
         try:
+            if hasattr(hub, "query_recent"):
+                q = hub.query_recent(limit=int(limit or 200), cursor=cursor, event_type=type, symbol=symbol, trace_id=trace_id)
+                return {"ok": True, **q}
             return {"ok": True, "events": hub.get_recent(limit=int(limit or 200))}
         except Exception as e:
             return {"ok": False, "events": [], "message": str(e)}
@@ -655,6 +664,7 @@ def init_module_control_api(app, main_controller):
         allowed = {
             "min_trade_interval",
             "min_confidence_to_trade",
+            "ai_core_min_confidence_to_open",
             "min_data_quality_to_trade",
             "min_rr_to_trade",
             "max_spread_bps_to_trade",
@@ -693,6 +703,11 @@ def init_module_control_api(app, main_controller):
             "critical_risk_auto_close_liq_only",
             "critical_risk_auto_close_max_liq_distance",
             "critical_risk_auto_close_min_loss_pct",
+            "hold_avoidance_override_enabled",
+            "hold_avoidance_override_cooldown_sec",
+            "hold_avoidance_override_min_abs_sentiment",
+            "hold_avoidance_override_min_mi_quality_score",
+            "hold_avoidance_override_require_mi_trend_alignment",
         }
         applied: Dict[str, Any] = {}
         for k, v in (config or {}).items():
