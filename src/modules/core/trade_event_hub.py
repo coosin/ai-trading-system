@@ -122,6 +122,21 @@ class TradeEventHub:
         lim = int(max(1, min(limit or 100, self._buffer_size)))
         return list(self._ring[-lim:])
 
+    async def _publish_event(self, ev: Event, *, persist: bool = True) -> None:
+        """
+        Compatible publish adapter:
+        - Some codepaths use EventBus.publish(event, persist)
+        - EnhancedEventSystem exposes emit(...) instead of publish(event,...)
+        """
+        if hasattr(self._es, "publish"):
+            await self._es.publish(ev, persist=persist)  # type: ignore[attr-defined]
+            return
+        bus = getattr(self._es, "event_bus", None)
+        if bus and hasattr(bus, "publish"):
+            await bus.publish(ev, persist)  # type: ignore[attr-defined]
+            return
+        # last resort: do nothing (ring buffer still records)
+
     async def _append_ring(self, payload: Dict[str, Any]) -> None:
         async with self._lock:
             self._ring.append(payload)
@@ -157,7 +172,7 @@ class TradeEventHub:
             data={"kind": "intent", **intent.to_dict()},
             metadata={"trace_id": intent.trace_id},
         )
-        await self._es.publish(ev, persist=True)
+        await self._publish_event(ev, persist=True)
         await self._fanout(
             "trade.intent",
             {
@@ -175,7 +190,7 @@ class TradeEventHub:
             data={"kind": "fill", **fill.to_dict()},
             metadata={"trace_id": fill.trace_id},
         )
-        await self._es.publish(ev, persist=True)
+        await self._publish_event(ev, persist=True)
         status = "✅" if fill.success else "❌"
         await self._fanout(
             "trade.fill",
@@ -220,7 +235,7 @@ class TradeEventHub:
             data=payload,
             metadata={"trace_id": trace_id, "kind": kind},
         )
-        await self._es.publish(ev, persist=True)
+        await self._publish_event(ev, persist=True)
         await self._fanout(
             "trade.position",
             {
@@ -253,7 +268,7 @@ class TradeEventHub:
             data=data,
             metadata={"kind": kind},
         )
-        await self._es.publish(ev, persist=True)
+        await self._publish_event(ev, persist=True)
         await self._fanout(
             "market.update",
             {

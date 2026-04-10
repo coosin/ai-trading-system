@@ -158,7 +158,7 @@ class ExecutionGateway:
             pol = {}
             if self._mc and hasattr(self._mc, "config_manager") and self._mc.config_manager:
                 pol = self._mc.config_manager.get_config_sync("ai_brain", {}) or {}
-            if bool(pol.get("enable_secondary_controller", False)) and src in {"ai_core", "ai_trading_engine"}:
+            if isinstance(pol, dict) and bool(pol.get("enable_secondary_controller", False)) and src in {"ai_core", "ai_trading_engine"}:
                 return True
         except Exception:
             pass

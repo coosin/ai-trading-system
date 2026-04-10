@@ -1472,7 +1472,15 @@ class AITradingEngine:
 
                 max_same = int(self.ai_config.get("max_same_direction_positions", 5) or 5)
                 max_hedged = int(self.ai_config.get("max_hedged_positions", 8) or 8)
-                max_positions = int(self.ai_config.get("max_positions", DEFAULT_MAX_POSITIONS) or DEFAULT_MAX_POSITIONS)
+                # Prefer external config (tests & simple deployments) then fallback to ai_config defaults.
+                try:
+                    max_positions_cfg = (self.config or {}).get("trading", {}).get("max_positions")
+                except Exception:
+                    max_positions_cfg = None
+                max_positions = int(
+                    (max_positions_cfg if max_positions_cfg is not None else self.ai_config.get("max_positions", DEFAULT_MAX_POSITIONS))
+                    or DEFAULT_MAX_POSITIONS
+                )
                 long_cnt, short_cnt = self._count_open_directions()
                 opening_long = decision.action == TradeAction.OPEN_LONG
                 opening_short = decision.action == TradeAction.OPEN_SHORT

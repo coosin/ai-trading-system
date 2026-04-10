@@ -279,7 +279,8 @@ class APIServer:
 
         # 认证
         self.security = HTTPBearer() if HAS_FASTAPI else None
-        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto") if HAS_FASTAPI else None
+        # Use pbkdf2_sha256 to avoid bcrypt 72-byte limitation and backend quirks.
+        self.pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto") if HAS_FASTAPI else None
         self.secret_key = secrets.token_urlsafe(32) if HAS_FASTAPI else None
         self.algorithm = "HS256" if HAS_FASTAPI else None
         self.access_token_expire_minutes = 30 if HAS_FASTAPI else None
