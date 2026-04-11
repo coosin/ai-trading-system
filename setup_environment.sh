@@ -2,6 +2,9 @@
 
 # 全智能量化交易系统 - 环境设置脚本
 # 在 Ubuntu 24.04 上安装所有必要的开发工具
+#
+# 生产/服务器仅跑容器时：见 DEVELOPMENT.md「仅 Docker 运行」— 无需执行本脚本；
+# 使用 docker compose build trading-system && docker compose up -d 即可。
 
 set -e  # 出错时退出
 

@@ -3,7 +3,7 @@
 本系统的“记忆库”不是单一文件，而是一套**统一入口 + 分层落盘 + 可检索/可总结/可治理**的机制。
 本文档面向开发/运维/策略迭代，解释整体结构、写入与召回方式、维护与修改方法，以及常见问题排查。
 
-**全模块职责与 API 总表**：见仓库根目录 `docs/ARCHITECTURE_MODULES.md`，运行时以 `GET /api/v1/modules/surface/registry` 为准。
+**工程与模块总览**：见 `docs/ENGINEERING.md`；运行时模块面以 `GET /api/v1/modules/surface/registry` 与 OpenAPI 为准。
 
 ---
 
@@ -305,8 +305,7 @@ python3 scripts/memory_inventory_archive.py --roots data/memory --archive --arch
 ## 八、与现有文档关系
 
 - 对齐/迁移背景：
-  - `docs/MEMORY_UNIFICATION_BLUEPRINT.md`
-  - `docs/MEMORY_ARCHITECTURE_ALIGNMENT.md`
+  - （历史蓝图文档已合并清理；以本指南与 `docs/ENGINEERING.md` 为准。）
 
 本文档是**日常使用与运维/开发的“操作手册”**版本。
 

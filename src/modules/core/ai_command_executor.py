@@ -17,14 +17,24 @@ from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
+from .model_reply_guard import sanitize_commander_result
+
 logger = logging.getLogger(__name__)
+
+
+def _finalize_commander_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    """与 CommanderAgentRuntime 单点护栏一致；直连 process_input 的调用方也会经过清洗。"""
+    return sanitize_commander_result(result)
+
 
 from .timing_constants import SLEEP_5S, SLEEP_60S
 from .commander_charter import (
     CHARTER,
     CONTEXT_FRAMING_FOR_CHAT,
+    HONESTY_CONTRACT,
     WORKSPACE_READ_PREFIXES,
     WORKSPACE_SELF_MAINTAIN_PREFIXES,
+    honesty_contract_enabled,
 )
 from src.modules.memory.memory_schema import SummaryKey, base_metadata, kind_tag, tags
 from src.modules.memory.memory_context_policy import (
@@ -281,13 +291,18 @@ class AICommandExecutor:
                             )
                     except Exception:
                         pass
-                return result
+                return _finalize_commander_payload(result)
 
             internal_q = self._looks_like_internal_price_query(utter)
+            plain_price_q = self._looks_like_plain_price_quote_question(utter)
             sym = self._resolve_symbol_for_price(utter)
-            if internal_q:
+            if internal_q or plain_price_q:
                 sym = sym or str(os.environ.get("OPENCLAW_DEFAULT_PRICE_SYMBOL", "ETH/USDT")).strip()
-            if sym and (internal_q or self._looks_like_live_price_only_request(utter)):
+            if sym and (
+                internal_q
+                or plain_price_q
+                or self._looks_like_live_price_only_request(utter)
+            ):
                 result = await self._answer_live_price_from_exchange(sym)
                 intent = Intent(action="market_analysis", params={"symbol": sym}, confidence=1.0)
                 if self.unified_memory:
@@ -323,9 +338,51 @@ class AICommandExecutor:
                             )
                     except Exception:
                         pass
-                return result
+                return _finalize_commander_payload(result)
+
+            if self._looks_like_system_learning_request(utter):
+                result = await self._answer_system_familiarity_bootstrap()
+                intent = Intent(
+                    action="workspace_read",
+                    params={"path": "docs/ENGINEERING.md"},
+                    confidence=1.0,
+                )
+                if self.unified_memory:
+                    try:
+                        await self.unified_memory.add_memory(
+                            memory_type=self._get_memory_type_from_intent(intent.action),
+                            content=f"用户: {user_input}",
+                            summary=f"用户指令: {user_input[:100]}",
+                            metadata=base_metadata(
+                                source_module="ai_command_executor",
+                                kind="user_input",
+                                extra={"intent": intent.action, "params": intent.params},
+                            ),
+                            source_module="ai_command_executor",
+                        )
+                        action_msg = str((result or {}).get("response") or "")[:500]
+                        if action_msg:
+                            await self.unified_memory.add_memory(
+                                memory_type="conversation",
+                                content=f"动作结果[{intent.action}] {action_msg}",
+                                summary=f"{intent.action} 执行结果摘要",
+                                metadata=base_metadata(
+                                    source_module="ai_command_executor",
+                                    kind="action_result",
+                                    extra={
+                                        "intent": intent.action,
+                                        "success": bool((result or {}).get("success", False)),
+                                    },
+                                ),
+                                source_module="ai_command_executor",
+                                importance=0.55,
+                                tags=tags(kind_tag("action_result"), kind_tag(intent.action)),
+                            )
+                    except Exception:
+                        pass
+                return _finalize_commander_payload(result)
             
-            # 默认极简自由模式：直接自然对话，避免复杂规则/模板链路介入。
+            # 极简模式：只聊天不跑意图；默认关闭，走下方 LLM 意图解析与执行。
             if self._is_minimal_free_mode():
                 user_rules = await self._get_user_rules_context()
                 result = await self._general_chat(
@@ -393,7 +450,7 @@ class AICommandExecutor:
                 except Exception:
                     pass
             
-            return result
+            return _finalize_commander_payload(result)
             
         except Exception as e:
             # 中文化错误提示：把常见英文异常翻译成“人话”
@@ -406,11 +463,13 @@ class AICommandExecutor:
             logger.error(f"处理用户输入失败: {e}")
             import traceback
             traceback.print_exc()
-            return {
-                "success": False,
-                "response": f"处理过程中遇到问题：{friendly}",
-                "timestamp": datetime.now().isoformat()
-            }
+            return _finalize_commander_payload(
+                {
+                    "success": False,
+                    "response": f"处理过程中遇到问题：{friendly}",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
     
     async def _get_user_rules_context(self) -> str:
         """
@@ -425,6 +484,8 @@ class AICommandExecutor:
             )
 
         parts.append("\n【司令部宪章 · 原则锚点】\n" + CHARTER)
+        if honesty_contract_enabled():
+            parts.append("\n" + HONESTY_CONTRACT)
 
         try:
             wb = self._get_workspace_boundaries()
@@ -528,9 +589,11 @@ class AICommandExecutor:
 action ∈ chat, system_status, trade_history, positions, balance, market_analysis, trade, strategy_create, strategy_optimize, backtest, risk, signals, third_party_data, workspace_read, workspace_edit, plugin_list, plugin_reload, plugin_load, plugin_unload
 
 说明：
+- 用户可用日常口语、中英文混说，不必固定指令模板；按真实意图选 action。
+- 诚实：reasoning 只写从用户话里能推出的判断，不得捏造用户未说的情节或系统状态。
 - 非工作话题（生活/学习/娱乐/情绪支持/日常建议）默认 action=chat。
 - 只有用户明确要求系统状态/巡检/交易执行/策略操作，才选择对应工作 action。
-- workspace_read：params 必须包含 path（字符串，相对仓库根的路径，用 /）。
+- workspace_read：params 必须包含 path（相对仓库根，用 /）。可以是**文件**或**允许前缀下的目录**；目录则返回真实列目录树（非推断）。了解本项目优先 path=docs/ENGINEERING.md 或 docs/README.md、ARCHITECTURE.md、README.md；看模块分布用 path=src/modules。勿编造 src/data_source、src/trading 等不存在的顶层路径。
 - workspace_edit：params 必须包含 path、edit_type、content；edit_type 为 insert|delete|replace|full_replace；delete/replace 需 start_line、end_line（从 1 起的行号）；full_replace 用 content 替换整个文件；insert 可用 start_line 指定插入位置。
 
 用户消息：
@@ -614,11 +677,12 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
     @staticmethod
     def _is_minimal_free_mode() -> bool:
         """
-        极简自由模式（默认开启）：
-        - 仅保留“自然对话 + 记忆记录”主链路
-        - 不强制走复杂意图路由/模板流程
+        极简自由模式（默认关闭）：
+        - 关闭时：LLM 解析意图 → _execute_intent，自然语言驱动执行（完全智能主路径）。
+        - 开启时：仅“自然对话 + 记忆”，除身份/问价等快路径外不走意图执行；适合只要闲聊、怕误触的场景。
+        环境变量 OPENCLAW_COMMANDER_MINIMAL_MODE=1/true/on 可显式开启。
         """
-        raw = str(os.environ.get("OPENCLAW_COMMANDER_MINIMAL_MODE", "1") or "").strip().lower()
+        raw = str(os.environ.get("OPENCLAW_COMMANDER_MINIMAL_MODE", "0") or "").strip().lower()
         return raw not in {"0", "false", "no", "off"}
 
     @staticmethod
@@ -708,6 +772,66 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         }
 
     @staticmethod
+    def _looks_like_plain_price_quote_question(text: str) -> bool:
+        """
+        用户问价但未写币种（如「能查到价格吗」「现在多少钱」）：走默认 OPENCLAW_DEFAULT_PRICE_SYMBOL。
+        若已能解析出币种，交给 _looks_like_live_price_only_request，避免重复。
+        """
+        t = (text or "").strip()
+        if not t or len(t) > 600:
+            return False
+        if AICommandExecutor._resolve_symbol_for_price(t):
+            return False
+        if any(
+            k in t
+            for k in (
+                "趋势",
+                "走势",
+                "建议",
+                "看法",
+                "技术",
+                "多空",
+                "布局",
+                "策略",
+                "预测",
+                "怎么看",
+                "觉得",
+            )
+        ):
+            return False
+        if any(k in t for k in ("你是谁", "什么身份", "什么人格", "宪章")):
+            return False
+        low = t.lower()
+        price_kw = (
+            "价格",
+            "行情",
+            "现价",
+            "多少钱",
+            "什么价",
+            "报价",
+            "实时",
+            "价位",
+            "查价",
+            "ticker",
+            "quote",
+            "u价",
+        )
+        has_price = any(k in t for k in price_kw) or any(k in low for k in ("ticker", "quote"))
+        has_price = has_price or bool(re.search(r"(多少|啥价|几块钱|几个u|几u)", t))
+        if not has_price:
+            return False
+        # 有「价」且很短，多半是问报价（如「当前价」「最新价」）
+        if len(t) <= 24 and "价" in t:
+            return True
+        action_or_meta = bool(
+            re.search(
+                r"(查|拉|取|读|看|给|报|吗|呢|嘛|能|可不可以|行不行|现在|当前|接口|对接|通了吗|有没有数据|实时)",
+                t,
+            )
+        )
+        return action_or_meta or (len(t) <= 40 and has_price)
+
+    @staticmethod
     def _looks_like_live_price_only_request(text: str) -> bool:
         """
         仅「现价/报价」类短问：走交易所真实 ticker，禁止交给纯模型编造数字。
@@ -757,6 +881,28 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
             return True
         # 「ETH 多少」「比特币现在多少」
         if re.search(r"(多少|几个|几块钱|啥价)", t):
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_system_learning_request(text: str) -> bool:
+        """用户要求读文档/熟悉本仓库（非闲聊编造目录树）。"""
+        t = (text or "").strip()
+        if not t or len(t) > 900:
+            return False
+        if re.search(r"(读(取)?|阅读|翻看|打开|先).{0,8}文档", t):
+            return True
+        if "相关文档" in t or "先看文档" in t or "读一下文档" in t:
+            return True
+        if re.search(r"(熟悉|了解|弄清楚|搞清|认识).{0,10}(系统|项目|仓库|代码库|咱们|我们).{0,6}(东西|情况)?", t):
+            return True
+        if "不了解" in t and ("工作" in t or "系统" in t or "项目" in t):
+            return True
+        if re.search(r"(项目|系统).{0,6}(结构|架构|目录|代码)", t) and any(
+            k in t for k in ("读", "看", "翻", "了解", "熟悉", "从")
+        ):
+            return True
+        if re.search(r"(每行|逐行).{0,6}代码", t):
             return True
         return False
 
@@ -836,6 +982,56 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
             "data": {"symbol": symbol, "ticker": ticker},
         }
 
+    async def _answer_system_familiarity_bootstrap(self) -> Dict[str, Any]:
+        """用户要「先读文档再懂系统」时，直接列真实目录 + 读架构文档节选，避免模型空演。"""
+        chunks: List[str] = [
+            "【以下为进程内刚执行的列目录 / 读文件结果，不是训练记忆里的假项目结构】\n"
+            "本仓库主代码在 **src/modules/**（core、data、exchanges、notification 等），"
+            "没有 src/data_source、src/trading 这类顶层目录名。\n",
+        ]
+        src_mod = self._repo_root() / "src" / "modules"
+        if src_mod.is_dir():
+            tree = self._workspace_dir_tree_lines(src_mod, max_depth=2, max_lines=160)
+            chunks.append("\n### src/modules（真实列举）\n" + "\n".join(tree))
+
+        doc_candidates = (
+            "docs/ENGINEERING.md",
+            "docs/README.md",
+            "ARCHITECTURE.md",
+            "README.md",
+        )
+        doc_snip: Optional[str] = None
+        for rel in doc_candidates:
+            chunk = await self._workspace_read({"path": rel})
+            if chunk.get("success") and isinstance(chunk.get("response"), str):
+                body = chunk["response"]
+                if len(body) > 14_000:
+                    body = body[:14_000] + "\n\n…（节选截断，完整请指定 workspace_read 同一 path）"
+                doc_snip = body
+                break
+        if doc_snip:
+            chunks.append("\n\n" + doc_snip)
+        else:
+            chunks.append(
+                "\n（未读到优先文档；可让用户指定 path，例如 docs/ENGINEERING.md）"
+            )
+
+        try:
+            st = await self._get_system_status()
+            if st.get("success") and st.get("response"):
+                sr = str(st["response"]).strip()
+                if sr:
+                    chunks.append("\n\n### 系统状态摘要\n" + sr[:4_000])
+        except Exception as e:
+            logger.debug("bootstrap system_status: %s", e)
+
+        return {
+            "success": True,
+            "response": "\n".join(chunks),
+            "source": "workspace_bootstrap",
+            "timestamp": datetime.now().isoformat(),
+        }
+
     @staticmethod
     def _workspace_blocked(rel_posix: str) -> bool:
         lower = rel_posix.lower()
@@ -882,11 +1078,69 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         except ValueError:
             return str(path)
 
+    def _workspace_dir_tree_lines(
+        self,
+        root_dir: Path,
+        *,
+        max_depth: int,
+        max_lines: int,
+    ) -> List[str]:
+        """列出仓库内目录树（供 workspace_read 目录路径使用）。"""
+        rel_root = self._path_relative_repo(root_dir)
+        out: List[str] = [f"{rel_root}/"]
+
+        def walk(cur: Path, indent: str, depth_left: int) -> None:
+            if depth_left < 0 or len(out) >= max_lines:
+                return
+            try:
+                items = sorted(
+                    cur.iterdir(),
+                    key=lambda p: (not p.is_dir(), p.name.lower()),
+                )
+            except OSError:
+                return
+            for p in items:
+                if len(out) >= max_lines:
+                    break
+                name = p.name
+                if name.startswith(".") or name in ("__pycache__", "node_modules", ".git"):
+                    continue
+                slash = "/" if p.is_dir() else ""
+                out.append(f"{indent}{name}{slash}")
+                if p.is_dir() and depth_left > 0:
+                    walk(p, indent + "  ", depth_left - 1)
+
+        walk(root_dir, "  ", max_depth)
+        return out
+
     async def _workspace_read(self, params: Dict[str, Any]) -> Dict[str, Any]:
         raw = params.get("path") or params.get("file_path") or ""
         path, err = self._resolve_workspace_path(str(raw))
         if err:
             return {"success": False, "response": err, "timestamp": datetime.now().isoformat()}
+        if path.is_dir():
+            try:
+                max_depth = int(params.get("depth") or params.get("max_depth") or 2)
+            except (TypeError, ValueError):
+                max_depth = 2
+            try:
+                max_lines = int(params.get("max_lines") or 220)
+            except (TypeError, ValueError):
+                max_lines = 220
+            max_depth = max(0, min(max_depth, 4))
+            max_lines = max(20, min(max_lines, 500))
+            lines = self._workspace_dir_tree_lines(path, max_depth=max_depth, max_lines=max_lines)
+            rel = self._path_relative_repo(path)
+            body = "\n".join(lines)
+            return {
+                "success": True,
+                "response": (
+                    f"【已列举目录 {rel}/】（真实列盘，非推断；深度≤{max_depth}，至多约 {max_lines} 行）\n"
+                    f"主代码在 src/modules/ 下；需要正文请再指定文件路径做 workspace_read。\n\n{body}"
+                ),
+                "data": {"path": rel + "/", "lines": len(lines)},
+                "timestamp": datetime.now().isoformat(),
+            }
         if not path.is_file():
             return {
                 "success": False,
@@ -1971,7 +2225,112 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
             
         except Exception as e:
             return {"success": False, "response": f"获取系统状态失败: {str(e)}"}
-    
+
+    @staticmethod
+    def _grounded_chat_enabled() -> bool:
+        """先拉事实再让模型说话（根上减少空演）；OPENCLAW_COMMANDER_GROUNDED_CHAT=0 可关。"""
+        raw = str(os.environ.get("OPENCLAW_COMMANDER_GROUNDED_CHAT", "1") or "").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _chat_requires_tool_grounding(text: str) -> bool:
+        """
+        判断本轮是否「需要接口/读盘事实」才能负责任地回答。
+        纯情绪短骂（无事实关键词）返回 False，避免无谓拉接口。
+        """
+        t = (text or "").strip()
+        if len(t) < 4:
+            return False
+        if len(t) <= 56 and ("骗" in t or "忽悠" in t):
+            if not re.search(r"(读|文档|代码|系统|项目|目录|价格|行情|持仓|余额|架构|模块)", t):
+                return False
+        patterns = (
+            r"(文档|目录|结构|架构|代码|项目|仓库|readme|模块|src/|读本|读取|读一下|了解|熟悉|全景)",
+            r"(系统|诊断|巡检|运行|就绪)",
+            r"(价格|行情|报价|现价|ticker|多少.?钱|u价)",
+            r"(持仓|仓位|余额|账户|权益)",
+        )
+        if "workspace" in t.lower() or "architecture" in t.lower():
+            return True
+        return any(re.search(p, t, re.IGNORECASE) for p in patterns)
+
+    async def _prefetch_chat_grounding(self, utter: str) -> str:
+        """在调用 LLM 前自动拉取可注入的事实（与话题正则互补，不靠无限黑名单）。"""
+        parts: List[str] = []
+        need_doc = bool(
+            re.search(
+                r"(文档|目录|结构|架构|代码|项目|仓库|readme|模块|src|读本|读取|读一下|了解|熟悉|全景)",
+                utter,
+                re.I,
+            )
+        )
+        need_sys = bool(re.search(r"(系统|诊断|巡检|运行|就绪)", utter, re.I))
+        need_px = bool(
+            self._resolve_symbol_for_price(utter)
+            or re.search(r"(价格|行情|报价|现价|ticker|多少.?钱|u价)", utter, re.I)
+        )
+        need_acc = bool(re.search(r"(持仓|仓位|余额|账户|权益)", utter, re.I))
+
+        if need_doc:
+            try:
+                for rel in ("docs/ENGINEERING.md", "docs/README.md", "README.md", "ARCHITECTURE.md"):
+                    r = await self._workspace_read({"path": rel})
+                    if r.get("success") and (r.get("response") or ""):
+                        body = str(r["response"])[:5500]
+                        parts.append(body)
+                        break
+                p = self._repo_root() / "src" / "modules"
+                if p.is_dir():
+                    lines = self._workspace_dir_tree_lines(p, max_depth=2, max_lines=72)
+                    parts.append("【src/modules 真实列举】\n" + "\n".join(lines))
+            except Exception as e:
+                logger.debug("prefetch doc grounding: %s", e)
+
+        if need_sys:
+            try:
+                st = await self._get_system_status()
+                if st.get("success") and st.get("response"):
+                    parts.append("【系统状态】\n" + str(st["response"])[:4000])
+            except Exception as e:
+                logger.debug("prefetch system grounding: %s", e)
+
+        if need_px:
+            try:
+                sym = self._resolve_symbol_for_price(utter) or str(
+                    os.environ.get("OPENCLAW_DEFAULT_PRICE_SYMBOL", "ETH/USDT")
+                ).strip()
+                px = await self._answer_live_price_from_exchange(sym)
+                if px.get("success") and px.get("response"):
+                    parts.append(str(px["response"])[:2800])
+            except Exception as e:
+                logger.debug("prefetch price grounding: %s", e)
+
+        if need_acc:
+            try:
+                bal = await self._get_balance()
+                if bal.get("success") and bal.get("response"):
+                    parts.append(str(bal["response"])[:2200])
+                pos = await self._get_positions()
+                if pos.get("success") and pos.get("response"):
+                    parts.append(str(pos["response"])[:3200])
+            except Exception as e:
+                logger.debug("prefetch account grounding: %s", e)
+
+        if not parts:
+            return "（本轮自动拉取未得到可用事实；请勿编造路径、目录树、价格或持仓。）"
+        return "\n\n---\n\n".join(parts)[:16000]
+
+    async def _resolve_grounding_anchor(
+        self,
+        utter: str,
+        grounding_facts: Optional[str],
+    ) -> str:
+        if grounding_facts is not None:
+            return grounding_facts
+        if not self._grounded_chat_enabled() or not self._chat_requires_tool_grounding(utter):
+            return ""
+        return await self._prefetch_chat_grounding(utter)
+
     async def _general_chat(
         self,
         user_input: str,
@@ -1980,9 +2339,24 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         intent_action: str = "chat",
         conversation_scope: Optional[str] = None,
         memory_channel: Optional[str] = None,
+        grounding_facts: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """通用对话 - 带用户规则上下文"""
+        """通用对话 - 带用户规则上下文；事实类话题可先注入 TOOL_ANCHOR（见 GROUNDED_CHAT）。"""
         try:
+            utter = self._strip_user_utterance_for_routing(user_input)
+            anchor_text = await self._resolve_grounding_anchor(utter, grounding_facts)
+            anchor_section = ""
+            if self._grounded_chat_enabled() and self._chat_requires_tool_grounding(utter):
+                if anchor_text:
+                    anchor_section = (
+                        f"\n\n【事实锚点 TOOL_ANCHOR — 仅可复述其中事实】\n{anchor_text}\n【/TOOL_ANCHOR】\n"
+                        f"凡路径、目录、文件内容、现价、持仓、余额、系统是否在线，只许来自上方锚点；"
+                        f"锚点未写到的不得编造；禁止「[调用：…]」与未经验证的目录代码块。\n"
+                    )
+                else:
+                    anchor_section = (
+                        "\n\n【事实锚点】为空。不得编造仓库结构/价格/持仓；禁止假装已执行工具。\n"
+                    )
             if self.llm_integration:
                 use_work_context = bool(intent_action and intent_action != "chat")
                 if use_work_context:
@@ -2008,18 +2382,20 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
 {task_mem}
 
 用户消息：{user_input}
-
+{anchor_section}
 按上面「人格与画像」与宪章自然说人话；涉及盘面/仓位时只信上文里给的数据，没有就承认没有，别编。
-若本回复没有出现「接口/系统」给出的具体数字，就不要写任何价位或区间。"""
+若本回复没有出现「接口/系统」给出的具体数字，就不要写任何价位或区间。
+禁止用「[调用：…]」或假装已跑 workspace_read / 系统诊断；没有上文真实读盘/诊断内容时不要写仓库目录树或模块路径。"""
                 else:
                     prompt = f"""{user_rules}
 
 {CONTEXT_FRAMING_FOR_CHAT}
 
 用户消息：{user_input}
-
+{anchor_section}
 按「人格与画像」与宪章像真人一样说话：有温度、有判断；话题可以很宽。不必套模板、不必列条。没把握就说没把握。
-若本回复没有附带系统接口返回的价位，就不要编造价格或「外部联网」假查询。"""
+若本回复没有附带系统接口返回的价位，就不要编造价格或「外部联网」假查询。
+禁止用「[调用：…]」「假装已执行 workspace_read / 系统诊断」等话术；没有本消息上方由系统注入的真实读盘结果时，不要写本仓库目录树或模块名。需要文档或目录时说明应走系统的 workspace_read / system_status，由执行器跑完再答。"""
 
                 response = await self.llm_integration.generate(
                     prompt,

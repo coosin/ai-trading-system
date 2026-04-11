@@ -12,6 +12,7 @@ __pycache__
 .eggs
 *.egg
 .venv
+.venv_test/
 venv/
 ENV/
 

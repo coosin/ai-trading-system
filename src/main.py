@@ -7,6 +7,7 @@
 import asyncio
 import logging
 import logging.handlers
+import os
 import signal
 import sys
 from pathlib import Path
@@ -95,6 +96,10 @@ class TradingSystem:
         logger.info("🚀 启动全智能量化交易系统...")
 
         try:
+            logger.info(
+                "运行模式 MODE=%s（容器/compose 与 .env 注入；配置层见 OPENCLAW__trading__mode）",
+                os.environ.get("MODE", ""),
+            )
             logger.info("1. 初始化配置管理器...")
             self.config_manager = await get_config_manager()
 

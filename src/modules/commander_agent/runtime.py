@@ -16,6 +16,7 @@ from src.modules.commander_agent.specialists import (
     run_specialist,
 )
 from src.modules.commander_agent.types import CommanderContextBundle, CommanderRunMeta, CommanderRoute
+from src.modules.core.model_reply_guard import sanitize_commander_result
 
 if TYPE_CHECKING:
     from src.modules.main_controller import MainController
@@ -23,6 +24,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 LOOP_VERSION = "2026.04.10"
+
+
+def _guard_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    """用户可见回复统一经 model_reply_guard（与提示词互补）。"""
+    return sanitize_commander_result(d)
 
 
 def strip_user_utterance_for_memory_query(raw: str) -> str:
@@ -174,6 +180,18 @@ def commander_capabilities(mc: "MainController") -> Dict[str, Any]:
     plugins = sorted(list(mc.plugin_manager.plugins.keys())) if getattr(mc, "plugin_manager", None) else []
     return {
         "design": "commander_agent_runtime",
+        "architecture": {
+            "role": "commander_as_orchestrator",
+            "description": (
+                "司令部是系统的核心控制与对话入口：统一接收 HTTP/Telegram 等渠道的指令，"
+                "经 CommanderAgentRuntime（intake→context→route→execute→persist）调度到 "
+                "AICommandExecutor、specialists 子智能体与各业务模块；交易所执行、策略、风控、记忆等为受控子系统。"
+            ),
+            "realtime_messaging": {
+                "unified_dispatch": "POST /api/v1/modules/commander/dispatch",
+                "telegram": "main_controller.telegram_bot → process_user_command(source=telegram)",
+            },
+        },
         "openclaw_parity_note": (
             "Phases mirror docs/concepts/agent-loop (intake/context/route/execute/persist); "
             "sub-agents map to specialists.* — not embedded pi-agent-core."
@@ -197,9 +215,10 @@ def commander_capabilities(mc: "MainController") -> Dict[str, Any]:
             "dispatch": f"{base}/dispatch",
             "chores": f"{base}/chores",
             "audit": f"{base}/audit",
+            "audit_enriched": f"{base}/audit?enrich=true",
             "capabilities": f"{base}/capabilities",
-            "surface_registry": f"{base}/surface/registry",
-            "surface_channels": f"{base}/surface/channels",
+            "surface_registry": "/api/v1/modules/surface/registry",
+            "surface_channels": "/api/v1/modules/surface/channels",
             "memory_status": f"{base}/memory/status",
             "memory_workspace": f"{base}/memory/workspace",
         },
@@ -217,7 +236,7 @@ class CommanderAgentRuntime:
         meta = CommanderRunMeta(phases=["intake"])
         raw = (command or "").strip()
         if not raw:
-            return {"success": False, "response": "空指令", "source": "commander_agent_runtime"}
+            return _guard_dict({"success": False, "response": "空指令", "source": "commander_agent_runtime"})
 
         meta.phases.append("persist_user")
         await store_user_turn(mc, command, source)
@@ -230,6 +249,7 @@ class CommanderAgentRuntime:
             meta.phases.append("execute_specialist")
             out = await run_specialist(mc, route.specialist_id, route.body, source)
             if isinstance(out, dict):
+                out = _guard_dict(out)
                 out.setdefault("commander_loop", meta.phases)
                 out.setdefault("commander_meta", {"route": route.specialist_id, "loop_version": self.LOOP_VERSION})
                 await store_assistant_turn(mc, out, source)
@@ -244,6 +264,7 @@ class CommanderAgentRuntime:
             try:
                 result = await mc.ai_command_executor.process_input(ctx.executor_input, source=source)
                 if isinstance(result, dict):
+                    result = _guard_dict(result)
                     result.setdefault("source", "ai_command_executor")
                     result.setdefault("commander_loop", meta.phases)
                     result.setdefault(
@@ -252,13 +273,15 @@ class CommanderAgentRuntime:
                     )
                     await store_assistant_turn(mc, result, source)
                     return result
-                wrapped = {
-                    "success": True,
-                    "response": str(result),
-                    "source": "ai_command_executor",
-                    "commander_loop": meta.phases,
-                    "commander_meta": {"route": "main", "context": ctx.trace(), "loop_version": self.LOOP_VERSION},
-                }
+                wrapped = _guard_dict(
+                    {
+                        "success": True,
+                        "response": str(result),
+                        "source": "ai_command_executor",
+                        "commander_loop": meta.phases,
+                        "commander_meta": {"route": "main", "context": ctx.trace(), "loop_version": self.LOOP_VERSION},
+                    }
+                )
                 await store_assistant_turn(mc, wrapped, source)
                 return wrapped
             except Exception as e:
@@ -270,6 +293,7 @@ class CommanderAgentRuntime:
             try:
                 result = await brain.process_user_command(ctx.brain_input)
                 if isinstance(result, dict):
+                    result = _guard_dict(result)
                     result.setdefault("source", getattr(brain, "__class__", type(brain)).__name__)
                     result.setdefault("commander_loop", meta.phases)
                     result.setdefault(
@@ -278,12 +302,14 @@ class CommanderAgentRuntime:
                     )
                     await store_assistant_turn(mc, result, source)
                     return result
-                out = {
-                    "success": True,
-                    "response": str(result),
-                    "commander_loop": meta.phases,
-                    "commander_meta": {"route": "fallback_brain", "context": ctx.trace(), "loop_version": self.LOOP_VERSION},
-                }
+                out = _guard_dict(
+                    {
+                        "success": True,
+                        "response": str(result),
+                        "commander_loop": meta.phases,
+                        "commander_meta": {"route": "fallback_brain", "context": ctx.trace(), "loop_version": self.LOOP_VERSION},
+                    }
+                )
                 await store_assistant_turn(mc, out, source)
                 return out
             except Exception as e:
@@ -292,22 +318,27 @@ class CommanderAgentRuntime:
         if getattr(mc, "natural_language_interface", None):
             result = await mc.natural_language_interface.process_and_respond(command, {"source": source})
             if isinstance(result, dict):
+                result = _guard_dict(result)
                 result.setdefault("source", "natural_language_interface")
                 result.setdefault("commander_loop", meta.phases)
                 await store_assistant_turn(mc, result, source)
                 return result
-            out = {
-                "success": True,
-                "response": str(result),
-                "source": "natural_language_interface",
-                "commander_loop": meta.phases,
-            }
+            out = _guard_dict(
+                {
+                    "success": True,
+                    "response": str(result),
+                    "source": "natural_language_interface",
+                    "commander_loop": meta.phases,
+                }
+            )
             await store_assistant_turn(mc, out, source)
             return out
 
-        return {
-            "success": False,
-            "response": "核心大脑未就绪",
-            "source": "none",
-            "commander_loop": meta.phases,
-        }
+        return _guard_dict(
+            {
+                "success": False,
+                "response": "核心大脑未就绪",
+                "source": "none",
+                "commander_loop": meta.phases,
+            }
+        )

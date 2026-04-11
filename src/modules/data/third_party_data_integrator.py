@@ -5,6 +5,8 @@
 import asyncio
 import aiohttp
 import logging
+import random
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -15,6 +17,20 @@ import hashlib
 import os
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
 
 
 class DataSource(Enum):
@@ -76,6 +92,15 @@ class BaseDataProvider(ABC):
         self._rate_limit_remaining = 100
         self._rate_limit_reset = datetime.now()
         self._proxy_url = proxy_url
+        self._req_lock = asyncio.Lock()
+        self._last_request_mono = 0.0
+        self._stats: Dict[str, Any] = {
+            "requests": 0,
+            "http_429": 0,
+            "http_403": 0,
+            "errors": 0,
+            "last_wait_429_sec": 0.0,
+        }
     
     async def _init_proxy(self):
         """初始化代理"""
@@ -99,69 +124,110 @@ class BaseDataProvider(ABC):
     @abstractmethod
     async def fetch_data(self, symbol: str, **kwargs) -> Dict[str, Any]:
         pass
-    
+
+    async def _throttle(self) -> None:
+        """全局最小请求间隔，降低 Reddit/Twitter 等 429 概率（可按环境调参）。"""
+        min_iv = max(0.0, _env_float("OPENCLAW_THIRD_PARTY_MIN_INTERVAL_SEC", 1.1))
+        if min_iv <= 0:
+            return
+        now = time.monotonic()
+        if self._last_request_mono > 0:
+            gap = now - self._last_request_mono
+            if gap < min_iv:
+                await asyncio.sleep(min_iv - gap)
+
     async def _make_request(self, url: str, headers: Dict[str, str] = None, params: Dict[str, Any] = None) -> Optional[Dict]:
         if not self.session:
             self.session = aiohttp.ClientSession()
-        
+
         await self._init_proxy()
-        
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                async with self.session.get(url, headers=headers, params=params, proxy=self._proxy_url, timeout=30) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    elif response.status == 429:
-                        wait_time = 60 * (attempt + 1)
-                        logger.warning(f"Rate limit hit for {self.__class__.__name__}, waiting {wait_time}s")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    elif response.status == 403:
-                        # dedup noisy 403 logs (common for reddit without auth)
-                        try:
-                            now = time.time()
-                            key = f"{self.__class__.__name__}:403"
-                            if not hasattr(self, "_warn_dedup"):
-                                self._warn_dedup = {}
-                            last = self._warn_dedup.get(key)
-                            if not last or (now - float(last)) >= 900.0:
-                                self._warn_dedup[key] = now
-                                logger.warning(
-                                    f"API access denied (403) for {self.__class__.__name__} - skipping this provider (dedup 15m)"
-                                )
+
+        max_retries = _env_int("OPENCLAW_THIRD_PARTY_MAX_RETRIES", 4)
+        base_429 = _env_float("OPENCLAW_THIRD_PARTY_429_BASE_WAIT_SEC", 28.0)
+        cap_429 = _env_float("OPENCLAW_THIRD_PARTY_429_MAX_WAIT_SEC", 240.0)
+
+        async with self._req_lock:
+            await self._throttle()
+            self._last_request_mono = time.monotonic()
+            self._stats["requests"] = int(self._stats.get("requests", 0)) + 1
+
+            for attempt in range(max_retries):
+                try:
+                    async with self.session.get(url, headers=headers, params=params, proxy=self._proxy_url, timeout=30) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        elif response.status == 429:
+                            self._stats["http_429"] = int(self._stats.get("http_429", 0)) + 1
+                            ra = response.headers.get("Retry-After")
+                            wait_time: float
+                            if ra:
+                                try:
+                                    wait_time = float(ra)
+                                except ValueError:
+                                    wait_time = min(cap_429, base_429 * (2**attempt) + random.uniform(0.4, 2.0))
                             else:
-                                logger.debug(
-                                    f"API access denied (403) for {self.__class__.__name__} - skipping (dedup)"
+                                wait_time = min(
+                                    cap_429,
+                                    base_429 * (2**attempt) + random.uniform(0.4, 2.5),
                                 )
-                        except Exception:
-                            logger.warning(f"API access denied (403) for {self.__class__.__name__} - skipping this provider")
-                        return None
-                    elif response.status == 401:
-                        logger.warning(f"API unauthorized (401) for {self.__class__.__name__} - check API key")
-                        return None
-                    elif response.status >= 500:
-                        wait_time = 5 * (attempt + 1)
-                        logger.warning(f"Server error {response.status}, retrying in {wait_time}s")
-                        await asyncio.sleep(wait_time)
+                            self._stats["last_wait_429_sec"] = round(wait_time, 2)
+                            logger.warning(
+                                "Rate limit (429) for %s, waiting %.1fs (attempt %s/%s)",
+                                self.__class__.__name__,
+                                wait_time,
+                                attempt + 1,
+                                max_retries,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        elif response.status == 403:
+                            self._stats["http_403"] = int(self._stats.get("http_403", 0)) + 1
+                            # dedup noisy 403 logs (common for reddit without auth)
+                            try:
+                                now = time.time()
+                                key = f"{self.__class__.__name__}:403"
+                                if not hasattr(self, "_warn_dedup"):
+                                    self._warn_dedup = {}
+                                last = self._warn_dedup.get(key)
+                                if not last or (now - float(last)) >= 900.0:
+                                    self._warn_dedup[key] = now
+                                    logger.warning(
+                                        f"API access denied (403) for {self.__class__.__name__} - skipping this provider (dedup 15m)"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"API access denied (403) for {self.__class__.__name__} - skipping (dedup)"
+                                    )
+                            except Exception:
+                                logger.warning(f"API access denied (403) for {self.__class__.__name__} - skipping this provider")
+                            return None
+                        elif response.status == 401:
+                            logger.warning(f"API unauthorized (401) for {self.__class__.__name__} - check API key")
+                            return None
+                        elif response.status >= 500:
+                            wait_time = 5 * (attempt + 1)
+                            logger.warning(f"Server error {response.status}, retrying in {wait_time}s")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            logger.debug(f"API returned status {response.status} for {self.__class__.__name__}")
+                            return None
+                except asyncio.TimeoutError:
+                    self._stats["errors"] = int(self._stats.get("errors", 0)) + 1
+                    logger.debug(f"Request timeout for {url} (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(5)
                         continue
-                    else:
-                        logger.debug(f"API returned status {response.status} for {self.__class__.__name__}")
-                        return None
-            except asyncio.TimeoutError:
-                logger.debug(f"Request timeout for {url} (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(5)
-                    continue
-                return None
-            except Exception as e:
-                logger.debug(f"Request error: {e} (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
-                return None
-        
-        return None
+                    return None
+                except Exception as e:
+                    self._stats["errors"] = int(self._stats.get("errors", 0)) + 1
+                    logger.debug(f"Request error: {e} (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+                        continue
+                    return None
+
+            return None
     
     async def close(self):
         if self.session:
@@ -238,8 +304,11 @@ class RedditProvider(BaseDataProvider):
     async def fetch_data(self, symbol: str, **kwargs) -> Dict[str, Any]:
         subreddits = kwargs.get("subreddits", ["CryptoCurrency", "CryptoMarkets", f"{symbol}"])
         mentions = []
-        
-        for subreddit in subreddits:
+        pause = max(0.0, _env_float("OPENCLAW_REDDIT_SUBREDDIT_PAUSE_SEC", 1.6))
+
+        for i, subreddit in enumerate(subreddits):
+            if i > 0 and pause > 0:
+                await asyncio.sleep(pause)
             url = f"https://www.reddit.com/r/{subreddit}/search.json"
             params = {
                 "q": symbol,
@@ -477,6 +546,25 @@ class ThirdPartyDataIntegrator:
         """启用指定的数据源"""
         self._disabled_providers.discard(source)
         logger.info(f"已启用数据源: {source.value}")
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """运维/司令部：第三方请求限速与 429 统计（只读）。"""
+        providers: Dict[str, Any] = {}
+        for src, prov in self.providers.items():
+            st = getattr(prov, "_stats", None)
+            if isinstance(st, dict):
+                providers[src.value] = dict(st)
+            else:
+                providers[src.value] = {}
+        return {
+            "min_interval_sec": _env_float("OPENCLAW_THIRD_PARTY_MIN_INTERVAL_SEC", 1.1),
+            "max_retries": _env_int("OPENCLAW_THIRD_PARTY_MAX_RETRIES", 4),
+            "429_base_wait_sec": _env_float("OPENCLAW_THIRD_PARTY_429_BASE_WAIT_SEC", 28.0),
+            "429_max_wait_sec": _env_float("OPENCLAW_THIRD_PARTY_429_MAX_WAIT_SEC", 240.0),
+            "reddit_sub_pause_sec": _env_float("OPENCLAW_REDDIT_SUBREDDIT_PAUSE_SEC", 1.6),
+            "providers": providers,
+            "disabled_sources": [s.value for s in self._disabled_providers],
+        }
     
     async def get_social_sentiment(self, symbol: str, sources: Optional[List[DataSource]] = None) -> Dict[str, Any]:
         sources = sources or [DataSource.TWITTER, DataSource.REDDIT]

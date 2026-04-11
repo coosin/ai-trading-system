@@ -11,6 +11,7 @@ AI主动性增强模块
 import asyncio
 import logging
 import json
+import math
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable
@@ -23,6 +24,26 @@ from src.modules.core.module_config_utils import resolve_module_config
 logger = logging.getLogger(__name__)
 
 from .timing_constants import SLEEP_1S, SLEEP_5S, SLEEP_10S, SLEEP_30S, SLEEP_60S, SLEEP_5MIN
+
+
+def _coerce_fear_greed_index(raw: Any) -> Optional[float]:
+    """Normalize API responses (float / int / nested dict) to a scalar index."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            x = float(raw)
+            return x if math.isfinite(x) else None
+        except Exception:
+            return None
+    if isinstance(raw, dict):
+        for key in ("value", "index", "score", "data", "fear_greed_index", "fearAndGreedIndex"):
+            if key not in raw:
+                continue
+            inner = _coerce_fear_greed_index(raw.get(key))
+            if inner is not None:
+                return inner
+    return None
 
 
 class ProactiveLevel(Enum):
@@ -1061,9 +1082,15 @@ class ProactiveInformationCollector:
                 third_party = getattr(self.main_controller, 'third_party_data_integrator', None)
                 if third_party and hasattr(third_party, 'get_fear_greed_index'):
                     index = await third_party.get_fear_greed_index()
-                    if index:
-                        self._fear_greed_index = index
-                        logger.info(f"😰 恐慌贪婪指数: {index}")
+                    coerced = _coerce_fear_greed_index(index)
+                    if coerced is not None:
+                        self._fear_greed_index = coerced
+                        logger.info(f"😰 恐慌贪婪指数: {coerced}")
+                    elif index not in (None, 0, 0.0, False, ""):
+                        logger.debug(
+                            "恐慌贪婪指数无法解析为数值，已忽略 raw_type=%s",
+                            type(index).__name__,
+                        )
         except Exception as e:
             logger.debug(f"收集恐慌贪婪指数失败: {e}")
     
@@ -1074,10 +1101,11 @@ class ProactiveInformationCollector:
             if important_news:
                 logger.info(f"📰 发现 {len(important_news)} 条重要新闻")
         
-        if self._fear_greed_index:
-            if self._fear_greed_index < 25:
+        fg = self._fear_greed_index
+        if fg is not None:
+            if fg < 25:
                 logger.info("😰 市场极度恐慌，可能是买入机会")
-            elif self._fear_greed_index > 75:
+            elif fg > 75:
                 logger.info("🤑 市场极度贪婪，注意风险")
     
     def get_latest_news(self) -> List[Dict]:

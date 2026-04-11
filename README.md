@@ -3,7 +3,7 @@
 **全智能量化交易系统** - 基于AI的自主交易解决方案
 
 [![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](https://github.com/openclaw-trading)
-[![Python](https://img.shields.io/badge/python-3.11+-green.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.12+-green.svg)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
 
@@ -63,22 +63,25 @@ open http://localhost:8000/docs
 
 ---
 
-## 文档导航
+## 文档（统一入口）
 
-| 文档 | 描述 |
+**正式文档集**见 **[docs/README.md](./docs/README.md)**。核心文件：
+
+| 文档 | 说明 |
 |------|------|
-| [**系统架构文档**](./ARCHITECTURE.md) | 详细的系统架构、模块说明、配置指南 |
-| [**快速开始指南**](./快速开始指南.md) | 环境搭建和开发流程 |
-| [**AI记忆文件**](./workspace/) | AI核心信念、身份定义、交易知识 |
-| [**记忆库使用与维护指南**](./docs/memory/MEMORY_LIBRARY_GUIDE.md) | MemoryGateway 单一真源：结构、写入/召回、总结晋升、清理与扩展 |
-| [**Clash代理基线设置与排障指南**](./docs/CLASH_PROXY_BASELINE_GUIDE.md) | 生产固化：规则模式/自动选择/DNS/环境变量/一键回归与排障 |
+| [docs/ENGINEERING.md](./docs/ENGINEERING.md) | **工程文档**：架构、启动流程、配置、对接、API 总览 |
+| [docs/OPERATIONS.md](./docs/OPERATIONS.md) | 运维：Docker、代理/网络、巡检、排障 |
+| [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) | 开发与测试 |
+| [docs/CHANGELOG.md](./docs/CHANGELOG.md) | 变更记录 |
+
+根目录 [ARCHITECTURE.md](./ARCHITECTURE.md)、[DEVELOPMENT.md](./DEVELOPMENT.md) 为跳转 stub。运行时人格与信念类文本见 [workspace/](./workspace/)；记忆库维护见 [docs/memory/MEMORY_LIBRARY_GUIDE.md](./docs/memory/MEMORY_LIBRARY_GUIDE.md)。
 
 ---
 
 ## 系统要求
 
 - **操作系统**: Ubuntu 22.04+ / macOS 12+ / Windows 10+ (WSL2)
-- **Python**: 3.11+
+- **Python**: 3.12（Docker 镜像）；本地开发 3.11+ 亦可
 - **Docker**: 20.10+
 - **内存**: 4GB+ (推荐8GB)
 - **磁盘**: 10GB+
@@ -129,15 +132,14 @@ OPENCLAW_HTTP_PROXY=http://host.docker.internal:7890
 OPENCLAW_HTTPS_PROXY=http://host.docker.internal:7890
 ```
 
-推荐先阅读并固化生产代理基线：  
-[**Clash 代理基线设置与排障指南**](./docs/CLASH_PROXY_BASELINE_GUIDE.md)
+代理与网络基线见 **[docs/OPERATIONS.md](./docs/OPERATIONS.md)**（含 Clash/DNS 要点与 `production_network_baseline.py`）。
 
 ### 交易配置
 
 ```yaml
-# data/config/default.yml
+# data/config/default.yml（示例；实际以当前仓库与环境变量为准）
 trading:
-  mode: "simulation"    # simulation（模拟）/ live（实盘）
+  mode: "live_trading"  # simulation | paper_trading | live_trading
   exchange: "okx"
   max_positions: 5
   max_loss_per_trade: 0.02
@@ -200,51 +202,7 @@ docker exec -it openclaw-trading bash
 
 ## 项目状态
 
-- ✅ AI决策引擎 - 运行正常
-- ✅ OKX交易所接口 - 已连接
-- ✅ 风险控制系统 - 已启用
-- ✅ Telegram通知 - 已配置
-- ✅ 记忆系统 - 已初始化
-- ✅ 真实回测指标 - 已接入（收益/回撤/夏普/胜率）
-- ✅ 参数自动优化 - 已接入（基于行情网格搜索）
-- ✅ 多源数据融合 - 初始化稳定（修复异步注册错误）
-
----
-
-## 2026-04-07 当日更新
-
-- ✅ **S1 执行主干稳定化**：`ai_core` 作为单一写入所有者（SWO），`ExecutionGateway` 作为统一下单出口，`/api/v1/s1/verify` 可直接校验执行链路。
-- ✅ **止盈止损跟踪对账增强**：启动同步时会将本地 `active` 跟踪单与交易所实时持仓对账，自动清理陈旧跟踪单（返回 `stale_cancelled`）。
-- ✅ **系统状态口径修正**：状态报告兼容 `data_fusion`/`multi_source_fusion` 与 `third_party_data`/`third_party_integrator`，避免模块“误报离线”。
-- ✅ **健康检查告警降噪**：将“缺少人工请求”的工具技能与真实故障分离；仅在关键失败达到阈值时标记 `critical`，其余为 `warning`。
-- ✅ **风险日志语义修正**：风险监控日志改为“当前未发现高风险持仓”，不再误导为“黑名单风险”。
-- ✅ **外部数据源退化可观测**：新增数据源健康状态与退化标记，状态输出可展示退化源列表，便于排障。
-- ✅ **开仓时机与仓位跟踪联动优化**：`ai_core` 开仓成功后，自动将自适应门控（分组/时段阈值、实时盘口）映射为该仓位的 SL/TP 跟踪配置，确保“开仓判断”与“后续风控执行”一致。
-- ✅ **止盈止损实时动态调整**：`StopLossTakeProfitManager` 增加基于实时订单簿的动态调整（价差/深度失衡），在浮盈阶段可自动收紧止损或小幅延展止盈，减少震荡回吐并跟随趋势延续。
-- ✅ **策略开发与执行流程文档化**：将“门控阈值 -> 开仓 -> 跟踪 -> 动态SL/TP -> 触发平仓”链路纳入统一执行说明，便于后续策略迭代直接复用。
-- ✅ **巡检与日报自动化**：新增 `continuous_system_probe.py` 与 `system_probe_daily_summary.py`，支持关键接口巡检、峰值统计与中文日报输出。
-- ✅ **Telegram 巡检推送闭环**：新增 `probe_report_to_tg.py`，支持“一条命令”完成巡检 + 报告生成 + TG 推送。
-- ✅ **止盈止损统计接口**：新增 `/api/v1/modules/stop-loss/stats`，供巡检、可视化面板与告警系统统一读取。
-- ✅ **代理订阅更新运维脚本**：新增 `update_clash_subscriptions.sh`，支持订阅更新后自动 reload Clash，便于定时任务托管。
-- ✅ **多类型策略研发放宽**：DSL 与研究候选扩展为趋势/波动/剥头皮/抓针（`volatility_breakout`、`scalp_reversion`、`pinbar_reversal`），支持并行筛选高分策略。
-- ✅ **研究发布类型修复**：修复研究发布 `strategy_type` 映射，避免无效类型导致策略无法正确入池。
-- ✅ **策略池治理上线**：低分淘汰 + 总量上限（当前 30）+ 每小时清理窗口，防止策略无限累积。
-- ✅ **每日固定优化 + 回撤优化**：全策略每日执行参数与回撤联合优化，持续写入 `metadata.daily_optimization`。
-- ✅ **回撤任务资源保护**：每日优化改为“分批 + 时间预算 + 让出事件循环”，降低 CPU 峰值与主链路抖动。
-- ✅ **前端对接接口预留**：
-  - `GET /api/v1/modules/strategy/optimization-status`（查询策略池与每日优化状态）
-  - `POST /api/v1/modules/strategy/optimization-config`（热更新批处理/周期/上限参数，无需重启）
-
----
-
-## 2026-04-08/09 最新状态（交付前最终审查）
-
-- ✅ **重启接管**：系统启动后会强制同步 **钱包余额 + 持仓**，并接管 SL/TP 跟踪与仓位管理建议输出。
-- ✅ **司令部快照增强**：`GET /api/v1/modules/commander/snapshot?mode=fast` 将返回：
-  - `account.balance / account.positions / account.synced_at`
-  - `risk.sltp` 与 `risk.position_recommendations`
-- ✅ **OKX 稳定性增强**：修复 GET 签名未包含 query string、以及 instId/`-SWAP-SWAP` 混用导致的错误噪音。
-- ✅ **代理策略调整**：默认不启用系统代理变量；使用 `OPENCLAW_HTTP_PROXY/OPENCLAW_HTTPS_PROXY` 显式开启，降低不稳定因素。
+以运行环境为准：使用 `curl http://localhost:8000/health` 与 `GET /api/v1/modules/commander/audit` 自检。历史交付项与细粒度变更见 **[docs/CHANGELOG.md](./docs/CHANGELOG.md)**。
 
 ---
 
@@ -267,4 +225,4 @@ docker exec -it openclaw-trading bash
 
 ---
 
-**版本**: 2.1.1 | **更新日期**: 2026-04-07
+**版本**: 2.2.x | **文档整理**: 2026-04-11

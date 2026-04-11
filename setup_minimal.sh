@@ -2,6 +2,8 @@
 
 # 最小化安装脚本
 # 只安装最必要的依赖
+#
+# 仅 Docker 部署时无需本脚本；见 DEVELOPMENT.md「仅 Docker 运行」。
 
 set -e
 

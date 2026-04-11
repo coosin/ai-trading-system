@@ -1,5 +1,12 @@
 # 系统更新日志
 
+## [2026-04-11] 文档与工程说明整理
+
+- **文档体系**：新增 `docs/README.md`（索引）、`docs/ENGINEERING.md`（工程主文档）、`docs/OPERATIONS.md`（运维合并版）；根目录 `ARCHITECTURE.md` / `DEVELOPMENT.md` 改为跳转 stub；`DEVELOPMENT.md` 正文迁至 `docs/DEVELOPMENT.md`。
+- **清理**：删除重复/过时文档若干（旧代理/维护/网络基线独立稿、架构模块表、旧 API 手写稿、评审/验证报告、已合并的记忆蓝图等）；总控中心内嵌文档目录改为指向新文档集。
+- **代码引用**：司令部宪章、执行器、护栏与前端总控中的文档路径已改为 `docs/ENGINEERING.md` 等。
+- **Docker**：已验证 `docker compose build` + `up` 后 `/health` 正常。
+
 ## [2026-04-05] V2.1.0 重大更新
 
 ### 新增模块

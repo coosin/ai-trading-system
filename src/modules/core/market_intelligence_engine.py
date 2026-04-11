@@ -526,6 +526,10 @@ class MarketIntelligenceEngine:
         alerts = snapshot.get("监控告警") if isinstance(snapshot, dict) else None
         prov = (snapshot.get("数据来源状态") or {}) if isinstance(snapshot, dict) else {}
 
+        quality_score: Optional[float] = None
+        if isinstance(q, dict) and q.get("score") is not None:
+            quality_score = _safe_float(q.get("score"), default=0.0)
+
         price = _safe_float(ticker.get("price") or ticker.get("last") or ticker.get("close") or 0, 0.0)
         sp = _spread_bps(ticker) if isinstance(ticker, dict) else None
         change_24h = _safe_float(ticker.get("change24h") or ticker.get("change") or 0, 0.0)
@@ -555,6 +559,17 @@ class MarketIntelligenceEngine:
             trend_n = "sideways"
         else:
             trend_n = "unknown"
+
+        conf = None
+        try:
+            if isinstance(tp_sent, dict) and tp_sent.get("confidence") is not None:
+                conf = tp_sent.get("confidence")
+            elif isinstance(oc_sent, dict) and oc_sent.get("strength") is not None:
+                conf = oc_sent.get("strength")
+        except Exception:
+            conf = None
+        conf_f = _safe_float(conf, default=0.0) if conf is not None else None
+
         # Derive bias from trend + confidence (never treated as an order signal).
         action_bias = "hold"
         try:
@@ -571,15 +586,6 @@ class MarketIntelligenceEngine:
             action_bias = "sell"
         else:
             action_bias = "hold"
-        conf = None
-        try:
-            if isinstance(tp_sent, dict) and tp_sent.get("confidence") is not None:
-                conf = tp_sent.get("confidence")
-            elif isinstance(oc_sent, dict) and oc_sent.get("strength") is not None:
-                conf = oc_sent.get("strength")
-        except Exception:
-            conf = None
-        conf_f = _safe_float(conf, default=0.0) if conf is not None else None
 
         conflicts: List[str] = []
         # simple conflict detection: trend vs bias mismatch
@@ -750,6 +756,20 @@ class MarketIntelligenceEngine:
             "alerts": alerts if isinstance(alerts, list) else [],
         }
 
+        provenance = str(prov.get("provenance") or "unknown") if isinstance(prov, dict) else "unknown"
+        summary = ""
+        try:
+            if isinstance(tp_sent, dict):
+                summary = str(tp_sent.get("summary") or tp_sent.get("details", {}).get("summary") or "")
+        except Exception:
+            summary = ""
+        if not summary:
+            try:
+                if isinstance(oc_sent, dict):
+                    summary = str(oc_sent.get("report") or oc_sent.get("summary") or "")
+            except Exception:
+                summary = ""
+
         # Execution/SLTP support suggestions (read-only)
         # Suggest tighter guards when quality degraded or spread wide.
         max_spread_bps = 35.0
@@ -869,6 +889,7 @@ class MarketIntelligenceEngine:
             base = max(0.008, min(0.03, (float(sp or 35.0) / 10000.0) * 2.0))
             trailing_offset_s = max(0.006, min(0.03, base))
 
+        llm_block: Dict[str, Any] = {}
         execution_support = {
             "guards": {
                 "min_quality_score_to_trade": float(min_quality),
@@ -896,26 +917,8 @@ class MarketIntelligenceEngine:
             ],
         }
 
-        quality_score = None
-        if isinstance(q, dict) and q.get("score") is not None:
-            quality_score = _safe_float(q.get("score"), default=0.0)
-        provenance = str(prov.get("provenance") or "unknown") if isinstance(prov, dict) else "unknown"
-        summary = ""
-        try:
-            # prefer third-party sentiment details if present
-            if isinstance(tp_sent, dict):
-                summary = str(tp_sent.get("summary") or tp_sent.get("details", {}).get("summary") or "")
-        except Exception:
-            summary = ""
-        if not summary:
-            try:
-                if isinstance(oc_sent, dict):
-                    summary = str(oc_sent.get("report") or oc_sent.get("summary") or "")
-            except Exception:
-                summary = ""
-
-        # Optional LLM deep analysis (analysis module responsibility, bounded by quality+timeout)
-        llm_block: Dict[str, Any] = {}
+        # Optional LLM deep analysis (analysis module responsibility, bounded by quality+timeout).
+        # Mutate llm_block in place so execution_support["llm_analysis"] stays consistent.
         try:
             if bool(self._cfg.get("enable_llm_analysis", False)):
                 minq = float(self._cfg.get("min_quality_score_for_llm", 0.55) or 0.55)
@@ -935,17 +938,20 @@ class MarketIntelligenceEngine:
                         to = float(self._cfg.get("llm_timeout_sec", 3.5) or 3.5)
                         ai = await asyncio.wait_for(llm.analyze_market(payload), timeout=to)
                         if isinstance(ai, dict) and ai:
-                            llm_block = {
-                                "source": "llm",
-                                "summary": ai.get("summary") or ai.get("reasoning") or "",
-                                "trend": ai.get("trend"),
-                                "action_bias": ai.get("signal") or ai.get("action") or ai.get("recommendation"),
-                                "confidence": ai.get("confidence"),
-                                "risk_level": ai.get("risk_level"),
-                                "raw": ai,
-                            }
+                            llm_block.clear()
+                            llm_block.update(
+                                {
+                                    "source": "llm",
+                                    "summary": ai.get("summary") or ai.get("reasoning") or "",
+                                    "trend": ai.get("trend"),
+                                    "action_bias": ai.get("signal") or ai.get("action") or ai.get("recommendation"),
+                                    "confidence": ai.get("confidence"),
+                                    "risk_level": ai.get("risk_level"),
+                                    "raw": ai,
+                                }
+                            )
         except Exception:
-            llm_block = {}
+            llm_block.clear()
 
         view = SymbolView(
             symbol=sym,

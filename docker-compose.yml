@@ -9,12 +9,20 @@ services:
     container_name: openclaw-trading
     # 与宿主机挂载目录属主一致（常见为 uid 1000），避免 data/logs 写权限错误
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    init: true
+    stop_grace_period: 90s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     restart: unless-stopped
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
       # 挂载源码：修改 src/ 后执行 `docker compose restart trading-system` 即可加载（无需 rebuild）
       - ./src:/app/src
+      # 测试目录：便于容器内执行 pytest（与宿主机一致，无需重建镜像）
+      - ./tests:/app/tests:ro
       - ./data:/app/data
       - ./logs:/app/logs
       - ./workspace:/app/workspace
@@ -22,7 +30,12 @@ services:
     env_file:
       - .env
     environment:
-      - MODE=${MODE:-simulation}
+      # 容器化生产默认：实盘（与 OPENCLAW__* 覆盖 data/config）；本地/回测可在 .env 设 MODE=simulation
+      - MODE=${MODE:-live_trading}
+      - OPENCLAW__trading__mode=${TRADING_MODE:-live_trading}
+      - OPENCLAW__system__mode=${SYSTEM_MODE:-live_trading}
+      # 主网实盘默认 0；模拟盘 OKX 填 OKX_TESTNET=1
+      - OKX_TESTNET=${OKX_TESTNET:-0}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # 固定代理：容器内统一走 Clash，避免出现“部分链路直连”导致抖动
       - HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-http://host.docker.internal:7890}
@@ -40,6 +53,15 @@ services:
       - OPENCLAW_OKX_MIN_REQUEST_INTERVAL=${OPENCLAW_OKX_MIN_REQUEST_INTERVAL:-0.1}
       - OPENCLAW_OKX_MAX_RETRIES=${OPENCLAW_OKX_MAX_RETRIES:-3}
       - OPENCLAW_OKX_PROXY_ONLY=${OPENCLAW_OKX_PROXY_ONLY:-1}
+      # OKX WebSocket（v5）：与 REST 共用 aiohttp 会话 + 宿主机 Clash 代理；与官方 public/private URL 一致
+      - OPENCLAW_OKX_WS_ENABLED=${OPENCLAW_OKX_WS_ENABLED:-1}
+      - OPENCLAW_OKX_WS_TICKER_FASTPATH=${OPENCLAW_OKX_WS_TICKER_FASTPATH:-1}
+      - OPENCLAW_OKX_WS_TICKER_MAX_AGE_MS=${OPENCLAW_OKX_WS_TICKER_MAX_AGE_MS:-4000}
+      - OPENCLAW_OKX_WS_TICKER_INSTIDS=${OPENCLAW_OKX_WS_TICKER_INSTIDS:-BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP}
+      # 司令部：默认 LLM 意图解析并执行；设为 1 则仅闲聊（除问价/身份快路径）
+      - OPENCLAW_COMMANDER_MINIMAL_MODE=${OPENCLAW_COMMANDER_MINIMAL_MODE:-0}
+      - OPENCLAW_COMMANDER_GROUNDED_CHAT=${OPENCLAW_COMMANDER_GROUNDED_CHAT:-1}
+      - OPENCLAW_COMMANDER_HONESTY_STRICT=${OPENCLAW_COMMANDER_HONESTY_STRICT:-1}
       # 避免对容器内部地址走代理
       - NO_PROXY=localhost,127.0.0.1,redis
       - no_proxy=localhost,127.0.0.1,redis
@@ -71,6 +93,8 @@ services:
   redis:
     image: docker.m.daocloud.io/library/redis:7-alpine
     container_name: openclaw-redis
+    init: true
+    stop_grace_period: 30s
     restart: unless-stopped
     ports:
       - "${REDIS_PORT:-6379}:6379"

@@ -236,11 +236,12 @@ class AITradingEngine:
             passphrase = os.getenv('OKX_PASSPHRASE')
             
             if api_key and secret and passphrase:
+                testnet_flag = str(os.getenv("OKX_TESTNET", "") or "").strip().lower() in ("1", "true", "yes")
                 okx_config = {
                     'api_key': api_key,
                     'api_secret': secret,  # 注意：ExchangeBase期望的键名是api_secret
                     'api_passphrase': passphrase,  # 注意：ExchangeBase期望的键名是api_passphrase
-                    'testnet': False
+                    'testnet': testnet_flag,
                 }
                 logger.info("✅ 从环境变量加载OKX配置")
             else:
@@ -249,6 +250,10 @@ class AITradingEngine:
                     exchanges_config = await self.main_controller.config_manager.get_config("exchanges", {})
                     okx_config = exchanges_config.get("okx", {})
                     logger.info(f"📋 从配置文件加载OKX配置")
+
+            if okx_config and str(os.getenv("OKX_TESTNET", "") or "").strip().lower() in ("1", "true", "yes"):
+                okx_config = dict(okx_config or {})
+                okx_config["testnet"] = True
             
             if okx_config and okx_config.get('api_key'):
                 from src.modules.exchanges.okx import OKXExchange

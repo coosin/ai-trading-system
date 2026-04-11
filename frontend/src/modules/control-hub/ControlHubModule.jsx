@@ -95,7 +95,7 @@ function ControlHubModule() {
   });
 
   const [docQuery, setDocQuery] = useState('');
-  const [selectedDocId, setSelectedDocId] = useState('control-hub-user-manual');
+  const [selectedDocId, setSelectedDocId] = useState('docs-readme');
   const [docContents, setDocContents] = useState({});
   const [docLoading, setDocLoading] = useState(false);
 
@@ -106,12 +106,13 @@ function ControlHubModule() {
 
   const docsCatalog = useMemo(
     () => [
-      { id: 'control-hub-user-manual', title: '总控中心操作手册', group: '总控', path: '../../../docs/control-hub-user-manual.md' },
-      { id: 'control-hub-module-checklist', title: '总控功能清单', group: '总控', path: '../../../docs/control-hub-module-checklist.md' },
-      { id: 'dynamic-open-close', title: '动态开平仓与SLTP手册', group: '交易', path: '../../../docs/dynamic-open-close-and-sltp-playbook.md' },
-      { id: 'maintenance-guide', title: '维护指南', group: '运维', path: '../../../docs/MAINTENANCE_GUIDE.md' },
-      { id: 'clash-proxy-baseline', title: 'Clash代理基线设置与排障指南', group: '运维', path: '../../../docs/CLASH_PROXY_BASELINE_GUIDE.md' },
-      { id: 'api-doc', title: 'API 文档', group: '接口', path: '../../../docs/api.md' },
+      { id: 'docs-readme', title: '文档索引（必读）', group: '文档', path: '../../../docs/README.md' },
+      { id: 'engineering', title: '工程文档（架构·配置·API）', group: '文档', path: '../../../docs/ENGINEERING.md' },
+      { id: 'operations', title: '运维手册（Docker·网络·排障）', group: '文档', path: '../../../docs/OPERATIONS.md' },
+      { id: 'development', title: '开发指南', group: '文档', path: '../../../docs/DEVELOPMENT.md' },
+      { id: 'changelog', title: '变更记录', group: '文档', path: '../../../docs/CHANGELOG.md' },
+      { id: 'memory-guide', title: '记忆库维护指南', group: '文档', path: '../../../docs/memory/MEMORY_LIBRARY_GUIDE.md' },
+      { id: 'okx-ref', title: 'OKX 字段参考（可选）', group: '文档', path: '../../../docs/OKX_SOURCE_REFERENCE_MAP.md' },
     ],
     []
   );

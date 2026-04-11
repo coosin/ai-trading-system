@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from src.modules.data.data_quality_advisor import DataQualityAdvisor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -229,6 +232,11 @@ class DataSourceHub:
 
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         exchange = self._get_exchange()
+        if not exchange:
+            logger.warning(
+                "DataSourceHub.get_ticker(%s): main_controller 上无可用 exchange（检查 ai_trading_engine.exchange / okx_exchange）",
+                symbol,
+            )
         if exchange and hasattr(exchange, "get_ticker"):
             try:
                 ticker = await exchange.get_ticker(symbol)

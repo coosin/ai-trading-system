@@ -67,8 +67,13 @@ class OKXExchange(ExchangeBase):
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.api_url = "https://www.okx.com" if not self.testnet else "https://www.okx.com"
-        self.ws_url = "wss://ws.okx.com:8443" if not self.testnet else "wss://wspap.okx.com:8443"
+        # REST 实盘/模拟盘均为 https://www.okx.com；模拟盘需额外请求头 x-simulated-trading: 1（见官方文档）
+        self.api_url = "https://www.okx.com"
+        self.ws_url = (
+            "wss://ws.okx.com:8443/ws/v5/public"
+            if not self.testnet
+            else "wss://wspap.okx.com:8443/ws/v5/public"
+        )
         self._session = None
         self._ws_connections = {}
         req_concurrency = int(os.getenv("OPENCLAW_OKX_MAX_CONCURRENCY", "4") or "4")
@@ -134,6 +139,15 @@ class OKXExchange(ExchangeBase):
         # log dedup: avoid spamming "positions count" every call
         self._last_positions_log_ts: float = 0.0
         self._last_positions_nonzero_count: Optional[int] = None
+        self._ws_hub = None  # OKXWebSocketHub，可选
+
+    @property
+    def is_connected(self) -> bool:
+        """REST 会话是否可用（供控制面 /api/v1/exchanges 等展示；与 WS 订阅无关）。"""
+        sess = self._session
+        if sess is None:
+            return False
+        return not bool(getattr(sess, "closed", True))
 
     def _build_ssl_context(self) -> ssl.SSLContext:
         """
@@ -260,8 +274,10 @@ class OKXExchange(ExchangeBase):
             "OK-ACCESS-SIGN": signature,
             "OK-ACCESS-TIMESTAMP": timestamp,
             "OK-ACCESS-PASSPHRASE": self.api_passphrase or "",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
+        if getattr(self, "testnet", False):
+            headers["x-simulated-trading"] = "1"
         return headers
 
     def _build_request_path(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> str:
@@ -584,7 +600,18 @@ class OKXExchange(ExchangeBase):
                                 continue
                             
                             data = await response.json()
-                            if data.get("code") == "0":
+                            okx_code = str(data.get("code") or "")
+                            if okx_code == "50011" and attempt < max_retries:
+                                logger.warning(
+                                    "⚠️ OKX 限速(50011)，%.1fs 后重试: %s %s",
+                                    retry_delay,
+                                    method,
+                                    endpoint,
+                                )
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= retry_backoff
+                                continue
+                            if okx_code == "0":
                                 await self._record_payload_sample(endpoint, data.get("data", []))
                                 await self._mark_request_success()
                                 return data.get("data", [])
@@ -607,7 +634,18 @@ class OKXExchange(ExchangeBase):
                             
                             data = await response.json()
                             logger.debug(f"📥 OKX响应: {data}")
-                            if data.get("code") == "0":
+                            okx_code = str(data.get("code") or "")
+                            if okx_code == "50011" and attempt < max_retries:
+                                logger.warning(
+                                    "⚠️ OKX 限速(50011)，%.1fs 后重试: %s %s",
+                                    retry_delay,
+                                    method,
+                                    endpoint,
+                                )
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= retry_backoff
+                                continue
+                            if okx_code == "0":
                                 await self._record_payload_sample(endpoint, data.get("data", []))
                                 await self._mark_request_success()
                                 return data.get("data", [])
@@ -625,7 +663,18 @@ class OKXExchange(ExchangeBase):
                                 continue
                             
                             data = await response.json()
-                            if data.get("code") == "0":
+                            okx_code = str(data.get("code") or "")
+                            if okx_code == "50011" and attempt < max_retries:
+                                logger.warning(
+                                    "⚠️ OKX 限速(50011)，%.1fs 后重试: %s %s",
+                                    retry_delay,
+                                    method,
+                                    endpoint,
+                                )
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= retry_backoff
+                                continue
+                            if okx_code == "0":
                                 await self._record_payload_sample(endpoint, data.get("data", []))
                                 await self._mark_request_success()
                                 return data.get("data", [])
@@ -807,6 +856,17 @@ class OKXExchange(ExchangeBase):
                     self._payload_sample_limit,
                 )
             logger.info(f"OKX交易所初始化成功")
+            if str(os.getenv("OPENCLAW_OKX_WS_ENABLED", "0")).strip().lower() in ("1", "true", "yes"):
+                if self.api_key and self.api_secret:
+                    try:
+                        from src.modules.exchanges.okx_websocket import OKXWebSocketHub
+
+                        self._ws_hub = OKXWebSocketHub(self)
+                        await self._ws_hub.start()
+                        logger.info("OKX WebSocket Hub 已启动（公共 tickers + 私有 positions）")
+                    except Exception as e:
+                        logger.warning("OKX WebSocket Hub 启动失败，继续使用 REST: %s", e)
+                        self._ws_hub = None
             return True
         except Exception as e:
             logger.error(f"OKX交易所初始化失败: {e}")
@@ -816,6 +876,13 @@ class OKXExchange(ExchangeBase):
         """清理资源"""
         try:
             await self._flush_payload_matrix(force=True)
+            hub = getattr(self, "_ws_hub", None)
+            if hub is not None:
+                try:
+                    await hub.stop()
+                except Exception as e:
+                    logger.debug("OKX WebSocket Hub stop: %s", e)
+                self._ws_hub = None
             if self._session:
                 await self._session.close()
             # 关闭所有WebSocket连接
@@ -1470,6 +1537,29 @@ class OKXExchange(ExchangeBase):
             okx_symbol = symbol.replace("/", "-") + "-SWAP"
         
         params = {"instId": okx_symbol}
+
+        hub = getattr(self, "_ws_hub", None)
+        if hub is not None and str(os.getenv("OPENCLAW_OKX_WS_TICKER_FASTPATH", "1")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            max_ms = float(os.getenv("OPENCLAW_OKX_WS_TICKER_MAX_AGE_MS", "3000") or "3000")
+            row = hub.get_cached_ticker(okx_symbol, max_age_ms=max_ms)
+            if row:
+                return {
+                    "symbol": symbol,
+                    "last": float(row.get("last", 0) or 0),
+                    "bid": float(row.get("bidPx", 0) or 0),
+                    "ask": float(row.get("askPx", 0) or 0),
+                    "high": float(row.get("high24h", 0) or 0),
+                    "low": float(row.get("low24h", 0) or 0),
+                    "volume": float(row.get("vol24h", 0) or 0),
+                    "change": float(
+                        row.get("chgUtc", row.get("sodUtc8", row.get("change24h", 0))) or 0
+                    ),
+                    "timestamp": int(row.get("ts", 0) or 0),
+                }
         
         try:
             data = await self._make_request("GET", endpoint, params)

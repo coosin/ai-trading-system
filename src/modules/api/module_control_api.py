@@ -1331,9 +1331,16 @@ def init_module_control_api(app, main_controller):
             if tpi:
                 prov = getattr(tpi, "providers", {}) or {}
                 disabled = list(getattr(tpi, "_disabled_providers", set()) or [])
+                diag: Dict[str, Any] = {}
+                if hasattr(tpi, "get_diagnostics"):
+                    try:
+                        diag = tpi.get_diagnostics()
+                    except Exception:
+                        diag = {}
                 out["data_hub"]["third_party"] = {
                     "provider_count": len(prov),
                     "disabled_count": len(disabled),
+                    "diagnostics": diag,
                 }
         except Exception:
             pass
@@ -1437,9 +1444,10 @@ def init_module_control_api(app, main_controller):
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
     @router.get("/commander/audit")
-    async def commander_audit():
+    async def commander_audit(enrich: bool = False):
         """
         司令部全链路审查：检查前端/消息通道/后端关键能力是否已接入。
+        enrich=true 时附带第三方限速诊断摘要与记忆网关快照（供运维质检）。
         """
         checks: List[Dict[str, Any]] = []
 
@@ -1468,7 +1476,13 @@ def init_module_control_api(app, main_controller):
         )
         add("data.hub", bool(getattr(mc, "data_source_hub", None)), "data_source_hub")
         add("data.integration", bool(getattr(mc, "data_integration", None)), "data_integration")
-        add("data.third_party", bool(getattr(mc, "third_party_data_integrator", None)), "third_party_data_integrator")
+        tpi = getattr(mc, "third_party_data_integrator", None)
+        add("data.third_party", bool(tpi), "third_party_data_integrator")
+        add(
+            "data.third_party.diagnostics",
+            bool(tpi and hasattr(tpi, "get_diagnostics")),
+            "get_diagnostics for rate-limit QC",
+        )
         add("analysis.market_intelligence", bool(getattr(mc, "market_intelligence", None)), "market_intelligence")
         add("plugin.manager", bool(getattr(mc, "plugin_manager", None)), "plugin_manager")
         add("strategy.manager", bool(getattr(mc, "strategy_manager", None)), "strategy_manager")
@@ -1476,7 +1490,42 @@ def init_module_control_api(app, main_controller):
         add("execution.gateway", bool(getattr(mc, "execution_gateway", None)), "execution_gateway")
         add("api.module_control", True, "routes_registered")
         all_passed = all(c["passed"] for c in checks)
-        return {"success": True, "all_passed": all_passed, "checks": checks, "timestamp": datetime.now().isoformat()}
+        out: Dict[str, Any] = {
+            "success": True,
+            "all_passed": all_passed,
+            "checks": checks,
+            "timestamp": datetime.now().isoformat(),
+            "architecture": {
+                "pattern": "commander_centric",
+                "summary": (
+                    "司令部(CommanderAgentRuntime)为统一入口：process_user_command → 指令执行器/子智能体(specialists)/记忆网关；"
+                    "各业务模块为子系统，由 MainController 装配；实时消息(Telegram 等)与 HTTP dispatch 同源接入。"
+                ),
+            },
+        }
+        if enrich:
+            out["third_party_diagnostics"] = {}
+            if tpi and hasattr(tpi, "get_diagnostics"):
+                try:
+                    out["third_party_diagnostics"] = tpi.get_diagnostics()
+                except Exception as e:
+                    out["third_party_diagnostics"] = {"error": str(e)}
+            gw = getattr(mc, "memory_gateway", None)
+            out["memory_quick"] = {}
+            if gw:
+                try:
+                    out["memory_quick"] = {
+                        "stats": gw.get_stats() if hasattr(gw, "get_stats") else {},
+                        "summary": gw.get_summary_status() if hasattr(gw, "get_summary_status") else {},
+                    }
+                except Exception as e:
+                    out["memory_quick"] = {"error": str(e)}
+            tb = getattr(mc, "telegram_bot", None)
+            out["realtime_channels"] = {
+                "telegram_configured": tb is not None,
+                "hint": "前端/脚本与 Bot 均可用 POST /api/v1/modules/commander/dispatch 统一 source 标签",
+            }
+        return out
 
     @router.get("/commander/memory/status")
     async def commander_memory_status():

@@ -212,18 +212,18 @@ telegram:
     trade_signals: true
 trading:
   live:
-    enabled: false
+    enabled: true
     exchange: okx
     max_daily_loss: 1000
     risk_control: true
-  mode: simulation
+  mode: live_trading
   paper:
     enabled: false
     exchange: okx
     initial_capital: 100000
   simulation:
     contract_type: perpetual
-    enabled: true
+    enabled: false
     fee_rate:
       maker: 0.0002
       taker: 0.0005
