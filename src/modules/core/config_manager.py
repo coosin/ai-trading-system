@@ -142,7 +142,7 @@ class ConfigManager:
             "min_trade_interval": 300,
             "contract_config": {
                 "leverage_min": 10,
-                "leverage_max": 50,
+                "leverage_max": 100,
                 "default_leverage": 20,
                 "max_positions": 5,
                 "min_positions": 3,
@@ -255,7 +255,7 @@ class ConfigManager:
                 "enabled": True,
                 "trade_type": "swap",
                 "leverage_min": 10,
-                "leverage_max": 50,
+                "leverage_max": 100,
                 "default_leverage": 20,
                 "max_positions": 5,
                 "min_positions": 1,
@@ -274,7 +274,7 @@ class ConfigManager:
                 "trade_mode": "real",
                 "auto_risk_management": True,
                 # True: emit close recommendations to main lane/Telegram/events; no auto exchange close
-                "critical_risk_auto_close": True,
+                "critical_risk_auto_close": False,  # 关闭自动平仓，由主逻辑判断
                 "critical_risk_auto_close_liq_only": True,
                 "critical_risk_auto_close_max_liq_distance": 0.08,
                 "critical_risk_auto_close_min_loss_pct": 25.0,

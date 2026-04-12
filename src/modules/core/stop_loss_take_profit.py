@@ -156,23 +156,23 @@ class StopLossTakeProfitOrder:
 
 @dataclass
 class StopLossTakeProfitConfig:
-    """止盈止损管理器配置"""
-    default_stop_loss_percent: float = 0.03
-    default_take_profit_percent: float = 0.06
+    """止盈止损管理器配置 - 移动止损模式"""
+    default_stop_loss_percent: float = 0.05  # 固定止损5%（兜底）
+    default_take_profit_percent: float = 0.0  # 不设固定止盈
     enable_trailing_stop: bool = True
-    trailing_stop_offset: float = 0.02
-    trailing_stop_trigger: float = 0.02
-    # --- 移动止盈止损优先（默认）：开仓即 1% 追踪带宽；浮盈达阈值后收紧到二档；不设固定止盈价 ---
+    trailing_stop_offset: float = 0.023
+    trailing_stop_trigger: float = 0.023
+    # --- 移动止盈止损模式：开仓即2.3%追踪；浮盈达2.3%后收紧到1.3%；不设固定止盈 ---
     trailing_only_mode: bool = True
     """为 True 时：新建单使用 TRAILING 止损 + 无固定止盈价，仅依赖移动止损出场。"""
     trailing_active_on_open: bool = True
     """开仓即启用移动止损逻辑（不等浮盈达到 trailing_stop_trigger）。"""
-    initial_trailing_offset: float = 0.01
-    """初始移动止损相对峰值/入场的回撤比例（1%）。"""
-    profit_tier2_pnl_threshold: float = 0.50
-    """二档：相对入场的浮盈比例达到该值后，将移动带宽收紧为 tier2_trailing_offset（默认 50%）。"""
-    tier2_trailing_offset: float = 0.005
-    """二档移动带宽（0.5%），通常比初始更紧以锁利。"""
+    initial_trailing_offset: float = 0.023
+    """初始移动止损相对峰值/入场的回撤比例（2.3%）。"""
+    profit_tier2_pnl_threshold: float = 0.023
+    """二档：相对入场的浮盈比例达到2.3%后，将移动带宽收紧为 tier2_trailing_offset。"""
+    tier2_trailing_offset: float = 0.013
+    """二档移动带宽（1.3%），浮盈2.3%后启用，更严格锁利。"""
     # 动能微调：趋势+短周期变化在「中性带」内则不改变 trailing_offset；转弱收紧，顺势略放宽
     trailing_momentum_adjust_enable: bool = True
     trailing_momentum_trend_neutral_abs: float = 0.002
@@ -200,8 +200,8 @@ class StopLossTakeProfitConfig:
     market_tracking_window: int = 20
     volatility_tighten_threshold: float = 0.02
     trend_extend_threshold: float = 0.005
-    min_trailing_offset: float = 0.003
-    max_trailing_offset: float = 0.02
+    min_trailing_offset: float = 0.005
+    max_trailing_offset: float = 0.025
     # SLTP trigger close confirmation / retry
     pending_close_max_retries: int = 6
     pending_close_backoff_base_sec: float = 2.0
@@ -639,7 +639,8 @@ class StopLossTakeProfitManager:
                 order.remaining_quantity = new_sz
                 changed = True
 
-        entry = float(p.get("entry_price", 0) or 0)
+        # 优先使用 avgPx（平均开仓价），其次 entry_price，最后用 mark_px（标记价格）
+        entry = float(p.get("avgPx", 0) or p.get("entry_price", 0) or 0)
         if entry <= 0:
             entry = float(p.get("mark_px", 0) or 0)
         if entry > 0:
@@ -746,7 +747,8 @@ class StopLossTakeProfitManager:
                 if not sym:
                     continue
                 side = self._resolved_side_from_position(p)
-                entry = float(p.get("entry_price", 0) or 0)
+                # 优先使用 avgPx（平均开仓价），其次 entry_price，最后用 mark_px（标记价格）
+                entry = float(p.get("avgPx", 0) or p.get("entry_price", 0) or 0)
                 if entry <= 0:
                     entry = float(p.get("mark_px", 0) or 0)
                 inst_id = str(p.get("instId") or "").strip()
@@ -1079,8 +1081,9 @@ class StopLossTakeProfitManager:
                    else entry_price + config.atr_multiplier * config.stop_value
 
         elif config.stop_type == StopType.TRAILING:
-            off = float(getattr(config, "trailing_offset", None) or config.stop_value or 0.01)
-            off = min(0.25, max(0.0005, off))
+            off = float(getattr(config, "trailing_offset", None) or config.stop_value or 0.023)
+            # 限制偏移量在合理范围内：0.5%到25%
+            off = min(0.25, max(0.005, off))
             if side == "long":
                 return entry_price * (1.0 - off)
             return entry_price * (1.0 + off)
@@ -1354,9 +1357,9 @@ class StopLossTakeProfitManager:
                         )
                 if order.side == "long":
                     if adverse and sl > 0:
-                        # 向现价上移止损，锁定部分利润
-                        target_sl = sl + (current_price - sl) * tighten_ratio
-                        if target_sl > sl:
+                        # 逆风时向下移动止损保护本金（不能向上移动到现价！）
+                        target_sl = sl - (sl - current_price) * tighten_ratio
+                        if target_sl > 0 and target_sl < sl:
                             order.stop_loss_price = target_sl
                             changed = True
                     elif favorable and tp is not None and tp > 0:

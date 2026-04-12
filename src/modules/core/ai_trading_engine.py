@@ -173,8 +173,8 @@ class AITradingEngine:
             "max_total_exposure_ratio": 0.8,
             "trade_mode": "real",
             "auto_risk_management": True,
-            # True：临界风险时向主链路发「建议平仓」告警，不直接下平仓单
-            "critical_risk_auto_close": True,
+            # False：关闭自动平仓，由主逻辑判断是否平仓
+            "critical_risk_auto_close": False,
             # 与 AccountRiskMonitor.liquidation_distance_critical 对齐的「贴近强平」阈值（比例，如 0.08=8%）
             "critical_risk_auto_close_max_liq_distance": 0.08,
             # 保留字段：曾错误地屏蔽「仅浮亏达极端」的自动平仓，逻辑上已不再参与闸门判定（见 _on_risk_warning）。

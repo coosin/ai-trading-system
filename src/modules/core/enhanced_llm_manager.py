@@ -13,6 +13,8 @@
 import asyncio
 import logging
 import json
+import os
+import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -114,18 +116,54 @@ class BaseLLMProvider(ABC):
         self.config = config
         self.session: Optional[httpx.AsyncClient] = None
 
-    async def initialize(self):
-        """初始化"""
-        import os
+    def _build_httpx_client(self) -> httpx.AsyncClient:
+        """创建 httpx 客户端（显式超时与连接池，降低复用死连接导致的 Server disconnected）"""
         proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
-        if proxy:
-            self.session = httpx.AsyncClient(
-                timeout=self.config.timeout,
-                proxy=proxy
-            )
-            logger.info(f"LLM Provider 使用代理: {proxy}")
+        total = float(self.config.timeout or 60.0)
+        connect_cap = min(30.0, max(5.0, total))
+        timeout = httpx.Timeout(total, connect=connect_cap, read=total, write=total, pool=connect_cap)
+        # 根因：对端/代理/中间盒常提前关空闲 TCP，复用池内连接时触发 RemoteProtocolError: Server disconnected。
+        # 默认关闭 keep-alive；稳定链路可设 OPENCLAW_LLM_ENABLE_KEEPALIVE=1。
+        ka_force_off = os.getenv("OPENCLAW_LLM_DISABLE_KEEPALIVE", "").strip().lower() in ("1", "true", "yes")
+        ka_force_on = os.getenv("OPENCLAW_LLM_ENABLE_KEEPALIVE", "").strip().lower() in ("1", "true", "yes")
+        proxy_keepalive = os.getenv("OPENCLAW_LLM_PROXY_KEEPALIVE", "").strip().lower() in ("1", "true", "yes")
+        proxied = bool(proxy)
+        if ka_force_off:
+            use_keepalive = False
+        elif proxied:
+            use_keepalive = proxy_keepalive
         else:
-            self.session = httpx.AsyncClient(timeout=self.config.timeout)
+            use_keepalive = ka_force_on
+        limits = httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=(8 if use_keepalive else 0),
+            keepalive_expiry=(12.0 if use_keepalive else 5.0),
+        )
+        kw: Dict[str, Any] = {"timeout": timeout, "limits": limits, "http2": False}
+        if proxy:
+            kw["proxy"] = proxy
+            # 仅走显式 HTTP(S)_PROXY，避免与 ALL_PROXY(socks) 叠加或触发 socksio 依赖问题
+            kw["trust_env"] = False
+            logger.info(
+                f"LLM Provider 使用代理: {proxy}（keep-alive: {'开' if use_keepalive else '关'}）"
+            )
+        elif ka_force_off:
+            logger.debug("LLM Provider: keep-alive 已禁用 (OPENCLAW_LLM_DISABLE_KEEPALIVE)")
+        elif use_keepalive:
+            logger.debug("LLM Provider: keep-alive 已启用")
+        return httpx.AsyncClient(**kw)
+
+    async def initialize(self):
+        """初始化 HTTP 会话"""
+        await self.recycle_session(force=True)
+
+    async def recycle_session(self, force: bool = False) -> None:
+        """关闭并重新打开会话；网络/协议错误重试前调用，避免复用已断开的连接"""
+        if self.session is not None:
+            await self.session.aclose()
+            self.session = None
+        if force or self.session is None:
+            self.session = self._build_httpx_client()
 
     async def cleanup(self):
         """清理"""
@@ -156,7 +194,10 @@ class OpenAIProvider(BaseLLMProvider):
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
         """生成文本（带重试机制和认证错误检测）"""
         start_time = time.time()
-        max_retries = kwargs.get('max_retries', self.config.max_retries)
+        max_retries = int(kwargs.get('max_retries', self.config.max_retries) or 3)
+        env_mr = os.getenv("OPENCLAW_LLM_MAX_RETRIES", "").strip()
+        if env_mr.isdigit():
+            max_retries = max(1, int(env_mr))
         last_error = None
         is_auth_failure = False
         api_key = (self.config.api_key or "").strip()
@@ -256,7 +297,11 @@ class OpenAIProvider(BaseLLMProvider):
                 logger.warning(f"OpenAI API超时 (重试 {retry + 1}/{max_retries}): {type(e).__name__}")
                 last_error = f"请求超时"
                 if retry < max_retries - 1:
-                    await asyncio.sleep(2)
+                    try:
+                        await self.recycle_session(force=True)
+                    except Exception as re:
+                        logger.debug(f"LLM recycle_session after timeout: {re}")
+                    await asyncio.sleep(min(30.0, 2.0 * (2**retry) + random.random()))
                     continue
                 return LLMResponse(
                     content="",
@@ -286,7 +331,11 @@ class OpenAIProvider(BaseLLMProvider):
                 logger.warning(f"OpenAI API网络错误 (重试 {retry + 1}/{max_retries}): {type(e).__name__}: {e}")
                 last_error = f"网络错误: {type(e).__name__}"
                 if retry < max_retries - 1:
-                    await asyncio.sleep(2)
+                    try:
+                        await self.recycle_session(force=True)
+                    except Exception as re:
+                        logger.debug(f"LLM recycle_session after RequestError: {re}")
+                    await asyncio.sleep(min(30.0, 2.0 * (2**retry) + random.random()))
                     continue
                 return LLMResponse(
                     content="",
@@ -584,6 +633,7 @@ class EnhancedLLMManager:
                 temperature=model_config.get("temperature", 0.7),
                 max_tokens=model_config.get("max_tokens", 2000),
                 timeout=model_config.get("timeout", 30.0),
+                max_retries=int(model_config.get("max_retries", 3) or 3),
                 cost_per_input_token=model_config.get("cost_per_input_token", 0.0),
                 cost_per_output_token=model_config.get("cost_per_output_token", 0.0),
                 context_window=model_config.get("context_window", 8192),

@@ -64,13 +64,13 @@ class OKXWebSocketHub:
         }
 
     async def _ws_send_periodic_ping(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """OKX 建议周期性 ping，降低中间设备空闲断连概率。"""
+        """OKX v5：无数据时发送纯文本 ping，期望 pong（JSON op:ping 会返回 60012 Illegal request）。"""
         interval = float(os.getenv("OPENCLAW_OKX_WS_PING_INTERVAL_SEC", "20") or "20")
         interval = max(8.0, min(interval, 120.0))
         while not self._stop.is_set():
             await asyncio.sleep(interval)
             try:
-                await ws.send_str(json.dumps({"op": "ping"}, separators=(",", ":")))
+                await ws.send_str("ping")
             except Exception:
                 return
 
