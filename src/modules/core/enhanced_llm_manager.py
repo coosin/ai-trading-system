@@ -115,10 +115,16 @@ class BaseLLMProvider(ABC):
     def __init__(self, config: ModelConfig):
         self.config = config
         self.session: Optional[httpx.AsyncClient] = None
+        # OPENCLAW_LLM_DIRECT_FALLBACK=1 且代理连续失败时，切换为直连客户端（容器须能直达各模型 base_url）
+        self._httpx_force_direct: bool = False
 
     def _build_httpx_client(self) -> httpx.AsyncClient:
         """创建 httpx 客户端（显式超时与连接池，降低复用死连接导致的 Server disconnected）"""
-        proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+        proxy = (
+            None
+            if self._httpx_force_direct
+            else (os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"))
+        )
         total = float(self.config.timeout or 60.0)
         connect_cap = min(30.0, max(5.0, total))
         timeout = httpx.Timeout(total, connect=connect_cap, read=total, write=total, pool=connect_cap)
@@ -157,11 +163,13 @@ class BaseLLMProvider(ABC):
         """初始化 HTTP 会话"""
         await self.recycle_session(force=True)
 
-    async def recycle_session(self, force: bool = False) -> None:
+    async def recycle_session(self, force: bool = False, *, force_direct: Optional[bool] = None) -> None:
         """关闭并重新打开会话；网络/协议错误重试前调用，避免复用已断开的连接"""
         if self.session is not None:
             await self.session.aclose()
             self.session = None
+        if force_direct is not None:
+            self._httpx_force_direct = bool(force_direct)
         if force or self.session is None:
             self.session = self._build_httpx_client()
 
@@ -212,6 +220,10 @@ class OpenAIProvider(BaseLLMProvider):
                 error_code="AUTH_FAILED"
             )
         
+        direct_fb = os.getenv("OPENCLAW_LLM_DIRECT_FALLBACK", "").strip().lower() in ("1", "true", "yes")
+        proxy_env_set = bool(os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"))
+        tried_direct_fallback = False
+
         for retry in range(max_retries):
             try:
                 base_url = self.config.base_url or "https://api.openai.com/v1"
@@ -297,6 +309,22 @@ class OpenAIProvider(BaseLLMProvider):
                 logger.warning(f"OpenAI API超时 (重试 {retry + 1}/{max_retries}): {type(e).__name__}")
                 last_error = f"请求超时"
                 if retry < max_retries - 1:
+                    if (
+                        direct_fb
+                        and proxy_env_set
+                        and not tried_direct_fallback
+                        and not self._httpx_force_direct
+                    ):
+                        tried_direct_fallback = True
+                        logger.warning(
+                            "LLM 经代理读超时，尝试直连回退 (OPENCLAW_LLM_DIRECT_FALLBACK=1)"
+                        )
+                        try:
+                            await self.recycle_session(force=True, force_direct=True)
+                        except Exception as re:
+                            logger.debug(f"LLM recycle_session after timeout direct: {re}")
+                        await asyncio.sleep(min(5.0, 1.0 + random.random()))
+                        continue
                     try:
                         await self.recycle_session(force=True)
                     except Exception as re:
@@ -331,6 +359,38 @@ class OpenAIProvider(BaseLLMProvider):
                 logger.warning(f"OpenAI API网络错误 (重试 {retry + 1}/{max_retries}): {type(e).__name__}: {e}")
                 last_error = f"网络错误: {type(e).__name__}"
                 if retry < max_retries - 1:
+                    err_l = str(e).lower()
+                    proxyish = any(
+                        x in err_l
+                        for x in (
+                            "disconnected",
+                            "connection reset",
+                            "broken pipe",
+                            "proxy",
+                            "tunnel",
+                            "connect",
+                            "timed out",
+                            "timeout",
+                        )
+                    )
+                    if (
+                        direct_fb
+                        and proxy_env_set
+                        and not tried_direct_fallback
+                        and proxyish
+                        and not self._httpx_force_direct
+                    ):
+                        tried_direct_fallback = True
+                        logger.warning(
+                            "LLM 经代理请求失败，启用直连回退 (OPENCLAW_LLM_DIRECT_FALLBACK=1)；"
+                            "若仍失败请检查容器出口或关闭此选项"
+                        )
+                        try:
+                            await self.recycle_session(force=True, force_direct=True)
+                        except Exception as re:
+                            logger.debug(f"LLM recycle_session direct fallback: {re}")
+                        await asyncio.sleep(min(5.0, 1.0 + random.random()))
+                        continue
                     try:
                         await self.recycle_session(force=True)
                     except Exception as re:

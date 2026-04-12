@@ -6,14 +6,33 @@
 
 import logging
 import asyncio
-import aiohttp
+import os
+import ssl
 import time
-from typing import Dict, List, Optional, Any
+import aiohttp
+import certifi
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
+
+
+def _datasource_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def _datasource_timeout() -> aiohttp.ClientTimeout:
+    total = float(os.getenv("OPENCLAW_DATASOURCE_HTTP_TIMEOUT", "28") or "28")
+    conn = min(18.0, max(5.0, total * 0.45))
+    return aiohttp.ClientTimeout(total=total, connect=conn, sock_read=total)
+
+
+def _datasource_max_retries() -> int:
+    return max(1, int(os.getenv("OPENCLAW_DATASOURCE_MAX_RETRIES", "3") or "3"))
 
 
 @dataclass
@@ -36,20 +55,67 @@ class DataSourceBase(ABC):
         self.proxy_url = proxy_url
         self._session: Optional[aiohttp.ClientSession] = None
         self._initialized = False
+
+    async def _open_session(self) -> None:
+        """创建会话：HTTPS 目标必须校验 TLS；禁用 trust_env 避免与显式 proxy= 叠加。"""
+        if self._session and not self._session.closed:
+            return
+        connector = aiohttp.TCPConnector(
+            ssl=_datasource_ssl_context(),
+            enable_cleanup_closed=True,
+            ttl_dns_cache=max(10, int(os.getenv("OPENCLAW_DATASOURCE_DNS_TTL", "300") or "300")),
+            limit=max(8, int(os.getenv("OPENCLAW_DATASOURCE_CONNECTOR_LIMIT", "32") or "32")),
+        )
+        self._session = aiohttp.ClientSession(connector=connector, trust_env=False)
     
     async def initialize(self) -> bool:
         """初始化数据源"""
         if self._initialized:
             return True
         
-        connector = None
-        if self.proxy_url:
-            connector = aiohttp.TCPConnector(ssl=False)
-        
-        self._session = aiohttp.ClientSession(connector=connector)
+        await self._open_session()
         self._initialized = True
         logger.info(f"{self.__class__.__name__} 初始化完成")
         return True
+
+    async def _recycle_session(self) -> None:
+        old = self._session
+        self._session = None
+        if old and not old.closed:
+            try:
+                await old.close()
+            except Exception:
+                pass
+        await self._open_session()
+    
+    async def _http_get_json(
+        self, url: str, params: Optional[Dict[str, Any]] = None, log_label: str = "source"
+    ) -> Tuple[bool, Any]:
+        """GET JSON，带短重试；代理隧道半开时重建会话。"""
+        proxy = self.proxy_url if self.proxy_url else None
+        retries = _datasource_max_retries()
+        timeout = _datasource_timeout()
+        last_err: Optional[str] = None
+        for attempt in range(retries):
+            try:
+                if not self._initialized:
+                    await self.initialize()
+                if self._session is None:
+                    await self._open_session()
+                async with self._session.get(url, params=params, proxy=proxy, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        return True, await resp.json()
+                    last_err = f"HTTP {resp.status}"
+            except aiohttp.ClientError as e:
+                last_err = f"{type(e).__name__}: {e}"
+                if attempt < retries - 1:
+                    logger.debug("%s ClientError (attempt %s/%s): %s", log_label, attempt + 1, retries, last_err)
+                    await self._recycle_session()
+                    await asyncio.sleep(0.25 * (attempt + 1))
+            except Exception as e:
+                last_err = str(e)
+                break
+        return False, last_err
     
     async def close(self):
         """关闭连接"""
@@ -79,63 +145,59 @@ class BinanceDataSource(DataSourceBase):
     
     async def get_market_data(self, symbol: str) -> Optional[MarketData]:
         """获取市场数据"""
-        if not self._initialized:
-            await self.initialize()
-        
-        try:
-            url = f"{self.api_url}/api/v3/ticker/24hr"
-            params = {"symbol": symbol.replace("/", "")}
-            
-            proxy = self.proxy_url if self.proxy_url else None
-            async with self._session.get(url, params=params, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return MarketData(
-                        symbol=symbol,
-                        price=float(data.get("lastPrice", 0)),
-                        volume=float(data.get("volume", 0)),
-                        change_24h=float(data.get("priceChangePercent", 0)),
-                        high_24h=float(data.get("highPrice", 0)),
-                        low_24h=float(data.get("lowPrice", 0)),
-                        source="binance"
-                    )
-        except Exception as e:
-            logger.warning(f"Binance获取市场数据失败: {e}")
-        
+        url = f"{self.api_url}/api/v3/ticker/24hr"
+        params = {"symbol": symbol.replace("/", "")}
+        ok, data = await self._http_get_json(url, params, log_label="Binance")
+        if ok and isinstance(data, dict):
+            return MarketData(
+                symbol=symbol,
+                price=float(data.get("lastPrice", 0)),
+                volume=float(data.get("volume", 0)),
+                change_24h=float(data.get("priceChangePercent", 0)),
+                high_24h=float(data.get("highPrice", 0)),
+                low_24h=float(data.get("lowPrice", 0)),
+                source="binance",
+            )
+        logger.warning("Binance获取市场数据失败: %s", data if not ok else "bad payload")
         return None
     
     async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict]:
         """获取K线数据"""
-        if not self._initialized:
-            await self.initialize()
-        
-        try:
-            url = f"{self.api_url}/api/v3/klines"
-            params = {
-                "symbol": symbol.replace("/", ""),
-                "interval": interval,
-                "limit": limit
-            }
-            
-            proxy = self.proxy_url if self.proxy_url else None
-            async with self._session.get(url, params=params, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return [
-                        {
-                            "timestamp": k[0],
-                            "open": float(k[1]),
-                            "high": float(k[2]),
-                            "low": float(k[3]),
-                            "close": float(k[4]),
-                            "volume": float(k[5])
-                        }
-                        for k in data
-                    ]
-        except Exception as e:
-            logger.warning(f"Binance获取K线数据失败: {e}")
-        
+        url = f"{self.api_url}/api/v3/klines"
+        params = {
+            "symbol": symbol.replace("/", ""),
+            "interval": interval,
+            "limit": limit,
+        }
+        ok, data = await self._http_get_json(url, params, log_label="Binance.klines")
+        if ok and isinstance(data, list):
+            return [
+                {
+                    "timestamp": k[0],
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                }
+                for k in data
+            ]
+        logger.warning("Binance获取K线数据失败: %s", data if not ok else "bad payload")
         return []
+
+
+def _coin_gecko_log_fail(source: Any, err: Any) -> None:
+    """CoinGecko 失败去重日志（限流/网络差时避免刷屏）"""
+    try:
+        now = time.time()
+        last = float(getattr(source, "_warn_last_ts", 0.0) or 0.0)
+        if now - last >= 900.0:
+            source._warn_last_ts = now
+            logger.warning("CoinGecko获取市场数据失败(去重15m): %s", err)
+        else:
+            logger.debug("CoinGecko获取市场数据失败(去重): %s", err)
+    except Exception:
+        logger.warning("CoinGecko获取市场数据失败: %s", err)
 
 
 class CoinGeckoDataSource(DataSourceBase):
@@ -165,45 +227,25 @@ class CoinGeckoDataSource(DataSourceBase):
     
     async def get_market_data(self, symbol: str) -> Optional[MarketData]:
         """获取市场数据"""
-        if not self._initialized:
-            await self.initialize()
-        
-        try:
-            coin_id = self._get_coin_id(symbol)
-            url = f"{self.api_url}/simple/price"
-            params = {
-                "ids": coin_id,
-                "vs_currencies": "usd",
-                "include_24hr_vol": "true",
-                "include_24hr_change": "true"
-            }
-            
-            proxy = self.proxy_url if self.proxy_url else None
-            async with self._session.get(url, params=params, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if coin_id in data:
-                        coin_data = data[coin_id]
-                        return MarketData(
-                            symbol=symbol,
-                            price=coin_data.get("usd", 0),
-                            volume=coin_data.get("usd_24h_vol", 0),
-                            change_24h=coin_data.get("usd_24h_change", 0),
-                            source="coingecko"
-                        )
-        except Exception as e:
-            # 去重：CoinGecko 在某些网络/限流环境下会持续失败，避免刷爆日志
-            try:
-                now = time.time()
-                last = float(getattr(self, "_warn_last_ts", 0.0) or 0.0)
-                if now - last >= 900.0:
-                    self._warn_last_ts = now
-                    logger.warning(f"CoinGecko获取市场数据失败(去重15m): {e}")
-                else:
-                    logger.debug(f"CoinGecko获取市场数据失败(去重): {e}")
-            except Exception:
-                logger.warning(f"CoinGecko获取市场数据失败: {e}")
-        
+        coin_id = self._get_coin_id(symbol)
+        url = f"{self.api_url}/simple/price"
+        params = {
+            "ids": coin_id,
+            "vs_currencies": "usd",
+            "include_24hr_vol": "true",
+            "include_24hr_change": "true",
+        }
+        ok, data = await self._http_get_json(url, params, log_label="CoinGecko")
+        if ok and isinstance(data, dict) and coin_id in data:
+            coin_data = data[coin_id]
+            return MarketData(
+                symbol=symbol,
+                price=coin_data.get("usd", 0),
+                volume=coin_data.get("usd_24h_vol", 0),
+                change_24h=coin_data.get("usd_24h_change", 0),
+                source="coingecko",
+            )
+        _coin_gecko_log_fail(self, data if not ok else "missing coin_id in response")
         return None
     
     async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict]:
