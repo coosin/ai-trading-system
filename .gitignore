@@ -61,6 +61,13 @@ workspace/memory/experience/
 workspace/memory/history/
 workspace/memory/_archive/
 workspace/memory/core/*.json
+# Local persona shards (optional; tracked packs like SKILL_PACK_* stay explicit)
+workspace/memory/core/IDENTITY.md
+workspace/memory/core/INSTRUCTIONS.md
+workspace/memory/core/MEMORY.md
+workspace/memory/core/SOUL.md
+workspace/memory/core/TRADING.md
+workspace/memory/core/USER.md
 
 # Local config overrides (never commit)
 config/local.yaml

@@ -3,7 +3,7 @@
 ## 2026-04-13 — 文档与仓库卫生
 
 - **文档**：`ENGINEERING` 补充 Compose 挂载 `./scripts`、`./tests` 与 `HOST_CLASH_EGRESS` 引用；`OPERATIONS` 补充 `verify_full_stack_network.sh`、`/api/v1/system/acceptance`、`startup_acceptance.py` 与宿主机 Clash 文档链接；`docs/README`、根 `README` 同步索引与快速命令。
-- **仓库**：`agents/`（本地会话类 `*.jsonl` 等）不再纳入版本控制，已加入 `.gitignore` 并从索引移除历史误提交文件；`workspace/memory/working/` 等运行时碎片与 `data/**/*.db`、`backups/`、`logs` 下滚动日志与 `logs/config-health.json` 等写入 `.gitignore`，已跟踪的 `working/*.json` 从索引移除。
+- **仓库**：`agents/`（本地会话类 `*.jsonl` 等）不再纳入版本控制，已加入 `.gitignore` 并从索引移除历史误提交文件；`workspace/memory/working/` 等运行时碎片、`workspace/memory/core` 下本机人格 Markdown（保留已跟踪的 `SKILL_PACK_*` 等）、`data/**/*.db`、`backups/`、`logs` 下滚动日志与 `logs/config-health.json` 等写入 `.gitignore`，已跟踪的 `working/*.json` 从索引移除。
 
 ## 2026-04-12 — 配置统一与仓库清理
 
