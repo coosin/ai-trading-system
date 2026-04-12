@@ -26,3 +26,21 @@ trading:
   max_position_size: 0.1
   paper_trading: true
   slippage_rate: 0.0005
+
+stop_loss_take_profit:
+  trailing_only_mode: true
+  trailing_active_on_open: true
+  initial_trailing_offset: 0.01
+  profit_tier2_pnl_threshold: 0.50
+  tier2_trailing_offset: 0.005
+  trailing_momentum_adjust_enable: true
+  default_stop_loss_percent: 0.03
+  default_take_profit_percent: 0.06
+  enable_trailing_stop: true
+  trailing_stop_offset: 0.01
+  trailing_stop_trigger: 0.0
+  enable_breakeven: false
+  breakeven_trigger: 0.02
+  enable_partial_tp: false
+  check_interval: 5
+  execute_exchange_on_trigger: true

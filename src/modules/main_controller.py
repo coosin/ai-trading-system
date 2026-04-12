@@ -55,13 +55,13 @@ from src.modules.monitoring.enhanced_monitoring import EnhancedMonitoringSystem,
 
 # 导入止盈止损管理模块
 from src.modules.core.stop_loss_take_profit import (
-    StopLossTakeProfitManager, 
-    StopLossTakeProfitConfig,
+    StopLossTakeProfitManager,
     StopLossConfig,
     TakeProfitConfig,
     StopLossTakeProfitOrder,
     StopType,
-    TakeProfitType
+    TakeProfitType,
+    stop_loss_take_profit_config_from_mapping,
 )
 
 # 导入执行验证模块
@@ -1273,26 +1273,23 @@ class MainController:
             logger.warning(f"⚠️ 增强监控系统初始化失败: {e}")
             self.enhanced_monitoring = None
         
-        # 初始化止盈止损管理器
+        # 初始化止盈止损管理器（配置来自 ConfigManager：default.yml / DEFAULT_CONFIG / 环境变量）
         try:
-            sltp_config = StopLossTakeProfitConfig(
-                # 默认：仅移动止损/追踪出场（无固定止盈）；开仓 1% 带宽，浮盈 50% 后收紧至 0.5%
-                trailing_only_mode=True,
-                trailing_active_on_open=True,
-                initial_trailing_offset=0.01,
-                profit_tier2_pnl_threshold=0.50,
-                tier2_trailing_offset=0.005,
-                trailing_momentum_adjust_enable=True,
-                default_stop_loss_percent=0.03,
-                default_take_profit_percent=0.06,
-                enable_trailing_stop=True,
-                trailing_stop_offset=0.01,
-                trailing_stop_trigger=0.0,
-                enable_breakeven=False,
-                breakeven_trigger=0.02,
-                enable_partial_tp=False,
-                check_interval=5,
-                execute_exchange_on_trigger=True,
+            sltp_raw = await self.config_manager.get_config("stop_loss_take_profit", {}) or {}
+            if not isinstance(sltp_raw, dict):
+                sltp_raw = {}
+            strat_raw = await self.config_manager.get_config("strategy", {}) or {}
+            if not isinstance(strat_raw, dict):
+                strat_raw = {}
+            sltp_config = stop_loss_take_profit_config_from_mapping(
+                sltp_raw, strategy_section=strat_raw
+            )
+            logger.info(
+                "止盈止损配置来源=config_manager trailing_only_mode=%s initial=%.4f tier2_thr=%.4f execute_exchange=%s",
+                sltp_config.trailing_only_mode,
+                sltp_config.initial_trailing_offset,
+                sltp_config.profit_tier2_pnl_threshold,
+                sltp_config.execute_exchange_on_trigger,
             )
             self.stop_loss_manager = StopLossTakeProfitManager(sltp_config)
             self.stop_loss_manager.set_main_controller(self)

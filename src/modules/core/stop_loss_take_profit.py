@@ -14,6 +14,7 @@ import logging
 import json
 import time
 import uuid
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable, Tuple
@@ -206,6 +207,66 @@ class StopLossTakeProfitConfig:
     pending_close_max_retries: int = 6
     pending_close_backoff_base_sec: float = 2.0
     pending_close_backoff_cap_sec: float = 120.0
+
+
+def _coerce_stop_loss_take_profit_field(name: str, raw: Any, template: StopLossTakeProfitConfig) -> Any:
+    """Coerce a single config value to the dataclass field type."""
+    if raw is None:
+        return getattr(template, name)
+    fmap = {f.name: f for f in dataclasses.fields(StopLossTakeProfitConfig)}
+    f = fmap.get(name)
+    if not f:
+        return raw
+    ann = f.type
+    if ann is bool:
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    if ann is int:
+        return int(float(raw))
+    if ann is float:
+        return float(raw)
+    if ann is str:
+        return str(raw)
+    return raw
+
+
+def stop_loss_take_profit_config_from_mapping(
+    data: Optional[Dict[str, Any]] = None,
+    *,
+    strategy_section: Optional[Dict[str, Any]] = None,
+) -> StopLossTakeProfitConfig:
+    """
+    Build StopLossTakeProfitConfig from ConfigManager / YAML dict.
+
+    Unknown keys are ignored. Optional legacy ``strategy.risk_management`` is applied
+    only for ``default_stop_loss_percent`` / ``default_take_profit_percent`` when those
+    keys are absent from ``data`` (so old docs that only set strategy.* still work).
+    """
+    template = StopLossTakeProfitConfig()
+    raw = dict(data or {})
+    raw_keys = set(raw.keys())
+    cfg = StopLossTakeProfitConfig()
+    field_names = {f.name for f in dataclasses.fields(StopLossTakeProfitConfig)}
+    for key, val in raw.items():
+        if key not in field_names:
+            logger.debug("Unknown stop_loss_take_profit config key (ignored): %s", key)
+            continue
+        setattr(cfg, key, _coerce_stop_loss_take_profit_field(key, val, template))
+
+    strat = strategy_section if isinstance(strategy_section, dict) else {}
+    rm = strat.get("risk_management") if isinstance(strat.get("risk_management"), dict) else {}
+    if "default_stop_loss_percent" not in raw_keys and rm.get("stop_loss") is not None:
+        try:
+            cfg.default_stop_loss_percent = float(rm["stop_loss"])
+        except (TypeError, ValueError):
+            logger.warning("Invalid strategy.risk_management.stop_loss: %r", rm.get("stop_loss"))
+    if "default_take_profit_percent" not in raw_keys and rm.get("take_profit") is not None:
+        try:
+            cfg.default_take_profit_percent = float(rm["take_profit"])
+        except (TypeError, ValueError):
+            logger.warning("Invalid strategy.risk_management.take_profit: %r", rm.get("take_profit"))
+    return cfg
 
 
 class StopLossTakeProfitManager:
