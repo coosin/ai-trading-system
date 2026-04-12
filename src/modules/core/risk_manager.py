@@ -709,6 +709,19 @@ class RiskManager:
         if self.config_manager:
             risk_config = await self.config_manager.get_config("risk", {})
 
+            try:
+                if risk_config.get("max_leverage") is not None:
+                    self.max_leverage = float(risk_config.get("max_leverage"))
+            except (TypeError, ValueError):
+                pass
+            tr = await self.config_manager.get_config("trading", {}) or {}
+            c = tr.get("contract") if isinstance(tr, dict) else None
+            if isinstance(c, dict) and c.get("leverage_max") is not None:
+                try:
+                    self.max_leverage = float(c["leverage_max"])
+                except (TypeError, ValueError):
+                    pass
+
             # 仓位限制
             position_config = risk_config.get("position_limits", {})
             self.position_limits = PositionLimit(

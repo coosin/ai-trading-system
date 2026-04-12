@@ -4,8 +4,9 @@
 负责统一配置加载、管理、验证和热重载。
 支持多格式配置（JSON/YAML/Env）、配置验证和默认值设置。
 
-可调参数主文件：``config/openclaw.yml``；内置兜底 ``openclaw.embedded.yml``（与本模块同目录）；
-各配置目录下另有 ``local.*`` 覆盖，顺序见 ``_ordered_config_files_in_dir``；合并后由 ``config_runtime_validate`` 校验。
+业务可调参数**仅**从各配置目录下的 ``config.yaml``（或 ``config.yml``）加载；
+可选同目录 ``local.yaml`` / ``local.yml`` / ``local.json`` 做本机覆盖（勿提交 Git）。
+合并后由 ``config_runtime_validate`` 校验。其它 ``config/*.yaml`` 若需使用请由业务代码自行读取，不经本管理器自动合并。
 """
 
 import asyncio
@@ -91,7 +92,7 @@ class ConfigManager:
         "/app/config"
     ]
 
-    # 完整默认由 config/openclaw.yml 与 openclaw.embedded.yml 提供；此处仅占位（热重载前可为空）。
+    # 默认仅占位；实际内容来自各目录的 config.yaml（及可选 local.*）。
     DEFAULT_CONFIG: Dict[str, Dict[str, Any]] = {}
 
     def __init__(self, config_dir: str = None, watch_interval: int = 30):
@@ -133,54 +134,26 @@ class ConfigManager:
         return base
 
     @staticmethod
-    def _ordered_config_files_in_dir(config_dir: Path) -> List[Path]:
-        """
-        单目录内加载顺序（后者覆盖前者）：
-        default.* < openclaw.* < 其它片段文件（字母序）< local.*
-        """
+    def _primary_config_yaml_in_dir(config_dir: Path) -> List[Path]:
+        """每个目录至多一个主文件：config.yaml 优先于 config.yml。"""
         if not config_dir.is_dir():
             return []
+        for name in ("config.yaml", "config.yml"):
+            p = config_dir / name
+            if p.is_file():
+                return [p]
+        return []
 
-        def files_sorted(pattern: str) -> List[Path]:
-            return sorted([p for p in config_dir.glob(pattern) if p.is_file()])
-
-        ordered: List[Path] = []
-        for pattern in (
-            "default.json",
-            "default.yaml",
-            "default.yml",
-            "openclaw.json",
-            "openclaw.yaml",
-            "openclaw.yml",
-        ):
-            ordered.extend(files_sorted(pattern))
-
-        other: List[Path] = []
-        for pattern in ("*.json", "*.yaml", "*.yml"):
-            for p in sorted(config_dir.glob(pattern), key=lambda x: str(x).lower()):
-                if not p.is_file():
-                    continue
-                ln = p.name.lower()
-                if (
-                    ln.startswith("default.")
-                    or ln.startswith("openclaw.")
-                    or ln.startswith("local.")
-                ):
-                    continue
-                other.append(p)
-        ordered.extend(other)
-
-        for pattern in ("local.json", "local.yaml", "local.yml"):
-            ordered.extend(files_sorted(pattern))
-
-        seen: set[str] = set()
+    @staticmethod
+    def _local_override_files_in_dir(config_dir: Path) -> List[Path]:
+        """本机覆盖（可选）：local.yaml / local.yml / local.json。"""
+        if not config_dir.is_dir():
+            return []
         out: List[Path] = []
-        for p in ordered:
-            key = str(p.resolve())
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(p)
+        for name in ("local.yaml", "local.yml", "local.json"):
+            p = config_dir / name
+            if p.is_file():
+                out.append(p)
         return out
 
     def _find_config_dir(self) -> Path:
@@ -520,29 +493,32 @@ class ConfigManager:
     # 私有方法
 
     async def _load_all_configs(self) -> None:
-        """加载所有配置文件（从多个配置目录）"""
+        """从各配置目录加载唯一主文件 config.yaml（及可选 local.*）。"""
         self._config = {}
         self._deep_update(self._config, self.DEFAULT_CONFIG)
 
         loaded_paths: set[str] = set()
 
-        embedded = Path(__file__).resolve().parent / "openclaw.embedded.yml"
-        if embedded.is_file() and yaml:
-            await self._load_config_file(embedded)
-            loaded_paths.add(str(embedded.resolve()))
-        else:
-            logger.warning(
-                "未找到内置默认配置 %s（请确保仓库含 openclaw.embedded.yml 或由各 config 目录提供 openclaw.yml）",
-                embedded,
-            )
-
         for config_dir in self._config_dirs:
-            for config_file in self._ordered_config_files_in_dir(config_dir):
+            for config_file in self._primary_config_yaml_in_dir(config_dir):
                 path_key = str(config_file.resolve())
                 if path_key in loaded_paths:
                     continue
                 await self._load_config_file(config_file)
                 loaded_paths.add(path_key)
+
+        for config_dir in self._config_dirs:
+            for config_file in self._local_override_files_in_dir(config_dir):
+                path_key = str(config_file.resolve())
+                if path_key in loaded_paths:
+                    continue
+                await self._load_config_file(config_file)
+                loaded_paths.add(path_key)
+
+        if not loaded_paths:
+            logger.warning(
+                "未找到 config.yaml / config.yml（请在 config/ 或 data/config/ 放置主配置文件）"
+            )
 
         await self._load_environment_configs()
         try:
@@ -554,7 +530,15 @@ class ConfigManager:
             validate_merged_runtime_config(self._config)
         except ConfigRuntimeValidateError as e:
             raise ConfigValidationError(str(e)) from e
-        logger.info("已加载 %d 个配置文件（路径去重）", len(loaded_paths))
+        try:
+            from src.modules.core.network_env_from_config import (
+                apply_proxy_environment_from_merged_config,
+            )
+
+            apply_proxy_environment_from_merged_config(self._config)
+        except Exception as e:
+            logger.warning("主配置网络代理注入进程环境失败（忽略）: %s", e)
+        logger.info("已加载 %d 个配置文件（config.yaml + 可选 local）", len(loaded_paths))
 
     async def _load_config_file(self, config_file: Path) -> None:
         """加载配置文件"""

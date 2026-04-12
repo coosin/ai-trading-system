@@ -26,7 +26,7 @@
 
 ### 仅 Docker 运行（生产推荐）
 
-- 运行依赖在**镜像**内完成安装；仓库根下的 `venv/`、`.venv/` **不是容器运行所必需**。若只走 Docker，可删除它们以省磁盘；需要跑全量测试时再执行 `./scripts/run_full_test_suite.sh`（会自动创建 `.venv_test/`）。
+- 运行依赖在**镜像**内完成安装；仓库根下的 `venv/`、`.venv/` **不是容器运行所必需**。若只走 Docker，可删除它们以省磁盘；需要跑全量测试时再执行 `./scripts/run_full_test_suite.sh`（会自动创建 `.venv_test/`）。根目录 **`agents/`** 为本地/IDE 会话类产物，已在 `.gitignore`，勿提交。
 - 维护：`./scripts/check_trading_host_health.sh` 做宿主体检；`./scripts/cleanup_trading_workspace.sh` 做日志与缓存清理（可选环境变量见脚本内注释）。
 - 降低 swap 抖动：见 `config/trading-host-sysctl.conf`（复制到 `/etc/sysctl.d/` 后 `sysctl --system`）。
 - **重建并加载**：`docker compose build trading-system && docker compose up -d`
@@ -88,9 +88,11 @@ python start.py
 
 ```
 openclaw-trading/
-├── config/                    # 配置文件
-│   ├── config.yaml           # 主配置文件
-│   └── logging.yaml          # 日志配置
+├── config/                    # 配置目录
+│   ├── config.yaml           # 唯一主业务配置（必选）
+│   ├── local.yaml            # 本机覆盖（可选，勿提交；见 config.local.example.yaml）
+│   ├── clash_config.yaml     # Clash 等专项文件（由脚本单独读取）
+│   └── subscription.yaml     # 订阅等专项文件
 │
 ├── src/                      # 源代码
 │   ├── modules/              # 功能模块
@@ -390,20 +392,28 @@ tests/
 
 ### 编写测试
 
+**Pytest 9**：异步 **fixture** 必须使用 `import pytest_asyncio` 且装饰为 `@pytest_asyncio.fixture`；若仍用 `unittest` 写异步用例，请继承 **`unittest.IsolatedAsyncioTestCase`**，否则协程不会被 await。
+
 ```python
 import pytest
+import pytest_asyncio
 from unittest.mock import Mock, AsyncMock, patch
 
+@pytest_asyncio.fixture
+async def engine():
+    e = AITradingEngine()
+    await e.initialize()
+    yield e
+    await e.cleanup()
+
 @pytest.mark.asyncio
-async def test_ai_decision():
+async def test_ai_decision(engine):
     """测试AI决策生成"""
-    # 准备
-    engine = AITradingEngine()
     engine.llm_integration = Mock()
     engine.llm_integration.generate_trading_signal = AsyncMock(
         return_value={"signal": "buy", "confidence": 0.8}
     )
-    
+
     # 执行
     context = MarketContext(
         symbol="BTC/USDT",
@@ -421,17 +431,22 @@ async def test_ai_decision():
 ### 运行测试
 
 ```bash
-# 运行所有测试
-pytest tests/
+# 若 pyproject 里配置了 coverage 等 addopts，可临时清空：
+export PYTEST_ADDOPTS=""
+
+# 运行所有测试（无 coverage 时可覆盖 addopts）
+pytest tests/ -o addopts="--strict-markers --strict-config --tb=short"
 
 # 运行特定测试
-pytest tests/unit/test_ai_engine.py
+pytest tests/unit/test_natural_language_interface.py -q
 
-# 运行并生成覆盖率报告
+# 运行并生成覆盖率报告（需 pytest-cov）
 pytest --cov=src tests/
 
-# 运行异步测试
-pytest tests/ -v --asyncio-mode=auto
+# 容器内（与 CI 一致）
+docker compose run --rm --no-deps trading-system sh -c \
+  'export PYTHONPATH=/app HOME=/tmp/tsthome && mkdir -p /tmp/tsthome && cd /app && \
+   python -m pytest tests/unit/ -q -o addopts="--strict-markers --strict-config --tb=line" -o cache_dir=/tmp/pytest_cache'
 ```
 
 ---

@@ -4,142 +4,80 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+.eggs/
+dist/
+build/
 
-# Virtual Environment
+# Virtual envs
 venv/
-ENV/
-env/
-.venv
+.venv*/
 .venv_mro/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Environment Variables
-.env
-.env.local
-.env.*.local
-
-# 本机配置覆盖（统一主文件为 config/openclaw.yml）
-config/local.yml
-config/local.yaml
-config/local.json
-data/config/local.yml
-data/config/local.yaml
-data/config/local.json
-
-# Logs
-logs/
-*.log
-*.log.*
-
-# Frontend
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
-frontend/node_modules/.vite/
-
-# Data (root level only)
-/data/
-*.db
-*.sqlite
-*.sqlite3
-
-# Cache
-.cache/
-*.cache
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Distribution
-*.manifest
-*.spec
-
-# Backup
-*.bak
-*.backup
-*.old
-backups/
-
-# Temporary
-*.tmp
-*.temp
-tmp/
-temp/
-
-# OS
-Thumbs.db
-Desktop.ini
-
-# CI/local venv (not committed)
 .ci_venv/
 .venv_test/
 
-# Local reference clone (large; optional)
+# Env & secrets
+.env
+.env.local
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Logs & runtime data (keep structure via .gitkeep where needed)
+logs/*.log
+logs/**/*.log
+logs/*.log.*
+logs/audit/
+logs/okx_payload_matrix/
+!logs/.gitkeep
+
+# SQLite / runtime DBs and trade artifacts (never commit)
+data/**/*.db
+data/stop_loss_orders.json
+data/strategy_optimization.json
+data/audit/
+data/executions/
+data/trade_history/
+data/memory/
+
+# Local backups and ad-hoc DB tree
+backups/
+database/
+
+# Ephemeral memory shards (runtime; see docs/memory)
+workspace/memory/working/
+workspace/memory/daily/
+workspace/memory/experience/
+workspace/memory/history/
+workspace/memory/_archive/
+workspace/memory/core/*.json
+
+# Local config overrides (never commit)
+config/local.yaml
+config/local.yml
+config/local.json
+data/config/local.yaml
+data/config/local.yml
+data/config/local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend
+frontend/node_modules/
+
+# Reference subtree (optional local clone; not part of trading runtime)
 _reference_openclaw/
 
-# Project Specific
-workspace/memory/
-workspace/USER.md
-data/historical/*.csv
-data/historical/*.json
-data/memory/*.json
-data/strategy_optimization.json
-agents/*/sessions/*.json
-agents/*/sessions/*.jsonl
-agents/*/sessions/*.jsonl.lock
-*.lock
-agents/*/agent/models.json
-backups/*.tar.gz
-backups/*.zip
-
-# Secrets (never commit these!)
-secrets/
-.secrets/
-*.pem
-*.key
-
-# Build
-*.pyc
-*.pyo
-
-# Documentation builds
-docs/_build/
-
-# MyPy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre
-.pyre/
-
-# Pytype
-.pytype/
+# Local agent / IDE session transcripts (never commit)
+agents/

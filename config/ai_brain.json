@@ -1,8 +1,0 @@
-{
-  "ai_brain": {
-    "primary_controller": "ai_core",
-    "single_write_owner": "ai_core",
-    "enable_secondary_controller": false,
-    "enable_autonomous_executor": true
-  }
-}

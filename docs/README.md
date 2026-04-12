@@ -1,21 +1,23 @@
 # OpenClaw Trading — 文档中心
 
-本目录为**唯一规范的正式文档集**。根目录 `README.md` 仅保留项目简介与快速开始；细节以本文档索引为准。
+本目录为**正式文档集**。根目录 [README.md](../README.md) 仅保留简介与快速开始。
 
 | 文档 | 说明 |
 |------|------|
-| [**ENGINEERING.md**](./ENGINEERING.md) | **工程文档（主文档）**：架构、启动流程、目录与模块、配置与环境变量、对接关系、API 总览 |
-| [**OPERATIONS.md**](./OPERATIONS.md) | 运维：Docker 部署、网络/代理基线、健康检查、脚本、排障要点 |
-| [**DEVELOPMENT.md**](./DEVELOPMENT.md) | 开发环境、测试、调试与项目结构说明 |
+| [**ENGINEERING.md**](./ENGINEERING.md) | **工程主文档**：架构、配置模型、Docker、模块索引 |
+| [**OPERATIONS.md**](./OPERATIONS.md) | 运维：Compose、网络/代理、健康检查、排障 |
+| [**DEVELOPMENT.md**](./DEVELOPMENT.md) | 开发环境、测试（含 Pytest 9）、目录结构 |
 | [**CHANGELOG.md**](./CHANGELOG.md) | 变更记录 |
-| [**memory/MEMORY_LIBRARY_GUIDE.md**](./memory/MEMORY_LIBRARY_GUIDE.md) | MemoryGateway：结构、写入/召回、维护 |
-| [**OKX_SOURCE_REFERENCE_MAP.md**](./OKX_SOURCE_REFERENCE_MAP.md) | OKX 字段/端点对照（深度参考，可选阅读） |
+| [**memory/MEMORY_LIBRARY_GUIDE.md**](./memory/MEMORY_LIBRARY_GUIDE.md) | Memory：配置段与运维要点 |
+| [**API_REFERENCE.md**](./API_REFERENCE.md) | API 摘要（权威以运行时 `/openapi.json` 为准） |
+| [**OKX_SOURCE_REFERENCE_MAP.md**](./OKX_SOURCE_REFERENCE_MAP.md) | OKX 字段/端点参考 |
+| [**../deploy/HOST_CLASH_EGRESS.md**](../deploy/HOST_CLASH_EGRESS.md) | 宿主机 Clash 出站、容器代理与验收要点 |
 
-## 非规范内容（运行时/人格）
+## 非规范内容
 
-- `../workspace/`：司令部人格、交易信念等运行时文本，**不属于** API/架构规范文档。
-- `../USER_PROFILE.md`、`../TRADING_SOUL.md`：用户侧叙事/设定，按需阅读。
+- `../workspace/`：人格与运行时文本，非 API 规范。  
+- `../USER_PROFILE.md`、`../TRADING_SOUL.md`：用户侧叙事，按需阅读。
 
 ## API 权威来源
 
-运行时 OpenAPI：**`GET /openapi.json`** 或浏览器 **`/docs`**。工程说明中的路由表为摘要，以 OpenAPI 为准。
+**`GET /openapi.json`** 或浏览器 **`/docs`**。

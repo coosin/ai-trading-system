@@ -150,12 +150,12 @@ class AITradingEngine:
             "enabled": True,
             "trade_type": "swap",
             "leverage_min": 10,
-            "leverage_max": 50,
+            "leverage_max": 100,
             "default_leverage": 20,
             "max_positions": DEFAULT_MAX_POSITIONS,
             "min_positions": 1,
             "margin_mode": "cross",
-            "grid_trading": False,
+            "grid_trading": True,
             "grid_levels": 5,
             "grid_spacing": 0.02,
         }
@@ -310,11 +310,14 @@ class AITradingEngine:
             from src.modules.data.data_integration import BinanceDataSource, CoinGeckoDataSource
             
             self.data_fusion = MultiSourceDataFusion(
-                data_integration=self,
-                llm_integration=self.llm_integration
+                data_integration=None,
+                llm_integration=self.llm_integration,
             )
             
-            proxy_url = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "http://host.docker.internal:7890"
+            from src.modules.core.network_env_from_config import proxy_url_for_data_sources
+
+            cm = getattr(self.main_controller, "config_manager", None)
+            proxy_url = proxy_url_for_data_sources(cm)
             
             binance_source = BinanceDataSource(proxy_url=proxy_url)
             coingecko_source = CoinGeckoDataSource(proxy_url=proxy_url)
@@ -390,7 +393,15 @@ class AITradingEngine:
             if isinstance(config, dict):
                 symbols = config.get("symbols")
                 if isinstance(symbols, list) and symbols:
-                    self.symbols = symbols
+                    self.symbols = [str(s) for s in symbols if s]
+                else:
+                    trading_cfg = await self.main_controller.config_manager.get_config(
+                        "trading", {}
+                    )
+                    if isinstance(trading_cfg, dict):
+                        ts = trading_cfg.get("symbols")
+                        if isinstance(ts, list) and ts:
+                            self.symbols = [str(s) for s in ts if s]
                 self._use_dynamic_symbols = bool(
                     config.get("dynamic_symbol_universe", self._use_dynamic_symbols)
                 )
@@ -411,6 +422,17 @@ class AITradingEngine:
                 ai_cfg = config.get("ai_config", {})
                 if isinstance(ai_cfg, dict):
                     self.ai_config.update(ai_cfg)
+            trading_full = await self.main_controller.config_manager.get_config("trading", {})
+            from src.modules.core.trading_contract_settings import (
+                apply_trading_contract_unified,
+            )
+
+            apply_trading_contract_unified(
+                trading_full if isinstance(trading_full, dict) else {},
+                contract_config=self.contract_config,
+                ai_config=self.ai_config,
+                ai_core_config=None,
+            )
         await self._sync_symbols_from_selector(force=True)
         
         self._running = True

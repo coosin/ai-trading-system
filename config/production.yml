@@ -1,5 +1,0 @@
-system:
-  debug: false
-  log_level: INFO
-trading:
-  paper_trading: false

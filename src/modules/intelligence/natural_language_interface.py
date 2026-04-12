@@ -345,7 +345,8 @@ class NaturalLanguageInterface:
             
             command = await self._identify_command(query)
             
-            if command:
+            # "unknown" 应走通用问答，而非按命令执行（否则无匹配模板会得到错误结构）
+            if command and command != "unknown":
                 command_info = self.command_templates.get(command, {})
                 
                 if command_info.get("use_skill") and command_info.get("skill_name"):
@@ -466,11 +467,15 @@ class NaturalLanguageInterface:
 只返回命令名称，不要返回其他内容。"""
         
         response = await self.llm_integration.generate(prompt)
-        content = self._get_response_content(response)
-        command = content.strip() if response and hasattr(response, 'success') and response.success else 'unknown'
-        
-        if command not in self.command_templates and command != 'unknown':
-            command = 'unknown'
+        content = (self._get_response_content(response) or "").strip()
+        # 兼容单元测试 Mock / 纯字符串返回；仅有显式 success=False 时视为 unknown
+        if response is not None and hasattr(response, "success") and getattr(response, "success") is False:
+            command = "unknown"
+        else:
+            command = content or "unknown"
+
+        if command not in self.command_templates and command != "unknown":
+            command = "unknown"
         
         logger.debug(f"识别命令: {query} -> {command}")
         return command

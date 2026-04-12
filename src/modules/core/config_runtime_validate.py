@@ -90,6 +90,7 @@ def _check_sltp(sltp: Dict[str, Any]) -> None:
         "breakeven_trigger",
         "min_trailing_offset",
         "max_trailing_offset",
+        "open_rr_synthetic_reward_multiple",
     )
     for k in float_keys:
         if k not in sltp:
@@ -110,6 +111,7 @@ def _check_sltp(sltp: Dict[str, Any]) -> None:
 
     bool_keys: Tuple[str, ...] = (
         "trailing_only_mode",
+        "trailing_only_coerce_inputs",
         "trailing_active_on_open",
         "enable_trailing_stop",
         "trailing_momentum_adjust_enable",

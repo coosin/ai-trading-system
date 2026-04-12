@@ -9,7 +9,8 @@
 ### 1.1 首次与更新
 
 ```bash
-cp .env.example .env   # 编辑密钥与 MODE
+cp .env.example .env   # 编辑密钥与 MODE / TRADING_MODE
+# 主调参仅使用仓库内 config/config.yaml；compose 已挂载 ./config:/app/config
 docker compose build trading-system
 docker compose up -d
 ```
@@ -19,6 +20,8 @@ docker compose up -d
 ```bash
 ./scripts/deploy_production_stack.sh
 ```
+
+全栈网络与健康链（Compose 已起、脚本会进容器抽检）：仓库根执行 `bash scripts/verify_full_stack_network.sh`，以终端输出 **`VERIFY_FULL_STACK=PASS`** 为准。应用侧快照：`GET http://localhost:8000/api/v1/system/acceptance`；轮询脚本：`python3 scripts/startup_acceptance.py`（可用 `ACCEPTANCE_BASE` 改基址）。宿主机 Clash/TUN 与 `host.docker.internal` 说明见 **`deploy/HOST_CLASH_EGRESS.md`**。
 
 ### 1.2 仅重载代码（卷挂载）
 
@@ -32,7 +35,8 @@ docker compose restart trading-system
 
 - **trading-system**: `8000` → API / 静态前端  
 - **redis**: `6379`（内部网络 `redis:6379`）  
-- **健康检查**: 容器内 `curl http://localhost:8000/health`
+- **健康检查**: 容器内 `curl http://localhost:8000/health`  
+- **配置卷**: `./config` → `/app/config`（修改 `config.yaml` 后 `docker compose restart trading-system` 即可，无需重建镜像）
 
 ---
 
@@ -50,13 +54,15 @@ docker compose restart trading-system
 
 ### 3.1 目标
 
-- 容器访问外网经 **宿主机 Clash**：`host.docker.internal:7890`（见 `docker-compose.yml` `extra_hosts`）  
+- 容器访问外网经 **宿主机 Clash**：`host.docker.internal:7890`（见 `docker-compose.yml` `extra_hosts`；详细步骤与排障见 **`deploy/HOST_CLASH_EGRESS.md`**）  
 - **OKX** 使用 `https://www.okx.com`，TLS 校验开启  
 - DNS：避免将 OKX 解析到异常池；Clash 建议 **Rule** 模式、`fake-ip-filter` 含 `+.okx.com`
 
 ### 3.2 脚本
 
 ```bash
+python3 scripts/network_connectivity_smoke.py
+python3 scripts/network_connectivity_smoke.py --redis   # 需能访问 REDIS_HOST（如 compose 内 redis）
 python3 scripts/production_network_baseline.py --check-only
 python3 scripts/production_network_baseline.py --apply   # 按脚本设计写回配置时
 ```

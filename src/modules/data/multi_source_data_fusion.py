@@ -71,6 +71,10 @@ class MultiSourceDataFusion:
             "sentiment": 0.1,
             "onchain": 0.05
         }
+
+    def set_data_integration(self, data_integration: Any) -> None:
+        """在 MainController 完成 DataIntegration 初始化后绑定（引擎早于 DataIntegration 创建）。"""
+        self.data_integration = data_integration
     
     async def initialize(self) -> bool:
         """初始化数据融合器"""

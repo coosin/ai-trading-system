@@ -68,6 +68,9 @@ class DynamicSymbolSelectorConfig:
     discovery_interval: int = 3600          # 发现间隔（秒）
     always_include: List[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
     always_exclude: List[str] = field(default_factory=list)
+    # symbol_universe=full_exchange：全所 USDT 永续候选；restricted 时仅保留 allowed_symbols
+    restricted_universe: bool = False
+    allowed_symbols: List[str] = field(default_factory=list)
     scoring_weights: Dict[str, float] = field(default_factory=lambda: {
         "liquidity": 0.25,
         "volatility": 0.20,
@@ -195,6 +198,14 @@ class DynamicSymbolSelector:
         except Exception as e:
             logger.error(f"发现币种失败: {e}")
             return self.config.always_include
+
+        if self.config.restricted_universe and self.config.allowed_symbols:
+            allow = {str(s).strip() for s in self.config.allowed_symbols if s}
+            discovered = [s for s in discovered if s in allow]
+            if not discovered:
+                discovered = [s for s in self.config.always_include if s in allow] or list(
+                    self.config.always_include
+                )
         
         return discovered
     

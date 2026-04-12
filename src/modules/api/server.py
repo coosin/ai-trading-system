@@ -833,6 +833,100 @@ class APIServer:
                 "uptime": self._get_uptime(),
             }
 
+        @api_v1_router.get("/system/acceptance", tags=["system"])
+        async def system_architect_acceptance_v1():
+            """
+            客户侧 / 产品架构师验收快照：进程状态、模块概况、网络出口模型说明。
+            不包含密钥；代理 URL 仅显示是否已配置。
+            """
+            from src.modules.core.network_env_from_config import (
+                build_proxy_url_from_config,
+                egress_architecture_notes,
+            )
+
+            ts = datetime.now().isoformat()
+            px: Dict[str, Any] = {}
+            if self.config_manager:
+                try:
+                    raw = await self.config_manager.get_config("proxy", {}) or {}
+                    px = raw if isinstance(raw, dict) else {}
+                except Exception:
+                    px = {}
+
+            hp = bool((os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "").strip())
+            purl = build_proxy_url_from_config(px)
+            no_preview = (os.getenv("NO_PROXY") or os.getenv("no_proxy") or "")[:400]
+
+            sys_body: Dict[str, Any] = {}
+            if main_controller:
+                try:
+                    sys_body = await main_controller.get_system_status()
+                except Exception as e:
+                    sys_body = {"error": str(e)}
+
+            checklist: List[Dict[str, Any]] = []
+
+            def _add(cid: str, ok: bool, detail: str) -> None:
+                checklist.append({"id": cid, "ok": bool(ok), "detail": detail})
+
+            _add(
+                "config_manager",
+                self.config_manager is not None,
+                "配置管理器已绑定 API 服务" if self.config_manager else "未绑定",
+            )
+            _add(
+                "main_controller",
+                main_controller is not None,
+                "主控制器已绑定" if main_controller else "未绑定",
+            )
+            rh = (os.getenv("REDIS_HOST") or "").strip()
+            _add("redis_env", bool(rh), f"REDIS_HOST={rh or '(empty)'}")
+
+            ex = getattr(main_controller, "okx_exchange", None) if main_controller else None
+            ex_ok = False
+            if ex is not None and hasattr(ex, "is_connected"):
+                try:
+                    ex_ok = bool(ex.is_connected)
+                except Exception:
+                    ex_ok = False
+            _add("okx_exchange_session", ex_ok, "REST 会话可用" if ex_ok else "未连接或不可用")
+
+            sltp = getattr(main_controller, "stop_loss_manager", None) if main_controller else None
+            _add("stop_loss_manager", sltp is not None, "止盈止损管理器已挂载" if sltp else "未挂载")
+
+            mc = int(sys_body.get("module_count", 0) or 0)
+            rm = int(sys_body.get("running_modules", 0) or 0)
+            ratio = (rm / mc) if mc > 0 else 0.0
+            _add(
+                "module_availability",
+                ratio >= 0.85 or rm >= 20,
+                f"running_modules={rm} module_count={mc} ratio={ratio:.2f}",
+            )
+
+            sys_st = str(sys_body.get("system_status") or "")
+            critical_ids = {"config_manager", "main_controller", "redis_env"}
+            critical_ok = all(x["ok"] for x in checklist if x["id"] in critical_ids)
+            verdict = (
+                "PASS"
+                if critical_ok and sys_st == "running"
+                else "ATTENTION"
+            )
+
+            return {
+                "acceptance_version": "1.1",
+                "role": "product_architect_snapshot",
+                "timestamp": ts,
+                "verdict": verdict,
+                "system_status": sys_body,
+                "network": {
+                    **egress_architecture_notes(px),
+                    "http_proxy_env_active": hp,
+                    "proxy_url_built_from_config": bool(purl),
+                    "no_proxy_preview": no_preview,
+                },
+                "checklist": checklist,
+            }
+
         # 指标端点 - 支持 /api/v1/metrics
         @api_v1_router.get("/metrics", tags=["metrics"])
         async def get_metrics_v1():
@@ -2870,6 +2964,7 @@ class APIServer:
             probes: List[Dict[str, Any]] = [
                 {"name": "system.status", "method": "GET", "path": "/system/status"},
                 {"name": "system.health", "method": "GET", "path": "/system/health"},
+                {"name": "system.acceptance", "method": "GET", "path": "/system/acceptance"},
                 {"name": "market.symbols", "method": "GET", "path": "/market/symbols"},
                 {"name": "risk.metrics", "method": "GET", "path": "/risk/metrics"},
                 {"name": "control_center.state", "method": "GET", "path": "/control-center/state?limit=5"},

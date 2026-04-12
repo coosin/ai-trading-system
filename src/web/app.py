@@ -2,16 +2,59 @@ from flask import Flask, render_template, request, jsonify
 import json
 import os
 import sys
+from pathlib import Path
 
 # 添加项目根目录到Python路径
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.modules.core.config_manager import ConfigManager
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 app = Flask(__name__)
 
-# 配置文件路径
-CONFIG_PATH = os.path.join(os.path.expanduser('~'), '.openclaw-trading', 'config.json')
+
+def _primary_config_path() -> Path:
+    """与运行时一致：仓库根下 config/config.yaml（或 config.yml）。"""
+    for name in ("config.yaml", "config.yml"):
+        p = _PROJECT_ROOT / "config" / name
+        if p.is_file():
+            return p
+    return _PROJECT_ROOT / "config" / "config.yaml"
+
+
+def _load_merged_config_dict():
+    """同步读取主配置 + 可选 local.*（只读视图；与 ConfigManager 文件集合对齐）。"""
+    if yaml is None:
+        raise RuntimeError("需要安装 pyyaml 才能读取 config.yaml")
+    primary = _primary_config_path()
+    if not primary.is_file():
+        return None, str(primary)
+    with open(primary, "r", encoding="utf-8") as f:
+        merged = yaml.safe_load(f) or {}
+    if not isinstance(merged, dict):
+        merged = {}
+    cfg_dir = primary.parent
+    for name in ("local.yaml", "local.yml", "local.json"):
+        p = cfg_dir / name
+        if not p.is_file():
+            continue
+        if p.suffix == ".json":
+            with open(p, "r", encoding="utf-8") as f:
+                extra = json.load(f)
+        else:
+            with open(p, "r", encoding="utf-8") as f:
+                extra = yaml.safe_load(f) or {}
+        if isinstance(extra, dict):
+            for section, values in extra.items():
+                if isinstance(values, dict) and isinstance(merged.get(section), dict):
+                    merged[section] = {**merged[section], **values}
+                else:
+                    merged[section] = values
+    return merged, str(primary)
+
 
 @app.route('/')
 def index():
@@ -20,24 +63,22 @@ def index():
 
 @app.route('/config', methods=['GET'])
 def get_config():
-    """获取当前配置"""
+    """获取当前配置（只读 YAML 合并视图）"""
     try:
-        config_manager = ConfigManager(CONFIG_PATH)
-        config = config_manager.get_config()
-        return jsonify(config)
+        data, path = _load_merged_config_dict()
+        if data is None:
+            return jsonify({'error': f'主配置不存在: {path}'}), 404
+        return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/config', methods=['POST'])
 def update_config():
-    """更新配置"""
-    try:
-        new_config = request.json
-        config_manager = ConfigManager(CONFIG_PATH)
-        config_manager.update_config(new_config)
-        return jsonify({'message': '配置更新成功'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """主配置请直接编辑 config/config.yaml 或本机 config/local.yaml；此旧接口不再写 JSON。"""
+    return jsonify({
+        'error': '已弃用',
+        'message': '请编辑仓库内 config/config.yaml，或创建 config/local.yaml / local.json 做本机覆盖（勿提交）。密钥放在根目录 .env。',
+    }), 410
 
 @app.route('/config/templates', methods=['GET'])
 def get_config_templates():
@@ -86,12 +127,12 @@ def get_config_templates():
 def get_status():
     """获取系统状态"""
     try:
-        # 这里可以添加系统状态检查逻辑
+        path = _primary_config_path()
         status = {
             'status': 'running',
             'version': '1.0.0',
-            'config_file': CONFIG_PATH,
-            'config_exists': os.path.exists(CONFIG_PATH)
+            'config_file': str(path),
+            'config_exists': path.is_file(),
         }
         return jsonify(status)
     except Exception as e:

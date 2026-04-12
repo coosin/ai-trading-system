@@ -1,24 +1,348 @@
-# =============================================================================
-# OpenClaw 统一可调配置（主文件）
-# -----------------------------------------------------------------------------
-# 合并优先级（后者覆盖前者）：
-#   1) openclaw.embedded.yml（与源码同目录，内置兜底）
-#   2) 各配置目录：default.* < openclaw.* < 其它片段 < local.*
-#   3) 环境变量 OPENCLAW__section__key__nested
-#
-# 密钥仅放在仓库根目录 .env，勿写入本文件。
-# 本机覆盖：复制 config/openclaw.local.example.yml 为 config/local.yml（已 gitignore）。
-#
-# 修改后运行： python scripts/generate_openclaw_yaml.py
-# 以同步 embedded 与 test_config/openclaw.yml。
-# =============================================================================
+# OpenClaw Trading — 唯一主配置文件 config/config.yaml
+# 勿在 config/ 下再增加业务 YAML/JSON 片段；本机差异请用同目录 local.yaml（见 config.local.example.yaml）。
+# 密钥仍使用仓库根目录 .env；环境变量覆盖：OPENCLAW__section__key__nested
 
 system:
-  environment: development
+  name: OpenClaw Trading
+  version: 1.0.0
+  mode: simulation
   debug: false
   log_level: INFO
-  name: AI Trading System
-  version: 1.0.0
+  environment: development
+llm:
+  default_model: astron-code-latest
+  models:
+  - provider: xunfei
+    model_id: astron-code-latest
+    display_name: 讯飞 astron-code-latest
+    api_key_env: XUNFEI_API_KEY
+    base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions
+    temperature: 0.7
+    max_tokens: 2000
+    timeout: 60.0
+    max_retries: 3
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 32768
+    supports_vision: false
+    supports_reasoning: true
+    enabled: true
+    priority: 10
+    fallback_models: []
+  - provider: openai
+    model_id: gpt-4-turbo
+    display_name: OpenAI GPT-4 Turbo
+    api_key_env: OPENAI_API_KEY
+    base_url: https://api.openai.com/v1/chat/completions
+    temperature: 0.7
+    max_tokens: 2000
+    timeout: 60.0
+    max_retries: 3
+    cost_per_input_token: 1.0e-05
+    cost_per_output_token: 3.0e-05
+    context_window: 128000
+    supports_vision: true
+    supports_reasoning: true
+    enabled: false
+    priority: 8
+  - provider: anthropic
+    model_id: claude-3-opus-20240229
+    display_name: Anthropic Claude 3 Opus
+    api_key_env: ANTHROPIC_API_KEY
+    base_url: https://api.anthropic.com/v1/messages
+    temperature: 0.7
+    max_tokens: 2000
+    timeout: 60.0
+    max_retries: 3
+    cost_per_input_token: 1.5e-05
+    cost_per_output_token: 7.5e-05
+    context_window: 200000
+    supports_vision: true
+    supports_reasoning: true
+    enabled: false
+    priority: 9
+  - provider: local
+    model_id: llama3
+    display_name: Llama 3 (本地)
+    base_url: http://localhost:11434/api/chat
+    temperature: 0.7
+    max_tokens: 2000
+    timeout: 120.0
+    max_retries: 2
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 8192
+    supports_vision: false
+    supports_reasoning: false
+    enabled: false
+    priority: 5
+  task_model_mapping:
+    market_analysis:
+    - astron-code-latest
+    - gpt-4-turbo
+    - claude-3-opus-20240229
+    strategy_generation:
+    - astron-code-latest
+    - gpt-4-turbo
+    signal_generation:
+    - astron-code-latest
+    risk_assessment:
+    - astron-code-latest
+    - gpt-4-turbo
+    news_analysis:
+    - astron-code-latest
+    - gpt-4-turbo
+    code_generation:
+    - gpt-4-turbo
+    - claude-3-opus-20240229
+    natural_language:
+    - astron-code-latest
+    - gpt-4-turbo
+trading:
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  analysis_interval: 60
+  min_confidence: 0.65
+  max_positions: 3
+  risk_per_trade: 0.02
+  order:
+    type: market
+    time_in_force: GTC
+    post_only: false
+  stop_loss:
+    enabled: true
+    percent: 0.03
+    trailing: false
+  take_profit:
+    enabled: true
+    percent: 0.06
+    partial:
+      enabled: false
+      levels:
+      - percent: 0.03
+        close_percent: 0.5
+      - percent: 0.06
+        close_percent: 0.5
+  commission_rate: 0.001
+  enabled: true
+  max_daily_loss: 0.02
+  max_position_count: 10
+  max_position_size: 0.1
+  paper_trading: true
+  slippage_rate: 0.0005
+risk:
+  max_drawdown: 0.15
+  max_leverage: 3.0
+  margin_call_level: 0.8
+  liquidation_level: 0.9
+  max_position_size_percent: 0.2
+  max_correlation: 0.7
+  monitoring:
+    enabled: true
+    interval: 10
+    alert_channels:
+    - telegram
+    - log
+  limits:
+    daily_loss_limit: 0.05
+    weekly_loss_limit: 0.1
+    monthly_loss_limit: 0.15
+  enabled: true
+  position_limit: 0.2
+  var_limit: 0.05
+exchanges:
+  okx:
+    enabled: true
+    api_key_env: OKX_API_KEY
+    secret_env: OKX_SECRET
+    passphrase_env: OKX_PASSPHRASE
+    testnet: true
+    rate_limit: 20
+    timeout: 30
+  binance:
+    enabled: false
+    api_key_env: BINANCE_API_KEY
+    secret_env: BINANCE_SECRET
+    testnet: true
+    rate_limit: 20
+    timeout: 30
+data:
+  historical:
+    enabled: true
+    storage_path: data/historical
+    max_days: 365
+    cleanup_interval: 86400
+  realtime:
+    enabled: true
+    buffer_size: 1000
+    update_interval: 1
+  timeframes:
+  - 1m
+  - 5m
+  - 15m
+  - 1h
+  - 4h
+  - 1d
+  sources:
+  - provider: binance
+    enabled: true
+    priority: 1
+  - provider: coingecko
+    enabled: true
+    priority: 2
+  history_days: 365
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  update_interval: 60
+strategies:
+  max_strategies: 10
+  optimization_interval: 3600
+  default:
+    name: AI智能策略
+    enabled: true
+    type: ai_driven
+  evaluation:
+    min_trades: 10
+    lookback_days: 30
+    metrics:
+    - sharpe_ratio
+    - win_rate
+    - max_drawdown
+    - profit_factor
+monitoring:
+  performance:
+    enabled: true
+    interval: 60
+    metrics:
+    - cpu_usage
+    - memory_usage
+    - network_io
+    - disk_io
+  trading:
+    enabled: true
+    track_positions: true
+    track_orders: true
+    track_pnl: true
+  alerts:
+    enabled: true
+    channels:
+      telegram:
+        enabled: true
+        bot_token_env: TELEGRAM_BOT_TOKEN
+        chat_id_env: TELEGRAM_CHAT_ID
+      email:
+        enabled: false
+        smtp_host: smtp.gmail.com
+        smtp_port: 587
+        smtp_user_env: SMTP_USER
+        smtp_password_env: SMTP_PASSWORD
+        from_addr: noreply@openclaw-trading.com
+        to_addrs: []
+  enabled: true
+  health_check_interval: 30
+  metrics_interval: 60
+telegram:
+  enabled: true
+  bot_token_env: TELEGRAM_BOT_TOKEN
+  chat_ids_env: TELEGRAM_CHAT_ID
+  proxy: null
+api:
+  enabled: true
+  host: 0.0.0.0
+  port: 8000
+  workers: 1
+  reload: false
+  debug: false
+  cors:
+    enabled: true
+    allow_origins:
+    - '*'
+    allow_methods:
+    - '*'
+    allow_headers:
+    - '*'
+  auth:
+    enabled: false
+    api_key_header: X-API-Key
+    api_key_env: API_KEY
+  enable_cors: true
+  enable_swagger: true
+database:
+  type: sqlite
+  path: data/trading.db
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+cache:
+  enabled: true
+  type: memory
+  redis:
+    host: localhost
+    port: 6379
+    db: 0
+    password_env: REDIS_PASSWORD
+  default_ttl: 300
+  max_size: 1000
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  file:
+    enabled: true
+    path: logs/trading.log
+    max_size: 10MB
+    backup_count: 5
+  console:
+    enabled: true
+    colorize: true
+proxy:
+  enabled: true
+  use_global_proxy: true
+  global_proxy:
+    enabled: true
+    proxy_type: http
+    host: 127.0.0.1
+    port: 7890
+    username_env: PROXY_USER
+    password_env: PROXY_PASSWORD
+  clash:
+    auto_detect: true
+    port: 7890
+    socks_port: 7891
+    api_port: 9090
+  domain_proxies: []
+  bypass_domains:
+  - localhost
+  - 127.0.0.1
+  - '*.local'
+  - '*.internal'
+backup:
+  enabled: true
+  interval: 86400
+  retention_days: 30
+  include:
+  - data
+  - config
+  - logs
+  exclude:
+  - '*.tmp'
+  - '*.log'
+plugins:
+  enabled: true
+  auto_load: true
+  directory: plugins
+  loaded: []
+development:
+  debug: false
+  use_mock_data: false
+  mock_data_size: 1000
+  testing:
+    enabled: false
+    mock_exchange: true
+    mock_llm: true
 controller:
   auto_restart_modules: true
   max_restart_attempts: 3
@@ -32,11 +356,6 @@ ai_brain:
   policy:
     allow_system_open: false
     gateway_sets_leverage: false
-api:
-  host: 0.0.0.0
-  port: 8000
-  enable_cors: true
-  enable_swagger: true
 paths:
   base_path: /app
   data_path: /app/data
@@ -338,29 +657,6 @@ research:
     enabled: true
     folds: 3
     train_ratio: 0.7
-data:
-  history_days: 365
-  symbols:
-  - BTC/USDT
-  - ETH/USDT
-  update_interval: 60
-monitoring:
-  enabled: true
-  health_check_interval: 30
-  metrics_interval: 60
-risk:
-  enabled: true
-  max_drawdown: 0.1
-  position_limit: 0.2
-  var_limit: 0.05
-trading:
-  commission_rate: 0.001
-  enabled: true
-  max_daily_loss: 0.02
-  max_position_count: 10
-  max_position_size: 0.1
-  paper_trading: true
-  slippage_rate: 0.0005
 strategy:
   risk_management:
     stop_loss: 0.03

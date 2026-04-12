@@ -1,152 +1,104 @@
 #!/usr/bin/env python3
 """
-对外部行情与 LLM 网关做只读烟测（不下单）。
-用法：在项目根目录  python scripts/network_connectivity_smoke.py
+轻量网络自检：DNS + HTTPS 可达性（不依赖交易所密钥）。
+用于部署后快速确认容器/宿主机出站网络正常。
+
+用法:
+  python3 scripts/network_connectivity_smoke.py
+  python3 scripts/network_connectivity_smoke.py --redis   # 需 REDIS_HOST / REDIS_PORT
+  python3 scripts/network_connectivity_smoke.py --api-url http://127.0.0.1:8000/health
 """
 from __future__ import annotations
 
-import asyncio
+import argparse
 import os
+import socket
 import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-# 与主程序一致：从仓库根目录加载 .env（否则终端直接跑脚本时 os.environ 里没有密钥）
-try:
-    from dotenv import load_dotenv
-
-    _env = ROOT / ".env"
-    if _env.is_file():
-        load_dotenv(_env)
-    _local = ROOT / ".env.local"
-    if _local.is_file():
-        load_dotenv(_local, override=True)
-except ImportError:
-    pass
+import urllib.error
+import urllib.request
 
 
-async def _httpx_get(
-    url: str,
-    headers: dict | None = None,
-    params: dict | None = None,
-) -> tuple[int, str]:
-    import httpx
-
-    proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or None
-    kw: dict = {"timeout": 20.0, "http2": False}
-    if proxy:
-        kw["proxy"] = proxy
-        kw["trust_env"] = False
-    async with httpx.AsyncClient(**kw) as client:
-        r = await client.get(url, headers=headers or {}, params=params)
-        return r.status_code, (r.text or "")[:300]
-
-
-async def main() -> int:
-    results: list[tuple[str, str]] = []
-
+def _check_dns(host: str) -> tuple[bool, str]:
     try:
-        code, body = await _httpx_get("https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT")
-        ok = code == 200 and "last" in body
-        results.append(("OKX ticker (public REST)", "OK" if ok else "HTTP %s %s" % (code, body[:80])))
-    except Exception as e:
-        results.append(("OKX ticker (public REST)", "ERR %s: %s" % (type(e).__name__, e)))
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        if not infos:
+            return False, f"{host}: no addresses"
+        return True, f"{host} -> {infos[0][4][0]}"
+    except OSError as e:
+        return False, f"{host}: {e}"
 
+
+def _check_tcp_connect(host: str, port: int = 443, timeout: float = 12.0) -> tuple[bool, str]:
     try:
-        code, body = await _httpx_get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT")
-        ok = code == 200 and "lastPrice" in body
-        results.append(("Binance 24h ticker", "OK" if ok else "HTTP %s" % code))
-    except Exception as e:
-        results.append(("Binance 24h ticker", "ERR %s: %s" % (type(e).__name__, e)))
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            pass
+        return True, f"TCP {host}:{port} reachable"
+    except OSError as e:
+        return False, f"TCP {host}:{port}: {e}"
 
+
+def _check_https(url: str, timeout: float = 12.0) -> tuple[bool, str]:
+    req = urllib.request.Request(url, headers={"User-Agent": "openclaw-network-smoke/1.0"})
     try:
-        code, body = await _httpx_get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin", "vs_currencies": "usd"},
-        )
-        ok = code == 200 and "bitcoin" in body
-        results.append(("CoinGecko simple/price", "OK" if ok else "HTTP %s" % code))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return True, f"{url} HTTP {resp.status}"
+    except urllib.error.HTTPError as e:
+        return e.code in (401, 403, 404), f"{url} HTTP {e.code} (treated ok for reachability)"
     except Exception as e:
-        results.append(("CoinGecko simple/price", "ERR %s: %s" % (type(e).__name__, e)))
+        return False, f"{url}: {e}"
 
+
+def _check_redis() -> tuple[bool, str]:
+    host = os.environ.get("REDIS_HOST", "127.0.0.1")
+    port = int(os.environ.get("REDIS_PORT", "6379"))
     try:
-        code, _ = await _httpx_get(
-            "https://api.openai.com/v1/models",
-            headers={"Authorization": "Bearer sk-smoke-invalid"},
-        )
-        ok = code in (200, 401, 403)
-        results.append(("OpenAI API reachability", "HTTP %s%s" % (code, " OK" if ok else " unexpected")))
+        import redis
+
+        r = redis.Redis(host=host, port=port, socket_connect_timeout=3)
+        if r.ping():
+            return True, f"redis {host}:{port} PONG"
+        return False, f"redis {host}:{port} no PONG"
+    except ImportError:
+        return False, "redis-py not installed"
     except Exception as e:
-        results.append(("OpenAI API reachability", "ERR %s: %s" % (type(e).__name__, e)))
+        return False, f"redis {host}:{port}: {e}"
 
-    key = (os.getenv("OKX_API_KEY") or "").strip()
-    # 与 .env.example / OKXExchange 一致：主项目用 OKX_SECRET；部分文档写成 OKX_SECRET_KEY
-    sec = (os.getenv("OKX_SECRET_KEY") or os.getenv("OKX_SECRET") or "").strip()
-    passphrase = (os.getenv("OKX_PASSPHRASE") or "").strip()
-    if key and sec and passphrase:
-        try:
-            from src.modules.exchanges.okx import OKXExchange
 
-            cfg = {
-                "api_key": key,
-                "api_secret": sec,
-                "passphrase": passphrase,
-                "testnet": str(os.getenv("OKX_TESTNET", "")).strip().lower() in ("1", "true", "yes"),
-            }
-            ex = OKXExchange(cfg)
-            await ex.initialize()
-            bal = await ex.get_balance()
-            await ex.cleanup()
-            results.append(("OKX signed get_balance", "OK keys=%d" % len(bal)))
-        except Exception as e:
-            results.append(("OKX signed get_balance", "ERR %s: %s" % (type(e).__name__, e)))
-    else:
-        results.append(("OKX signed get_balance", "SKIP (no OKX_* in env)"))
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--redis", action="store_true", help="Also ping Redis (REDIS_HOST/REDIS_PORT)")
+    p.add_argument(
+        "--api-url",
+        default="",
+        help="可选：本机 API 健康检查 URL（如 http://127.0.0.1:8000/health）",
+    )
+    args = p.parse_args()
 
-    try:
-        import importlib.util
+    ok_all = True
+    checks = [
+        ("DNS okx.com", lambda: _check_dns("www.okx.com")),
+        ("DNS cloudflare", lambda: _check_dns("one.one.one.one")),
+        # 用 TCP 443 代替 HTTPS GET：透明代理/TUN 场景下 TLS 握手常被中间盒干扰，不代表交易 API 不可用
+        ("TCP443 OKX", lambda: _check_tcp_connect("www.okx.com", 443)),
+    ]
+    if args.redis:
+        checks.append(("Redis ping", _check_redis))
+    if (args.api_url or "").strip():
+        u = (args.api_url or "").strip()
+        checks.append(("API health", lambda url=u: _check_https(url, timeout=15.0)))
 
-        ellm_path = ROOT / "src/modules/core/enhanced_llm_manager.py"
-        spec = importlib.util.spec_from_file_location("_oc_enhanced_llm_manager", ellm_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("cannot load enhanced_llm_manager")
-        ellm = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(ellm)
-        ModelConfig = ellm.ModelConfig
-        ModelProvider = ellm.ModelProvider
-        OpenAIProvider = ellm.OpenAIProvider
+    for name, fn in checks:
+        ok, msg = fn()
+        ok_all = ok_all and ok
+        tag = "OK " if ok else "FAIL"
+        print(f"[{tag}] {name}: {msg}")
 
-        mc = ModelConfig(
-            provider=ModelProvider.OPENAI,
-            model_id="gpt-4o-mini",
-            display_name="smoke",
-            api_key="sk-smoke",
-            base_url="https://api.openai.com/v1",
-            timeout=15.0,
-            max_retries=1,
-        )
-        p = OpenAIProvider(mc)
-        await p.initialize()
-        assert p.session is not None
-        r = await p.session.get(
-            "https://api.openai.com/v1/models",
-            headers={"Authorization": "Bearer sk-smoke"},
-        )
-        code = r.status_code
-        await p.cleanup()
-        ok = code in (401, 403)
-        results.append(("OpenAIProvider httpx session", "HTTP %s%s" % (code, " OK" if ok else "")))
-    except Exception as e:
-        results.append(("OpenAIProvider httpx session", "ERR %s: %s" % (type(e).__name__, e)))
-
-    for name, status in results:
-        print("%s: %s" % (name, status))
-    failed = [x for x in results if x[1].startswith("ERR") or ("unexpected" in x[1])]
-    return 1 if failed else 0
+    if ok_all:
+        print("NETWORK_SMOKE=PASS")
+        return 0
+    print("NETWORK_SMOKE=FAIL", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    sys.exit(main())

@@ -1,0 +1,8 @@
+# 复制为同目录 local.yaml（或 local.yml / local.json），填写本机密钥与覆盖项。
+# 该文件被 Git 忽略；ConfigManager 会在加载 config/config.yaml 之后深合并 local.*。
+#
+# 示例（取消注释并修改）：
+# llm:
+#   default_model: your-local-default
+# trading:
+#   paper_trading: true

@@ -800,14 +800,16 @@ class MainController:
             telegram_config = await self.config_manager.get_config("telegram", {})
             logger.info(f"📱 Telegram配置: {telegram_config}")
             
-            # 获取代理配置
             proxy_config = await self.config_manager.get_config("proxy", {})
-            if proxy_config.get("enabled") and proxy_config.get("use_global_proxy"):
-                global_proxy = proxy_config.get("global_proxy", {})
-                if global_proxy.get("enabled"):
-                    proxy_url = f"{global_proxy.get('proxy_type', 'http')}://{global_proxy.get('host')}:{global_proxy.get('port')}"
-                    telegram_config["proxy"] = proxy_url
-                    logger.info(f"Telegram机器人配置代理: {proxy_url}")
+            if isinstance(proxy_config, dict) and proxy_config.get("enabled"):
+                from src.modules.core.network_env_from_config import (
+                    build_proxy_url_from_config,
+                )
+
+                purl = build_proxy_url_from_config(proxy_config)
+                if purl:
+                    telegram_config["proxy"] = purl
+                    logger.info("Telegram 使用主配置代理: %s", purl)
             
             self.telegram_bot = TelegramBot(
                 telegram_config,
@@ -1008,15 +1010,70 @@ class MainController:
             self.ai_core = None
             self.active_trader = None
         
-        # 初始化统一信息收集分析管理器
+        # 初始化统一信息收集分析管理器（交易对与 trading.symbols / unified_info_collector 对齐）
         try:
+            default_uic_symbols = [
+                "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+                "XRP/USDT", "ADA/USDT", "DOGE/USDT", "DOT/USDT",
+            ]
+            uic_yaml: Dict[str, Any] = {}
+            uic_symbols: List[str] = []
+            if self.config_manager:
+                try:
+                    uic_yaml = await self.config_manager.get_config(
+                        "unified_info_collector", {}
+                    ) or {}
+                except Exception:
+                    uic_yaml = {}
+            if not isinstance(uic_yaml, dict):
+                uic_yaml = {}
+            raw_uic = uic_yaml.get("symbols")
+            if isinstance(raw_uic, list) and raw_uic:
+                uic_symbols = [str(s) for s in raw_uic if s]
+            if not uic_symbols and self.config_manager:
+                try:
+                    trading_cfg = await self.config_manager.get_config("trading", {}) or {}
+                    if isinstance(trading_cfg, dict):
+                        ts = trading_cfg.get("symbols")
+                        if isinstance(ts, list) and ts:
+                            uic_symbols = [str(s) for s in ts if s]
+                except Exception:
+                    pass
+            if not uic_symbols:
+                uic_symbols = list(default_uic_symbols)
+
+            ic_extra: Dict[str, Any] = {}
+            for k in (
+                "enabled",
+                "enable_realtime_collection",
+                "enable_market_analysis",
+                "enable_sentiment_analysis",
+                "enable_onchain_analysis",
+            ):
+                if k in uic_yaml:
+                    ic_extra[k] = bool(uic_yaml[k])
+            if "update_interval" in uic_yaml:
+                try:
+                    ic_extra["update_interval"] = float(uic_yaml["update_interval"])
+                except (TypeError, ValueError):
+                    pass
+            if "cache_ttl" in uic_yaml:
+                try:
+                    ic_extra["cache_ttl"] = int(uic_yaml["cache_ttl"])
+                except (TypeError, ValueError):
+                    pass
+            if "max_cache_size" in uic_yaml:
+                try:
+                    ic_extra["max_cache_size"] = int(uic_yaml["max_cache_size"])
+                except (TypeError, ValueError):
+                    pass
+            ss = uic_yaml.get("sentiment_sources")
+            if isinstance(ss, list) and ss:
+                ic_extra["sentiment_sources"] = [str(x) for x in ss if x]
+
             info_collector_config = InfoCollectorConfig(
-                enable_realtime_collection=True,
-                enable_market_analysis=True,
-                enable_sentiment_analysis=True,
-                enable_onchain_analysis=True,
-                symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", 
-                        "XRP/USDT", "ADA/USDT", "DOGE/USDT", "DOT/USDT"]
+                symbols=uic_symbols,
+                **ic_extra,
             )
             self.unified_info_collector = UnifiedInfoCollector(
                 main_controller=self,
@@ -1070,6 +1127,15 @@ class MainController:
         except Exception as e:
             logger.warning(f"⚠️ DataIntegration 初始化失败: {e}")
             self.data_integration = None
+
+        if self.data_integration and self.ai_trading_engine:
+            fusion = getattr(self.ai_trading_engine, "data_fusion", None)
+            if fusion is not None and hasattr(fusion, "set_data_integration"):
+                try:
+                    fusion.set_data_integration(self.data_integration)
+                    logger.info("✅ MultiSourceDataFusion 已绑定 DataIntegration")
+                except Exception as e:
+                    logger.debug("绑定 DataIntegration 到 data_fusion 失败: %s", e)
 
         # 初始化市场情报汇总引擎（只读：汇总行情/信号，供 ai_core/风控/前端复用）
         try:
@@ -1363,16 +1429,37 @@ class MainController:
             logger.warning(f"⚠️ 执行验证器初始化失败: {e}")
             self.execution_verifier = None
         
-        # 初始化动态币种筛选器
+        # 初始化动态币种筛选器（参数来自 trading / trading.contract）
         try:
+            trading_cfg = await self.config_manager.get_config("trading", {}) or {}
+            contract = (
+                trading_cfg.get("contract") if isinstance(trading_cfg.get("contract"), dict) else {}
+            )
+            dyn = (
+                trading_cfg.get("dynamic_symbols")
+                if isinstance(trading_cfg.get("dynamic_symbols"), dict)
+                else {}
+            )
+            su = str(contract.get("symbol_universe", "full_exchange") or "full_exchange").lower()
+            restricted = su in ("whitelist", "restricted", "list")
+            allowed = contract.get("allowed_symbols")
+            if not isinstance(allowed, list) or not allowed:
+                allowed = trading_cfg.get("symbols") or []
+            base_include = dyn.get("always_include")
+            if not isinstance(base_include, list) or not base_include:
+                base_include = trading_cfg.get("symbols") or ["BTC/USDT", "ETH/USDT"]
             selector_config = DynamicSymbolSelectorConfig(
-                max_symbols=10,
-                min_symbols=3,
-                selection_interval=300,
-                min_24h_volume=10000000,
-                enable_auto_discovery=True,
-                always_include=["BTC/USDT", "ETH/USDT"],
-                always_exclude=[]
+                max_symbols=int(dyn.get("max_symbols", 12) or 12),
+                min_symbols=int(dyn.get("min_symbols", 2) or 2),
+                selection_interval=int(
+                    dyn.get("selection_interval", 300) or 300
+                ),
+                min_24h_volume=float(dyn.get("min_24h_volume", 10_000_000) or 10_000_000),
+                enable_auto_discovery=bool(dyn.get("enable_auto_discovery", True)),
+                always_include=[str(x) for x in base_include if x],
+                always_exclude=[str(x) for x in (dyn.get("always_exclude") or []) if x],
+                restricted_universe=restricted,
+                allowed_symbols=[str(x) for x in allowed if x] if restricted else [],
             )
             self.dynamic_symbol_selector = DynamicSymbolSelector(selector_config)
             await self.dynamic_symbol_selector.initialize()
@@ -4128,8 +4215,30 @@ class MainController:
 
     async def _send_notification_direct(self, title: str, message: str, priority: str = "medium"):
         """直接发送通知到底层渠道（不做智能去重/节流）。"""
+        channels = {"telegram", "log"}
+        try:
+            if self.config_manager:
+                msg = await self.config_manager.get_config("messaging", {}) or {}
+                inst = msg.get("instant") if isinstance(msg.get("instant"), dict) else {}
+                if inst.get("enabled") is False:
+                    log_level = {
+                        "critical": logging.CRITICAL,
+                        "high": logging.WARNING,
+                        "medium": logging.INFO,
+                        "low": logging.DEBUG,
+                    }.get(priority.lower(), logging.INFO)
+                    logger.log(
+                        log_level, f"📢 [messaging.instant 已关闭] {title}: {message[:200]}"
+                    )
+                    return
+                ch = inst.get("channels")
+                if isinstance(ch, list) and ch:
+                    channels = {str(x).strip().lower() for x in ch if x}
+        except Exception:
+            pass
+
         # 发送到Telegram
-        if self.telegram_bot:
+        if "telegram" in channels and self.telegram_bot:
             try:
                 await self.telegram_bot.send_message(f"{title}\n\n{message}")
                 logger.debug(f"Telegram通知已发送: {title}")
@@ -4151,14 +4260,14 @@ class MainController:
                     self._telegram_fail_dedup[key] = now  # type: ignore[attr-defined]
                     logger.error(f"Telegram通知发送失败: {e}")
 
-        # 记录到日志
-        log_level = {
-            "critical": logging.CRITICAL,
-            "high": logging.WARNING,
-            "medium": logging.INFO,
-            "low": logging.DEBUG
-        }.get(priority.lower(), logging.INFO)
-        logger.log(log_level, f"📢 [{priority.upper()}] {title}: {message[:100]}")
+        if "log" in channels:
+            log_level = {
+                "critical": logging.CRITICAL,
+                "high": logging.WARNING,
+                "medium": logging.INFO,
+                "low": logging.DEBUG,
+            }.get(priority.lower(), logging.INFO)
+            logger.log(log_level, f"📢 [{priority.upper()}] {title}: {message[:100]}")
 
     async def _send_notification_handler(self, title: str, message: str, priority: str = "medium"):
         """
@@ -4170,6 +4279,16 @@ class MainController:
             priority: 优先级
         """
         try:
+            if self.config_manager:
+                try:
+                    msg = await self.config_manager.get_config("messaging", {}) or {}
+                    inst = msg.get("instant") if isinstance(msg.get("instant"), dict) else {}
+                    if inst.get("enabled") is False:
+                        logger.debug("即时消息通道已关闭(messaging.instant)，跳过: %s", title)
+                        return
+                except Exception:
+                    pass
+
             # Hard-block low-value "opportunity discovery" notifications.
             try:
                 block_phrases = []

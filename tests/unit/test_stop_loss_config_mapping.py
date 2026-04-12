@@ -54,3 +54,10 @@ def test_matches_builtin_defaults_shape():
     cfg = stop_loss_take_profit_config_from_mapping({})
     assert cfg.trailing_only_mode == base.trailing_only_mode
     assert cfg.persist_file == base.persist_file
+
+
+def test_trailing_only_coerce_inputs_mapping():
+    cfg = stop_loss_take_profit_config_from_mapping(
+        {"trailing_only_coerce_inputs": "false"}
+    )
+    assert cfg.trailing_only_coerce_inputs is False

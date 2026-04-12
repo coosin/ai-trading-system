@@ -166,6 +166,8 @@ class StopLossTakeProfitConfig:
     # --- 移动止盈止损模式：开仓即2.3%追踪；浮盈达2.3%后收紧到1.3%；不设固定止盈 ---
     trailing_only_mode: bool = True
     """为 True 时：新建单使用 TRAILING 止损 + 无固定止盈价，仅依赖移动止损出场。"""
+    trailing_only_coerce_inputs: bool = True
+    """为 True 且 trailing_only_mode 时：忽略外部传入的固定/百分比 SLTP，强制移动止损 + 无止盈价。"""
     trailing_active_on_open: bool = True
     """开仓即启用移动止损逻辑（不等浮盈达到 trailing_stop_trigger）。"""
     initial_trailing_offset: float = 0.023
@@ -935,7 +937,17 @@ class StopLossTakeProfitManager:
         sl_config = stop_loss_config or StopLossConfig()
         tp_config = take_profit_config or TakeProfitConfig()
 
-        if (
+        if self.config.trailing_only_mode and getattr(
+            self.config, "trailing_only_coerce_inputs", True
+        ):
+            off0 = float(self.config.initial_trailing_offset)
+            sl_config = StopLossConfig(
+                stop_type=StopType.TRAILING,
+                stop_value=off0,
+                trailing_offset=off0,
+            )
+            tp_config = TakeProfitConfig(tp_type=TakeProfitType.NONE, tp_value=0.0)
+        elif (
             self.config.trailing_only_mode
             and stop_loss_config is None
             and take_profit_config is None

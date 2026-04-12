@@ -81,13 +81,16 @@ fi
 
 echo ""
 
-# 配置文件检查
+# 配置文件检查（主调参：仓库内 config/config.yaml）
 echo "⚙️ 配置文件:"
-if [ -f "$TRADING_HOME/openclaw-trading.json" ]; then
-    CONFIG_SIZE=$(wc -c < "$TRADING_HOME/openclaw-trading.json")
-    echo "  ✅ 交易系统配置 ($CONFIG_SIZE 字节)"
+if [ -f "$TRADING_HOME/config/config.yaml" ]; then
+    CONFIG_SIZE=$(wc -c < "$TRADING_HOME/config/config.yaml")
+    echo "  ✅ 交易系统主配置 config/config.yaml ($CONFIG_SIZE 字节)"
+elif [ -f "$TRADING_HOME/config/config.yml" ]; then
+    CONFIG_SIZE=$(wc -c < "$TRADING_HOME/config/config.yml")
+    echo "  ✅ 交易系统主配置 config/config.yml ($CONFIG_SIZE 字节)"
 else
-    echo "  ❌ 交易系统配置不存在"
+    echo "  ❌ 未找到 config/config.yaml（或 config.yml）"
 fi
 
 if [ -f "/home/cool/.openclaw/openclaw.json" ]; then

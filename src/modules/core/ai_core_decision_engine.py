@@ -105,7 +105,7 @@ class AICoreDecisionEngine:
         
         self.config = {
             "leverage_min": 10,
-            "leverage_max": 50,
+            "leverage_max": 100,
             "default_leverage": 20,
             "max_positions": 5,
             # 中频档：在不激进放宽风控的前提下，适度提升开单频率
@@ -190,6 +190,9 @@ class AICoreDecisionEngine:
             "hold_avoidance_override_min_mi_quality_score": 0.62,
             "hold_avoidance_override_require_mi_trend_alignment": True,
         }
+
+        # 开仓 RR 门控与主配置 stop_loss_take_profit（移动止损）对齐
+        self._sltp_open_snapshot: Dict[str, Any] = {}
         
         # 状态
         self._running = False
@@ -297,6 +300,31 @@ class AICoreDecisionEngine:
         
         # 加载用户规则
         await self._load_user_rules()
+
+        if self.main_controller.config_manager:
+            try:
+                tr = await self.main_controller.config_manager.get_config("trading", {}) or {}
+                from src.modules.core.trading_contract_settings import (
+                    apply_trading_contract_unified,
+                )
+
+                _cc: Dict[str, Any] = {}
+                _ai: Dict[str, Any] = {}
+                apply_trading_contract_unified(
+                    tr if isinstance(tr, dict) else {},
+                    contract_config=_cc,
+                    ai_config=_ai,
+                    ai_core_config=self.config,
+                )
+                sltp = (
+                    await self.main_controller.config_manager.get_config(
+                        "stop_loss_take_profit", {}
+                    )
+                    or {}
+                )
+                self._sltp_open_snapshot = dict(sltp) if isinstance(sltp, dict) else {}
+            except Exception as e:
+                logger.warning("AI核心加载 trading.contract / SLTP 快照失败: %s", e)
         
         logger.info("✅ AI核心决策引擎初始化完成 - AI拥有完整控制权")
 
@@ -3224,7 +3252,10 @@ class AICoreDecisionEngine:
             
             decision.entry_price = current_price
             
-            leverage = min(decision.leverage, self.config['leverage_max'])
+            lev_min = float(self.config.get("leverage_min", 1) or 1)
+            lev_max = float(self.config.get("leverage_max", 100) or 100)
+            leverage = float(decision.leverage or self.config.get("default_leverage", 20))
+            leverage = min(max(leverage, lev_min), lev_max)
             low_thr = float(self.config.get("low_balance_usdt_threshold") or 25.0)
             if is_open:
                 # 3. 根据余额动态调整数量：低余额时允许用更高比例的可用作保证金（仍受杠杆上限约束）
@@ -3285,7 +3316,7 @@ class AICoreDecisionEngine:
             except Exception as e:
                 logger.debug(f"动态仓位调整失败: {e}")
             
-            decision.leverage = leverage
+            decision.leverage = int(round(leverage))
 
             rr = 0.0
             spread_bps = None
@@ -3306,14 +3337,28 @@ class AICoreDecisionEngine:
                 }
                 logger.info("🎯 平仓路径：跳过开仓专用 RR/盘口/深度门控")
             else:
-                # 4. 设置止损止盈（开仓）
-                atr = current_price * 0.02
-                if decision.side == 'long':
-                    decision.stop_loss = current_price - 2 * atr
-                    decision.take_profit = current_price + 3 * atr
+                # 4. 开仓门控用风险距离：主路径为移动止损（固定止盈止损关闭），此处仅构造合成 RR
+                sltp = self._sltp_open_snapshot or {}
+                trailing_only = bool(sltp.get("trailing_only_mode", True))
+                if trailing_only:
+                    off = float(sltp.get("initial_trailing_offset", 0.01) or 0.01)
+                    mult = float(sltp.get("open_rr_synthetic_reward_multiple", 1.5) or 1.5)
+                    risk_px = current_price * off
+                    reward_px = risk_px * mult
+                    if decision.side == "long":
+                        decision.stop_loss = current_price - risk_px
+                        decision.take_profit = current_price + reward_px
+                    else:
+                        decision.stop_loss = current_price + risk_px
+                        decision.take_profit = current_price - reward_px
                 else:
-                    decision.stop_loss = current_price + 2 * atr
-                    decision.take_profit = current_price - 3 * atr
+                    atr = current_price * 0.02
+                    if decision.side == "long":
+                        decision.stop_loss = current_price - 2 * atr
+                        decision.take_profit = current_price + 3 * atr
+                    else:
+                        decision.stop_loss = current_price + 2 * atr
+                        decision.take_profit = current_price - 3 * atr
                 
                 # 3.2 数据退化时自动降仓（避免单点数据故障造成激进下单）
                 if "data_quality_guard" in str(decision.reasoning or ""):
