@@ -1,0 +1,46 @@
+data:
+  history_days: 365
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  update_interval: 60
+monitoring:
+  enabled: true
+  health_check_interval: 30
+  metrics_interval: 60
+risk:
+  enabled: true
+  max_drawdown: 0.1
+  position_limit: 0.2
+  var_limit: 0.05
+system:
+  debug: false
+  log_level: INFO
+  name: AI Trading System
+  version: 1.0.0
+trading:
+  commission_rate: 0.001
+  enabled: true
+  max_daily_loss: 0.02
+  max_position_count: 10
+  max_position_size: 0.1
+  paper_trading: true
+  slippage_rate: 0.0005
+
+stop_loss_take_profit:
+  trailing_only_mode: true
+  trailing_active_on_open: true
+  initial_trailing_offset: 0.01
+  profit_tier2_pnl_threshold: 0.50
+  tier2_trailing_offset: 0.005
+  trailing_momentum_adjust_enable: true
+  default_stop_loss_percent: 0.03
+  default_take_profit_percent: 0.06
+  enable_trailing_stop: true
+  trailing_stop_offset: 0.01
+  trailing_stop_trigger: 0.0
+  enable_breakeven: false
+  breakeven_trigger: 0.02
+  enable_partial_tp: false
+  check_interval: 5
+  execute_exchange_on_trigger: true

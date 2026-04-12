@@ -3,6 +3,9 @@
 
 负责统一配置加载、管理、验证和热重载。
 支持多格式配置（JSON/YAML/Env）、配置验证和默认值设置。
+
+可调参数主文件：各配置目录下的 ``openclaw.yml``（及 ``local.yml`` 本机覆盖），
+加载顺序见 ``_ordered_config_files_in_dir``；合并后由 ``config_runtime_validate`` 做关键校验。
 """
 
 import asyncio
@@ -300,7 +303,7 @@ class ConfigManager:
                 "opportunity_cooldown_sec": 14400,
             },
         },
-        # Stop-loss / take-profit manager (merged by YAML/env; see config/default.yml).
+        # Stop-loss / take-profit manager (merged by YAML/env; see config/openclaw.yml).
         "stop_loss_take_profit": {
             "trailing_only_mode": True,
             "trailing_active_on_open": True,
@@ -517,6 +520,57 @@ class ConfigManager:
             else:
                 base[k] = v
         return base
+
+    @staticmethod
+    def _ordered_config_files_in_dir(config_dir: Path) -> List[Path]:
+        """
+        单目录内加载顺序（后者覆盖前者）：
+        default.* < openclaw.* < 其它片段文件（字母序）< local.*
+        """
+        if not config_dir.is_dir():
+            return []
+
+        def files_sorted(pattern: str) -> List[Path]:
+            return sorted([p for p in config_dir.glob(pattern) if p.is_file()])
+
+        ordered: List[Path] = []
+        for pattern in (
+            "default.json",
+            "default.yaml",
+            "default.yml",
+            "openclaw.json",
+            "openclaw.yaml",
+            "openclaw.yml",
+        ):
+            ordered.extend(files_sorted(pattern))
+
+        other: List[Path] = []
+        for pattern in ("*.json", "*.yaml", "*.yml"):
+            for p in sorted(config_dir.glob(pattern), key=lambda x: str(x).lower()):
+                if not p.is_file():
+                    continue
+                ln = p.name.lower()
+                if (
+                    ln.startswith("default.")
+                    or ln.startswith("openclaw.")
+                    or ln.startswith("local.")
+                ):
+                    continue
+                other.append(p)
+        ordered.extend(other)
+
+        for pattern in ("local.json", "local.yaml", "local.yml"):
+            ordered.extend(files_sorted(pattern))
+
+        seen: set[str] = set()
+        out: List[Path] = []
+        for p in ordered:
+            key = str(p.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+        return out
 
     def _find_config_dir(self) -> Path:
         """查找第一个存在的配置目录"""
@@ -860,39 +914,27 @@ class ConfigManager:
         self._config = {}
         self._deep_update(self._config, self.DEFAULT_CONFIG)
 
-        loaded_files = set()
-        
+        loaded_paths: set[str] = set()
+
         for config_dir in self._config_dirs:
-            # Deterministic priority: default.* first, then other files sorted.
-            config_files: List[Path] = []
-            default_candidates: List[Path] = []
-            other_candidates: List[Path] = []
+            for config_file in self._ordered_config_files_in_dir(config_dir):
+                path_key = str(config_file.resolve())
+                if path_key in loaded_paths:
+                    continue
+                await self._load_config_file(config_file)
+                loaded_paths.add(path_key)
 
-            default_candidates.extend(sorted(config_dir.glob("default.json")))
-            if yaml:
-                default_candidates.extend(sorted(config_dir.glob("default.yaml")))
-                default_candidates.extend(sorted(config_dir.glob("default.yml")))
-
-            other_candidates.extend(sorted(config_dir.glob("*.json")))
-            if yaml:
-                other_candidates.extend(sorted(config_dir.glob("*.yaml")))
-                other_candidates.extend(sorted(config_dir.glob("*.yml")))
-
-            # Remove defaults from other_candidates to avoid double load
-            default_set = {p.resolve() for p in default_candidates}
-            other_candidates = [p for p in other_candidates if p.resolve() not in default_set]
-
-            config_files.extend(default_candidates)
-            config_files.extend(other_candidates)
-            
-            for config_file in config_files:
-                file_key = f"{config_dir.name}/{config_file.name}"
-                if file_key not in loaded_files:
-                    await self._load_config_file(config_file)
-                    loaded_files.add(file_key)
-        
         await self._load_environment_configs()
-        logger.info(f"已加载 {len(loaded_files)} 个配置文件")
+        try:
+            from src.modules.core.config_runtime_validate import (
+                ConfigRuntimeValidateError,
+                validate_merged_runtime_config,
+            )
+
+            validate_merged_runtime_config(self._config)
+        except ConfigRuntimeValidateError as e:
+            raise ConfigValidationError(str(e)) from e
+        logger.info("已加载 %d 个配置文件（路径去重）", len(loaded_paths))
 
     async def _load_config_file(self, config_file: Path) -> None:
         """加载配置文件"""
@@ -913,6 +955,13 @@ class ConfigManager:
                     return
             else:
                 logger.warning(f"不支持的配置文件格式: {config_file}")
+                return
+
+            if config_data is None:
+                logger.debug("跳过空/仅注释的配置文件: %s", config_file)
+                return
+            if not isinstance(config_data, dict):
+                logger.warning("配置文件根必须为字典，跳过: %s", config_file)
                 return
 
             # 合并配置

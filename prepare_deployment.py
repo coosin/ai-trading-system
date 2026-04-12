@@ -67,10 +67,10 @@ def check_config_files():
     """检查配置文件"""
     logger.info("🔍 检查配置文件...")
     
-    # 检查默认配置文件
-    default_config = Path("config/default.yml")
-    if not default_config.exists():
-        logger.warning("默认配置文件不存在，将创建默认配置")
+    # 主可调配置：config/openclaw.yml（default.yml 仅为兼容占位）
+    primary_config = Path("config/openclaw.yml")
+    if not primary_config.exists():
+        logger.warning("主配置文件 config/openclaw.yml 不存在，将创建默认配置")
         # 创建默认配置
         default_config_content = {
             "system": {
@@ -123,11 +123,12 @@ def check_config_files():
         }
         
         import yaml
-        with open(default_config, 'w', encoding='utf-8') as f:
+        primary_config.parent.mkdir(parents=True, exist_ok=True)
+        with open(primary_config, 'w', encoding='utf-8') as f:
             yaml.dump(default_config_content, f, default_flow_style=False, allow_unicode=True)
-        logger.info("✅ 创建默认配置文件")
+        logger.info("✅ 创建主配置文件 config/openclaw.yml")
     else:
-        logger.info("✅ 默认配置文件存在")
+        logger.info("✅ 主配置文件存在: config/openclaw.yml")
     
     # 检查生产环境配置文件
     production_config = Path("config/production.yml")

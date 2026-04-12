@@ -1,0 +1,67 @@
+# =============================================================================
+# OpenClaw 统一可调配置（主文件）
+# -----------------------------------------------------------------------------
+# 优先级（后者覆盖前者）：代码内置 DEFAULT_CONFIG < 各目录 default.* <
+#   openclaw.* < 同目录其它 *.yml/json < local.* < 环境变量 OPENCLAW__*__
+#
+# 密钥（API Key、Token、数据库密码）请放在仓库根目录 .env，勿写入本文件。
+# 本机差异：可将 config/openclaw.local.example.yml 复制为 config/local.yml（已 gitignore）。
+#
+# 若同时使用 data/config 与 config 两个目录：每个目录内按上述顺序合并；
+# 目录之间按 ConfigManager.DEFAULT_CONFIG_PATHS 顺序依次合并（靠后的目录覆盖同名键）。
+# =============================================================================
+
+data:
+  history_days: 365
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  update_interval: 60
+monitoring:
+  enabled: true
+  health_check_interval: 30
+  metrics_interval: 60
+risk:
+  enabled: true
+  max_drawdown: 0.1
+  position_limit: 0.2
+  var_limit: 0.05
+system:
+  debug: false
+  log_level: INFO
+  name: AI Trading System
+  version: 1.0.0
+trading:
+  commission_rate: 0.001
+  enabled: true
+  max_daily_loss: 0.02
+  max_position_count: 10
+  max_position_size: 0.1
+  paper_trading: true
+  slippage_rate: 0.0005
+
+# 止盈止损（StopLossTakeProfitManager）：与 ConfigManager.stop_loss_take_profit 深度合并。
+stop_loss_take_profit:
+  trailing_only_mode: true
+  trailing_active_on_open: true
+  initial_trailing_offset: 0.01
+  profit_tier2_pnl_threshold: 0.50
+  tier2_trailing_offset: 0.005
+  trailing_momentum_adjust_enable: true
+  default_stop_loss_percent: 0.03
+  default_take_profit_percent: 0.06
+  enable_trailing_stop: true
+  trailing_stop_offset: 0.01
+  trailing_stop_trigger: 0.0
+  enable_breakeven: false
+  breakeven_trigger: 0.02
+  enable_partial_tp: false
+  check_interval: 5
+  execute_exchange_on_trigger: true
+
+# 可选：旧文档中的 strategy.risk_management；仅当 stop_loss_take_profit 未提供
+# default_stop_loss_percent / default_take_profit_percent 时作为回退。
+strategy:
+  risk_management:
+    stop_loss: 0.03
+    take_profit: 0.06

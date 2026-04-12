@@ -40,6 +40,14 @@ env/
 .env.local
 .env.*.local
 
+# 本机配置覆盖（统一主文件为 config/openclaw.yml）
+config/local.yml
+config/local.yaml
+config/local.json
+data/config/local.yml
+data/config/local.yaml
+data/config/local.json
+
 # Logs
 logs/
 *.log

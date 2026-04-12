@@ -555,5 +555,48 @@ class TestConfigTransaction:
         assert value == "new_value"
 
 
+class TestConfigFilePrecedence:
+    """default < openclaw < local；路径 resolve 去重。"""
+
+    @pytest.mark.asyncio
+    async def test_openclaw_overrides_default(self, tmp_path):
+        d = tmp_path / "cfg"
+        d.mkdir()
+        (d / "default.yml").write_text("demo:\n  x: 1\n", encoding="utf-8")
+        (d / "openclaw.yml").write_text("demo:\n  x: 2\n", encoding="utf-8")
+        m = ConfigManager(config_dir=str(d), watch_interval=0)
+        await m.initialize()
+        try:
+            assert await m.get_config("demo", "x") == 2
+        finally:
+            await m.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_local_overrides_openclaw(self, tmp_path):
+        d = tmp_path / "cfg"
+        d.mkdir()
+        (d / "default.yml").write_text("demo:\n  x: 1\n", encoding="utf-8")
+        (d / "openclaw.yml").write_text("demo:\n  x: 2\n", encoding="utf-8")
+        (d / "local.yml").write_text("demo:\n  x: 3\n", encoding="utf-8")
+        m = ConfigManager(config_dir=str(d), watch_interval=0)
+        await m.initialize()
+        try:
+            assert await m.get_config("demo", "x") == 3
+        finally:
+            await m.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_invalid_stop_loss_type_raises(self, tmp_path):
+        d = tmp_path / "cfg"
+        d.mkdir()
+        (d / "openclaw.yml").write_text(
+            "stop_loss_take_profit:\n  check_interval: notint\n",
+            encoding="utf-8",
+        )
+        m = ConfigManager(config_dir=str(d), watch_interval=0)
+        with pytest.raises(ConfigValidationError):
+            await m.initialize()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
