@@ -41,6 +41,7 @@ class TakeProfitType(Enum):
     TRAILING = "trailing"           # 移动止盈
     PARTIAL = "partial"             # 分批止盈
     PERCENTAGE = "percentage"       # 百分比止盈
+    NONE = "none"                   # 不使用固定止盈（仅移动止损/追踪出场）
 
 
 class StopLossTakeProfitStatus(Enum):
@@ -138,7 +139,10 @@ class StopLossTakeProfitOrder:
             "stop_loss_type": self.stop_loss_type.value,
             "take_profit_price": _safe_num(self.take_profit_price),
             "take_profit_type": self.take_profit_type.value,
+            "take_profit_value": _safe_num(self.take_profit_value),
+            "stop_loss_value": _safe_num(self.stop_loss_value),
             "trailing_stop_activated": self.trailing_stop_activated,
+            "trailing_stop_offset": _safe_num(self.trailing_stop_offset),
             "highest_price": _safe_num(self.highest_price),
             "lowest_price": _safe_num(self.lowest_price),
             "breakeven_activated": self.breakeven_activated,
@@ -158,9 +162,26 @@ class StopLossTakeProfitConfig:
     enable_trailing_stop: bool = True
     trailing_stop_offset: float = 0.02
     trailing_stop_trigger: float = 0.02
-    enable_breakeven: bool = True
+    # --- 移动止盈止损优先（默认）：开仓即 1% 追踪带宽；浮盈达阈值后收紧到二档；不设固定止盈价 ---
+    trailing_only_mode: bool = True
+    """为 True 时：新建单使用 TRAILING 止损 + 无固定止盈价，仅依赖移动止损出场。"""
+    trailing_active_on_open: bool = True
+    """开仓即启用移动止损逻辑（不等浮盈达到 trailing_stop_trigger）。"""
+    initial_trailing_offset: float = 0.01
+    """初始移动止损相对峰值/入场的回撤比例（1%）。"""
+    profit_tier2_pnl_threshold: float = 0.50
+    """二档：相对入场的浮盈比例达到该值后，将移动带宽收紧为 tier2_trailing_offset（默认 50%）。"""
+    tier2_trailing_offset: float = 0.005
+    """二档移动带宽（0.5%），通常比初始更紧以锁利。"""
+    # 动能微调：趋势+短周期变化在「中性带」内则不改变 trailing_offset；转弱收紧，顺势略放宽
+    trailing_momentum_adjust_enable: bool = True
+    trailing_momentum_trend_neutral_abs: float = 0.002
+    trailing_momentum_short_neutral_abs: float = 0.0015
+    trailing_momentum_tighten_factor: float = 0.92
+    trailing_momentum_loosen_factor: float = 1.05
+    enable_breakeven: bool = False
     breakeven_trigger: float = 0.02
-    enable_partial_tp: bool = True
+    enable_partial_tp: bool = False
     check_interval: int = 5
     # 仅限制「活跃跟踪」数量；已触发/已取消的历史单不计入（否则会误伤 sync_open_positions）
     max_orders: int = 100
@@ -179,8 +200,8 @@ class StopLossTakeProfitConfig:
     market_tracking_window: int = 20
     volatility_tighten_threshold: float = 0.02
     trend_extend_threshold: float = 0.005
-    min_trailing_offset: float = 0.006
-    max_trailing_offset: float = 0.03
+    min_trailing_offset: float = 0.003
+    max_trailing_offset: float = 0.02
     # SLTP trigger close confirmation / retry
     pending_close_max_retries: int = 6
     pending_close_backoff_base_sec: float = 2.0
@@ -594,7 +615,10 @@ class StopLossTakeProfitManager:
             tp_value=float(order.take_profit_value or 0.06),
         )
         order.stop_loss_price = self._calculate_stop_loss_price(order.entry_price, order.side, slc)
-        order.take_profit_price = self._calculate_take_profit_price(order.entry_price, order.side, tpc)
+        if order.take_profit_type == TakeProfitType.NONE:
+            order.take_profit_price = None
+        else:
+            order.take_profit_price = self._calculate_take_profit_price(order.entry_price, order.side, tpc)
 
     def _refresh_active_order_from_exchange_position(
         self,
@@ -847,6 +871,19 @@ class StopLossTakeProfitManager:
         
         sl_config = stop_loss_config or StopLossConfig()
         tp_config = take_profit_config or TakeProfitConfig()
+
+        if (
+            self.config.trailing_only_mode
+            and stop_loss_config is None
+            and take_profit_config is None
+        ):
+            off0 = float(self.config.initial_trailing_offset)
+            sl_config = StopLossConfig(
+                stop_type=StopType.TRAILING,
+                stop_value=off0,
+                trailing_offset=off0,
+            )
+            tp_config = TakeProfitConfig(tp_type=TakeProfitType.NONE, tp_value=0.0)
         
         stop_loss_price = self._calculate_stop_loss_price(
             entry_price, side, sl_config
@@ -877,12 +914,19 @@ class StopLossTakeProfitManager:
             take_profit_price=take_profit_price,
             take_profit_type=tp_config.tp_type,
             take_profit_value=tp_config.tp_value,
-            trailing_stop_offset=sl_config.trailing_offset,
+            trailing_stop_offset=float(
+                getattr(sl_config, "trailing_offset", None)
+                or sl_config.stop_value
+                or self.config.initial_trailing_offset
+            ),
             highest_price=entry_price if side == "long" else 0,
             lowest_price=entry_price if side == "short" else float('inf'),
             time_limit=time_limit,
             metadata=meta
         )
+        if self.config.trailing_active_on_open and self.config.enable_trailing_stop:
+            order.trailing_stop_activated = True
+            order.trailing_stop_offset = float(self.config.initial_trailing_offset)
         
         self.orders[order_id] = order
         for k in variants + [canonical]:
@@ -908,13 +952,16 @@ class StopLossTakeProfitManager:
                         "order_id": order_id,
                         "entry_price": float(entry_price),
                         "stop_loss_price": float(stop_loss_price),
-                        "take_profit_price": float(take_profit_price),
+                        "take_profit_price": float(take_profit_price) if take_profit_price is not None else None,
                         "stop_loss_type": getattr(sl_config.stop_type, "value", str(sl_config.stop_type)),
                         "take_profit_type": getattr(tp_config.tp_type, "value", str(tp_config.tp_type)),
                         "quantity": float(quantity),
                         "metadata": dict(meta),
                     },
-                    tg_message=f"🧷 SLTP 建立\n{symbol} {side}\nsl={stop_loss_price:.4g} tp={take_profit_price:.4g}\ntrace_id={trace_id}",
+                    tg_message=(
+                        f"🧷 SLTP 建立\n{symbol} {side}\nsl={stop_loss_price:.4g} tp="
+                        f"{(take_profit_price if take_profit_price is not None else 'trailing-only')}\ntrace_id={trace_id}"
+                    ),
                 )
         except Exception:
             pass
@@ -925,7 +972,9 @@ class StopLossTakeProfitManager:
             logger.info(f"   止损价: {stop_loss_price:.4f} ({sl_config.stop_value*100:.1f}%)")
         else:
             logger.info(f"   止损价: {stop_loss_price:.4f} ({sl_config.stop_type.value})")
-        if tp_config.tp_type == TakeProfitType.PERCENTAGE:
+        if take_profit_price is None or tp_config.tp_type == TakeProfitType.NONE:
+            logger.info("   止盈价: (无固定止盈，移动止损/追踪出场)")
+        elif tp_config.tp_type == TakeProfitType.PERCENTAGE:
             logger.info(f"   止盈价: {take_profit_price:.4f} ({tp_config.tp_value*100:.1f}%)")
         else:
             logger.info(f"   止盈价: {take_profit_price:.4f} ({tp_config.tp_type.value})")
@@ -954,10 +1003,10 @@ class StopLossTakeProfitManager:
         entry_price: float,
         side: str,
         stop_loss_price: float,
-        take_profit_price: float,
+        take_profit_price: Optional[float],
         sl_config: StopLossConfig,
         tp_config: TakeProfitConfig,
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float, Optional[float]]:
         """
         强制止损/止盈相对入场方向正确：
         - 多：止损 < 入场 < 止盈
@@ -969,7 +1018,7 @@ class StopLossTakeProfitManager:
         if ep <= 0 or not math.isfinite(ep):
             return stop_loss_price, take_profit_price
         sl = float(stop_loss_price)
-        tp = float(take_profit_price)
+        tp = float(take_profit_price) if take_profit_price is not None else None
         eps = max(ep * 1e-7, 1e-9)
         # FIXED 时 stop_value/tp_value 为绝对价，不能当百分比用
         if sl_config.stop_type == StopType.PERCENTAGE:
@@ -981,27 +1030,31 @@ class StopLossTakeProfitManager:
         else:
             tp_pct = 0.06
         fixed = False
+        if tp_config.tp_type == TakeProfitType.NONE:
+            tp = None
         if side_l == "long":
             if (not math.isfinite(sl)) or sl >= ep - eps:
                 sl = ep * (1 - sl_pct)
                 fixed = True
-            if (not math.isfinite(tp)) or tp <= ep + eps:
-                tp = ep * (1 + tp_pct)
-                fixed = True
+            if tp is not None:
+                if (not math.isfinite(tp)) or tp <= ep + eps:
+                    tp = ep * (1 + tp_pct)
+                    fixed = True
         elif side_l == "short":
             if (not math.isfinite(sl)) or sl <= ep + eps:
                 sl = ep * (1 + sl_pct)
                 fixed = True
-            if (not math.isfinite(tp)) or tp >= ep - eps:
-                tp = ep * (1 - tp_pct)
-                fixed = True
+            if tp is not None:
+                if (not math.isfinite(tp)) or tp >= ep - eps:
+                    tp = ep * (1 - tp_pct)
+                    fixed = True
         if fixed:
             logger.warning(
-                "SLTP: 止损/止盈与方向不一致已按百分比修正 side=%s entry=%.8g sl->%.8g tp->%.8g",
+                "SLTP: 止损/止盈与方向不一致已按百分比修正 side=%s entry=%.8g sl->%.8g tp->%s",
                 side_l,
                 ep,
                 sl,
-                tp,
+                f"{tp:.8g}" if tp is not None else "None",
             )
         return sl, tp
     
@@ -1024,6 +1077,13 @@ class StopLossTakeProfitManager:
         elif config.stop_type == StopType.ATR_BASED:
             return entry_price - config.atr_multiplier * config.stop_value if side == "long" \
                    else entry_price + config.atr_multiplier * config.stop_value
+
+        elif config.stop_type == StopType.TRAILING:
+            off = float(getattr(config, "trailing_offset", None) or config.stop_value or 0.01)
+            off = min(0.25, max(0.0005, off))
+            if side == "long":
+                return entry_price * (1.0 - off)
+            return entry_price * (1.0 + off)
         
         return entry_price * 0.97 if side == "long" else entry_price * 1.03
     
@@ -1032,8 +1092,11 @@ class StopLossTakeProfitManager:
         entry_price: float,
         side: str,
         config: TakeProfitConfig
-    ) -> float:
-        """计算止盈价格"""
+    ) -> Optional[float]:
+        """计算止盈价格；NONE 表示不设固定止盈。"""
+        if config.tp_type == TakeProfitType.NONE:
+            return None
+
         if config.tp_type == TakeProfitType.FIXED:
             return config.tp_value
         
@@ -1100,11 +1163,12 @@ class StopLossTakeProfitManager:
         if order.side == "long":
             if current_price > order.highest_price:
                 order.highest_price = current_price
-                await self._update_trailing_stop(order, current_price)
         else:
             if current_price < order.lowest_price:
                 order.lowest_price = current_price
-                await self._update_trailing_stop(order, current_price)
+
+        await self._apply_profit_tier2_trailing(order, current_price)
+        await self._update_trailing_stop(order, current_price)
         
         await self._check_breakeven(order, current_price)
         
@@ -1200,6 +1264,16 @@ class StopLossTakeProfitManager:
             tp_extend_ratio = float(meta.get("dynamic_tp_extend_ratio", self.config.dynamic_tp_extend_ratio) or self.config.dynamic_tp_extend_ratio)
             changed = False
 
+            mom_short = 0.0
+            if len(ph) >= 3:
+                base_m = max(1e-9, abs(float(ph[-3])))
+                mom_short = (float(ph[-1]) - float(ph[-3])) / base_m
+            neutral_momentum = False
+            if bool(getattr(self.config, "trailing_momentum_adjust_enable", True)):
+                nt_n = float(getattr(self.config, "trailing_momentum_trend_neutral_abs", 0.002) or 0.002)
+                ns_n = float(getattr(self.config, "trailing_momentum_short_neutral_abs", 0.0015) or 0.0015)
+                neutral_momentum = abs(float(trend)) < nt_n and abs(float(mom_short)) < ns_n
+
             # 仅在浮盈阶段做主动动态调整，降低频繁噪音修改。
             if pnl > 0:
                 adverse = False
@@ -1234,18 +1308,50 @@ class StopLossTakeProfitManager:
                     favorable = True
 
                 sl = float(order.stop_loss_price or 0)
-                tp = float(order.take_profit_price or 0)
-                # 追踪偏移也动态化：高波动收紧，顺势平稳可小幅放宽
-                if volatility >= float(self.config.volatility_tighten_threshold):
+                tp = float(order.take_profit_price) if order.take_profit_price is not None else None
+                vol_thr = float(self.config.volatility_tighten_threshold)
+                risk_tighten_trail = bool(whale_risk) or (
+                    unified_quality is not None and unified_quality < 0.5
+                ) or (spread_bps is not None and spread_bps > max(25.0, spread_guard))
+                # 追踪偏移：风险类始终可收紧；波动/顺势放宽仅在「非中性动能」时调整，中性则保持带宽
+                off0 = float(order.trailing_stop_offset or self.config.initial_trailing_offset)
+                if risk_tighten_trail or (ai_confidence is not None and ai_confidence >= 0.65 and ai_bias and (
+                    (order.side == "long" and ai_bias in {"sell", "short"})
+                    or (order.side == "short" and ai_bias in {"buy", "long"})
+                )):
                     order.trailing_stop_offset = max(
                         float(self.config.min_trailing_offset),
-                        float(order.trailing_stop_offset) * (1.0 - tighten_ratio * 0.5),
+                        off0 * float(getattr(self.config, "trailing_momentum_tighten_factor", 0.92) or 0.92),
                     )
-                elif favorable:
+                elif volatility >= vol_thr and (not neutral_momentum):
+                    order.trailing_stop_offset = max(
+                        float(self.config.min_trailing_offset),
+                        off0 * (1.0 - tighten_ratio * 0.5),
+                    )
+                elif favorable and (not neutral_momentum):
                     order.trailing_stop_offset = min(
                         float(self.config.max_trailing_offset),
-                        float(order.trailing_stop_offset) * (1.0 + tp_extend_ratio * 0.3),
+                        off0 * (1.0 + tp_extend_ratio * 0.3),
                     )
+                elif not neutral_momentum:
+                    nt_n = float(getattr(self.config, "trailing_momentum_trend_neutral_abs", 0.002) or 0.002)
+                    ns_n = float(getattr(self.config, "trailing_momentum_short_neutral_abs", 0.0015) or 0.0015)
+                    weak = (order.side == "long" and (float(trend) < -nt_n or float(mom_short) < -ns_n)) or (
+                        order.side == "short" and (float(trend) > nt_n or float(mom_short) > ns_n)
+                    )
+                    if weak:
+                        order.trailing_stop_offset = max(
+                            float(self.config.min_trailing_offset),
+                            off0 * float(getattr(self.config, "trailing_momentum_tighten_factor", 0.92) or 0.92),
+                        )
+                    elif (
+                        (order.side == "long" and float(trend) >= float(self.config.trend_extend_threshold) and float(mom_short) > ns_n)
+                        or (order.side == "short" and float(trend) <= -float(self.config.trend_extend_threshold) and float(mom_short) < -ns_n)
+                    ):
+                        order.trailing_stop_offset = min(
+                            float(self.config.max_trailing_offset),
+                            off0 * float(getattr(self.config, "trailing_momentum_loosen_factor", 1.05) or 1.05),
+                        )
                 if order.side == "long":
                     if adverse and sl > 0:
                         # 向现价上移止损，锁定部分利润
@@ -1253,7 +1359,7 @@ class StopLossTakeProfitManager:
                         if target_sl > sl:
                             order.stop_loss_price = target_sl
                             changed = True
-                    elif favorable and tp > 0:
+                    elif favorable and tp is not None and tp > 0:
                         # 顺风单略微放宽止盈目标，争取趋势延续利润
                         ext = (tp - current_price) * tp_extend_ratio
                         if ext > 0:
@@ -1265,7 +1371,7 @@ class StopLossTakeProfitManager:
                         if target_sl < sl:
                             order.stop_loss_price = target_sl
                             changed = True
-                    elif favorable and tp > 0:
+                    elif favorable and tp is not None and tp > 0:
                         ext = (current_price - tp) * tp_extend_ratio
                         if ext > 0:
                             order.take_profit_price = tp - ext
@@ -1291,7 +1397,7 @@ class StopLossTakeProfitManager:
                     order.side,
                     pnl * 100.0,
                     float(order.stop_loss_price or 0),
-                    float(order.take_profit_price or 0),
+                    float(order.take_profit_price or 0) if order.take_profit_price is not None else -1.0,
                     float(order.trailing_stop_offset or 0.0),
                     f"{spread_bps:.2f}" if spread_bps is not None else "N/A",
                     f"{depth_imb:.3f}" if depth_imb is not None else "N/A",
@@ -1300,44 +1406,84 @@ class StopLossTakeProfitManager:
                 )
         except Exception as e:
             logger.debug(f"动态调整止盈止损失败: {e}")
-    
+
+    async def _apply_profit_tier2_trailing(self, order: StopLossTakeProfitOrder, current_price: float) -> None:
+        """浮盈达到二档阈值后，将移动带宽收紧为 tier2（默认 +50% 浮盈 → 0.5% 带宽）。"""
+        thr = float(self.config.profit_tier2_pnl_threshold or 0.0)
+        if thr <= 0:
+            return
+        pnl = self._calculate_pnl_percent(order, current_price)
+        if pnl < thr:
+            return
+        meta = dict(order.metadata or {})
+        if meta.get("tier2_trailing_applied"):
+            return
+        t2 = float(self.config.tier2_trailing_offset)
+        t2 = min(max(t2, float(self.config.min_trailing_offset)), float(self.config.max_trailing_offset))
+        old_off = float(order.trailing_stop_offset or t2)
+        order.trailing_stop_offset = t2
+        meta["tier2_trailing_applied"] = True
+        meta["tier2_trailing_offset"] = t2
+        order.metadata = meta
+        logger.info(
+            "📐 %s 二档移动止损: 浮盈=%.2f%% >= %.2f%%，带宽 %.4f -> %.4f",
+            order.symbol,
+            pnl * 100.0,
+            thr * 100.0,
+            old_off,
+            t2,
+        )
+
     async def _update_trailing_stop(self, order: StopLossTakeProfitOrder, current_price: float):
-        """更新移动止损"""
+        """更新移动止损（每 tick 根据峰值/谷值与当前带宽重算止损价）。"""
         if not self.config.enable_trailing_stop:
             return
-        
+
         pnl_percent = self._calculate_pnl_percent(order, current_price)
-        
-        if pnl_percent >= self.config.trailing_stop_trigger and not order.trailing_stop_activated:
-            order.trailing_stop_activated = True
-            logger.info(f"📊 {order.symbol} 激活移动止损 (盈利 {pnl_percent*100:.1f}%)")
-            
-            if self._enhanced_monitoring:
-                await self._enhanced_monitoring.update_metric(
-                    "trailing_stop_activated",
-                    1,
-                    {"symbol": order.symbol}
-                )
-        
-        if order.trailing_stop_activated:
-            if order.side == "long":
-                new_stop = order.highest_price * (1 - order.trailing_stop_offset)
-                if new_stop > order.stop_loss_price:
-                    old_stop = order.stop_loss_price
-                    order.stop_loss_price = new_stop
-                    self._stats["trailing_updates"] += 1
-                    logger.info(f"📈 {order.symbol} 移动止损更新: {old_stop:.4f} -> {new_stop:.4f}")
-                    
-                    await self._notify_callbacks("on_trailing_update", order, old_stop, new_stop)
-            else:
-                new_stop = order.lowest_price * (1 + order.trailing_stop_offset)
-                if new_stop < order.stop_loss_price or order.stop_loss_price == 0:
-                    old_stop = order.stop_loss_price
-                    order.stop_loss_price = new_stop
-                    self._stats["trailing_updates"] += 1
-                    logger.info(f"📉 {order.symbol} 移动止损更新: {old_stop:.4f} -> {new_stop:.4f}")
-                    
-                    await self._notify_callbacks("on_trailing_update", order, old_stop, new_stop)
+
+        if not order.trailing_stop_activated:
+            if self.config.trailing_active_on_open:
+                order.trailing_stop_activated = True
+            elif pnl_percent >= float(self.config.trailing_stop_trigger or 0):
+                order.trailing_stop_activated = True
+                logger.info(f"📊 {order.symbol} 激活移动止损 (盈利 {pnl_percent*100:.1f}%)")
+                if self._enhanced_monitoring:
+                    await self._enhanced_monitoring.update_metric(
+                        "trailing_stop_activated",
+                        1,
+                        {"symbol": order.symbol},
+                    )
+
+        if not order.trailing_stop_activated:
+            return
+
+        off = float(order.trailing_stop_offset or self.config.initial_trailing_offset)
+        off = min(max(off, float(self.config.min_trailing_offset)), float(self.config.max_trailing_offset))
+
+        if order.side == "long":
+            hp = float(order.highest_price or 0)
+            if hp <= 0:
+                hp = float(order.entry_price or current_price)
+            new_stop = hp * (1.0 - off)
+            cur_sl = float(order.stop_loss_price or 0)
+            if new_stop > cur_sl or cur_sl <= 0 or not math.isfinite(cur_sl):
+                old_stop = order.stop_loss_price
+                order.stop_loss_price = new_stop
+                self._stats["trailing_updates"] += 1
+                logger.info(f"📈 {order.symbol} 移动止损更新: {old_stop} -> {new_stop:.4f}")
+                await self._notify_callbacks("on_trailing_update", order, old_stop, new_stop)
+        else:
+            lp = float(order.lowest_price) if order.lowest_price is not None else float("inf")
+            if (not math.isfinite(lp)) or lp <= 0:
+                lp = float(order.entry_price or current_price)
+            new_stop = lp * (1.0 + off)
+            cur_sl = float(order.stop_loss_price or 0)
+            if (new_stop < cur_sl) or cur_sl <= 0 or not math.isfinite(cur_sl):
+                old_stop = order.stop_loss_price
+                order.stop_loss_price = new_stop
+                self._stats["trailing_updates"] += 1
+                logger.info(f"📉 {order.symbol} 移动止损更新: {old_stop} -> {new_stop:.4f}")
+                await self._notify_callbacks("on_trailing_update", order, old_stop, new_stop)
     
     async def _check_breakeven(self, order: StopLossTakeProfitOrder, current_price: float):
         """检查保本止损"""
@@ -1926,6 +2072,16 @@ class StopLossTakeProfitManager:
                 data = json.load(f)
             
             for oid, order_data in data.get("orders", {}).items():
+                tp_type_raw = order_data.get("take_profit_type", "percentage")
+                try:
+                    tp_type_e = TakeProfitType(tp_type_raw)
+                except Exception:
+                    tp_type_e = TakeProfitType.PERCENTAGE
+                sl_type_raw = order_data.get("stop_loss_type", "percentage")
+                try:
+                    sl_type_e = StopType(sl_type_raw)
+                except Exception:
+                    sl_type_e = StopType.PERCENTAGE
                 order = StopLossTakeProfitOrder(
                     order_id=order_data["order_id"],
                     symbol=order_data["symbol"],
@@ -1934,12 +2090,13 @@ class StopLossTakeProfitManager:
                     quantity=order_data["quantity"],
                     remaining_quantity=order_data["remaining_quantity"],
                     stop_loss_price=order_data.get("stop_loss_price"),
-                    stop_loss_type=StopType(order_data.get("stop_loss_type", "percentage")),
+                    stop_loss_type=sl_type_e,
                     stop_loss_value=order_data.get("stop_loss_value", 0.03),
                     take_profit_price=order_data.get("take_profit_price"),
-                    take_profit_type=TakeProfitType(order_data.get("take_profit_type", "percentage")),
+                    take_profit_type=tp_type_e,
                     take_profit_value=order_data.get("take_profit_value", 0.06),
                     trailing_stop_activated=order_data.get("trailing_stop_activated", False),
+                    trailing_stop_offset=float(order_data.get("trailing_stop_offset") or 0.02),
                     highest_price=order_data.get("highest_price", 0),
                     lowest_price=order_data.get("lowest_price", float('inf')),
                     status=StopLossTakeProfitStatus(order_data.get("status", "active")),

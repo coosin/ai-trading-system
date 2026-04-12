@@ -3,14 +3,13 @@ Single narrow exit for live swap orders (S1 execution spine).
 
 - Records last intent/outcome for observability
 - Enforces single-write-owner policy for discretionary trading sources
-- Risk/auxiliary sources (e.g. SL/TP) may always submit closes
+- Auxiliary close sources are limited to SLTP + user manual; main lane closes with write_source=SWO.
 
-来源约定（避免多链路冲突）：
-- 主动策略开平：single_write_owner（默认 ai_core）经 AICoreDecisionEngine/ExecutionVerifier
-- 系统/扫描/NL 辅助入口：open 用 source=system（_allow_open 放行）
-- 账户风控强平：account_risk_monitor
-- 止盈止损触发平仓：stop_loss_take_profit（StopLossTakeProfitManager 独占）
-- 人工/验证：manual / execution_verifier（须带 write_source）
+来源约定（强制平仓仅三入口：主策略 SWO / 止盈止损 / 用户 manual）：
+- 主策略：single_write_owner（默认 ai_core）经 AICoreDecisionEngine/ExecutionVerifier，平仓须 write_source=SWO
+- 止盈止损：stop_loss_take_profit
+- 用户：manual（API 或确认后的指令）
+- 辅环：open 仍可用 source=system（见 _allow_open）；不得直连强制平仓
 """
 
 from __future__ import annotations
@@ -26,13 +25,10 @@ from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-# Sources that may submit protective / reconciled closes even when SWO is ai_core
+# Closes when source != SWO: only SLTP and explicit user manual (main lane uses write_source=SWO).
 _AUXILIARY_WRITE_SOURCES: Set[str] = {
     "stop_loss_take_profit",
-    "account_risk_monitor",
-    "execution_verifier",
     "manual",
-    "system",
 }
 
 
@@ -262,8 +258,8 @@ class ExecutionGateway:
         context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Close a perpetual swap position. SL/TP and risk paths set force=False but
-        pass source in _AUXILIARY_WRITE_SOURCES so policy always allows them.
+        Close a perpetual swap position. Non-SWO sources must be in
+        _AUXILIARY_WRITE_SOURCES (SLTP, manual) or match single_write_owner unless force=True.
         """
         swo = await self.single_write_owner()
         self._snapshot.single_write_owner = swo

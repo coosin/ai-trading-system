@@ -36,6 +36,16 @@ async def test_close_allowed_for_stop_loss_take_profit():
 
 
 @pytest.mark.asyncio
+async def test_close_allowed_for_manual():
+    ex = MagicMock()
+    ex.close_swap_position = AsyncMock(return_value={"success": True, "orderId": "m1"})
+    gw = ExecutionGateway(_mc_with_exchange(ex, swo="ai_core"))
+    res = await gw.close_swap("BTC/USDT", "short", None, "manual", "user_api")
+    assert res["success"] is True
+    ex.close_swap_position.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_open_denied_when_source_not_swo():
     ex = MagicMock()
     ex.set_leverage = AsyncMock(return_value={"success": True})
@@ -81,3 +91,14 @@ async def test_close_idempotent_within_ttl():
     assert r1.get("success") is True
     assert r2.get("skipped") is True
     ex.close_swap_position.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_close_denied_for_system_source():
+    ex = MagicMock()
+    ex.close_swap_position = AsyncMock(return_value={"success": True})
+    gw = ExecutionGateway(_mc_with_exchange(ex, swo="ai_core"))
+    res = await gw.close_swap("BTC/USDT", "long", None, "system", "proactive")
+    assert res["success"] is False
+    assert "policy_denied" in res.get("error", "")
+    ex.close_swap_position.assert_not_called()
+

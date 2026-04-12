@@ -273,6 +273,7 @@ class ConfigManager:
                 "risk_per_trade": 0.01,
                 "trade_mode": "real",
                 "auto_risk_management": True,
+                # True: emit close recommendations to main lane/Telegram/events; no auto exchange close
                 "critical_risk_auto_close": True,
                 "critical_risk_auto_close_liq_only": True,
                 "critical_risk_auto_close_max_liq_distance": 0.08,

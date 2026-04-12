@@ -76,7 +76,7 @@ class AICoreDecisionEngine:
     - 主路径：execute_command(write_source=ai_core) → ExecutionVerifier → ExecutionGateway
     - 回退：ExecutionGateway(open_swap/close_swap, source=ai_core)
     - 仅当无 ExecutionGateway 时允许交易所直连兜底
-    - 风控/用户指令平仓：经 _s1_close_swap（Gateway 优先，来源如 ai_core / manual）
+    - 用户指令平仓：manual；账户级临界风险由监控告警主链路，不经辅环强平
     """
     
     def __init__(self, main_controller=None):
@@ -122,12 +122,9 @@ class AICoreDecisionEngine:
             "max_spread_bps_to_trade": 40.0,
             "max_abs_depth_imbalance_to_trade": 0.92,
             "degraded_data_quantity_factor": 0.68,
-            # 低余额仍允许小额开仓（可经 ai_core_runtime 热更新）
-            "min_available_usdt_to_open": 1.0,
             "low_balance_usdt_threshold": 25.0,
             "default_max_margin_fraction": 0.30,
             "low_balance_margin_fraction": 0.55,
-            "open_fee_buffer_usdt": 0.35,
             "boost_on_low_risk": True,
             "low_risk_rr_multiplier": 0.96,
             "low_risk_spread_multiplier": 1.08,
@@ -167,7 +164,7 @@ class AICoreDecisionEngine:
             "risk_check_interval": 30,
             "auto_reduce_on_high_risk": True,
             "emergency_close_on_critical": True,
-            # AI 主观平仓防抖（仅作用于主决策循环里的 LLM close；SLTP/紧急风控/用户指令平仓不走此逻辑）
+            # AI 主观平仓防抖（仅作用于主决策循环里的 LLM close；SLTP/用户指令平仓不走此逻辑）
             "ai_core_discretionary_close_enabled": True,
             "ai_core_discretionary_close_cooldown_sec": 2700,
             "ai_core_min_confidence_to_close": 0.84,
@@ -1458,7 +1455,7 @@ class AICoreDecisionEngine:
         return {"success": False, "error": "no_close_method"}
     
     async def _handle_high_risk(self, risk_data) -> None:
-        """AI处理高风险情况 - 主动平仓黑名单持仓"""
+        """高风险扫描：仅告警与建议，不直接平仓（平仓入口限于主决策/SLTP/用户）。"""
         logger.warning(f"🚨 AI检测到高风险: {risk_data.risk_level.value}")
         
         if not self.exchange:
@@ -1474,36 +1471,32 @@ class AICoreDecisionEngine:
                 pnl_ratio = float(pos.get('uplRatio', 0))
                 pos_side = pos.get('posSide', 'long')
                 
-                # 黑名单已清空，不再检查黑名单
-                
-                # 检查亏损是否过大
                 if pnl_ratio < -0.1:
-                    logger.warning(f"🚨 AI自动平仓 {symbol} 亏损过大: {pnl_ratio:.2%}")
+                    logger.warning(
+                        "🚨 高风险持仓建议关注 %s 亏损 %s（未自动平仓，请主链路或用户处理）",
+                        symbol,
+                        f"{pnl_ratio:.2%}",
+                    )
+                    msg = (
+                        f"高风险持仓建议: {symbol} {pos_side} 未实现盈亏比例 {pnl_ratio:.2%}。"
+                        "未执行平仓；请主 AI 决策、止盈止损或用户 API。"
+                    )
+                    mc = self.main_controller
                     try:
-                        result = await self._s1_close_swap(
-                            symbol,
-                            pos_side,
-                            None,
-                            "ai_core",
-                            "high_risk_upl_ratio",
-                        )
-                        ok = bool(isinstance(result, dict) and result.get("success"))
-                        logger.info(
-                            "✅ AI已平仓亏损持仓: %s, 结果: %s" if ok else "⚠️ AI平仓未成功: %s, 结果: %s",
-                            symbol,
-                            result,
-                        )
-                        if (
-                            ok
-                            and self.telegram_bot
-                            and self.telegram_bot.chat_ids
-                        ):
-                            await self.telegram_bot.send_message(
-                                chat_id=self.telegram_bot.chat_ids[0],
-                                text=f"🚨 AI风险控制: 自动平仓 {symbol}，亏损 {pnl_ratio:.2%}",
+                        if mc and hasattr(mc, "_send_notification_handler"):
+                            await mc._send_notification_handler(
+                                "高风险持仓（建议）", msg, priority="high"
                             )
                     except Exception as e:
-                        logger.error(f"平仓失败: {e}")
+                        logger.debug("high risk notify: %s", e)
+                    if self.telegram_bot and self.telegram_bot.chat_ids:
+                        try:
+                            await self.telegram_bot.send_message(
+                                chat_id=self.telegram_bot.chat_ids[0],
+                                text=f"⚠️ {msg}",
+                            )
+                        except Exception as e:
+                            logger.debug("telegram high risk: %s", e)
                         
         except Exception as e:
             logger.error(f"AI风险处理失败: {e}")
@@ -3130,7 +3123,7 @@ class AICoreDecisionEngine:
     async def _discretionary_close_passes(self, decision: TradeDecision) -> tuple[bool, str]:
         """
         主循环中的 LLM 主观平仓防抖：冷却、更高置信度、连续确认、最短持仓时间。
-        SLTP / _handle_high_risk / 用户平仓指令不经过此函数。
+        SLTP / 用户平仓指令不经过此函数。
         """
         if not bool(self.config.get("ai_core_discretionary_close_enabled", True)):
             return False, "discretionary_close_disabled"
@@ -3219,20 +3212,8 @@ class AICoreDecisionEngine:
                     logger.info("🧷 AI主观平仓暂缓: %s %s — %s", decision.symbol, decision.side, why_dc)
                     return False
 
-            # 开仓：仅要求「可用 + 手续费缓冲」高于可配置下限；平仓不因低 USDT 阻塞
-            if is_open:
-                min_avail = float(self.config.get("min_available_usdt_to_open") or 1.0)
-                min_avail = max(0.5, min_avail)
-                fee_buf = float(self.config.get("open_fee_buffer_usdt") or 0.35)
-                if available < min_avail + fee_buf:
-                    logger.warning(
-                        "⚠️ 可用 USDT 过低 (%.2f < %.2f 开仓门槛+手续费缓冲)，跳过开仓: %s",
-                        available,
-                        min_avail + fee_buf,
-                        decision.symbol,
-                    )
-                    return False
-            
+            # 开仓：不再做应用层「最小可用 USDT」硬门槛；实际能否成交由交易所 minSz/余额 决定。平仓不因低 USDT 阻塞。
+
             # 2. 获取当前价格
             ticker = await self.exchange.get_ticker(decision.symbol.replace('/', '-'))
             current_price = ticker.get('last', 0)
@@ -4027,11 +4008,9 @@ class AICoreDecisionEngine:
                 "low_risk_spread_multiplier",
                 "high_risk_rr_multiplier",
                 "high_risk_spread_multiplier",
-                "min_available_usdt_to_open",
                 "low_balance_usdt_threshold",
                 "default_max_margin_fraction",
                 "low_balance_margin_fraction",
-                "open_fee_buffer_usdt",
                 "auto_frequency_profile_switch",
                 "frequency_profile_switch_telegram_notify",
                 "frequency_profile_cooldown_seconds",
@@ -4074,11 +4053,9 @@ class AICoreDecisionEngine:
                     elif k in (
                         "auto_tune_group_step_rr",
                         "auto_tune_group_step_spread_bps",
-                        "min_available_usdt_to_open",
                         "low_balance_usdt_threshold",
                         "default_max_margin_fraction",
                         "low_balance_margin_fraction",
-                        "open_fee_buffer_usdt",
                     ):
                         v = overrides[k]
                         self.config[k] = None if v == "" or v == "null" else float(v)

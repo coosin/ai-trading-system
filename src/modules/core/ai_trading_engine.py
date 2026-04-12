@@ -173,6 +173,7 @@ class AITradingEngine:
             "max_total_exposure_ratio": 0.8,
             "trade_mode": "real",
             "auto_risk_management": True,
+            # True：临界风险时向主链路发「建议平仓」告警，不直接下平仓单
             "critical_risk_auto_close": True,
             # 与 AccountRiskMonitor.liquidation_distance_critical 对齐的「贴近强平」阈值（比例，如 0.08=8%）
             "critical_risk_auto_close_max_liq_distance": 0.08,
@@ -197,9 +198,6 @@ class AITradingEngine:
         self._last_risk_events: Dict[str, float] = {}
         self._risk_event_cooldown = 300  # 相同风险事件冷却时间（秒）
         
-        # 自动平仓去重 - 避免重复平仓
-        self._auto_close_attempts: Dict[str, float] = {}
-        self._auto_close_cooldown = 60  # 自动平仓冷却时间（秒）
         self._empty_position_reads = 0
         self._wallet_snapshot: Dict[str, Any] = {}
         self._sltp_bound_keys: set[str] = set()
@@ -1603,9 +1601,9 @@ class AITradingEngine:
                         policy.get("single_write_owner") or policy.get("primary_controller") or "ai_core"
                     ).strip().lower()
                     enable_secondary = bool(policy.get("enable_secondary_controller", False))
-                    if swo == "ai_core" and not meta.get("auto_close") and not enable_secondary:
+                    if swo == "ai_core" and not enable_secondary:
                         logger.warning(
-                            "AITradingEngine: 跳过执行（single_write_owner=ai_core，仅保留风险自动平仓；"
+                            "AITradingEngine: 跳过执行（single_write_owner=ai_core，辅引擎不直连交易所；"
                             "若需双控请设置 ai_brain.enable_secondary_controller=true）"
                         )
                         return False
@@ -2608,22 +2606,27 @@ class AITradingEngine:
                         min_loss_pct = float(self.ai_config.get("critical_risk_auto_close_min_loss_pct", 25.0) or 25.0)
                         severe_loss = loss_pct >= min_loss_pct
 
-                        # 闸门：保证金占满、贴近强平价、或单仓位浮亏达极端（>= min_loss_pct，默认 25%）。
-                        # 不再使用 critical_risk_auto_close_liq_only 抑制 severe_loss（此前会导致 -34% 浮亏仍不平仓）。
-                        should_auto_close = margin_emergency or near_liq or severe_loss
-                        if should_auto_close:
+                        should_recommend = margin_emergency or near_liq or severe_loss
+                        if should_recommend:
                             logger.critical(
-                                "🤖 自动风险处理: 平仓 %s (liq_dist=%.3f, max_liq=%.3f, loss=%.1f%%, margin=%.3f)",
+                                "🤖 临界风险（建议主链路平仓，不自动下单）: %s "
+                                "(liq_dist=%.3f, max_liq=%.3f, loss=%.1f%%, margin=%.3f)",
                                 pos_risk.symbol,
                                 liq_dist,
                                 liq_auto_close_max,
                                 loss_pct,
                                 float(getattr(account_risk, "margin_ratio", 0) or 0),
                             )
-                            await self._auto_close_position(pos_risk.symbol)
+                            await self._recommend_close_to_main_lane(
+                                symbol=pos_risk.symbol,
+                                reason="critical_risk_recommendation",
+                                liq_dist=liq_dist,
+                                loss_pct=loss_pct,
+                                margin_ratio=float(getattr(account_risk, "margin_ratio", 0) or 0),
+                            )
                         else:
                             logger.warning(
-                                "🛡️ 跳过自动强平 %s：未命中闸门 (liq_dist=%.3f, need<=%.3f, loss=%.1f%%, need>=%.1f%%)",
+                                "🛡️ 未达建议平仓闸门 %s (liq_dist=%.3f, need<=%.3f, loss=%.1f%%, need>=%.1f%%)",
                                 pos_risk.symbol,
                                 liq_dist,
                                 liq_auto_close_max,
@@ -2643,85 +2646,60 @@ class AITradingEngine:
                 impact=f"总权益: {account_risk.total_equity:.2f} USDT"
             )
     
-    async def _auto_close_position(self, symbol: str) -> bool:
-        """账户风控强平：经 ExecutionGateway、source=account_risk_monitor（与 SLTP 分源，避免策略混写）。"""
+    async def _recommend_close_to_main_lane(
+        self,
+        *,
+        symbol: str,
+        reason: str,
+        liq_dist: float = 0.0,
+        loss_pct: float = 0.0,
+        margin_ratio: float = 0.0,
+    ) -> None:
+        """临界风险不向交易所强制平仓，仅通知主链路与事件总线。"""
+        position = self.positions.get(symbol)
+        side = getattr(position, "side", None) if position and not isinstance(position, dict) else None
+        qty = getattr(position, "quantity", None) if position and not isinstance(position, dict) else None
+        text = (
+            f"建议尽快处理持仓 {symbol}（reason={reason}）\n"
+            f"侧向={side} 数量={qty}\n"
+            f"距强平比例≈{liq_dist:.4f} 浮亏幅度≈{loss_pct:.1f}% 保证金占用≈{margin_ratio:.3f}\n"
+            "实际平仓仅由：主 AI 决策、止盈止损模块、或用户 API/显式指令。"
+        )
+        mc = self.main_controller
         try:
-            import time
-
-            current_time = time.time()
-            if symbol in self._auto_close_attempts:
-                last_attempt_time = self._auto_close_attempts[symbol]
-                if current_time - last_attempt_time < self._auto_close_cooldown:
-                    logger.warning(
-                        "⏸️ %s 自动平仓在冷却期内，跳过（距上次 %.1f 秒）",
-                        symbol,
-                        current_time - last_attempt_time,
-                    )
-                    return False
-
-            position = self.positions.get(symbol)
-            if not position:
-                logger.warning("⚠️ 未找到持仓 %s", symbol)
-                return False
-
-            if isinstance(position, dict):
-                logger.error("❌ 持仓数据格式错误: %s", symbol)
-                return False
-
-            self._auto_close_attempts[symbol] = current_time
-            logger.critical(
-                "🚨 执行自动平仓(风控): %s %s %s",
-                symbol,
-                position.side,
-                position.quantity,
-            )
-
-            mc = self.main_controller
-            gw = getattr(mc, "execution_gateway", None) if mc else None
-            if gw:
-                res = await gw.close_swap(
-                    symbol,
-                    position.side,
-                    None,
-                    "account_risk_monitor",
-                    "critical_risk_auto_close",
-                    context={
-                        "reasoning": "critical_risk_auto_close",
-                        "position_side": position.side,
-                        "position_qty": position.quantity,
-                    },
-                )
-                ok = bool(isinstance(res, dict) and res.get("success"))
-            else:
-                decision = AIDecision(
-                    action=(
-                        TradeAction.CLOSE_LONG
-                        if position.side == "long"
-                        else TradeAction.CLOSE_SHORT
-                    ),
-                    symbol=symbol,
-                    price=position.current_price,
-                    quantity=position.quantity,
-                    confidence=1.0,
-                    reasoning="风险控制自动平仓",
-                    risk_level="high",
-                    metadata={"auto_close": True, "reason": "critical_risk"},
-                )
-                ok = await self._execute_decision(decision)
-
-            if ok:
-                logger.critical("✅ 自动平仓成功: %s", symbol)
-                if symbol in self.positions:
-                    del self.positions[symbol]
-            else:
-                logger.error("❌ 自动平仓失败: %s", symbol)
-
-            return ok
-
+            if mc and hasattr(mc, "_send_notification_handler"):
+                await mc._send_notification_handler("风险：建议平仓（未自动下单）", text, priority="high")
         except Exception as e:
-            logger.error("自动平仓失败: %s", e)
-            return False
-    
+            logger.debug("recommend_close notify: %s", e)
+        try:
+            from src.modules.core.event_system import EventPriority, EventType
+
+            es = getattr(mc, "event_system", None) if mc else None
+            if es and hasattr(es, "emit"):
+                await es.emit(
+                    EventType.RISK_ALERT,
+                    "aitrading_engine",
+                    {
+                        "kind": "close_recommendation",
+                        "symbol": symbol,
+                        "reason": reason,
+                        "liq_dist": liq_dist,
+                        "loss_pct": loss_pct,
+                        "margin_ratio": margin_ratio,
+                        "side": side,
+                    },
+                    priority=EventPriority.HIGH,
+                )
+        except Exception as e:
+            logger.debug("recommend_close event: %s", e)
+        await self._save_risk_event_to_memory(
+            event_type="close_recommendation",
+            symbol=symbol,
+            description=text[:500],
+            action_taken="已通知主链路/用户（无自动平仓）",
+            impact=f"symbol={symbol}",
+        )
+
     async def _save_risk_event_to_memory(self, event_type: str, symbol: str,
                                          description: str, action_taken: str,
                                          impact: str) -> None:

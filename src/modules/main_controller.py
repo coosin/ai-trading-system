@@ -1276,14 +1276,21 @@ class MainController:
         # 初始化止盈止损管理器
         try:
             sltp_config = StopLossTakeProfitConfig(
+                # 默认：仅移动止损/追踪出场（无固定止盈）；开仓 1% 带宽，浮盈 50% 后收紧至 0.5%
+                trailing_only_mode=True,
+                trailing_active_on_open=True,
+                initial_trailing_offset=0.01,
+                profit_tier2_pnl_threshold=0.50,
+                tier2_trailing_offset=0.005,
+                trailing_momentum_adjust_enable=True,
                 default_stop_loss_percent=0.03,
                 default_take_profit_percent=0.06,
                 enable_trailing_stop=True,
-                trailing_stop_offset=0.02,
-                trailing_stop_trigger=0.02,
-                enable_breakeven=True,
+                trailing_stop_offset=0.01,
+                trailing_stop_trigger=0.0,
+                enable_breakeven=False,
                 breakeven_trigger=0.02,
-                enable_partial_tp=True,
+                enable_partial_tp=False,
                 check_interval=5,
                 execute_exchange_on_trigger=True,
             )

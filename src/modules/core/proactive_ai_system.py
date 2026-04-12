@@ -1407,39 +1407,43 @@ class ProactiveActionTrigger:
             return False
     
     async def _execute_close_position(self, action: Dict) -> bool:
-        """执行平仓（S1：ExecutionGateway，source=system）"""
+        """不强制平仓：仅向主链路发告警（主 AI / SLTP / 用户 API 才可下单）。"""
         if not self.main_controller:
             return False
-
-        gw = getattr(self.main_controller, "execution_gateway", None)
-        if not gw:
-            exchange = getattr(self.main_controller, "okx_exchange", None) or getattr(
-                self.main_controller, "exchange", None
-            )
-            if not exchange:
-                return False
-            try:
-                res = await exchange.close_position(
-                    action.get("symbol"),
-                    action.get("side", "long"),
-                )
-                return bool(res.get("success") if isinstance(res, dict) else res)
-            except Exception as e:
-                logger.error("平仓执行失败: %s", e)
-                return False
-
+        sym = action.get("symbol")
+        side = str(action.get("side", "long")).lower()
+        reason = action.get("reasoning", "proactive_ai")
+        msg = (
+            f"主动性模块建议平仓: {sym} {side}（{reason}）。"
+            "未向交易所下单；请由主 AI 决策、止盈止损或用户 API 执行。"
+        )
+        logger.warning(msg)
         try:
-            res = await gw.close_swap(
-                action.get("symbol"),
-                str(action.get("side", "long")).lower(),
-                None,
-                "system",
-                "proactive_ai_close",
-            )
-            return bool(isinstance(res, dict) and res.get("success"))
+            if hasattr(self.main_controller, "_send_notification_handler"):
+                await self.main_controller._send_notification_handler(
+                    "平仓建议（主动性，未执行）", msg, priority="high"
+                )
         except Exception as e:
-            logger.error(f"平仓执行失败: {e}")
-            return False
+            logger.debug("proactive close advisory notify: %s", e)
+        try:
+            from src.modules.core.event_system import EventPriority, EventType
+
+            es = getattr(self.main_controller, "event_system", None)
+            if es and hasattr(es, "emit"):
+                await es.emit(
+                    EventType.RISK_ALERT,
+                    "proactive_ai_system",
+                    {
+                        "kind": "close_recommendation",
+                        "symbol": sym,
+                        "side": side,
+                        "reason": reason,
+                    },
+                    priority=EventPriority.NORMAL,
+                )
+        except Exception as e:
+            logger.debug("proactive close advisory event: %s", e)
+        return True
     
     async def _execute_adjust_stop_loss(self, action: Dict) -> bool:
         """执行调整止损"""

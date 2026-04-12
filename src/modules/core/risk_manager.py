@@ -118,7 +118,7 @@ class PositionLimit:
     max_total_position: float = 0.5  # 总仓位最大比例（50%）
     max_daily_trades: int = 50  # 单日最大交易次数
     max_order_value: float = 10000.0  # 单笔订单最大价值
-    min_order_value: float = 5.0  # 单笔订单最小价值 (小资金优化)
+    min_order_value: float = 0.0  # 0=不限制；>0 时拒绝低于该名义价值的订单
 
 
 @dataclass
@@ -716,7 +716,7 @@ class RiskManager:
                 max_total_position=position_config.get("max_total_position", 0.5),
                 max_daily_trades=position_config.get("max_daily_trades", 50),
                 max_order_value=position_config.get("max_order_value", 10000.0),
-                min_order_value=position_config.get("min_order_value", 10.0),
+                min_order_value=position_config.get("min_order_value", 0.0),
             )
 
             # 亏损限制
@@ -838,8 +838,8 @@ class RiskManager:
         # 计算订单价值
         order_value = quantity * price
 
-        # 检查单笔订单最小价值
-        if order_value < self.position_limits.min_order_value:
+        # 检查单笔订单最小价值（0 表示关闭此门控）
+        if self.position_limits.min_order_value > 0 and order_value < self.position_limits.min_order_value:
             return {
                 "passed": False,
                 "message": f"订单价值${order_value:.2f}低于最小限制${self.position_limits.min_order_value:.2f}",
