@@ -344,6 +344,7 @@ proxy:
   force_override_env: false
   merge_no_proxy_from_config: true
   use_global_proxy: true
+  # OKX 专用：HTTP 代理经 Clash CONNECT 频繁断开时，可将 ignore_env_proxy 设为 true（OKX REST 直连，需容器出口可达 www.okx.com）
   okx:
     proxy_only: false
     ignore_env_proxy: false

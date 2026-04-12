@@ -95,9 +95,9 @@ class OKXExchange(ExchangeBase):
         self._last_request_time = 0
         self._min_request_interval = float(os.getenv("OPENCLAW_OKX_MIN_REQUEST_INTERVAL", "0.2") or "0.2")
         self._request_max_retries = int(os.getenv("OPENCLAW_OKX_MAX_RETRIES", "3") or "3")
-        self._timeout_total = float(os.getenv("OPENCLAW_OKX_TIMEOUT_TOTAL", "30") or "30")
-        self._timeout_connect = float(os.getenv("OPENCLAW_OKX_TIMEOUT_CONNECT", "10") or "10")
-        self._timeout_sock_read = float(os.getenv("OPENCLAW_OKX_TIMEOUT_SOCK_READ", "20") or "20")
+        self._timeout_total = float(os.getenv("OPENCLAW_OKX_TIMEOUT_TOTAL", "40") or "40")
+        self._timeout_connect = float(os.getenv("OPENCLAW_OKX_TIMEOUT_CONNECT", "15") or "15")
+        self._timeout_sock_read = float(os.getenv("OPENCLAW_OKX_TIMEOUT_SOCK_READ", "25") or "25")
         self._base_min_request_interval = self._min_request_interval
         self._adaptive_min_request_interval = self._min_request_interval
         self._max_adaptive_interval = float(
@@ -178,6 +178,17 @@ class OKXExchange(ExchangeBase):
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         return ctx
 
+    def _new_tcp_connector(self, ssl_context: ssl.SSLContext) -> aiohttp.TCPConnector:
+        """共享连接池参数，减轻代理/半开连接导致的 Server disconnected 抖动。"""
+        lim = int(os.getenv("OPENCLAW_OKX_CONNECTOR_LIMIT", "64") or "64")
+        ttl = int(os.getenv("OPENCLAW_OKX_DNS_CACHE_TTL", "300") or "300")
+        return aiohttp.TCPConnector(
+            ssl=ssl_context,
+            limit=max(8, lim),
+            enable_cleanup_closed=True,
+            ttl_dns_cache=max(10, ttl),
+        )
+
     def _proxy_temporarily_disabled(self) -> bool:
         return time.time() < float(self._proxy_disabled_until or 0.0)
 
@@ -232,7 +243,7 @@ class OKXExchange(ExchangeBase):
     async def _rebuild_session(self, reason: str) -> None:
         async with self._session_recreate_lock:
             old = self._session
-            connector = aiohttp.TCPConnector(ssl=self._build_ssl_context())
+            connector = self._new_tcp_connector(self._build_ssl_context())
             self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
             if old:
                 try:
@@ -261,7 +272,7 @@ class OKXExchange(ExchangeBase):
 
             try:
                 ssl_context = self._build_ssl_context()
-                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                connector = self._new_tcp_connector(ssl_context)
                 new_session = aiohttp.ClientSession(connector=connector, connector_owner=True)
             except Exception as e:
                 logger.error("直连会话重建失败: %s", e)
@@ -780,6 +791,22 @@ class OKXExchange(ExchangeBase):
                     await self._mark_request_failure(f"client {method} {endpoint}: {e}")
                     # 代理/网络链路错误：若当前在用代理，自动降级直连并重试
                     err_s = str(e)
+                    el = err_s.lower()
+                    # 半开连接、隧道被掐断：先换连接器再重试（直连/走代理均可能触发）
+                    if attempt < max_retries and any(
+                        x in el
+                        for x in (
+                            "server disconnected",
+                            "connection reset",
+                            "broken pipe",
+                            "connection closed",
+                            "disconnect",
+                        )
+                    ):
+                        await self._rebuild_session(f"{type(e).__name__}: {err_s[:200]}")
+                        await asyncio.sleep(min(1.0, retry_delay))
+                        retry_delay *= retry_backoff
+                        continue
                     proxy_related = any(
                         k in err_s.lower()
                         for k in (
@@ -864,14 +891,14 @@ class OKXExchange(ExchangeBase):
                     else:
                         logger.info("ℹ️ OPENCLAW_OKX_IGNORE_ENV_PROXY=1：OKX 固定直连（跳过环境代理与 proxy_manager）")
                     ssl_context = self._build_ssl_context()
-                    connector = aiohttp.TCPConnector(ssl=ssl_context)
+                    connector = self._new_tcp_connector(ssl_context)
                     self._proxy_url = None
                     self._proxy_mode = "direct"
                     self._proxy_from_env = False
                     logger.info("✅ OKX 已启用直连会话（容器/压测推荐路径）")
                 elif env_proxy:
                     ssl_context = self._build_ssl_context()
-                    connector = aiohttp.TCPConnector(ssl=ssl_context)
+                    connector = self._new_tcp_connector(ssl_context)
                     self._proxy_url = env_proxy
                     self._proxy_mode = "http"
                     self._proxy_from_env = True
@@ -907,7 +934,7 @@ class OKXExchange(ExchangeBase):
                             self._proxy_from_env = False
                         else:
                             ssl_context = self._build_ssl_context()
-                            connector = aiohttp.TCPConnector(ssl=ssl_context)
+                            connector = self._new_tcp_connector(ssl_context)
                             self._proxy_url = proxy.url
                             self._proxy_mode = "http"
                             self._proxy_from_env = False
@@ -916,7 +943,7 @@ class OKXExchange(ExchangeBase):
                             raise RuntimeError("OPENCLAW_OKX_PROXY_ONLY=1 but no proxy is available")
                         logger.warning("⚠️ 未找到可用代理，使用直连")
                         ssl_context = self._build_ssl_context()
-                        connector = aiohttp.TCPConnector(ssl=ssl_context)
+                        connector = self._new_tcp_connector(ssl_context)
                         self._proxy_mode = "direct"
                         self._proxy_from_env = False
             except Exception as proxy_error:
@@ -926,7 +953,7 @@ class OKXExchange(ExchangeBase):
                 import traceback
                 traceback.print_exc()
                 ssl_context = self._build_ssl_context()
-                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                connector = self._new_tcp_connector(ssl_context)
                 self._proxy_mode = "direct"
                 self._proxy_from_env = False
             
