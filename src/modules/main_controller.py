@@ -1788,100 +1788,107 @@ class MainController:
         logger.info("启动系统...")
 
         try:
+            # 勿在持锁期间 await 长任务：否则 get_system_status / acceptance 等会与启动串行抢同一把锁而长时间无响应。
             async with self._lock:
+                if self.system_status == ModuleStatus.RUNNING:
+                    logger.warning("系统已经在运行")
+                    return True
                 self.system_status = ModuleStatus.STARTING
                 self.start_time = datetime.now()
                 self.stop_time = None
 
-                # 发送系统启动事件
-                await self.emit_event(
-                    EventType.SYSTEM_START, "controller", {"timestamp": self.start_time.isoformat()}
-                )
+            # 发送系统启动事件
+            await self.emit_event(
+                EventType.SYSTEM_START, "controller", {"timestamp": self.start_time.isoformat()}
+            )
 
-                # 按依赖顺序启动模块
-                success = await self._start_modules_in_order()
+            # 按依赖顺序启动模块
+            success = await self._start_modules_in_order()
 
-                if success:
-                    self.system_status = ModuleStatus.RUNNING
-                    self._running = True
-                    logger.info("系统启动成功")
-                    
-                    # 验证关键模块连接状态
-                    await self._verify_module_connections()
-                    
-                    # 启动AI核心控制器（单脑仲裁，避免双控制器并行下单）
-                    await self._start_ai_brain_controllers()
-                    await self._start_ai_autonomous_supervision()
-
-                    # 重启动后的强制接管：同步余额/持仓，并把持仓接入 SLTP 跟踪与仓位管理。
-                    try:
-                        await self.force_sync_account_state(reason="startup")
-                    except Exception as e:
-                        logger.warning(f"⚠️ 启动同步余额/持仓失败（不阻塞启动）: {e}")
-                    
-                    # 启动主动性AI系统 - 让AI主动工作
-                    if self.proactive_ai:
-                        try:
-                            await self.proactive_ai.start()
-                            logger.info("🚀 主动性AI系统已启动 - AI将主动扫描市场、分析信息、执行交易")
-                        except Exception as e:
-                            logger.error(f"❌ 主动性AI系统启动失败: {e}")
-                    
-                    # 启动止盈止损监控
-                    await self.start_stop_loss_monitoring()
-                    
-                    # 启动心跳监控器
-                    if not self.heartbeat_monitor and self.ai_trading_engine and self.skill_manager:
-                        try:
-                            hb_cfg = {}
-                            try:
-                                hb_cfg = await self.config_manager.get_config("heartbeat", {}) if self.config_manager else {}
-                            except Exception:
-                                hb_cfg = {}
-                            self.heartbeat_monitor = HeartbeatMonitor(
-                                trading_engine=self.ai_trading_engine,
-                                skill_manager=self.skill_manager,
-                                memory_manager=self.hierarchical_memory,
-                                notification_handler=self._send_notification_handler,
-                                interval=int(hb_cfg.get("interval_sec", 1800)) if isinstance(hb_cfg, dict) else 1800,
-                                config_manager=self.config_manager,
-                            )
-                            if isinstance(hb_cfg, dict):
-                                try:
-                                    self.heartbeat_monitor.market_opportunity_cooldown_sec = int(
-                                        hb_cfg.get("market_opportunity_notice_cooldown_sec", 21600)
-                                    )
-                                    self.heartbeat_monitor.market_opportunity_notice_enabled = bool(
-                                        hb_cfg.get("market_opportunity_notice_enabled", False)
-                                    )
-                                except Exception:
-                                    pass
-                            logger.info("✅ 心跳监控器已初始化")
-                        except Exception as e:
-                            logger.error(f"心跳监控器初始化失败: {e}")
-                    
-                    # 启动心跳监控任务
-                    if self.heartbeat_monitor:
-                        try:
-                            heartbeat_task = asyncio.create_task(self.heartbeat_monitor.start())
-                            self._tasks.append(heartbeat_task)
-                            logger.info("💓 心跳监控器已启动 - 主动式系统监控")
-                        except Exception as e:
-                            logger.error(f"心跳监控器启动失败: {e}")
-
-                    # 发送心跳事件
-                    await self.emit_event(
-                        EventType.HEARTBEAT, "controller", {"status": "running", "uptime": 0}
-                    )
-
-                    return True
-                else:
+            if not success:
+                async with self._lock:
                     self.system_status = ModuleStatus.ERROR
-                    logger.error("系统启动失败")
-                    return False
+                logger.error("系统启动失败")
+                return False
+
+            async with self._lock:
+                self.system_status = ModuleStatus.RUNNING
+                self._running = True
+            logger.info("系统启动成功")
+
+            # 验证关键模块连接状态
+            await self._verify_module_connections()
+
+            # 启动AI核心控制器（单脑仲裁，避免双控制器并行下单）
+            await self._start_ai_brain_controllers()
+            await self._start_ai_autonomous_supervision()
+
+            # 重启动后的强制接管：同步余额/持仓，并把持仓接入 SLTP 跟踪与仓位管理。
+            try:
+                await self.force_sync_account_state(reason="startup")
+            except Exception as e:
+                logger.warning(f"⚠️ 启动同步余额/持仓失败（不阻塞启动）: {e}")
+
+            # 启动主动性AI系统 - 让AI主动工作
+            if self.proactive_ai:
+                try:
+                    await self.proactive_ai.start()
+                    logger.info("🚀 主动性AI系统已启动 - AI将主动扫描市场、分析信息、执行交易")
+                except Exception as e:
+                    logger.error(f"❌ 主动性AI系统启动失败: {e}")
+
+            # 启动止盈止损监控
+            await self.start_stop_loss_monitoring()
+
+            # 启动心跳监控器
+            if not self.heartbeat_monitor and self.ai_trading_engine and self.skill_manager:
+                try:
+                    hb_cfg = {}
+                    try:
+                        hb_cfg = await self.config_manager.get_config("heartbeat", {}) if self.config_manager else {}
+                    except Exception:
+                        hb_cfg = {}
+                    self.heartbeat_monitor = HeartbeatMonitor(
+                        trading_engine=self.ai_trading_engine,
+                        skill_manager=self.skill_manager,
+                        memory_manager=self.hierarchical_memory,
+                        notification_handler=self._send_notification_handler,
+                        interval=int(hb_cfg.get("interval_sec", 1800)) if isinstance(hb_cfg, dict) else 1800,
+                        config_manager=self.config_manager,
+                    )
+                    if isinstance(hb_cfg, dict):
+                        try:
+                            self.heartbeat_monitor.market_opportunity_cooldown_sec = int(
+                                hb_cfg.get("market_opportunity_notice_cooldown_sec", 21600)
+                            )
+                            self.heartbeat_monitor.market_opportunity_notice_enabled = bool(
+                                hb_cfg.get("market_opportunity_notice_enabled", False)
+                            )
+                        except Exception:
+                            pass
+                    logger.info("✅ 心跳监控器已初始化")
+                except Exception as e:
+                    logger.error(f"心跳监控器初始化失败: {e}")
+
+            # 启动心跳监控任务
+            if self.heartbeat_monitor:
+                try:
+                    heartbeat_task = asyncio.create_task(self.heartbeat_monitor.start())
+                    self._tasks.append(heartbeat_task)
+                    logger.info("💓 心跳监控器已启动 - 主动式系统监控")
+                except Exception as e:
+                    logger.error(f"心跳监控器启动失败: {e}")
+
+            # 发送心跳事件
+            await self.emit_event(
+                EventType.HEARTBEAT, "controller", {"status": "running", "uptime": 0}
+            )
+
+            return True
 
         except Exception as e:
-            self.system_status = ModuleStatus.ERROR
+            async with self._lock:
+                self.system_status = ModuleStatus.ERROR
             logger.error(f"系统启动异常: {e}")
             traceback.print_exc()
             return False
