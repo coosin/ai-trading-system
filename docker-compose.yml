@@ -97,8 +97,8 @@ networks:
     driver: bridge
 
 # 生产推荐：在「宿主机」安装 Clash/mihomo，TUN + auto-route 接管本机出站与分流；容器走
-# host.docker.internal:7890 或 trading-system 使用 network_mode: host。说明见：
-#   deploy/HOST_CLASH_EGRESS.md
+# host.docker.internal:7890。若 bridge 出网/DNS 仍异常：追加 -f docker-compose.hostnet.yml
+# 或 HOSTNET=1 ./scripts/deploy_production_stack.sh。说明见 deploy/HOST_CLASH_EGRESS.md
 # ---------------------------------------------------------------------------
 # 可选：同 compose 内 egress 侧车（无宿主机 Clash 时）
 #   docker compose --profile egress-sidecar up -d

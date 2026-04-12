@@ -7,11 +7,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# HOSTNET=1 或 OPENCLAW_HOSTNET=1：交易容器用宿主机网络（bridge 无出网/DNS 时）；见 docker-compose.hostnet.yml
+COMPOSE=(docker compose)
+if [[ "${HOSTNET:-0}" == "1" ]] || [[ "${OPENCLAW_HOSTNET:-0}" == "1" ]]; then
+  COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.hostnet.yml)
+  echo "==> 使用 host 网络模式（trading-system）…"
+fi
+
 echo "==> 构建镜像（trading-system）…"
-docker compose build trading-system
+"${COMPOSE[@]}" build trading-system
 
 echo "==> 启动 / 重建 trading-system 与 redis…"
-docker compose up -d
+"${COMPOSE[@]}" up -d
 
 echo "==> 等待 API 就绪（最多 120s）…"
 for i in $(seq 1 24); do

@@ -1,7 +1,6 @@
 # OpenClaw Trading — 运维手册
 
-与 [ENGINEERING.md](./ENGINEERING.md) 配合使用：本节聚焦**部署、网络、巡检与排障**。  
-**容器网络 / 代理 / DNS / host 模式与 Redis** 的系统性分析见 [**NETWORK_STABILITY_REPORT.md**](./NETWORK_STABILITY_REPORT.md)。
+与 [ENGINEERING.md](./ENGINEERING.md) 配合使用：本节聚焦**部署、网络、巡检与排障**。
 
 ---
 
@@ -14,6 +13,13 @@ cp .env.example .env   # 编辑密钥与 MODE / TRADING_MODE
 # 主调参仅使用仓库内 config/config.yaml；compose 已挂载 ./config:/app/config
 docker compose build trading-system
 docker compose up -d
+```
+
+若 **bridge 容器 DNS/出网全挂**（与宿主机 Clash 不一致），用宿主机网络跑交易服务（Redis 仍桥接并映射 `6379` 到宿主机）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d
+# 或：HOSTNET=1 ./scripts/deploy_production_stack.sh
 ```
 
 一键（含健康等待与 OKX 抽检）:
@@ -112,7 +118,7 @@ docker logs openclaw-trading --tail 200
 | 现象 | 方向 |
 |------|------|
 | OKX 连接失败 / SSL | 代理、DNS、Clash 规则；`production_network_baseline.py` |
-| 容器完全无外网 / DNS 全挂 | 见 [NETWORK_STABILITY_REPORT.md](./NETWORK_STABILITY_REPORT.md) 第 3 节；查 iptables、Clash 监听地址、`host.docker.internal` |
+| 容器完全无外网 / DNS 全挂 | 先试 `docker-compose.hostnet.yml`（上 1.1）；再查 iptables、Clash 是否监听 `0.0.0.0`、`host.docker.internal`（见 `deploy/HOST_CLASH_EGRESS.md`） |
 | 429 过多（Reddit 等） | `OPENCLAW_THIRD_PARTY_*` 与 `OPENCLAW_REDDIT_SUBREDDIT_PAUSE_SEC` |
 | Redis 错误 | `REDIS_HOST=redis`、服务是否 healthy |
 | API 404（司令部 surface） | 路径须为 `/api/v1/modules/surface/...` |

@@ -1,0 +1,17 @@
+# 当默认 bridge 容器出不了网 / DNS 全挂时：交易进程用宿主机网络栈（与宿主机 Clash/TUN 一致）。
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d
+# Redis 仍走 compose 桥接，端口映射到宿主机；应用连 127.0.0.1:6379。
+# 注意：API 监听宿主机 8000（或 .env 里 API_PORT，映射在 host 模式下不生效，以容器内 8000 为准）。
+
+services:
+  trading-system:
+    network_mode: host
+    networks: !reset null
+    ports: !reset null
+    dns: !reset null
+    dns_search: !reset null
+    dns_opt: !reset null
+    extra_hosts: !reset null
+    environment:
+      REDIS_HOST: "127.0.0.1"
