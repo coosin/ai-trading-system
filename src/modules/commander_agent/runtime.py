@@ -16,6 +16,7 @@ from src.modules.commander_agent.specialists import (
     run_specialist,
 )
 from src.modules.commander_agent.types import CommanderContextBundle, CommanderRunMeta, CommanderRoute
+from src.modules.core.commander_charter import WORKSPACE_READ_PREFIXES
 from src.modules.core.model_reply_guard import sanitize_commander_result
 
 if TYPE_CHECKING:
@@ -206,6 +207,18 @@ def commander_capabilities(mc: "MainController") -> Dict[str, Any]:
         "memory": {
             "memory_gateway": getattr(mc, "memory_gateway", None) is not None,
             "active_memory_env": str(os.environ.get("OPENCLAW_COMMANDER_ACTIVE_MEMORY", "1")),
+        },
+        "honesty_and_status": {
+            "reply_guard": str(os.environ.get("OPENCLAW_REPLY_GUARD", "1")),
+            "grounded_chat": str(os.environ.get("OPENCLAW_COMMANDER_GROUNDED_CHAT", "1")),
+            "honesty_strict": str(os.environ.get("OPENCLAW_COMMANDER_HONESTY_STRICT", "1")),
+            "minimal_mode": str(os.environ.get("OPENCLAW_COMMANDER_MINIMAL_MODE", "0")),
+            "status_use_llm": str(os.environ.get("OPENCLAW_COMMANDER_STATUS_USE_LLM", "0")),
+            "note": (
+                "默认系统状态为程序生成摘要（STATUS_USE_LLM=0），减少编造；"
+                "workspace_read 仅允许下列前缀；MINIMAL_MODE=1 时多数交易意图不会自动执行。"
+            ),
+            "workspace_read_prefixes": list(WORKSPACE_READ_PREFIXES),
         },
         "skills": skills,
         "plugins": plugins,

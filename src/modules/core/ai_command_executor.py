@@ -27,6 +27,52 @@ def _finalize_commander_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     return sanitize_commander_result(result)
 
 
+def _status_summary_use_llm() -> bool:
+    """默认关闭：系统状态用程序生成摘要，避免模型添油加醋。开启：OPENCLAW_COMMANDER_STATUS_USE_LLM=1"""
+    return str(os.environ.get("OPENCLAW_COMMANDER_STATUS_USE_LLM", "0") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _json_dumps_status_snapshot(obj: Any) -> str:
+    """状态注入 LLM 时用 default=str，避免 Enum/自定义对象导致 dumps 失败。"""
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+def _format_system_status_deterministic(
+    status_payload: Dict[str, Any],
+    *,
+    positions_meta: Dict[str, Any],
+) -> str:
+    """不含 LLM 的固定格式摘要，杜绝「系统平稳但接口挂了」类矛盾话术。"""
+    lines: List[str] = ["【系统状态】以下为本次程序拉取的事实摘要（非模型推测）。"]
+    mods = status_payload.get("modules") or {}
+    if isinstance(mods, dict) and mods:
+        ok = sum(1 for v in mods.values() if v)
+        lines.append(f"- 核心子系统挂载: {ok}/{len(mods)}（明细见返回 JSON data.modules）。")
+    st = status_payload.get("strategy") or {}
+    if isinstance(st, dict):
+        ex = st.get("examples") or []
+        ex_s = ", ".join(str(x) for x in ex) if ex else "无"
+        lines.append(f"- 策略配置数量: {st.get('count', 0)}；示例名: {ex_s}。")
+    pos = status_payload.get("positions") or []
+    err = positions_meta.get("error")
+    if err:
+        lines.append(f"- 交易所持仓: 拉取失败 — {err}。请勿根据聊天记录猜测持仓。")
+    elif not pos:
+        lines.append("- 交易所持仓: 当前快照无记录（可能无仓或未返回）。请勿编造手数/方向/币种。")
+    else:
+        lines.append("- 交易所持仓（接口快照）:")
+        for p in pos[:8]:
+            if isinstance(p, dict):
+                lines.append(f"  · {p.get('symbol')} {p.get('side')} 数量 {p.get('size')}")
+    lines.append("- 更全自检: API `GET /api/v1/modules/commander/audit?enrich=true`。")
+    return "\n".join(lines)
+
+
 from .timing_constants import SLEEP_5S, SLEEP_60S
 from .commander_charter import (
     CHARTER,
@@ -2063,6 +2109,15 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
             if self.main_controller:
                 mc = self.main_controller
 
+                # 注意：不得使用 (a and b and obj) 直接作为 dict 值——真值链会返回 obj 本身，json.dumps 会失败
+                _ms_fusion = None
+                if hasattr(mc, "ai_trading_engine") and mc.ai_trading_engine:
+                    _ms_fusion = getattr(mc.ai_trading_engine, "multi_source_fusion", None) or getattr(
+                        mc.ai_trading_engine, "data_fusion", None
+                    )
+                if _ms_fusion is None:
+                    _ms_fusion = getattr(mc, "multi_source_data_fusion", None)
+
                 modules = {
                     "策略管理器": hasattr(mc, 'strategy_manager') and mc.strategy_manager is not None,
                     "AI交易引擎": hasattr(mc, 'ai_trading_engine') and mc.ai_trading_engine is not None,
@@ -2071,15 +2126,8 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     "LLM集成": hasattr(mc, 'llm_integration') and mc.llm_integration is not None,
                     "记忆系统": self.unified_memory is not None,
                     "回测系统": hasattr(mc, 'enhanced_backtester') and mc.enhanced_backtester is not None,
-                    # 兼容历史命名：multi_source_fusion / data_fusion / multi_source_data_fusion
-                    "多源数据融合": (
-                        hasattr(mc, 'ai_trading_engine')
-                        and mc.ai_trading_engine
-                        and (
-                            (hasattr(mc.ai_trading_engine, 'multi_source_fusion') and mc.ai_trading_engine.multi_source_fusion)
-                            or (hasattr(mc.ai_trading_engine, 'data_fusion') and mc.ai_trading_engine.data_fusion)
-                        )
-                    ) or (hasattr(mc, 'multi_source_data_fusion') and mc.multi_source_data_fusion),
+                    # 兼容历史命名：multi_source_fusion / data_fusion / multi_source_data_fusion（仅布尔，勿嵌入实例）
+                    "多源数据融合": _ms_fusion is not None,
                     # 兼容 third_party_integrator / third_party_data 两种挂载方式
                     "第三方数据集成": (
                         (hasattr(mc, 'third_party_data_integrator') and mc.third_party_data_integrator is not None)
@@ -2176,34 +2224,53 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     "full_authorization": bool(self.authorization.get("full_authorization")),
                 }
 
-                # 获取持仓
-                if hasattr(mc, 'okx_exchange') and mc.okx_exchange:
+                positions_meta: Dict[str, Any] = {"source": "none", "error": None}
+                # 获取持仓（仅接口事实；失败则明确标记，禁止模型脑补）
+                if hasattr(mc, "okx_exchange") and mc.okx_exchange:
+                    positions_meta["source"] = "exchange"
                     try:
                         positions = await mc.okx_exchange.get_positions()
                         if positions:
                             for pos in positions[:5]:
-                                symbol = pos.get('instId', pos.get('symbol', 'Unknown'))
-                                side = pos.get('posSide', pos.get('side', 'unknown'))
-                                size = pos.get('pos', pos.get('size', 0))
+                                symbol = pos.get("instId", pos.get("symbol", "Unknown"))
+                                side = pos.get("posSide", pos.get("side", "unknown"))
+                                size = pos.get("pos", pos.get("size", 0))
                                 status_payload["positions"].append(
                                     {"symbol": symbol, "side": str(side), "size": size}
                                 )
                     except Exception as e:
-                        logger.debug(f"查询持仓信息失败: {e}")
+                        positions_meta["error"] = str(e)
+                        logger.debug("查询持仓信息失败: %s", e)
+                status_payload["evidence"] = {
+                    "positions_source": positions_meta.get("source"),
+                    "positions_error": positions_meta.get("error"),
+                    "positions_count": len(status_payload.get("positions") or []),
+                }
 
-                if self.llm_integration:
+                honesty: Dict[str, Any] = {
+                    "status_summary_mode": "llm" if _status_summary_use_llm() else "deterministic",
+                    "positions_from_exchange_attempted": positions_meta.get("source") == "exchange",
+                    "positions_in_payload": len(status_payload.get("positions") or []),
+                }
+
+                if _status_summary_use_llm() and self.llm_integration:
                     bundle = (getattr(self, "_workspace_startup_bundle", None) or "").strip()
                     persona_hint = (
                         f"\n【人格与画像节选】\n{bundle[:2500]}\n"
                         if bundle
                         else ""
                     )
+                    strict = (
+                        "\n【硬约束】JSON 中 evidence.positions_count 为 0 或 evidence.positions_error 非空时，"
+                        "禁止描述任何具体持仓、手数、多空方向、盈亏；不得用「上周/之前对话」补全。"
+                        "modules 仅为布尔挂载，不得推断「策略正在实盘跑单」除非 strategy 与接口有明确依据。\n"
+                    )
                     free_prompt = f"""{persona_hint}
 【司令部宪章 · 原则锚点】
 {CHARTER}
-
+{strict}
 下面是当前系统状态（JSON，事实以这里为准）：
-{json.dumps(status_payload, ensure_ascii=False)}
+{_json_dumps_status_snapshot(status_payload)}
 
 用符合「人格与画像」的口吻、像真人一样说；别按表格机械念。挑最重要几点说清；有矛盾就点出来；最后最多问一句接下来你最关心啥。
 """
@@ -2213,13 +2280,19 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                             is_user_input=False,
                         )
                         if llm_resp and getattr(llm_resp, "content", None):
-                            return {"success": True, "response": llm_resp.content, "data": status_payload}
+                            out = {
+                                "success": True,
+                                "response": llm_resp.content,
+                                "data": status_payload,
+                                "honesty": honesty,
+                            }
+                            return _finalize_commander_payload(out)
                     except Exception as e:
                         logger.debug(f"系统状态自然化生成失败，降级简答: {e}")
 
-                ok_count = sum(1 for _k, v in modules.items() if v)
-                fallback = f"司令部在线。当前核心模块就绪 {ok_count}/{len(modules)}。如果你愿意，我现在直接盯你最关心的一件事（比如持仓风险或为什么没开仓）。"
-                return {"success": True, "response": fallback, "data": status_payload}
+                text = _format_system_status_deterministic(status_payload, positions_meta=positions_meta)
+                out = {"success": True, "response": text, "data": status_payload, "honesty": honesty}
+                return _finalize_commander_payload(out)
             
             return {"success": False, "response": "主控制器未初始化"}
             
@@ -2249,6 +2322,7 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
             r"(系统|诊断|巡检|运行|就绪)",
             r"(价格|行情|报价|现价|ticker|多少.?钱|u价)",
             r"(持仓|仓位|余额|账户|权益)",
+            r"(别编|不要编|瞎编|胡说|说谎|骗人|忽悠|实事求是|不要骗|不要扯)",
         )
         if "workspace" in t.lower() or "architecture" in t.lower():
             return True

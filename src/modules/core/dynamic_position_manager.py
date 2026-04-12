@@ -50,10 +50,10 @@ class PositionLimit:
 
 @dataclass
 class DynamicPositionConfig:
-    """动态仓位配置"""
-    base_position_ratio: float = 0.1
+    """动态仓位配置 - 小资金优化"""
+    base_position_ratio: float = 0.05  # 小资金：降低到5%
     min_position_ratio: float = 0.01
-    max_position_ratio: float = 0.3
+    max_position_ratio: float = 0.15  # 小资金：降低到15%
     
     volatility_adjustment_factor: float = 0.5
     risk_adjustment_factor: float = 0.3

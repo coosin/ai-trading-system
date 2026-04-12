@@ -5,7 +5,7 @@
 """
 
 import logging
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException
 
@@ -32,6 +32,72 @@ def init_strategy_api(manager: StrategyManager):
     strategy_manager = manager
 
 
+def _strategy_list_items(manager: StrategyManager) -> List[Dict[str, Any]]:
+    """与 server.py 中 /api/v1/strategies 一致的列表结构（StrategyManager 真实字段）。"""
+    configs = getattr(manager, "strategy_configs", None) or {}
+    metrics = getattr(manager, "performance_metrics", None) or {}
+    out: List[Dict[str, Any]] = []
+    for sid, cfg in configs.items():
+        d = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
+        item: Dict[str, Any] = {
+            "id": d.get("strategy_id", sid),
+            "strategy_id": d.get("strategy_id", sid),
+            "name": d.get("name", sid),
+            "description": d.get("description", ""),
+            "strategy_type": d.get("strategy_type"),
+            "status": "active" if d.get("enabled", True) else "inactive",
+            "enabled": d.get("enabled", True),
+            "symbols": d.get("symbols", []),
+            "timeframe": d.get("timeframe", "1h"),
+            "parameters": d.get("parameters", {}),
+            "metadata": d.get("metadata", {}),
+            "returns": "-",
+            "max_drawdown": "-",
+            "sharpe_ratio": "-",
+        }
+        perf = metrics.get(sid)
+        if perf:
+            item["total_trades"] = int(getattr(perf, "total_trades", 0) or 0)
+            item["win_rate"] = round(100.0 * float(getattr(perf, "win_rate", 0.0) or 0.0), 2)
+            item["max_drawdown"] = str(
+                round(float(getattr(perf, "max_drawdown", 0.0) or 0.0) * 100.0, 2)
+            )
+            item["sharpe_ratio"] = str(round(float(getattr(perf, "sharpe_ratio", 0.0) or 0.0), 3))
+            item["returns"] = str(round(float(getattr(perf, "total_pnl", 0.0) or 0.0), 4))
+        out.append(item)
+    return out
+
+
+def _performance_payload(manager: StrategyManager) -> Dict[str, Any]:
+    """汇总 performance_metrics，避免调用已删除的同步 API。"""
+    metrics = getattr(manager, "performance_metrics", None) or {}
+    by_id: Dict[str, Any] = {}
+    for sid, perf in metrics.items():
+        mr = getattr(perf, "market_regime", None)
+        mr_val = mr.value if mr is not None and hasattr(mr, "value") else mr
+        lu = getattr(perf, "last_updated", None)
+        by_id[sid] = {
+            "strategy_id": getattr(perf, "strategy_id", sid),
+            "total_pnl": float(getattr(perf, "total_pnl", 0.0) or 0.0),
+            "total_trades": int(getattr(perf, "total_trades", 0) or 0),
+            "winning_trades": int(getattr(perf, "winning_trades", 0) or 0),
+            "losing_trades": int(getattr(perf, "losing_trades", 0) or 0),
+            "win_rate": float(getattr(perf, "win_rate", 0.0) or 0.0),
+            "sharpe_ratio": float(getattr(perf, "sharpe_ratio", 0.0) or 0.0),
+            "max_drawdown": float(getattr(perf, "max_drawdown", 0.0) or 0.0),
+            "market_regime": mr_val,
+            "last_updated": lu.isoformat() if lu is not None else None,
+        }
+    regime = getattr(manager, "market_regime", None)
+    regime_val = regime.value if regime is not None and hasattr(regime, "value") else regime
+    return {
+        "strategies": by_id,
+        "best_strategy": getattr(manager, "best_strategy", None),
+        "market_regime": regime_val,
+        "strategy_config_count": len(getattr(manager, "strategy_configs", None) or {}),
+    }
+
+
 @router.get("/list")
 def get_strategies() -> Dict[str, Any]:
     """获取所有策略
@@ -41,11 +107,13 @@ def get_strategies() -> Dict[str, Any]:
     """
     if not strategy_manager:
         raise HTTPException(status_code=500, detail="策略管理器未初始化")
-    
+
+    items = _strategy_list_items(strategy_manager)
+    active = [x for x in items if x.get("enabled", True)]
     return {
-        "strategies": strategy_manager.get_all_strategies(),
-        "active_strategies": strategy_manager.get_active_strategies(),
-        "best_strategy": strategy_manager.get_best_strategy()
+        "strategies": items,
+        "active_strategies": active,
+        "best_strategy": getattr(strategy_manager, "best_strategy", None),
     }
 
 
@@ -58,8 +126,8 @@ def get_strategy_performance() -> Dict[str, Any]:
     """
     if not strategy_manager:
         raise HTTPException(status_code=500, detail="策略管理器未初始化")
-    
-    return strategy_manager.get_strategy_performance()
+
+    return _performance_payload(strategy_manager)
 
 
 @router.post("/activate/{strategy_name}")

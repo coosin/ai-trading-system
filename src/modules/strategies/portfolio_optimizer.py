@@ -1,11 +1,37 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-from typing import List, Dict, Any, Tuple
+from typing import Any, List, Dict
 
 class PortfolioOptimizer:
     def __init__(self):
         self.strategies = {}
+
+    def seed_from_strategy_manager(self, strategy_manager: Any) -> int:
+        """从 StrategyManager 策略池预置优化条目（无历史时用占位收益/波动率，便于组合 API 可用）。"""
+        if strategy_manager is None:
+            return 0
+        configs = getattr(strategy_manager, "strategy_configs", None) or {}
+        metrics = getattr(strategy_manager, "performance_metrics", None) or {}
+        added = 0
+        for sid, cfg in configs.items():
+            name = getattr(cfg, "name", None) or sid
+            if name in self.strategies:
+                continue
+            vol = 0.25
+            ann = 0.08
+            perf = metrics.get(sid)
+            if perf is not None:
+                try:
+                    dd = float(getattr(perf, "max_drawdown", 0.0) or 0.0)
+                    vol = max(min(abs(dd) * 1.2, 0.8), 0.05)
+                    sh = float(getattr(perf, "sharpe_ratio", 0.0) or 0.0)
+                    ann = max(min(0.04 + sh * 0.03, 0.5), -0.2)
+                except Exception:
+                    pass
+            self.add_strategy(str(name), ann, vol, {})
+            added += 1
+        return added
     
     def add_strategy(self, strategy_name: str, returns: pd.Series or float, volatility: float, correlation: Dict[str, float] = None):
         """添加策略到组合中

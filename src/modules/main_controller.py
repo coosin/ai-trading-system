@@ -325,6 +325,9 @@ class MainController:
         
         # 数据库管理器
         self.database_manager = None
+
+        # 全局风险管理器（单例，供资金管理/交易引擎等复用）
+        self.risk_manager = None
         
         # 业务流程管理器
         self.business_process_manager = None
@@ -749,8 +752,14 @@ class MainController:
         # 设置异常检测器实例到API模块
         set_anomaly_detector(self.anomaly_detector)
         
-        # 初始化策略组合优化器
+        # 初始化策略组合优化器，并从策略池预置条目（否则 unified 系统内优化器为空壳）
         self.portfolio_optimizer = PortfolioOptimizer()
+        try:
+            seeded = self.portfolio_optimizer.seed_from_strategy_manager(self.strategy_manager)
+            if seeded:
+                logger.info("✅ 组合优化器已从策略池预置 %d 条", seeded)
+        except Exception as e:
+            logger.warning("⚠️ 组合优化器预置失败: %s", e)
         
         # 初始化参数优化器
         self.parameter_optimizer = ParameterOptimizer()
@@ -826,6 +835,17 @@ class MainController:
         # 初始化数据库管理器
         self.database_manager = DatabaseManager(self.config_manager)
         await self.database_manager.initialize()
+
+        # 风险管理器尽早初始化，避免 IntelligentFundManager 等模块使用「另一套」临时实例
+        try:
+            from src.modules.core.risk_manager import RiskManager
+
+            self.risk_manager = RiskManager()
+            await self.risk_manager.initialize()
+            logger.info("✅ 风险管理器已初始化（全局单例）")
+        except Exception as e:
+            logger.warning(f"⚠️ 风险管理器初始化失败: {e}")
+            self.risk_manager = None
         
         # 初始化统一系统
         await self._init_unified_systems()
@@ -874,10 +894,13 @@ class MainController:
                 "risk_per_trade": 0.02,
                 "max_leverage": 3
             }
-            risk_mgr = RiskManager()
+            if self.risk_manager is None:
+                self.risk_manager = RiskManager()
+                await self.risk_manager.initialize()
+                logger.info("✅ 风险管理器延迟初始化（供资金管理器绑定）")
             self.fund_manager = IntelligentFundManager(
                 db_manager=self.database_manager,
-                risk_manager=risk_mgr,
+                risk_manager=self.risk_manager,
                 config=fund_config
             )
             await self.fund_manager.initialize()
@@ -1140,15 +1163,17 @@ class MainController:
             logger.warning(f"⚠️ 主动性AI系统初始化失败: {e}")
             self.proactive_ai = None
         
-        # 初始化风险管理器
-        try:
-            from src.modules.core.risk_manager import RiskManager
-            self.risk_manager = RiskManager()
-            await self.risk_manager.initialize()
-            logger.info("✅ 风险管理器已初始化")
-        except Exception as e:
-            logger.warning(f"⚠️ 风险管理器初始化失败: {e}")
-            self.risk_manager = None
+        # 风险管理器已在数据库初始化后创建；此处仅补登（防止早期路径被跳过）
+        if self.risk_manager is None:
+            try:
+                from src.modules.core.risk_manager import RiskManager
+
+                self.risk_manager = RiskManager()
+                await self.risk_manager.initialize()
+                logger.info("✅ 风险管理器已初始化（补登）")
+            except Exception as e:
+                logger.warning(f"⚠️ 风险管理器初始化失败: {e}")
+                self.risk_manager = None
         
         # ========== 新增升级模块初始化 ==========
         

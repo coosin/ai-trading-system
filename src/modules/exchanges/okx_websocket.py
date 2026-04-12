@@ -63,6 +63,17 @@ class OKXWebSocketHub:
             "sign": sign,
         }
 
+    async def _ws_send_periodic_ping(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """OKX 建议周期性 ping，降低中间设备空闲断连概率。"""
+        interval = float(os.getenv("OPENCLAW_OKX_WS_PING_INTERVAL_SEC", "20") or "20")
+        interval = max(8.0, min(interval, 120.0))
+        while not self._stop.is_set():
+            await asyncio.sleep(interval)
+            try:
+                await ws.send_str(json.dumps({"op": "ping"}, separators=(",", ":")))
+            except Exception:
+                return
+
     def get_cached_ticker(self, inst_id: str, max_age_ms: float) -> Optional[Dict[str, Any]]:
         row = self._ticker_cache.get(inst_id)
         if not row:
@@ -113,27 +124,39 @@ class OKXWebSocketHub:
                     await ws.send_str(json.dumps({"op": "subscribe", "args": args}, separators=(",", ":")))
                     logger.info("OKX WS 已订阅 tickers: %s", ",".join(inst_ids))
                     backoff = 1.0
-                    while not self._stop.is_set():
-                        msg = await asyncio.wait_for(ws.receive(), timeout=30.0)
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = json.loads(msg.data)
-                            except Exception:
-                                continue
-                            if data.get("arg", {}).get("channel") == "tickers" and isinstance(data.get("data"), list):
-                                for row in data["data"]:
-                                    if not isinstance(row, dict):
-                                        continue
-                                    iid = row.get("instId")
-                                    if iid:
-                                        self._ticker_cache[str(iid)] = (time.time(), row)
-                            ev = data.get("event")
-                            if ev == "error":
-                                logger.warning("OKX WS 公共频道错误: %s", data)
-                        elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
-                            break
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            break
+                    ping_task = asyncio.create_task(self._ws_send_periodic_ping(ws))
+                    try:
+                        while not self._stop.is_set():
+                            msg = await asyncio.wait_for(ws.receive(), timeout=35.0)
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                except Exception:
+                                    continue
+                                if data.get("event") == "pong":
+                                    continue
+                                if data.get("arg", {}).get("channel") == "tickers" and isinstance(
+                                    data.get("data"), list
+                                ):
+                                    for row in data["data"]:
+                                        if not isinstance(row, dict):
+                                            continue
+                                        iid = row.get("instId")
+                                        if iid:
+                                            self._ticker_cache[str(iid)] = (time.time(), row)
+                                ev = data.get("event")
+                                if ev == "error":
+                                    logger.warning("OKX WS 公共频道错误: %s", data)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                                break
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                break
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -182,24 +205,34 @@ class OKXWebSocketHub:
                     await ws.send_str(json.dumps(sub, separators=(",", ":")))
                     logger.info("OKX WS 已订阅 positions SWAP（私有）")
                     backoff = 1.0
-                    while not self._stop.is_set():
-                        msg = await asyncio.wait_for(ws.receive(), timeout=30.0)
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = json.loads(msg.data)
-                            except Exception:
-                                continue
-                            if data.get("event") == "subscribe" and str(data.get("code")) != "0":
-                                logger.warning("OKX WS positions 订阅响应: %s", data)
-                            if data.get("arg", {}).get("channel") == "positions":
-                                # 预留：后续可将 data["data"] 写入 exchange 级缓存供 get_positions 快路径
-                                pass
-                            if data.get("event") == "error":
-                                logger.warning("OKX WS 私有频道错误: %s", data)
-                        elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
-                            break
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            break
+                    ping_task = asyncio.create_task(self._ws_send_periodic_ping(ws))
+                    try:
+                        while not self._stop.is_set():
+                            msg = await asyncio.wait_for(ws.receive(), timeout=35.0)
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                except Exception:
+                                    continue
+                                if data.get("event") == "pong":
+                                    continue
+                                if data.get("event") == "subscribe" and str(data.get("code")) != "0":
+                                    logger.warning("OKX WS positions 订阅响应: %s", data)
+                                if data.get("arg", {}).get("channel") == "positions":
+                                    # 预留：后续可将 data["data"] 写入 exchange 级缓存供 get_positions 快路径
+                                    pass
+                                if data.get("event") == "error":
+                                    logger.warning("OKX WS 私有频道错误: %s", data)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                                break
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                break
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
             except asyncio.CancelledError:
                 raise
             except Exception as e:

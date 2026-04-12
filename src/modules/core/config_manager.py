@@ -275,7 +275,7 @@ class ConfigManager:
                 "auto_risk_management": True,
                 "critical_risk_auto_close": True,
                 "critical_risk_auto_close_liq_only": True,
-                "critical_risk_auto_close_max_liq_distance": 0.02,
+                "critical_risk_auto_close_max_liq_distance": 0.08,
                 "critical_risk_auto_close_min_loss_pct": 25.0,
                 "max_loss_per_position": 0.05,
                 "daily_loss_limit": 0.10,

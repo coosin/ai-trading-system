@@ -174,9 +174,10 @@ class AITradingEngine:
             "trade_mode": "real",
             "auto_risk_management": True,
             "critical_risk_auto_close": True,
-            # 自动强平保护闸：默认仅在“非常接近强平”时自动平仓，避免把普通浮亏当成强制平仓。
+            # 与 AccountRiskMonitor.liquidation_distance_critical 对齐的「贴近强平」阈值（比例，如 0.08=8%）
+            "critical_risk_auto_close_max_liq_distance": 0.08,
+            # 保留字段：曾错误地屏蔽「仅浮亏达极端」的自动平仓，逻辑上已不再参与闸门判定（见 _on_risk_warning）。
             "critical_risk_auto_close_liq_only": True,
-            "critical_risk_auto_close_max_liq_distance": 0.02,
             "critical_risk_auto_close_min_loss_pct": 25.0,
             "max_loss_per_position": 0.05,
             "daily_loss_limit": 0.10,
@@ -2595,39 +2596,39 @@ class AITradingEngine:
                         loss_pct = abs(min(float(getattr(pos_risk, "unrealized_pnl_percent", 0) or 0), 0.0))
 
                         liq_critical = float(risk_cfg.get("liquidation_distance_critical", 0.08) or 0.08)
-                        liq_auto_close_max = float(
-                            self.ai_config.get(
-                                "critical_risk_auto_close_max_liq_distance",
-                                min(liq_critical, 0.04),
-                            ) or min(liq_critical, 0.04)
-                        )
+                        raw_max = self.ai_config.get("critical_risk_auto_close_max_liq_distance")
+                        liq_auto_close_max = float(raw_max) if raw_max is not None else liq_critical
+                        if liq_auto_close_max <= 0:
+                            liq_auto_close_max = liq_critical
                         near_liq = liq_dist > 0 and liq_dist <= liq_auto_close_max
 
                         margin_critical = float(risk_cfg.get("margin_ratio_critical", 0.9) or 0.9)
                         margin_emergency = margin_critical > 0 and float(getattr(account_risk, "margin_ratio", 0) or 0) >= margin_critical
 
-                        liq_only = bool(self.ai_config.get("critical_risk_auto_close_liq_only", True))
                         min_loss_pct = float(self.ai_config.get("critical_risk_auto_close_min_loss_pct", 25.0) or 25.0)
                         severe_loss = loss_pct >= min_loss_pct
 
-                        should_auto_close = margin_emergency or (near_liq if liq_only else (near_liq or severe_loss))
+                        # 闸门：保证金占满、贴近强平价、或单仓位浮亏达极端（>= min_loss_pct，默认 25%）。
+                        # 不再使用 critical_risk_auto_close_liq_only 抑制 severe_loss（此前会导致 -34% 浮亏仍不平仓）。
+                        should_auto_close = margin_emergency or near_liq or severe_loss
                         if should_auto_close:
                             logger.critical(
-                                "🤖 自动风险处理: 平仓 %s (liq_dist=%.3f, loss=%.1f%%, margin=%.3f)",
+                                "🤖 自动风险处理: 平仓 %s (liq_dist=%.3f, max_liq=%.3f, loss=%.1f%%, margin=%.3f)",
                                 pos_risk.symbol,
                                 liq_dist,
+                                liq_auto_close_max,
                                 loss_pct,
                                 float(getattr(account_risk, "margin_ratio", 0) or 0),
                             )
                             await self._auto_close_position(pos_risk.symbol)
                         else:
                             logger.warning(
-                                "🛡️ 跳过自动强平 %s：未命中强平闸门 (liq_dist=%.3f > %.3f, loss=%.1f%%, liq_only=%s)",
+                                "🛡️ 跳过自动强平 %s：未命中闸门 (liq_dist=%.3f, need<=%.3f, loss=%.1f%%, need>=%.1f%%)",
                                 pos_risk.symbol,
                                 liq_dist,
                                 liq_auto_close_max,
                                 loss_pct,
-                                liq_only,
+                                min_loss_pct,
                             )
         
         elif account_risk.risk_level == RiskLevel.HIGH:

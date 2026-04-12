@@ -118,7 +118,7 @@ class PositionLimit:
     max_total_position: float = 0.5  # 总仓位最大比例（50%）
     max_daily_trades: int = 50  # 单日最大交易次数
     max_order_value: float = 10000.0  # 单笔订单最大价值
-    min_order_value: float = 10.0  # 单笔订单最小价值
+    min_order_value: float = 5.0  # 单笔订单最小价值 (小资金优化)
 
 
 @dataclass

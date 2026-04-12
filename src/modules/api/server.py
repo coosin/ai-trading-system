@@ -1598,6 +1598,28 @@ class APIServer:
             except Exception as e:
                 logger.debug(f"总控聚合: trade review/stat 获取失败: {e}")
 
+            risk_manager_payload: Dict[str, Any] = {}
+            portfolio_optimizer_payload: Dict[str, Any] = {}
+            if mc:
+                try:
+                    rm = getattr(mc, "risk_manager", None)
+                    if rm is not None and hasattr(rm, "get_stats"):
+                        risk_manager_payload = await asyncio.wait_for(rm.get_stats(), timeout=0.9)
+                except Exception as e:
+                    logger.debug(f"总控聚合: risk_manager.get_stats 失败: {e}")
+                    risk_manager_payload = {"available": False, "error": "timeout_or_error"}
+                try:
+                    po = getattr(mc, "portfolio_optimizer", None)
+                    if po is not None:
+                        strat = getattr(po, "strategies", None) or {}
+                        portfolio_optimizer_payload = {
+                            "ready": bool(strat),
+                            "strategy_count": len(strat),
+                            "strategy_names": list(strat.keys())[:24],
+                        }
+                except Exception as e:
+                    logger.debug(f"总控聚合: portfolio_optimizer 摘要失败: {e}")
+
             return {
                 "success": True,
                 "timestamp": datetime.now().isoformat(),
@@ -1623,6 +1645,8 @@ class APIServer:
                     "strategy_performance": strategy_perf_payload,
                     "trade_statistics": trade_statistics_payload,
                     "trade_review": trade_review_payload,
+                    "risk_manager": risk_manager_payload,
+                    "portfolio_optimizer": portfolio_optimizer_payload,
                 },
                 "observability": {
                     "logs": logs_payload.get("data", []),

@@ -37,7 +37,7 @@ services:
       # 主网实盘默认 0；模拟盘 OKX 填 OKX_TESTNET=1
       - OKX_TESTNET=${OKX_TESTNET:-0}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      # 固定代理：容器内统一走 Clash，避免出现“部分链路直连”导致抖动
+      # 全局 HTTP(S)_PROXY：供 LLM/第三方等使用；OKX 默认见 OPENCLAW_OKX_IGNORE_ENV_PROXY（避免 Docker→Clash CONNECT 失败拖死行情）
       - HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-http://host.docker.internal:7890}
       - HTTPS_PROXY=${OPENCLAW_HTTPS_PROXY:-http://host.docker.internal:7890}
       - ALL_PROXY=${OPENCLAW_ALL_PROXY:-http://host.docker.internal:7890}
@@ -52,8 +52,10 @@ services:
       - OPENCLAW_OKX_MAX_CONCURRENCY=${OPENCLAW_OKX_MAX_CONCURRENCY:-2}
       - OPENCLAW_OKX_MIN_REQUEST_INTERVAL=${OPENCLAW_OKX_MIN_REQUEST_INTERVAL:-0.1}
       - OPENCLAW_OKX_MAX_RETRIES=${OPENCLAW_OKX_MAX_RETRIES:-3}
-      - OPENCLAW_OKX_PROXY_ONLY=${OPENCLAW_OKX_PROXY_ONLY:-1}
-      # OKX WebSocket（v5）：与 REST 共用 aiohttp 会话 + 宿主机 Clash 代理；与官方 public/private URL 一致
+      # OKX：IGNORE=1 时 REST/WS 均直连（压测最稳，且跳过 proxy_manager）；必须经代理时设 IGNORE=0 并修好 Docker→Clash CONNECT
+      - OPENCLAW_OKX_IGNORE_ENV_PROXY=${OPENCLAW_OKX_IGNORE_ENV_PROXY:-1}
+      - OPENCLAW_OKX_PROXY_ONLY=${OPENCLAW_OKX_PROXY_ONLY:-0}
+      # OKX WebSocket（v5）：与 REST 共用 aiohttp 会话；IGNORE=1 时 WS 与 REST 同为直连（最稳）
       - OPENCLAW_OKX_WS_ENABLED=${OPENCLAW_OKX_WS_ENABLED:-1}
       - OPENCLAW_OKX_WS_TICKER_FASTPATH=${OPENCLAW_OKX_WS_TICKER_FASTPATH:-1}
       - OPENCLAW_OKX_WS_TICKER_MAX_AGE_MS=${OPENCLAW_OKX_WS_TICKER_MAX_AGE_MS:-4000}
@@ -62,9 +64,9 @@ services:
       - OPENCLAW_COMMANDER_MINIMAL_MODE=${OPENCLAW_COMMANDER_MINIMAL_MODE:-0}
       - OPENCLAW_COMMANDER_GROUNDED_CHAT=${OPENCLAW_COMMANDER_GROUNDED_CHAT:-1}
       - OPENCLAW_COMMANDER_HONESTY_STRICT=${OPENCLAW_COMMANDER_HONESTY_STRICT:-1}
-      # 避免对容器内部地址走代理
-      - NO_PROXY=localhost,127.0.0.1,redis
-      - no_proxy=localhost,127.0.0.1,redis
+      # 避免对容器内部与 OKX 域名走全局代理（部分 HTTP 客户端尊重 NO_PROXY；OKX 主链路由 IGNORE 保证直连）
+      - NO_PROXY=localhost,127.0.0.1,redis,.okx.com,okx.com
+      - no_proxy=localhost,127.0.0.1,redis,.okx.com,okx.com
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     # 稳定 DNS：避免容器内偶发解析失败（如 api.okx.com）

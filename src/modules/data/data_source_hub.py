@@ -239,21 +239,37 @@ class DataSourceHub:
             )
         if exchange and hasattr(exchange, "get_ticker"):
             try:
-                ticker = await exchange.get_ticker(symbol)
-                if ticker:
-                    last = float(ticker.get("last") or ticker.get("close") or 0.0)
-                    return {
-                        "symbol": symbol,
-                        "last": last,
-                        "price": last,
-                        "bid": float(ticker.get("bid") or ticker.get("bidPx") or 0.0),
-                        "ask": float(ticker.get("ask") or ticker.get("askPx") or 0.0),
-                        "high": float(ticker.get("high") or ticker.get("high24h") or 0.0),
-                        "low": float(ticker.get("low") or ticker.get("low24h") or 0.0),
-                        "volume": float(ticker.get("volume") or ticker.get("quoteVolume") or ticker.get("vol24h") or 0.0),
-                        "timestamp": datetime.now().isoformat(),
-                        "source": "exchange",
-                    }
+                raw = await exchange.get_ticker(symbol)
+                if isinstance(raw, dict) and raw:
+                    last = float(
+                        raw.get("last")
+                        or raw.get("close")
+                        or raw.get("lastPx")
+                        or raw.get("idxPx")
+                        or 0.0
+                    )
+                    bid = float(raw.get("bid") or raw.get("bidPx") or 0.0)
+                    ask = float(raw.get("ask") or raw.get("askPx") or 0.0)
+                    if last <= 0.0 and bid > 0.0 and ask > 0.0:
+                        last = (bid + ask) / 2.0
+                    if last > 0.0 or bid > 0.0 or ask > 0.0:
+                        return {
+                            "symbol": symbol,
+                            "last": last,
+                            "price": last,
+                            "bid": bid,
+                            "ask": ask,
+                            "high": float(raw.get("high") or raw.get("high24h") or 0.0),
+                            "low": float(raw.get("low") or raw.get("low24h") or 0.0),
+                            "volume": float(
+                                raw.get("volume")
+                                or raw.get("quoteVolume")
+                                or raw.get("vol24h")
+                                or 0.0
+                            ),
+                            "timestamp": datetime.now().isoformat(),
+                            "source": "exchange",
+                        }
             except Exception:
                 pass
         return {"symbol": symbol, "timestamp": datetime.now().isoformat(), "source": "fallback"}
@@ -566,6 +582,7 @@ class DataSourceHub:
             orders = []
         if "liquidation_proxy" not in enabled:
             liq_proxy = {}
+        ticker_quality_notes = self._exchange_ticker_quality_notes(symbol, ticker)
         return {
             "symbol": symbol,
             "ticker": ticker,
@@ -582,16 +599,44 @@ class DataSourceHub:
                 "errors": errors[:30],
                 "health": health,
                 "enabled": sorted(enabled),
+                "ticker_quality_notes": ticker_quality_notes,
             },
         }
+
+    def _exchange_ticker_quality_notes(self, symbol: str, ticker: Dict[str, Any]) -> List[str]:
+        """对 ETH 等主品种做轻量一致性检查，便于总控/质量分解释。"""
+        notes: List[str] = []
+        if not isinstance(ticker, dict):
+            return notes
+        sym_u = str(symbol or "").upper()
+        last = float(ticker.get("last") or ticker.get("price") or 0.0)
+        bid = float(ticker.get("bid") or 0.0)
+        ask = float(ticker.get("ask") or 0.0)
+        src = str(ticker.get("source") or "")
+        if "ETH" in sym_u:
+            if last > 0 and bid > 0 and ask > 0:
+                spread = (ask - bid) / last
+                if spread > 0.003:
+                    notes.append(f"ETH 买卖价差偏大 relative_spread={spread:.5f}")
+            if last > 0 and last < 50.0:
+                notes.append("ETH 现价异常偏低，请核对 instId 与字段映射")
+            if src == "fallback":
+                notes.append("ETH 行情来源为 fallback，实盘决策前建议以 REST/交易所核对")
+        return notes
 
     def _score_quality(self, exchange_channel: Dict[str, Any], intel_channel: Dict[str, Any]) -> Dict[str, Any]:
         score = 0.0
         reasons: List[str] = []
-        if float(exchange_channel.get("ticker", {}).get("price") or 0.0) > 0:
+        t = exchange_channel.get("ticker") or {}
+        px = float(t.get("price") or t.get("last") or 0.0)
+        if px > 0:
             score += 0.35
         else:
             reasons.append("交易所行情缺失")
+        ex_col = exchange_channel.get("collector") or {}
+        for note in ex_col.get("ticker_quality_notes") or []:
+            if isinstance(note, str) and note:
+                reasons.append(note)
         if exchange_channel.get("order_book", {}).get("bids"):
             score += 0.2
         else:

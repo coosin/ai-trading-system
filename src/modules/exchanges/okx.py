@@ -64,7 +64,21 @@ def retry_on_error(max_retries=3, delay=1.0, backoff=2.0, allowed_exceptions=(Ex
 
 class OKXExchange(ExchangeBase):
     """OKX交易所实现"""
-    
+
+    # 紧凑代码（如 ETHUSDT）解析为 BASE/QUOTE，再统一成 OKX instId
+    _QUOTE_SUFFIXES = (
+        "USDT",
+        "USDC",
+        "USD",
+        "EUR",
+        "DAI",
+        "BUSD",
+        "TUSD",
+        "USDK",
+        "TRY",
+        "BRL",
+    )
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         # REST 实盘/模拟盘均为 https://www.okx.com；模拟盘需额外请求头 x-simulated-trading: 1（见官方文档）
@@ -95,9 +109,14 @@ class OKXExchange(ExchangeBase):
         self._proxy_from_env: bool = False
         self._proxy_disabled_until: float = 0.0
         # 仅走代理模式：开启后不再降级直连（适用于直连不稳定/被重置环境）
+        # 默认允许直连自愈；若必须全量走代理（合规/专线）请显式 OPENCLAW_OKX_PROXY_ONLY=1
         self._proxy_only: bool = str(
-            os.getenv("OPENCLAW_OKX_PROXY_ONLY", "1")
+            os.getenv("OPENCLAW_OKX_PROXY_ONLY", "0")
         ).strip().lower() not in ("0", "false", "no", "off")
+        # Docker 内 Clash HTTP 代理对 CONNECT 常失败时，跳过环境变量中的 HTTP(S)_PROXY，仅对 OKX 走 proxy_manager/直连
+        self._ignore_env_proxy: bool = str(
+            os.getenv("OPENCLAW_OKX_IGNORE_ENV_PROXY", "0")
+        ).strip().lower() in ("1", "true", "yes", "on")
         self._session_recreate_lock = asyncio.Lock()
         # 网络自愈：连续失败后主动重建会话/切换代理源
         self._network_consecutive_failures: int = 0
@@ -433,18 +452,44 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.debug("OKX payload matrix flush failed: %s", e)
 
+    def _compact_to_slash_format(self, symbol: str) -> str:
+        """ETHUSDT、BTCUSDT -> ETH/USDT、BTC/USDT（无分隔符的紧凑 ticker）。"""
+        s = (symbol or "").strip()
+        if not s or "/" in s or "-" in s:
+            return s
+        su = s.upper()
+        for q in self._QUOTE_SUFFIXES:
+            if su.endswith(q) and len(su) > len(q):
+                base = su[: -len(q)]
+                if base.isalnum():
+                    return f"{base}/{q}"
+        return s
+
     def _to_okx_inst_id(self, symbol: str, default_type: str = "SPOT") -> str:
         """
         将系统内 symbol 统一转换为 OKX instId。
+        - ETHUSDT -> ETH-USDT-SWAP（default_type=SWAP）
         - BTC/USDT/SWAP -> BTC-USDT-SWAP
-        - BTC/USDT      -> BTC-USDT （默认 SPOT）
+        - BTC/USDT + SWAP -> BTC-USDT-SWAP
+        - ETH-USDT + default SWAP -> ETH-USDT-SWAP
         """
         s = str(symbol or "").strip()
-        s_up = s.upper()
-        # 已经是 OKX instId（例如 BTC-USDT-SWAP / BTC-USDT）则直接返回
-        if "-" in s and "/" not in s:
+        if not s:
             return s
-        if "/SWAP" in s_up or s_up.endswith("SWAP"):
+        if "/" not in s and "-" not in s:
+            s = self._compact_to_slash_format(s)
+        elif "/" not in s and s.upper().endswith("-SWAP"):
+            # 如 ETHUSDT-SWAP（非 OKX 的 ETH-USDT-SWAP）先收成 BASE/QUOTE
+            core = s[:-5]
+            if core and "-" not in core:
+                s = self._compact_to_slash_format(core)
+        s_up = s.upper()
+        # 已是 OKX instId（含 ETH-USDT / ETH-USDT-SWAP），无斜杠
+        if "-" in s and "/" not in s:
+            if default_type.upper() == "SWAP" and not s_up.endswith("-SWAP"):
+                return f"{s}-SWAP"
+            return s
+        if "/SWAP" in s_up or (s_up.endswith("SWAP") and "/" in s):
             okx_symbol = s.replace("/SWAP", "").replace("/swap", "").replace("/", "-")
             if not okx_symbol.upper().endswith("-SWAP"):
                 okx_symbol = okx_symbol + "-SWAP"
@@ -689,6 +734,24 @@ class OKXExchange(ExchangeBase):
                                 
                 except asyncio.TimeoutError as e:
                     await self._mark_request_failure(f"timeout {method} {endpoint}")
+                    # 走代理时超时多为 CONNECT/隧道问题，与 ClientError 一样允许降级直连再试
+                    if (
+                        (not self._proxy_only)
+                        and proxy
+                        and getattr(self, "_proxy_url", None)
+                        and attempt < max_retries
+                    ):
+                        await self._switch_to_direct_session(f"timeout: {method} {endpoint}")
+                        proxy = None
+                        logger.warning(
+                            "⚠️ OKX API 超时后已切直连重试 (%s/%s): %s %s",
+                            attempt + 1,
+                            max_retries + 1,
+                            method,
+                            endpoint,
+                        )
+                        await asyncio.sleep(min(0.35, retry_delay))
+                        continue
                     if attempt < max_retries:
                         if endpoint == "/api/v5/trade/order":
                             await self._rebuild_session("order timeout fast-rebuild")
@@ -726,6 +789,8 @@ class OKXExchange(ExchangeBase):
                             "connection refused",
                             "connection reset",
                             "connect call failed",
+                            "disconnected",
+                            "server disconnected",
                         )
                     )
                     if (
@@ -785,7 +850,26 @@ class OKXExchange(ExchangeBase):
                     or os.getenv("HTTPS_PROXY")
                     or os.getenv("HTTP_PROXY")
                 )
-                if env_proxy:
+                if self._ignore_env_proxy:
+                    if self._proxy_only:
+                        raise RuntimeError(
+                            "OPENCLAW_OKX_IGNORE_ENV_PROXY=1 与 OPENCLAW_OKX_PROXY_ONLY=1 冲突："
+                            "开启 IGNORE 时 OKX 仅走直连，请关闭 PROXY_ONLY 或关闭 IGNORE"
+                        )
+                    if env_proxy:
+                        logger.info(
+                            "ℹ️ OPENCLAW_OKX_IGNORE_ENV_PROXY=1：忽略环境 HTTP(S)_PROXY（%s），OKX 固定直连",
+                            env_proxy,
+                        )
+                    else:
+                        logger.info("ℹ️ OPENCLAW_OKX_IGNORE_ENV_PROXY=1：OKX 固定直连（跳过环境代理与 proxy_manager）")
+                    ssl_context = self._build_ssl_context()
+                    connector = aiohttp.TCPConnector(ssl=ssl_context)
+                    self._proxy_url = None
+                    self._proxy_mode = "direct"
+                    self._proxy_from_env = False
+                    logger.info("✅ OKX 已启用直连会话（容器/压测推荐路径）")
+                elif env_proxy:
                     ssl_context = self._build_ssl_context()
                     connector = aiohttp.TCPConnector(ssl=ssl_context)
                     self._proxy_url = env_proxy
@@ -907,14 +991,8 @@ class OKXExchange(ExchangeBase):
         okx_interval = interval_map.get(interval, "1m")
         
         endpoint = "/api/v5/market/candles"
-        
-        if "/SWAP" in symbol or symbol.endswith("SWAP"):
-            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
-            if not okx_symbol.endswith("-SWAP"):
-                okx_symbol = okx_symbol + "-SWAP"
-        else:
-            okx_symbol = symbol.replace("/", "-") + "-SWAP"
-        
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+
         params = {
             "instId": okx_symbol,
             "bar": okx_interval,
@@ -963,14 +1041,8 @@ class OKXExchange(ExchangeBase):
         okx_interval = interval_map.get(interval, "1H")
         
         endpoint = "/api/v5/market/candles"
-        
-        if "/SWAP" in symbol or symbol.endswith("SWAP"):
-            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
-            if not okx_symbol.endswith("-SWAP"):
-                okx_symbol = okx_symbol + "-SWAP"
-        else:
-            okx_symbol = symbol.replace("/", "-") + "-SWAP"
-        
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+
         params = {
             "instId": okx_symbol,
             "bar": okx_interval,
@@ -1028,8 +1100,8 @@ class OKXExchange(ExchangeBase):
         """获取订单簿"""
         endpoint = "/api/v5/market/books"
 
-        # 行情订单簿：若 symbol 未明确 SWAP，则按现货 instId 请求，避免 “Instrument ID does not exist” 噪音。
-        okx_symbol = self._to_okx_inst_id(symbol, default_type="SPOT")
+        # 与 get_ticker / get_klines 一致：默认永续 SWAP，避免 ETH/USDT 等走到现货簿而合约侧无深度/空返回。
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         
         params = {
             "instId": okx_symbol,
@@ -1061,15 +1133,9 @@ class OKXExchange(ExchangeBase):
         """
         endpoint = "/api/v5/trade/order"
         
-        # 交易对格式转换
+        # 交易对格式转换（含 ETHUSDT 等紧凑格式）
         symbol = order.symbol
-        if "/SWAP" in symbol or symbol.endswith("SWAP"):
-            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
-            if not okx_symbol.endswith("-SWAP"):
-                okx_symbol = okx_symbol + "-SWAP"
-        else:
-            # 默认使用永续合约
-            okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         
         # 判断是开仓还是平仓
         is_close = hasattr(order, 'metadata') and order.metadata and order.metadata.get('is_close', False)
@@ -1129,7 +1195,7 @@ class OKXExchange(ExchangeBase):
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         """取消订单"""
         endpoint = "/api/v5/trade/cancel-order"
-        okx_symbol = symbol.replace("/", "-")
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         
         body = {
             "instId": okx_symbol,
@@ -1146,7 +1212,7 @@ class OKXExchange(ExchangeBase):
     async def get_order(self, order_id: str, symbol: str) -> Order:
         """获取订单信息"""
         endpoint = "/api/v5/trade/order"
-        okx_symbol = symbol.replace("/", "-")
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         
         params = {
             "instId": okx_symbol,
@@ -1433,7 +1499,7 @@ class OKXExchange(ExchangeBase):
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
         """获取交易对信息"""
         endpoint = "/api/v5/public/instruments"
-        okx_symbol = symbol.replace("/", "-")
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SPOT")
         params = {
             "instType": "SPOT",
             "instId": okx_symbol
@@ -1466,11 +1532,7 @@ class OKXExchange(ExchangeBase):
         - ctVal / ctValCcy: 合约面值
         - tickSz: 价格最小变动
         """
-        # 归一 instId：BTC/USDT -> BTC-USDT-SWAP
-        base = symbol.replace("/SWAP", "").replace("SWAP", "").replace("/", "-").strip()
-        if not base.endswith("-SWAP"):
-            base = base + "-SWAP"
-        okx_inst_id = base.replace("--", "-")
+        okx_inst_id = self._to_okx_inst_id(symbol, default_type="SWAP")
 
         now = time.time()
         cached = self._instrument_cache.get(okx_inst_id)
@@ -1528,14 +1590,8 @@ class OKXExchange(ExchangeBase):
         - 永续合约: BTC/USDT/SWAP 或 BTC/USDT -> BTC-USDT-SWAP (默认)
         """
         endpoint = "/api/v5/market/ticker"
-        
-        if "/SWAP" in symbol or symbol.endswith("SWAP"):
-            okx_symbol = symbol.replace("/SWAP", "").replace("/", "-")
-            if not okx_symbol.endswith("-SWAP"):
-                okx_symbol = okx_symbol + "-SWAP"
-        else:
-            okx_symbol = symbol.replace("/", "-") + "-SWAP"
-        
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+
         params = {"instId": okx_symbol}
 
         hub = getattr(self, "_ws_hub", None)
@@ -1581,8 +1637,8 @@ class OKXExchange(ExchangeBase):
             if "51001" in error_str or "doesn't exist" in error_str:
                 logger.debug(f"交易对 {okx_symbol} 不存在，尝试现货...")
                 try:
-                    spot_symbol = symbol.replace("/SWAP", "").replace("/", "-")
-                    params["instId"] = spot_symbol
+                    spot_inst = okx_symbol[:-5] if str(okx_symbol).endswith("-SWAP") else okx_symbol
+                    params["instId"] = spot_inst
                     data = await self._make_request("GET", endpoint, params)
                     if data and len(data) > 0:
                         ticker = data[0]
@@ -1612,7 +1668,7 @@ class OKXExchange(ExchangeBase):
             margin_mode: 保证金模式 cross(全仓) 或 isolated(逐仓)
         """
         endpoint = "/api/v5/account/set-leverage"
-        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         
         body = {
             "instId": okx_symbol,
@@ -1647,10 +1703,8 @@ class OKXExchange(ExchangeBase):
             price: 限价单价格，None为市价单
             margin_mode: 保证金模式 cross/isolated
         """
-        okx_symbol = symbol.replace("/", "-") + "-SWAP"
-        if "--" in okx_symbol:
-            okx_symbol = okx_symbol.replace("--", "-")
-        
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+
         await self.set_leverage(symbol, leverage, margin_mode)
         
         order_type = "market" if price is None else "limit"
@@ -1721,7 +1775,9 @@ class OKXExchange(ExchangeBase):
         s = (symbol or "").strip()
         if not s:
             return s
-        s = s.replace("-SWAP", "").replace("--", "-")
+        if "/" not in s and "-" not in s:
+            s = self._compact_to_slash_format(s)
+        s = s.replace("-SWAP", "").replace("/SWAP", "").replace("--", "-")
         if "/" in s:
             return s
         parts = [p for p in s.split("-") if p]
@@ -1745,13 +1801,13 @@ class OKXExchange(ExchangeBase):
             side: 方向 long/short
             size: 平仓数量，None为全部平仓
         """
-        okx_symbol = symbol.replace("/", "-") + "-SWAP"
-        
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+
         if size is None:
             positions = await self.get_positions()
             for pos in positions:
-                if pos["symbol"].replace("/USDT", "") == symbol.replace("/USDT", ""):
-                    size = abs(float(pos["size"]))
+                if (pos.get("instId") or "") == okx_symbol:
+                    size = abs(float(pos.get("size") or 0))
                     break
         
         if size is None or size <= 0:
@@ -1788,7 +1844,7 @@ class OKXExchange(ExchangeBase):
     async def get_swap_ticker(self, symbol: str) -> Dict[str, Any]:
         """获取永续合约行情"""
         endpoint = "/api/v5/market/ticker"
-        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         params = {"instId": okx_symbol}
         
         try:
@@ -1814,7 +1870,7 @@ class OKXExchange(ExchangeBase):
     async def get_swap_klines(self, symbol: str, interval: str = "1H", limit: int = 100) -> List[Dict[str, Any]]:
         """获取永续合约K线数据"""
         endpoint = "/api/v5/market/candles"
-        okx_symbol = symbol.replace("/", "-") + "-SWAP"
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         
         interval_map = {
             "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
