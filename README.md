@@ -137,8 +137,8 @@ OPENCLAW_HTTPS_PROXY=http://host.docker.internal:7890
 ### 交易配置
 
 ```yaml
-# 主入口：config/openclaw.yml（可选 data/config/local.yml 本机覆盖；密钥在 .env）
-# 详见 config/openclaw.yml 文件头注释与 .env.example
+# 主入口：config/openclaw.yml；改后执行 python scripts/generate_openclaw_yaml.py 同步内置兜底
+# 可选 config/local.yml 本机覆盖；密钥在 .env。详见 config/openclaw.yml 头注释与 .env.example
 trading:
   paper_trading: true
   max_position_size: 0.1

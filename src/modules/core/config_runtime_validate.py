@@ -42,6 +42,23 @@ def validate_merged_runtime_config(cfg: Dict[str, Any]) -> None:
     if brain is not None and not isinstance(brain, dict):
         _bad("root", "ai_brain", "dict", brain)
 
+    api = cfg.get("api")
+    if api is not None:
+        if not isinstance(api, dict):
+            _bad("root", "api", "dict", api)
+        elif "port" in api:
+            v = api["port"]
+            if isinstance(v, bool):
+                _bad("api", "port", "int", v)
+            if isinstance(v, numbers.Integral):
+                api["port"] = int(v)
+            elif isinstance(v, str) and v.strip().isdigit():
+                api["port"] = int(v.strip())
+            elif isinstance(v, float) and v == int(v):
+                api["port"] = int(v)
+            else:
+                _bad("api", "port", "int", v)
+
 
 def _check_sltp(sltp: Dict[str, Any]) -> None:
     int_keys: Tuple[str, ...] = ("check_interval", "max_orders", "exchange_resync_interval_sec")

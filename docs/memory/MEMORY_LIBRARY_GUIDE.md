@@ -242,7 +242,7 @@ tag 的目标是让召回“更准、更可控”。推荐至少包含：
 ### 5) 配置固化（`data/config/memory.json`）
 
 - 路径：`data/config/memory.json`（与 `default.yml` 等一起被 `ConfigManager` 加载）。
-- **重要**：该文件必须以顶层 **`"memory": { ... }`** 包裹，以便深合并到 `DEFAULT_CONFIG["memory"]`（与 section 名一致）。
+- **重要**：该文件必须以顶层 **`"memory": { ... }`** 包裹，以便深合并到运行中的 `memory` 配置段（与 `openclaw.yml` / `openclaw.embedded.yml` 中 section 名一致）。
 - 建议在此维护的块：
   - **`retrieval`**：混合检索权重、`min_score`、rerank 插槽
   - **`auto_capture`**：噪音过滤、按 category 的最小 importance

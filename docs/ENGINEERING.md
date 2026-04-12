@@ -105,8 +105,8 @@
 
 ### 6.1 层次
 
-1. 内置默认（ConfigManager `DEFAULT_CONFIG`）  
-2. `config/*.yml`、`data/config/*`  
+1. 内置默认（`src/modules/core/openclaw.embedded.yml`，由 `config/openclaw.yml` 经 `scripts/generate_openclaw_yaml.py` 同步）  
+2. 各配置目录内 `default.*` → `openclaw.*` → 其它片段 → `local.*`  
 3. 环境变量 **`OPENCLAW__section__key`**（双下划线分段，见 `config_manager.py`）  
 4. Docker Compose `environment` 覆盖 `.env` 中同名键（Compose 行为以实际版本为准）
 

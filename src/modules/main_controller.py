@@ -1273,7 +1273,7 @@ class MainController:
             logger.warning(f"⚠️ 增强监控系统初始化失败: {e}")
             self.enhanced_monitoring = None
         
-        # 初始化止盈止损管理器（配置来自 ConfigManager：openclaw.yml / local.yml / DEFAULT_CONFIG / 环境变量）
+        # 初始化止盈止损管理器（配置来自 openclaw.embedded.yml / 磁盘 openclaw.yml / local.* / 环境变量）
         try:
             sltp_raw = await self.config_manager.get_config("stop_loss_take_profit", {}) or {}
             if not isinstance(sltp_raw, dict):
