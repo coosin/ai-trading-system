@@ -38,6 +38,7 @@ logs/**/*.log
 logs/*.log.*
 logs/audit/
 logs/okx_payload_matrix/
+logs/config-health.json
 !logs/.gitkeep
 
 # SQLite / runtime DBs and trade artifacts (never commit)
