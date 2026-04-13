@@ -308,8 +308,14 @@ def attach_module_surface_routes(router: APIRouter, main_controller: Any) -> Non
         views: Dict[str, Any] = {}
         for sym in symbols:
             try:
-                view = await asyncio.wait_for(mi.get_symbol_view(sym, include_snapshot=False), timeout=4.0)
+                view = await asyncio.wait_for(mi.get_symbol_view(sym, include_snapshot=False), timeout=12.0)
                 views[sym] = view.to_dict() if hasattr(view, "to_dict") else {"summary": str(getattr(view, "summary", ""))}
+            except asyncio.TimeoutError:
+                views[sym] = {
+                    "degraded": True,
+                    "message": "market_intelligence_timeout",
+                    "hint": "请优先使用 /api/v1/market/symbol/{symbol}",
+                }
             except Exception as e:
                 views[sym] = {"error": str(e)}
         return {

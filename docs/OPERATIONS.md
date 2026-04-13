@@ -88,6 +88,45 @@ curl -s http://localhost:8000/api/v1/modules/stop-loss/stats
 - `stop-loss/stats` 在触发后计数递增，`active_orders` 与持仓状态一致。
 - `surface/channels` 与 `surface/registry` 返回成功，用于前端与第三方 API 对接配置。
 
+### 2.2 API / 推送 / 告警 / 记忆 二次验收（2026-04-13）
+
+> 目标：在实盘运行底座（官方模拟下单通道）下，确认 API 连通、事件推送、告警链路、记忆读写与持久化正常。
+
+```bash
+# 0) 基础健康
+curl -s http://localhost:8000/health
+curl -s http://localhost:8000/api/v1/s1/verify
+curl -s http://localhost:8000/api/v1/modules/system/health
+
+# 1) 推送/事件流（补偿通道）
+curl -s 'http://localhost:8000/api/v1/trade/events?limit=15'
+
+# 2) 报警链路
+curl -s http://localhost:8000/api/v1/monitoring/alerts
+
+# 3) 司令部链路与记忆系统
+curl -s 'http://localhost:8000/api/v1/modules/commander/audit?enrich=true'
+curl -s http://localhost:8000/api/v1/modules/commander/memory/status
+curl -s 'http://localhost:8000/api/v1/modules/commander/memory/workspace?filename=COMMANDER_PROFILE.md'
+
+# 4) 记忆读写探针（写入后立即召回）
+curl -s -X POST http://localhost:8000/api/v1/ai/memory/store \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"api_acceptance_memory_probe_2026_04_13","category":"conversation","layer":"working"}'
+
+curl -s -X POST http://localhost:8000/api/v1/ai/memory/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"api_acceptance_memory_probe_2026_04_13","limit":3}'
+```
+
+验收判定（通过标准）：
+
+- `health` 为 `healthy`，`s1/verify` 为 `all_passed=true`。
+- `trade/events` 可持续返回 `market.update`/`trade.position`/`trade.fill` 等事件。
+- `monitoring/alerts` 接口可用（空列表等于“当前无活跃告警”）。
+- 记忆写入返回 `memory_id`，召回结果包含刚写入探针内容。
+- `commander/memory/status` 显示分层统计与质量指标，`workspace` 读取成功。
+
 ---
 
 ## 3. 网络与代理基线（Clash / 生产）

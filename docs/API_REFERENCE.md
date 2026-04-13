@@ -35,6 +35,33 @@
   - `POST /api/v1/modules/execution/simulate-order`
   - 用于压测行情波动、触发止盈止损链路、验证通知与事件输出。
 
+### 二次验收快照（2026-04-13 21:31 UTC+8）
+
+以下接口已在当前运行环境复核通过（HTTP 200 且返回结构有效）：
+
+- **系统与链路**
+  - `GET /health` -> `healthy`
+  - `GET /api/v1/s1/verify` -> `all_passed=true`
+  - `GET /api/v1/modules/system/health` -> `overall=healthy`
+  - `GET /api/v1/modules/commander/audit?enrich=true` -> `all_passed=true`
+
+- **实时推送/事件补偿**
+  - `GET /api/v1/trade/events?limit=15` 返回持续 `market.update` / `trade.position` 等事件，作为前端与外部系统的补偿/回放基线。
+  - WebSocket 仍建议与 `trade/events` 并用：前者实时，后者补偿。
+
+- **报警**
+  - `GET /api/v1/monitoring/alerts` 可用（空数组表示当前无活跃告警，不是链路失败）。
+
+- **记忆系统（读写与持久化）**
+  - `POST /api/v1/ai/memory/store` 写入成功（返回 `memory_id`）。
+  - `POST /api/v1/ai/memory/recall` 立即召回命中（验证读写链路正常）。
+  - `GET /api/v1/modules/commander/memory/status` 返回网关统计、分层计数、质量指标。
+  - `GET /api/v1/modules/commander/memory/workspace?filename=COMMANDER_PROFILE.md` 返回工作区记忆文件内容。
+
+- **迁移兼容接口说明（重要）**
+  - `GET /api/v1/data-fusion/analyze{,/symbol}` 当前为兼容路由，返回 `status=deprecated` 与迁移提示。
+  - 生产调用请切换至：`GET /api/v1/market/symbol/{symbol}` 与 `POST /api/v1/modules/intelligence/batch-analyze`。
+
 ### WebSocket（OpenAPI 中不展开）
 
 - **URL:** `ws://<host>:8000/ws`（生产若走 HTTPS 则为 `wss://`）

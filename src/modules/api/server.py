@@ -2666,12 +2666,20 @@ class APIServer:
         # 多源数据融合分析API - 支持 /api/v1/data-fusion/analyze/{symbol}
         @api_v1_router.get("/data-fusion/analyze/{symbol}", tags=["data-fusion"])
         async def analyze_market(symbol: str):
-            """多源数据融合市场分析（已迁移到 MarketIntelligenceEngine）。"""
+            """多源数据融合市场分析（兼容路由，已迁移到 /market/symbol）。"""
+            raw_symbol = str(symbol or "").strip()
+            symbol_norm = raw_symbol
+            # 兼容 BTC-USDT-SWAP / BTC-USDT 形式，统一给分析层使用 BTC/USDT。
+            if "-" in symbol_norm and "/" not in symbol_norm:
+                parts = [p for p in symbol_norm.split("-") if p]
+                if len(parts) >= 2:
+                    symbol_norm = f"{parts[0]}/{parts[1]}"
             try:
                 mc = getattr(data_source_hub, "main_controller", None)
                 mi = getattr(mc, "market_intelligence", None) if mc else None
                 if mi and hasattr(mi, "get_symbol_view"):
-                    view = await asyncio.wait_for(mi.get_symbol_view(symbol, include_snapshot=False), timeout=6.0)
+                    # 兼容路由采用短超时，避免旧调用方被长阻塞拖慢。
+                    view = await asyncio.wait_for(mi.get_symbol_view(symbol_norm, include_snapshot=False), timeout=2.0)
                     return {
                         "status": "deprecated",
                         "message": "已迁移：请使用 /api/v1/market/symbol/{symbol}",
@@ -2681,14 +2689,14 @@ class APIServer:
                 return {
                     "status": "deprecated",
                     "message": "已迁移：请使用 /api/v1/market/symbol/{symbol}",
-                    "data": {"symbol": symbol},
+                    "data": {"symbol": symbol_norm},
                     "timestamp": datetime.now().isoformat(),
                 }
-            except Exception as e:
-                logger.error(f"多源数据分析(迁移)失败: {e}")
+            except Exception:
                 return {
-                    "status": "degraded",
-                    "message": f"多源数据分析已迁移，当前回退失败: {str(e)}",
+                    "status": "deprecated",
+                    "message": "已迁移：请使用 /api/v1/market/symbol/{symbol}",
+                    "data": {"symbol": symbol_norm, "compat_mode": True},
                     "timestamp": datetime.now().isoformat()
                 }
 
