@@ -74,6 +74,7 @@ python3 scripts/network_connectivity_smoke.py
 python3 scripts/network_connectivity_smoke.py --redis   # 需能访问 REDIS_HOST（如 compose 内 redis）
 python3 scripts/production_network_baseline.py --check-only
 python3 scripts/production_network_baseline.py --apply   # 按脚本设计写回配置时
+python3 scripts/proxy_mode_network_benchmark.py --label my_run --runs 7 --out /tmp/net.json  # TUN/代理拓扑对比
 ```
 
 期望检查输出含 **`BASELINE_CHECK=PASS`**（以脚本实际提示为准）。
@@ -90,6 +91,36 @@ Compose 已注入 `HTTP(S)_PROXY` / `OPENCLAW_*_PROXY` 与 `NO_PROXY=localhost,1
    - 在 **`config/config.yaml`** 的 `proxy.okx` 下设 **`ignore_env_proxy: true`**（或环境变量 **`OPENCLAW_OKX_IGNORE_ENV_PROXY=1`**），让 OKX **仅 REST 直连**（要求容器出口可达 `www.okx.com`）；或  
    - 在 Clash 侧为 `+.okx.com` 使用稳定线路，并确认 **`fake-ip-filter`** 包含 OKX 域名（见 3.1）。  
 4. **调参**：可通过 **`OPENCLAW_OKX_TIMEOUT_*`**、**`OPENCLAW_OKX_MAX_RETRIES`** 放宽超时与重试（见根目录 `.env.example`）。
+
+### 3.5 新代理 + TUN：怎么测「哪种最好」、和旧配置差多少
+
+**旧配置（常见痛点）**：Docker **bridge** + 仅 **`HTTP_PROXY=http://host.docker.internal:7890`**。OKX 等走 **HTTP CONNECT**，易被掐、延迟高，应用里会出现 **`ticker`=`fallback`**、`unified-snapshot` 里 **`exch.*:timeout`**。
+
+**新代理推荐拓扑**（与 `deploy/HOST_CLASH_EGRESS.md` 一致）：
+
+1. **宿主机** Clash/mihomo 开 **TUN**（`auto-route`、Rule 分流、`fake-ip-filter` 含 `+.okx.com`）。  
+2. **二选一（按基准脚本结果选优）**：  
+   - **A**：容器仍用 bridge + `HTTP_PROXY`（适合只改代理、不动 compose）。  
+   - **B**：交易容器 **`network_mode: host`**（`docker-compose.hostnet.yml`），`.env` 里代理指 **`127.0.0.1:7890`**，并依赖 **`OPENCLAW_DOCKER_NETWORK_HOST=1`** 避免把环回误改写成 `host.docker.internal`。  
+   - **C**：TUN 已接管宿主机路由时，对 **OKX REST** 试 **`OPENCLAW_OKX_IGNORE_ENV_PROXY=1`**（或 `proxy.okx.ignore_env_proxy: true`），让 HTTPS **不经 HTTP 代理**，由 TUN/直连出口访问 `www.okx.com`（需规则允许）。
+
+**可重复对比（改善多少用数字说话）**：
+
+```bash
+# 每种拓扑各跑一次，换 --label，得到 JSON
+python3 scripts/proxy_mode_network_benchmark.py --label before_old_proxy --runs 7 --out /tmp/net_before.json
+python3 scripts/proxy_mode_network_benchmark.py --label after_tun_host --runs 7 --out /tmp/net_after.json --api-base http://127.0.0.1:8000
+
+python3 scripts/proxy_mode_network_benchmark.py --compare /tmp/net_before.json /tmp/net_after.json
+```
+
+脚本会对比 **DNS/TCP/HTTPS（尊重代理 vs 强制不走 HTTP 代理）** 的中位数延迟；若 **`no_http_proxy` 明显快于 `respect_env_proxy`**，优先采用 **TUN + 减少容器内 HTTP 代理依赖**（上文的 B 或 C）。全链路再跑：
+
+```bash
+python3 scripts/full_system_integration_check.py
+```
+
+**最优选择（当前仓库实践结论）**：**宿主机 TUN + 规则正确** 为基座；容器侧若仍大量 **CONNECT 超时**，则 **host 网络或 OKX 忽略环境代理** 二选一或组合，直到 **`/api/v1/market/ticker` 的 `source` 为 `exchange` 且有价格**。
 
 ---
 

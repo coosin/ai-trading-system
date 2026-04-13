@@ -86,3 +86,9 @@ mixed-port: 7890
 - Clash Meta 路由与规则：以你所用发行版 Wiki 为准。
 
 若你们有**固定规则集 / 订阅命名规范**，建议单独维护一份「生产环境 Clash 配置」Git 仓库，本仓库仅引用端口与宿主机 IP 约定。
+
+---
+
+## 7. 与「仅 HTTP 代理」对比：可重复基准
+
+开启 TUN 前后、或改 compose 前后，用同一脚本各跑一次并 `--compare` 两次 JSON，可看 **DNS/TCP/HTTPS 中位数延迟** 与 **是否仍依赖 HTTP 代理更快**。详见 **`docs/OPERATIONS.md`** §3.5 与仓库 **`scripts/proxy_mode_network_benchmark.py`**。
