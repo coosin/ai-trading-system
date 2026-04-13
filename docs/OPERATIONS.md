@@ -18,11 +18,12 @@ docker compose up -d
 若 **bridge 容器 DNS/出网全挂**（与宿主机 Clash 不一致），用宿主机网络跑交易服务（Redis 仍桥接并映射 `6379` 到宿主机）：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --force-recreate trading-system
+# 或：./scripts/recover_trading_hostnet.sh
 # 或：HOSTNET=1 ./scripts/deploy_production_stack.sh
 ```
 
-`docker-compose.hostnet.yml` 只处理 **网络栈 + Redis**；**代理以 `.env` 为准**（`OPENCLAW_HTTP_PROXY` 等与当前代理一致）。该文件会注入 `OPENCLAW_DOCKER_NETWORK_HOST=1`，避免进程再把本机 `127.0.0.1` 误改成 `host.docker.internal`。
+`docker-compose.hostnet.yml` 处理 **网络栈 + Redis**，并注入 `OPENCLAW_DOCKER_NETWORK_HOST=1`（不把 `127.0.0.1` 误改成 `host.docker.internal`）。**默认**将 `HTTP_PROXY`/`HTTPS_PROXY`/`OPENCLAW_HTTP(S)_PROXY` 设为 `http://127.0.0.1:${CLASH_MIXED_PORT:-7890}`，并**清空** `ALL_PROXY` / `OPENCLAW_ALL_PROXY`（避免 SOCKS5 全失败拖慢请求）。覆盖：`.env` 中 `OPENCLAW_HOST_HTTP_PROXY` 或 `CLASH_MIXED_PORT`。
 
 一键（含健康等待与 OKX 抽检）:
 
@@ -56,6 +57,36 @@ docker compose restart trading-system
 3. `curl -s http://localhost:8000/api/v1/exchanges` — OKX `is_connected`  
 4. `curl -s "http://localhost:8000/api/v1/modules/commander/audit?enrich=true"` — 司令部与第三方诊断  
 5. 日志: `docker logs openclaw-trading --tail 80` — 无持续 Traceback  
+
+### 2.1 实时通知链路巡检（升级后必做）
+
+> 目标：确认“行情判断、开平仓、止盈止损、告警”可同步到司令部、前端与 API 对接端。
+
+```bash
+# 1) 控制面能力与渠道契约
+curl -s http://localhost:8000/api/v1/modules/commander/capabilities
+curl -s http://localhost:8000/api/v1/modules/surface/channels
+curl -s http://localhost:8000/api/v1/modules/surface/registry
+
+# 2) A 接口（司令部统一入口）触发交易动作
+curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"强制开仓 BTC/USDT 0.001","source":"api_chat"}'
+
+# 3) 事件流验证（前端/API 实时消费基线）
+curl -s 'http://localhost:8000/api/v1/trade/events?limit=20'
+
+# 4) 执行审计与 SLTP 状态
+curl -s http://localhost:8000/api/v1/modules/execution/production-audit
+curl -s http://localhost:8000/api/v1/modules/stop-loss/stats
+```
+
+验收关键字段（至少满足）：
+
+- `trade/events` 中出现 `trade.fill`（成交）与 `trade.position`（`sltp.create` / `sltp_stop_loss_triggered` 等）。
+- `production-audit.execution_spine.last_order_*` 与最近动作一致（source/op/symbol/size/success）。
+- `stop-loss/stats` 在触发后计数递增，`active_orders` 与持仓状态一致。
+- `surface/channels` 与 `surface/registry` 返回成功，用于前端与第三方 API 对接配置。
 
 ---
 
@@ -151,7 +182,8 @@ docker logs openclaw-trading --tail 200
 | 现象 | 方向 |
 |------|------|
 | OKX 连接失败 / SSL | 代理、DNS、Clash 规则；`production_network_baseline.py` |
-| 容器完全无外网 / DNS 全挂 | 先试 `docker-compose.hostnet.yml`（上 1.1）；再查 iptables、Clash 是否监听 `0.0.0.0`、`host.docker.internal`（见 `deploy/HOST_CLASH_EGRESS.md`） |
+| 容器完全无外网 / DNS 全挂 | 先试 `docker-compose.hostnet.yml`（上 1.1）；再查 iptables、Clash **mixed-port 是否监听 `0.0.0.0`**（仅 `127.0.0.1` 时 bridge 常连不上代理，见 `deploy/HOST_CLASH_EGRESS.md` §4） |
+| 容器内快速自检 | `docker exec openclaw-trading sh /app/scripts/diagnose_container_net.sh`（含 `ping`/`ip`；改 Dockerfile 后需 **`docker compose build trading-system`**） |
 | 429 过多（Reddit 等） | `OPENCLAW_THIRD_PARTY_*` 与 `OPENCLAW_REDDIT_SUBREDDIT_PAUSE_SEC` |
 | Redis 错误 | `REDIS_HOST=redis`、服务是否 healthy |
 | API 404（司令部 surface） | 路径须为 `/api/v1/modules/surface/...` |

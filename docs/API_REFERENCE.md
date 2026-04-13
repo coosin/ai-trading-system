@@ -6,10 +6,41 @@
 
 **机器可读规范（与线上一致，由运行中服务导出）:** 同目录下 [`API_OPENAPI_FULL.json`](./API_OPENAPI_FULL.json)（OpenAPI 3.1，约 160 条路径；含请求体、查询参数、422 校验模型等）。
 
+## 升级后实时链路（2026-04-13）
+
+以下为当前版本实测可用的“实时信息与通知”主链路，优先作为前端与司令部集成基线：
+
+- **司令部统一入口（A 接口）**
+  - `POST /api/v1/modules/commander/dispatch`
+  - body: `{"message":"...", "source":"api_chat|telegram|control_hub|..." }`
+  - 用途：统一接收开仓/平仓/行情问询/巡检指令。
+
+- **交易/风控事件流（前端与外部 API 推荐）**
+  - `GET /api/v1/trade/events?limit=...`
+  - 事件类型含：`trade.fill`（开平仓成交）、`trade.position`（含 `sltp.create` / `sltp_stop_loss_triggered` 等）、`market.update`（行情判断与质量摘要）。
+  - 该接口为环形缓冲读取，适合作为前端轮询与外部系统对账源。
+
+- **执行脊柱与审计快照**
+  - `GET /api/v1/trade/execution_spine`
+  - `GET /api/v1/modules/execution/production-audit`
+  - 用途：读取最新一笔开平仓来源、原因、成败、策略单写入状态（S1）与 SLTP 统计。
+
+- **行情与判断输出**
+  - `GET /api/v1/market/symbol/{symbol}`
+  - `GET /api/v1/market/state`
+  - `GET /api/v1/modules/data/hub/unified-snapshot`
+  - 用途：提供实时行情、质量分、执行成本、风险建议与“是否可交易”判断依据。
+
+- **模拟盘联调入口（升级验证用）**
+  - `POST /api/v1/modules/execution/simulate-order`
+  - 用于压测行情波动、触发止盈止损链路、验证通知与事件输出。
+
 ### WebSocket（OpenAPI 中不展开）
 
 - **URL:** `ws://<host>:8000/ws`（生产若走 HTTPS 则为 `wss://`）
 - **用途:** 实时推送；连接后发送 JSON，支持 `subscribe` / `unsubscribe` / `heartbeat`（与 `WebSocketEventType` 一致，详见 `src/modules/api/server.py` 中 `_handle_websocket_connection`）。
+- **频道匹配:** 支持精确频道与前缀通配，例如 `trade.*`、`market.*`。
+- **建议生产基线:** WebSocket 与 `GET /api/v1/trade/events` 并用（前者实时、后者补偿与回放），避免前端因连接抖动丢关键成交/止损事件。
 
 ### 代码中存在但未挂到当前主应用的模块
 

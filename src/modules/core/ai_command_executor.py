@@ -339,12 +339,17 @@ class AICommandExecutor:
                         pass
                 return _finalize_commander_payload(result)
 
+            force_trade_params = (
+                self._extract_trade_params_from_text(utter)
+                if self._looks_like_trade_execution_request(utter)
+                else None
+            )
             internal_q = self._looks_like_internal_price_query(utter)
             plain_price_q = self._looks_like_plain_price_quote_question(utter)
             sym = self._resolve_symbol_for_price(utter)
             if internal_q or plain_price_q:
                 sym = sym or str(os.environ.get("OPENCLAW_DEFAULT_PRICE_SYMBOL", "ETH/USDT")).strip()
-            if sym and (
+            if (not force_trade_params) and sym and (
                 internal_q
                 or plain_price_q
                 or self._looks_like_live_price_only_request(utter)
@@ -440,7 +445,10 @@ class AICommandExecutor:
                 )
                 intent = Intent(action="chat", params={}, confidence=1.0)
             else:
-                intent = await self._parse_intent(user_input)
+                if force_trade_params:
+                    intent = Intent(action="trade", params=force_trade_params, confidence=1.0)
+                else:
+                    intent = await self._parse_intent(user_input)
             # 用户已要求“取消限制”：不再把 system_inspection 意图强制降级为 chat。
                 user_rules = await self._get_user_rules_context()
                 
@@ -760,6 +768,65 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         if "以太坊" in t or re.search(r"(?<![A-Za-z])以太(?![A-Za-z])", t):
             return "ETH/USDT"
         return None
+
+    @staticmethod
+    def _looks_like_trade_execution_request(text: str) -> bool:
+        """识别执行型交易口令，避免被问价快路径误吞。"""
+        t = (text or "").strip()
+        if not t or len(t) > 900:
+            return False
+        trade_kw = (
+            "强制开仓",
+            "强制平仓",
+            "开仓",
+            "平仓",
+            "开多",
+            "开空",
+            "平多",
+            "平空",
+            "做多",
+            "做空",
+            "买入",
+            "卖出",
+            "下单",
+            "建仓",
+        )
+        if not any(k in t for k in trade_kw):
+            return False
+        if re.search(r"(怎么|如何|为何|为什么|教程|规则|原理|解释).{0,8}(开仓|平仓|做多|做空)", t):
+            return False
+        return True
+
+    @staticmethod
+    def _extract_trade_params_from_text(text: str) -> Dict[str, Any]:
+        """从自然语言里提取 symbol/side/quantity/force 参数。"""
+        t = (text or "").strip()
+        params: Dict[str, Any] = {}
+        sym = AICommandExecutor._resolve_symbol_for_price(t)
+        if sym:
+            params["symbol"] = sym
+        low = t.lower()
+        if any(k in t for k in ("强制平仓", "立即平仓", "马上平仓", "全平", "清仓")):
+            params["force_close"] = True
+        if any(k in t for k in ("强制开仓", "立即开仓", "马上开仓")):
+            params["force"] = True
+        if any(k in t for k in ("做多", "开多", "买入", "long")) or "buy" in low:
+            params["side"] = "long"
+        elif any(k in t for k in ("做空", "开空", "卖出", "short")) or "sell" in low:
+            params["side"] = "short"
+        elif "平多" in t:
+            params["side"] = "long"
+            params["force_close"] = True
+        elif "平空" in t:
+            params["side"] = "short"
+            params["force_close"] = True
+        m = re.search(r"(?<![A-Za-z])(\d+(?:\.\d+)?)(?![A-Za-z])", t)
+        if m:
+            try:
+                params["quantity"] = float(m.group(1))
+            except ValueError:
+                pass
+        return params
 
     @staticmethod
     def _looks_like_internal_price_query(text: str) -> bool:
@@ -1941,7 +2008,7 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
     async def _execute_trade(self, params: Dict[str, Any], user_input: str, user_rules: str = "") -> Dict[str, Any]:
         """执行交易 - 带黑名单检查"""
         try:
-            symbol = params.get('symbol', '')
+            symbol = str(params.get("symbol") or self._resolve_symbol_for_price(user_input) or "").strip()
             
             if symbol in self.blacklist:
                 return {
@@ -1955,52 +2022,118 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     "response": "我理解您想要交易，但您还没有明确授权我执行交易操作。如果您希望我全权负责交易，请告诉我。"
                 }
             
-            if self.main_controller and hasattr(self.main_controller, 'ai_trading_engine'):
-                engine = self.main_controller.ai_trading_engine
-                
-                if self.llm_integration:
-                    prompt = f"""解析用户交易指令，返回JSON格式的交易参数：
+            if self.main_controller and hasattr(self.main_controller, "ai_trading_engine"):
+                mc = self.main_controller
+                engine = mc.ai_trading_engine
+                merged = self._extract_trade_params_from_text(user_input)
+                merged.update(params or {})
 
-用户指令：{user_input}
+                symbol = str(merged.get("symbol") or symbol or "").strip()
+                if not symbol:
+                    return {"success": False, "response": "未识别到交易对，请补充如 BTC/USDT。"}
 
-返回格式：
-{{
-    "action": "buy/sell/hold",
-    "symbol": "交易对",
-    "quantity": 数量,
-    "leverage": 杠杆倍数
-}}
+                qty = float(
+                    merged.get("quantity")
+                    or merged.get("size")
+                    or merged.get("amount")
+                    or merged.get("value")
+                    or 0.01
+                )
+                side = str(merged.get("side") or "long").strip().lower()
+                if side in ("buy", "b"):
+                    side = "long"
+                elif side in ("sell", "s"):
+                    side = "short"
 
-只返回JSON。"""
-                    
-                    response = await self.llm_integration.generate(prompt, is_user_input=False)
-                    if response:
-                        try:
-                            trade_params = json.loads(response.content)
-                            
-                            trade_symbol = trade_params.get('symbol', '')
-                            if trade_symbol in self.blacklist:
-                                return {
-                                    "success": True,
-                                    "response": f"{trade_symbol} 在您的黑名单中，不执行交易。"
-                                }
-                            
-                            return {
-                                "success": True,
-                                "response": f"""交易执行中...
+                reason = str(user_input or "user_trade_command")[:240]
+                force_close = bool(merged.get("force_close"))
+                if force_close:
+                    gw = getattr(mc, "execution_gateway", None)
+                    if not gw:
+                        return {"success": False, "response": "ExecutionGateway 未初始化，无法执行平仓。"}
+                    res = await gw.close_swap(
+                        symbol=symbol,
+                        side=side,
+                        size=qty if qty > 0 else None,
+                        source="system",
+                        reason=reason,
+                        force=True,
+                    )
+                    ok = bool((res or {}).get("success"))
+                    return {
+                        "success": ok,
+                        "response": "强制平仓已提交。" if ok else f"强制平仓失败: {(res or {}).get('error', 'unknown')}",
+                        "data": res or {},
+                    }
 
-操作: {trade_params.get('action', 'N/A').upper()}
-交易对: {trade_params.get('symbol', 'N/A')}
-数量: {trade_params.get('quantity', 'N/A')}
-杠杆: {trade_params.get('leverage', 'N/A')}x
-
-交易指令已提交。""",
-                                "data": trade_params
-                            }
-                        except json.JSONDecodeError:
-                            pass
-                
-                return {"success": False, "response": "交易指令解析失败"}
+                gw = getattr(mc, "execution_gateway", None)
+                if gw:
+                    lev = int(getattr(engine, "contract_config", {}).get("default_leverage", 20))
+                    res = await gw.open_swap(
+                        symbol=symbol,
+                        side=side,
+                        size=qty,
+                        leverage=lev,
+                        source="manual",
+                        reason=reason,
+                        margin_mode="cross",
+                        price=None,
+                        context={"via": "ai_command_executor", "user_input": str(user_input)[:240]},
+                    )
+                else:
+                    res = await engine.execute_trade(
+                        symbol=symbol,
+                        side=side,
+                        quantity=qty,
+                        reasoning=reason,
+                    )
+                ok = bool((res or {}).get("success"))
+                sltp_created = False
+                sltp_error = None
+                if ok:
+                    try:
+                        slm = getattr(mc, "stop_loss_manager", None)
+                        if slm and hasattr(mc, "create_stop_loss_order"):
+                            cfg = getattr(slm, "config", None)
+                            sl_pct = float(getattr(cfg, "default_stop_loss_percent", 0.03) or 0.03)
+                            tp_pct = float(getattr(cfg, "default_take_profit_percent", 0.06) or 0.06)
+                            trailing_enabled = bool(getattr(cfg, "enable_trailing_stop", True))
+                            trailing_offset = float(getattr(cfg, "initial_trailing_offset", 0.02) or 0.02)
+                            entry_price = float((res or {}).get("price") or 0.0)
+                            if entry_price <= 0:
+                                try:
+                                    t = await engine.exchange.get_ticker(symbol)
+                                    entry_price = float((t or {}).get("last") or (t or {}).get("close") or 0.0)
+                                except Exception:
+                                    entry_price = 0.0
+                            if entry_price > 0:
+                                order = await mc.create_stop_loss_order(
+                                    symbol=symbol,
+                                    side=side,
+                                    entry_price=entry_price,
+                                    quantity=qty,
+                                    stop_loss_percent=sl_pct,
+                                    take_profit_percent=tp_pct,
+                                    enable_trailing=trailing_enabled,
+                                    trailing_offset=trailing_offset,
+                                    metadata={"source": "ai_command_executor", "reason": reason},
+                                )
+                                sltp_created = order is not None
+                    except Exception as e:
+                        sltp_error = str(e)
+                return {
+                    "success": ok,
+                    "response": (
+                        "开仓指令已提交执行，并已创建止盈止损跟踪。"
+                        if ok and sltp_created
+                        else ("开仓指令已提交执行。" if ok else f"开仓失败: {(res or {}).get('error', 'unknown')}")
+                    ),
+                    "data": {
+                        **(res or {}),
+                        "sltp_created": sltp_created,
+                        "sltp_error": sltp_error,
+                    },
+                }
             
             return {"success": False, "response": "AI交易引擎未初始化"}
             

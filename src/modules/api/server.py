@@ -589,7 +589,10 @@ class APIServer:
         Returns:
             发送成功的连接数
         """
-        if not self._running:
+        # 兼容外部启动器（例如直接 uvicorn 载入 app）：
+        # 这类模式下 API 已可用，但 _running 可能未显式置为 True。
+        # 仅在「未运行且无任何连接」时短路，避免误丢实时推送。
+        if (not self._running) and (not self.websocket_connections):
             return 0
 
         sent_count = 0
