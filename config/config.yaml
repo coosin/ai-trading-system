@@ -354,7 +354,7 @@ proxy:
   global_proxy:
     enabled: true
     proxy_type: http
-    # 容器内请用 host.docker.internal 指向宿主机 Clash/V2Ray；本机直连可改为 127.0.0.1（或用 local.yaml 覆盖）
+    # Docker bridge：host.docker.internal → 宿主机代理；network_mode: host 时请用 127.0.0.1（compose.hostnet 会注入 OPENCLAW__proxy__global_proxy__host）
     host: host.docker.internal
     port: 7890
     username_env: PROXY_USER

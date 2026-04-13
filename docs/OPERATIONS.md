@@ -22,6 +22,8 @@ docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d
 # 或：HOSTNET=1 ./scripts/deploy_production_stack.sh
 ```
 
+`docker-compose.hostnet.yml` 会把进程代理默认指到 **`127.0.0.1:${CLASH_MIXED_PORT:-7890}`**（并覆盖 `.env` 里仍写 `host.docker.internal` 的情况），与新装 Clash 常只监听回环一致；改端口见根目录 `.env.example`。
+
 一键（含健康等待与 OKX 抽检）:
 
 ```bash
