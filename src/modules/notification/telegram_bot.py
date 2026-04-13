@@ -21,6 +21,7 @@ from urllib.parse import urlparse, urlunparse
 import aiohttp
 
 from src.modules.core.commander_charter import CHARTER, CONTEXT_FRAMING_FOR_CHAT
+from src.modules.core.network_env_from_config import docker_loopback_proxy_use_gateway_host
 
 logger = logging.getLogger(__name__)
 
@@ -114,12 +115,12 @@ class TelegramBot:
             logger.warning("⚠️ Telegram机器人连接失败（已尝试代理与直连）")
 
     def _normalize_proxy_for_runtime(self, proxy_url: Optional[str]) -> Optional[str]:
-        """In Docker, rewrite loopback proxy URL to host gateway."""
+        """Bridge 容器内将环回代理 URL 改写为 host.docker.internal；host 网络等场景不改写。"""
         if not proxy_url:
             return proxy_url
-        if not os.path.exists("/.dockerenv"):
-            return proxy_url
         try:
+            if not docker_loopback_proxy_use_gateway_host():
+                return proxy_url
             parsed = urlparse(proxy_url)
             host = (parsed.hostname or "").strip().lower()
             if host not in {"127.0.0.1", "localhost"}:

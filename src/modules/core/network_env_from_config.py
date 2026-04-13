@@ -20,6 +20,21 @@ from urllib.parse import quote
 logger = logging.getLogger(__name__)
 
 
+def docker_loopback_proxy_use_gateway_host() -> bool:
+    """
+    是否在 Docker 内把代理 host 127.0.0.1 / localhost 改写为 host.docker.internal。
+
+    -默认：在 /.dockerenv 下为 True（bridge 容器访问宿主机代理）。
+    - host 网络：compose 可设 OPENCLAW_DOCKER_NETWORK_HOST=1，此时不改写（与 .env 里当前代理地址一致）。
+    - 显式关闭：OPENCLAW_PROXY_LOOPBACK_REWRITE=0
+    """
+    if os.getenv("OPENCLAW_DOCKER_NETWORK_HOST", "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    if os.getenv("OPENCLAW_PROXY_LOOPBACK_REWRITE", "").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    return os.path.exists("/.dockerenv")
+
+
 def _env_credentials(gp: Dict[str, Any]) -> tuple[str, str]:
     user_env = str(gp.get("username_env") or "").strip()
     pwd_env = str(gp.get("password_env") or "").strip()
@@ -177,4 +192,4 @@ def proxy_url_for_data_sources(config_manager: Any) -> str:
                 return u
     except Exception:
         pass
-    return "http://host.docker.internal:7890"
+    return ""

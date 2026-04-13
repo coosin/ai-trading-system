@@ -19,6 +19,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Callable
 from urllib.parse import urlparse
 
+from src.modules.core.network_env_from_config import docker_loopback_proxy_use_gateway_host
+
 logger = logging.getLogger(__name__)
 
 
@@ -135,14 +137,13 @@ class ProxyManager:
 
     def _normalize_proxy_host_for_runtime(self, host: Optional[str]) -> str:
         """
-        In Docker, loopback proxy host points to container itself.
-        Auto-rewrite localhost/127.0.0.1 to host.docker.internal.
+        Bridge 容器内：127.0.0.1指向容器自身，可改写为 host.docker.internal 以连宿主机代理。
+        host 网络或 OPENCLAW_PROXY_LOOPBACK_REWRITE=0 时不改写，由 .env 与当前代理试配。
         """
         h = (host or "").strip()
         if not h:
             return h
-        in_docker = os.path.exists("/.dockerenv")
-        if in_docker and h in {"127.0.0.1", "localhost"}:
+        if h in {"127.0.0.1", "localhost"} and docker_loopback_proxy_use_gateway_host():
             return "host.docker.internal"
         return h
     

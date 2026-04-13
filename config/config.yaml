@@ -354,7 +354,7 @@ proxy:
   global_proxy:
     enabled: true
     proxy_type: http
-    # Docker bridge：host.docker.internal → 宿主机代理；network_mode: host 时请用 127.0.0.1（compose.hostnet 会注入 OPENCLAW__proxy__global_proxy__host）
+    # 与 .env 中 OPENCLAW_*_PROXY / 实际代理一致；bridge 常用 host.docker.internal，本机环回用 127.0.0.1（可用 config/local.yaml 覆盖）
     host: host.docker.internal
     port: 7890
     username_env: PROXY_USER

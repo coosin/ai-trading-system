@@ -22,7 +22,7 @@ docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d
 # 或：HOSTNET=1 ./scripts/deploy_production_stack.sh
 ```
 
-`docker-compose.hostnet.yml` 会把进程代理默认指到 **`127.0.0.1:${CLASH_MIXED_PORT:-7890}`**（并覆盖 `.env` 里仍写 `host.docker.internal` 的情况），与新装 Clash 常只监听回环一致；改端口见根目录 `.env.example`。
+`docker-compose.hostnet.yml` 只处理 **网络栈 + Redis**；**代理以 `.env` 为准**（`OPENCLAW_HTTP_PROXY` 等与当前代理一致）。该文件会注入 `OPENCLAW_DOCKER_NETWORK_HOST=1`，避免进程再把本机 `127.0.0.1` 误改成 `host.docker.internal`。
 
 一键（含健康等待与 OKX 抽检）:
 
