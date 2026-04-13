@@ -268,6 +268,7 @@ class APIServer:
     4. API文档
     5. 请求验证和速率限制
     """
+    _shared_websocket_connections: Dict[str, WebSocketConnection] = {}
 
     def __init__(self, config_manager=None, main_controller=None, host: str = "0.0.0.0", port: int = 8000):
         """
@@ -592,13 +593,19 @@ class APIServer:
         # 兼容外部启动器（例如直接 uvicorn 载入 app）：
         # 这类模式下 API 已可用，但 _running 可能未显式置为 True。
         # 仅在「未运行且无任何连接」时短路，避免误丢实时推送。
-        if (not self._running) and (not self.websocket_connections):
+        if (
+            (not self._running)
+            and (not self.websocket_connections)
+            and (not self.__class__._shared_websocket_connections)
+        ):
             return 0
 
         sent_count = 0
         current_time = datetime.now()
-
-        for conn_id, connection in list(self.websocket_connections.items()):
+        targets: Dict[str, WebSocketConnection] = {}
+        targets.update(self.__class__._shared_websocket_connections or {})
+        targets.update(self.websocket_connections or {})
+        for conn_id, connection in list(targets.items()):
             try:
                 # 检查连接是否订阅了该频道
                 if connection.is_subscribed(channel):
@@ -3087,6 +3094,7 @@ class APIServer:
 
         async with self._lock:
             self.websocket_connections[conn_id] = connection
+            self.__class__._shared_websocket_connections[conn_id] = connection
             self.stats["websocket_connections"] += 1
 
         logger.info(f"WebSocket连接建立: {conn_id}")
@@ -3171,6 +3179,7 @@ class APIServer:
         async with self._lock:
             if conn_id in self.websocket_connections:
                 connection = self.websocket_connections.pop(conn_id)
+                self.__class__._shared_websocket_connections.pop(conn_id, None)
 
                 try:
                     await connection.websocket.close()
