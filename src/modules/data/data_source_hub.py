@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -38,10 +39,13 @@ class DataSourceHub:
         Falls back to safe defaults when config manager is unavailable.
         """
         mc = self.main_controller
+        _ft = float(os.getenv("OPENCLAW_DATA_HUB_FETCH_TIMEOUT_SEC", "22") or "22")
+        _st = float(os.getenv("OPENCLAW_DATA_HUB_SNAPSHOT_TIMEOUT_SEC", "55") or "55")
         defaults = {
             "enable_legacy_external_analysis": False,
-            "fetch_timeout_sec": 2.8,
-            "snapshot_timeout_sec": 6.0,
+            # 经 HTTP 代理访问 OKX 时 2.8s 过短，会导致 exch.* 全 timeout → ticker fallback
+            "fetch_timeout_sec": max(2.8, _ft),
+            "snapshot_timeout_sec": max(6.0, _st),
             "include_klines_1h": True,
             "klines_1h_limit": 64,
             "exchange_collectors": [

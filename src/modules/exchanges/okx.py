@@ -1629,12 +1629,15 @@ class OKXExchange(ExchangeBase):
         ):
             max_ms = float(os.getenv("OPENCLAW_OKX_WS_TICKER_MAX_AGE_MS", "3000") or "3000")
             row = hub.get_cached_ticker(okx_symbol, max_age_ms=max_ms)
-            if row:
+            _last = float((row or {}).get("last", 0) or 0)
+            _bid = float((row or {}).get("bidPx", 0) or 0)
+            _ask = float((row or {}).get("askPx", 0) or 0)
+            if row and (_last > 0 or _bid > 0 or _ask > 0):
                 return {
                     "symbol": symbol,
-                    "last": float(row.get("last", 0) or 0),
-                    "bid": float(row.get("bidPx", 0) or 0),
-                    "ask": float(row.get("askPx", 0) or 0),
+                    "last": _last,
+                    "bid": _bid,
+                    "ask": _ask,
                     "high": float(row.get("high24h", 0) or 0),
                     "low": float(row.get("low24h", 0) or 0),
                     "volume": float(row.get("vol24h", 0) or 0),
