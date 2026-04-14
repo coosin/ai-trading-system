@@ -1607,7 +1607,7 @@ def init_module_control_api(app, main_controller):
         if not hasattr(main_controller, "get_account_sync_diagnostics"):
             return {"success": False, "message": "诊断接口不可用", "timestamp": datetime.now().isoformat()}
         try:
-            data = await asyncio.wait_for(main_controller.get_account_sync_diagnostics(), timeout=8.0)
+            data = await asyncio.wait_for(main_controller.get_account_sync_diagnostics(), timeout=20.0)
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
         except asyncio.TimeoutError:
             return {

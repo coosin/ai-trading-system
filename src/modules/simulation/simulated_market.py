@@ -229,44 +229,45 @@ class SimulatedMarket:
         if not df.empty:
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             df.set_index("timestamp", inplace=True)
-            
-            # 按时间周期重采样
-            if timeframe == "1m":
+
+            # 按时间周期重采样（大小写兼容，适配新版 pandas 频率字符串）
+            tf = str(timeframe or "1m").strip().lower()
+            if tf == "1m":
                 resampled = df
-            elif timeframe == "5m":
-                resampled = df.resample("5T").agg({
+            elif tf == "5m":
+                resampled = df.resample("5min").agg({
                     "open": "first",
                     "high": "max",
                     "low": "min",
                     "close": "last",
                     "volume": "sum"
                 })
-            elif timeframe == "15m":
-                resampled = df.resample("15T").agg({
+            elif tf == "15m":
+                resampled = df.resample("15min").agg({
                     "open": "first",
                     "high": "max",
                     "low": "min",
                     "close": "last",
                     "volume": "sum"
                 })
-            elif timeframe == "1h":
-                resampled = df.resample("1H").agg({
+            elif tf == "1h":
+                resampled = df.resample("1h").agg({
                     "open": "first",
                     "high": "max",
                     "low": "min",
                     "close": "last",
                     "volume": "sum"
                 })
-            elif timeframe == "4h":
-                resampled = df.resample("4H").agg({
+            elif tf == "4h":
+                resampled = df.resample("4h").agg({
                     "open": "first",
                     "high": "max",
                     "low": "min",
                     "close": "last",
                     "volume": "sum"
                 })
-            elif timeframe == "1d":
-                resampled = df.resample("1D").agg({
+            elif tf == "1d":
+                resampled = df.resample("1d").agg({
                     "open": "first",
                     "high": "max",
                     "low": "min",

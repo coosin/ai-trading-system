@@ -115,7 +115,11 @@ class ExecutionGateway:
             pass
 
     def _exchange(self) -> Any:
-        ex = getattr(self._mc, "okx_exchange", None) or getattr(self._mc, "exchange", None)
+        ex = (
+            getattr(self._mc, "execution_exchange", None)
+            or getattr(self._mc, "okx_exchange", None)
+            or getattr(self._mc, "exchange", None)
+        )
         return ex
 
     async def _policy(self) -> Dict[str, Any]:

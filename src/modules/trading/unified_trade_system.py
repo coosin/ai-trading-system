@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import inspect
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
@@ -60,6 +61,8 @@ class UnifiedTradeSystem:
         
         # 订单队列
         self._order_queue: asyncio.Queue = asyncio.Queue()
+        self._order_task: Optional[asyncio.Task] = None
+        self.exchange_executor = None
         
         # 统计信息
         self.stats = {
@@ -95,7 +98,16 @@ class UnifiedTradeSystem:
             await self._init_notifier()
             
             # 启动订单处理任务
-            asyncio.create_task(self._process_orders())
+            self._order_task = asyncio.create_task(self._process_orders())
+
+            # 配置驱动初始化执行后端（兼容 simulation 模式）
+            if not self.exchange_executor and self.config.get("mode") == "simulation":
+                try:
+                    from src.modules.simulation.simulation_exchange import SimulationExchange
+                    self.exchange_executor = SimulationExchange(self.config.get("simulation", {}))
+                    logger.info("✅ 已按配置加载模拟交易执行后端")
+                except Exception as e:
+                    logger.warning(f"⚠️ 模拟交易执行后端加载失败: {e}")
             
             logger.info("✅ 统一交易系统初始化完成")
             return True
@@ -144,6 +156,10 @@ class UnifiedTradeSystem:
         except Exception as e:
             logger.warning(f"⚠️ 交易通知器初始化失败: {e}")
             self.notifier = None
+
+    def set_execution_backend(self, backend: Any):
+        """注入订单执行后端（支持 async/sync execute_order）。"""
+        self.exchange_executor = backend
     
     # ==================== 交易执行 ====================
     
@@ -208,6 +224,11 @@ class UnifiedTradeSystem:
             except Exception as e:
                 logger.error(f"处理订单失败: {e}")
                 await asyncio.sleep(1)
+            finally:
+                try:
+                    self._order_queue.task_done()
+                except ValueError:
+                    pass
     
     async def _execute_order(self, order_data: Dict) -> Dict[str, Any]:
         """
@@ -224,14 +245,40 @@ class UnifiedTradeSystem:
             order = order_data["order"]
             
             logger.info(f"执行订单: {order_id}")
+
+            execution_price = order.get("price")
+
+            if self.exchange_executor:
+                symbol = order.get("symbol")
+                side = str(order.get("side", "buy")).lower()
+                size = float(order.get("amount") or order.get("size") or order.get("quantity") or 0)
+                if not symbol or size <= 0:
+                    raise ValueError("订单缺少 symbol 或数量字段(amount/size/quantity)")
+
+                if side in ("long", "buy"):
+                    side = "buy"
+                elif side in ("short", "sell"):
+                    side = "sell"
+                else:
+                    raise ValueError(f"不支持的交易方向: {side}")
+
+                backend_call = self.exchange_executor.execute_order(
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    price=order.get("price"),
+                )
+                backend_result = await backend_call if inspect.isawaitable(backend_call) else backend_call
+                if isinstance(backend_result, dict):
+                    execution_price = backend_result.get("price", execution_price)
             
             # 记录交易
             await self.record_trade({
                 "id": order_id,
                 "symbol": order.get("symbol"),
                 "side": order.get("side"),
-                "amount": order.get("amount"),
-                "price": order.get("price"),
+                "amount": order.get("amount") or order.get("size") or order.get("quantity"),
+                "price": execution_price,
                 "status": "filled",
                 "executed_at": datetime.now()
             })
@@ -436,6 +483,14 @@ class UnifiedTradeSystem:
         """清理资源"""
         try:
             logger.info("清理统一交易系统...")
+
+            if self._order_task and not self._order_task.done():
+                self._order_task.cancel()
+                try:
+                    await self._order_task
+                except asyncio.CancelledError:
+                    pass
+            self._order_task = None
             
             # 清理交易记录
             self.trades.clear()

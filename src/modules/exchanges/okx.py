@@ -83,6 +83,8 @@ class OKXExchange(ExchangeBase):
         super().__init__(config)
         # REST 实盘/模拟盘均为 https://www.okx.com；模拟盘需额外请求头 x-simulated-trading: 1（见官方文档）
         self.api_url = "https://www.okx.com"
+        # simulated_order_only: 仅私有交易/账户链路走官方模拟盘，公共行情链路保持实盘。
+        self.simulated_order_only = bool(config.get("simulated_order_only", False))
         self.ws_url = (
             "wss://ws.okx.com:8443/ws/v5/public"
             if not self.testnet
@@ -91,8 +93,16 @@ class OKXExchange(ExchangeBase):
         self._session = None
         self._ws_connections = {}
         req_concurrency = int(os.getenv("OPENCLAW_OKX_MAX_CONCURRENCY", "4") or "4")
-        self._request_semaphore = asyncio.Semaphore(max(1, req_concurrency))  # 限制并发请求数
-        self._last_request_time = 0
+        self._request_semaphore = asyncio.Semaphore(max(1, req_concurrency))  # 兼容旧路径
+        market_concurrency = int(
+            os.getenv("OPENCLAW_OKX_MARKET_MAX_CONCURRENCY", str(max(1, min(2, req_concurrency)))) or "1"
+        )
+        account_concurrency = int(os.getenv("OPENCLAW_OKX_ACCOUNT_MAX_CONCURRENCY", "1") or "1")
+        self._market_request_semaphore = asyncio.Semaphore(max(1, market_concurrency))
+        self._account_request_semaphore = asyncio.Semaphore(max(1, account_concurrency))
+        self._default_request_semaphore = asyncio.Semaphore(max(1, req_concurrency))
+        self._last_request_time = 0.0
+        self._last_request_time_by_bucket: Dict[str, float] = {"market": 0.0, "account": 0.0, "default": 0.0}
         self._min_request_interval = float(os.getenv("OPENCLAW_OKX_MIN_REQUEST_INTERVAL", "0.2") or "0.2")
         self._request_max_retries = int(os.getenv("OPENCLAW_OKX_MAX_RETRIES", "3") or "3")
         self._timeout_total = float(os.getenv("OPENCLAW_OKX_TIMEOUT_TOTAL", "40") or "40")
@@ -144,6 +154,12 @@ class OKXExchange(ExchangeBase):
         self._payload_channel_fields: Dict[str, set] = defaultdict(set)
         self._payload_channel_samples: Dict[str, int] = defaultdict(int)
         self._payload_last_flush_ts: float = 0.0
+        self._ticker_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_TICKER_CACHE_TTL", "5") or "5")
+        self._balance_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_BALANCE_CACHE_TTL", "12") or "12")
+        self._positions_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_POSITIONS_CACHE_TTL", "15") or "15")
+        self._ticker_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._balances_cache: Tuple[float, List[Balance]] = (0.0, [])
+        self._positions_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
         self._payload_expected_fields: Dict[str, List[str]] = {
             "books": ["instId", "bids", "asks", "ts"],
             "tickers": ["instId", "last", "bidPx", "askPx", "vol24h", "ts"],
@@ -292,6 +308,14 @@ class OKXExchange(ExchangeBase):
         mac = hmac.new(self.api_secret.encode('utf-8'), message.encode('utf-8'), digestmod='sha256')
         return base64.b64encode(mac.digest()).decode('utf-8')
     
+    def _should_use_simulated_header(self, endpoint: str) -> bool:
+        ep = str(endpoint or "")
+        if getattr(self, "testnet", False):
+            return True
+        if not getattr(self, "simulated_order_only", False):
+            return False
+        return ep.startswith("/api/v5/trade/") or ep.startswith("/api/v5/account/")
+
     def _get_headers(self, method: str, endpoint: str, body: str = "") -> Dict[str, str]:
         """获取请求头"""
         # 使用 UTC 时间戳（ISO 8601 格式）
@@ -306,7 +330,7 @@ class OKXExchange(ExchangeBase):
             "OK-ACCESS-PASSPHRASE": self.api_passphrase or "",
             "Content-Type": "application/json",
         }
-        if getattr(self, "testnet", False):
+        if self._should_use_simulated_header(endpoint):
             headers["x-simulated-trading"] = "1"
         return headers
 
@@ -590,13 +614,27 @@ class OKXExchange(ExchangeBase):
                 }
             )
         return profile
+
+    def _request_bucket(self, endpoint: str) -> str:
+        ep = str(endpoint or "")
+        if ep.startswith("/api/v5/market/") or ep.startswith("/api/v5/public/"):
+            return "market"
+        if ep.startswith("/api/v5/account/") or ep.startswith("/api/v5/trade/"):
+            return "account"
+        return "default"
     
     async def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None, body: Dict[str, Any] = None) -> Any:
         """发送请求到OKX API - 带重试和限流机制"""
-        async with self._request_semaphore:
+        bucket = self._request_bucket(endpoint)
+        semaphore = {
+            "market": self._market_request_semaphore,
+            "account": self._account_request_semaphore,
+        }.get(bucket, self._default_request_semaphore)
+        async with semaphore:
             profile = self._build_request_profile(method, endpoint)
             current_time = time.time()
-            time_since_last = current_time - self._last_request_time
+            last_bucket_ts = float(self._last_request_time_by_bucket.get(bucket, 0.0))
+            time_since_last = current_time - last_bucket_ts
             effective_interval = max(
                 self._min_request_interval,
                 self._adaptive_min_request_interval,
@@ -604,7 +642,9 @@ class OKXExchange(ExchangeBase):
             if time_since_last < effective_interval:
                 await asyncio.sleep(effective_interval - time_since_last)
             
-            self._last_request_time = time.time()
+            now_ts = time.time()
+            self._last_request_time = now_ts
+            self._last_request_time_by_bucket[bucket] = now_ts
             
             url = self.api_url + endpoint
             body_str = json.dumps(body, separators=(',', ':')) if body else ""
@@ -1353,6 +1393,10 @@ class OKXExchange(ExchangeBase):
     
     async def get_balances(self) -> List[Balance]:
         """获取资产余额"""
+        now = time.time()
+        cached_ts, cached_balances = self._balances_cache
+        if cached_balances and (now - cached_ts) < self._balance_cache_ttl_s:
+            return list(cached_balances)
         endpoint = "/api/v5/account/balance"
         
         try:
@@ -1368,9 +1412,13 @@ class OKXExchange(ExchangeBase):
                         total=float(balance_data["eq"])
                     ))
             
+            self._balances_cache = (time.time(), list(balances))
             return balances
         except Exception as e:
             logger.error(f"获取OKX资产余额失败: {e}")
+            if cached_balances:
+                logger.warning("⚠️ 使用余额缓存降级返回（age=%.1fs）", max(0.0, now - cached_ts))
+                return list(cached_balances)
             return []
     
     async def get_positions(self) -> List[Dict[str, Any]]:
@@ -1378,6 +1426,10 @@ class OKXExchange(ExchangeBase):
         获取持仓：合并多类 instType 查询，避免只拉「全量」时漏掉 SWAP/FUTURES；
         支持 net 单向持仓（方向由 pos 正负决定）。
         """
+        now = time.time()
+        cached_ts, cached_positions = self._positions_cache
+        if cached_positions and (now - cached_ts) < self._positions_cache_ttl_s:
+            return list(cached_positions)
         endpoint = "/api/v5/account/positions"
 
         def _parse_row(pos_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1463,6 +1515,7 @@ class OKXExchange(ExchangeBase):
                     logger.debug("OKX 持仓(SWAP 权威): 非零 %d 条 (log dedup)", n)
             except Exception:
                 pass
+            self._positions_cache = (time.time(), list(out))
             return out
         except Exception as e:
             last_error = e
@@ -1481,9 +1534,13 @@ class OKXExchange(ExchangeBase):
         if fallback:
             out = list(fallback.values())
             logger.info("OKX 持仓(降级合并 FUTURES/全量): 非零 %d 条", len(out))
+            self._positions_cache = (time.time(), list(out))
             return out
         if last_error:
             logger.error(f"获取OKX持仓信息失败: {last_error}")
+        if cached_positions:
+            logger.warning("⚠️ 使用持仓缓存降级返回（age=%.1fs）", max(0.0, now - cached_ts))
+            return list(cached_positions)
         return []
     
     async def get_exchange_info(self) -> ExchangeInfo:
@@ -1618,6 +1675,13 @@ class OKXExchange(ExchangeBase):
         """
         endpoint = "/api/v5/market/ticker"
         okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+        now = time.time()
+        cached_entry = self._ticker_cache.get(okx_symbol)
+        cached_ticker = (
+            cached_entry[1]
+            if cached_entry and (now - float(cached_entry[0])) < self._ticker_cache_ttl_s
+            else None
+        )
 
         params = {"instId": okx_symbol}
 
@@ -1651,7 +1715,7 @@ class OKXExchange(ExchangeBase):
             data = await self._make_request("GET", endpoint, params)
             if data and len(data) > 0:
                 ticker = data[0]
-                return {
+                out = {
                     "symbol": symbol,
                     "last": float(ticker.get("last", 0)),
                     "bid": float(ticker.get("bidPx", 0)),
@@ -1662,6 +1726,8 @@ class OKXExchange(ExchangeBase):
                     "change": float(ticker.get("change24h", 0)),
                     "timestamp": int(ticker.get("ts", 0))
                 }
+                self._ticker_cache[okx_symbol] = (time.time(), dict(out))
+                return out
         except Exception as e:
             error_str = str(e)
             if "51001" in error_str or "doesn't exist" in error_str:
@@ -1672,7 +1738,7 @@ class OKXExchange(ExchangeBase):
                     data = await self._make_request("GET", endpoint, params)
                     if data and len(data) > 0:
                         ticker = data[0]
-                        return {
+                        out = {
                             "symbol": symbol,
                             "last": float(ticker.get("last", 0)),
                             "bid": float(ticker.get("bidPx", 0)),
@@ -1683,10 +1749,15 @@ class OKXExchange(ExchangeBase):
                             "change": float(ticker.get("change24h", 0)),
                             "timestamp": int(ticker.get("ts", 0))
                         }
+                        self._ticker_cache[okx_symbol] = (time.time(), dict(out))
+                        return out
                 except Exception as e2:
                     logger.debug(f"交易对 {symbol} 行情获取失败: {e2}")
             else:
                 logger.debug(f"获取OKX行情失败: {e}")
+        if cached_ticker:
+            logger.warning("⚠️ 使用ticker缓存降级返回: %s", symbol)
+            return dict(cached_ticker)
         return {}
     
     async def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "cross") -> Dict[str, Any]:

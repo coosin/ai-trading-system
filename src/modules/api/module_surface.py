@@ -166,7 +166,7 @@ def attach_module_surface_routes(router: APIRouter, main_controller: Any) -> Non
         if not hub or not hasattr(hub, "get_unified_snapshot"):
             return _reserved("data", "/modules/data/hub/unified-snapshot")
         try:
-            snap = await asyncio.wait_for(hub.get_unified_snapshot(symbol), timeout=8.0)
+            snap = await asyncio.wait_for(hub.get_unified_snapshot(symbol), timeout=20.0)
             return {
                 "success": True,
                 "implemented": True,

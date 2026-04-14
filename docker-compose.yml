@@ -29,9 +29,9 @@ services:
     env_file:
       - .env
     environment:
-      - MODE=${MODE:-simulation}
-      - OPENCLAW__trading__mode=${TRADING_MODE:-simulation}
-      - OPENCLAW__system__mode=${SYSTEM_MODE:-simulation}
+      - MODE=${MODE:-live_trading}
+      - OPENCLAW__trading__mode=${TRADING_MODE:-live_trading}
+      - OPENCLAW__system__mode=${SYSTEM_MODE:-live_trading}
       - OKX_TESTNET=${OKX_TESTNET:-0}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-}

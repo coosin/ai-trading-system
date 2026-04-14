@@ -67,9 +67,17 @@ mixed-port: 7890
 
 1. 宿主机 Clash 监听 **7890**（或你自定义的 mixed-port）。
 2. Compose 中交易容器已通过 `extra_hosts: host.docker.internal:host-gateway`，`config/proxy.global_proxy.host` 默认 **`host.docker.internal`**，即 **容器 → 宿主机 Clash**。
-3. **`network_mode: host` 与 `networks:` 在 Compose 合并时互斥**，不能仅靠第二个 yml「删掉」基座里的 `networks`。若必须让交易容器与宿主机完全同一网络栈，请任选其一：
-   - 运维侧用 **`docker run --network host ...`** 或单独拆一份**仅含 host 模式**的 compose（不在本仓库做 fragile 的 merge 覆盖）；或
-   - **保持当前 bridge + `HTTP_PROXY=http://host.docker.internal:7890`**（推荐）：与宿主机 TUN **可同时存在**——TUN 接管宿主机进程，容器内库走显式代理，稳定性与可重复验收最好。
+3. **`network_mode: host` 与 `networks:`**：本仓库用根目录 **`docker-compose.hostnet.yml`**（`networks: !reset null` 等）与基座 **合并**，让交易服务走宿主机网络栈且 **Redis 仍为 compose 桥接**。推荐：
+
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --force-recreate trading-system
+   ```
+
+   **勿**用裸 `docker run --network host` 替代整套 compose（易丢卷、`.env`、`depends_on`、Redis 约定）。一键：`./scripts/recover_trading_hostnet.sh`。
+
+4. **Clash / mihomo 的 mixed-port 若只监听 `127.0.0.1`**：bridge 容器通过 `host.docker.internal`（宿主机在 docker 网上的地址）去连 **经常失败**——目标端口在回环上，对「从容器来的」连接不可达。处理：让入站监听 **`0.0.0.0:7890`**（或等价），或改用 **`docker-compose.hostnet.yml`**，在进程内直接使用 **`http://127.0.0.1:7890`**。
+
+5. **bridge + 显式 HTTP 代理**（代理对 docker 网可达时）：与宿主机 TUN **可同时存在**——TUN 管宿主机进程，容器内 HTTP 库走 `HTTP_PROXY`，便于验收与排障。
 
 ---
 

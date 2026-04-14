@@ -224,17 +224,47 @@ class AITradingEngine:
             self.llm_integration = self.main_controller.llm_integration
             logger.info("✅ LLM集成已连接")
         
-        # 连接交易所 - 直接创建OKX交易所实例
+        # 连接交易所：simulation 模式优先复用主控制器注入的模拟交易所
         try:
             okx_config = {}
+            trading_mode = ""
+            sim_cfg = {}
+            system_cfg = {}
             
             # 优先从环境变量读取配置
             import os
             api_key = os.getenv('OKX_API_KEY')
             secret = os.getenv('OKX_SECRET')
             passphrase = os.getenv('OKX_PASSPHRASE')
-            
-            if api_key and secret and passphrase:
+
+            if self.main_controller and self.main_controller.config_manager:
+                trading_cfg = await self.main_controller.config_manager.get_config("trading", {})
+                system_cfg = await self.main_controller.config_manager.get_config("system", {})
+                top_mode = await self.main_controller.config_manager.get_config("mode", "")
+                sim_cfg = dict(trading_cfg.get("simulation", {}) or {})
+                mode_candidates = [
+                    trading_cfg.get("mode", ""),
+                    system_cfg.get("mode", ""),
+                    top_mode,
+                ]
+                trading_mode = next(
+                    (str(m).strip().lower() for m in mode_candidates if str(m).strip()),
+                    "",
+                )
+
+            use_real_market_data = bool(
+                sim_cfg.get("use_real_market_data", False)
+                or system_cfg.get("use_real_market_data", False)
+            )
+
+            if (
+                trading_mode == "simulation"
+                and (not use_real_market_data)
+                and getattr(self.main_controller, "simulation_exchange", None)
+            ):
+                self.exchange = self.main_controller.simulation_exchange
+                logger.info("✅ SimulationExchange 已连接（来自 MainController）")
+            elif api_key and secret and passphrase:
                 testnet_flag = str(os.getenv("OKX_TESTNET", "") or "").strip().lower() in ("1", "true", "yes")
                 okx_config = {
                     'api_key': api_key,
@@ -254,7 +284,7 @@ class AITradingEngine:
                 okx_config = dict(okx_config or {})
                 okx_config["testnet"] = True
             
-            if okx_config and okx_config.get('api_key'):
+            if not self.exchange and okx_config and okx_config.get('api_key'):
                 from src.modules.exchanges.okx import OKXExchange
                 self.exchange = OKXExchange(okx_config)
                 # 传递config_manager给OKXExchange
@@ -262,7 +292,7 @@ class AITradingEngine:
                     self.exchange._config_manager = self.main_controller.config_manager
                 await self.exchange.initialize()
                 logger.info("✅ OKX交易所已连接")
-            else:
+            elif not self.exchange:
                 logger.warning("⚠️ OKX配置不完整，使用模拟数据")
                 logger.warning(f"   API Key: {'已设置' if api_key else '未设置'}")
                 logger.warning(f"   Secret: {'已设置' if secret else '未设置'}")

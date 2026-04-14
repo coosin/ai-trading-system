@@ -37,13 +37,13 @@ class OKXWebSocketHub:
         self._ticker_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     def ws_private_url(self) -> str:
-        if self._ex.testnet:
+        if self._ex.testnet or getattr(self._ex, "simulated_order_only", False):
             return "wss://wspap.okx.com:8443/ws/v5/private"
         return "wss://ws.okx.com:8443/ws/v5/private"
 
     def _ws_headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {}
-        if getattr(self._ex, "testnet", False):
+        if getattr(self._ex, "testnet", False) or getattr(self._ex, "simulated_order_only", False):
             h["x-simulated-trading"] = "1"
         return h
 
