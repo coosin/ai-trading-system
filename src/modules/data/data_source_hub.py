@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -30,8 +31,96 @@ class DataSourceHub:
     """数据源统一编排入口（轻量 facade）。"""
 
     def __init__(self, main_controller: Any = None):
-        self.main_controller = main_controller
+        self.main_controller = main_controller or self._resolve_main_controller()
         self.quality_advisor = DataQualityAdvisor(window_size=80)
+        self._collector_cache: Dict[str, Dict[str, Any]] = {}
+        self._collector_cache_ts: Dict[str, float] = {}
+        self._exchange_override: Any = None
+        if self.main_controller is not None:
+            self.bind_main_controller(self.main_controller)
+
+    def _resolve_main_controller(self) -> Any:
+        """
+        Best-effort resolve active MainController across import namespaces.
+        Some runtimes may load `src.modules.*` and `modules.*` separately.
+        """
+        # Prefer already-loaded modules first (no extra import side effects).
+        for mod_name in ("src.modules.main_controller", "modules.main_controller"):
+            mod = sys.modules.get(mod_name)
+            cls = getattr(mod, "MainController", None) if mod else None
+            if cls and hasattr(cls, "get_active_instance"):
+                try:
+                    mc = cls.get_active_instance()
+                    if mc is not None:
+                        return mc
+                except Exception:
+                    pass
+        # Fallback imports if module not loaded yet.
+        for import_path in ("src.modules.main_controller", "modules.main_controller"):
+            try:
+                mod = __import__(import_path, fromlist=["MainController"])
+                cls = getattr(mod, "MainController", None)
+                if cls and hasattr(cls, "get_active_instance"):
+                    mc = cls.get_active_instance()
+                    if mc is not None:
+                        return mc
+            except Exception:
+                continue
+        return None
+
+    def bind_main_controller(self, main_controller: Any) -> None:
+        """
+        显式绑定主控制器与交易所引用，避免初始化窗口/重建后的引用漂移。
+        """
+        self.main_controller = main_controller
+        self._exchange_override = None
+        mc = main_controller
+        if not mc:
+            return
+        engine = getattr(mc, "ai_trading_engine", None)
+        self._exchange_override = (
+            (getattr(engine, "exchange", None) if engine else None)
+            or getattr(mc, "execution_exchange", None)
+            or getattr(mc, "market_data_exchange", None)
+            or getattr(mc, "okx_exchange", None)
+            or getattr(mc, "exchange", None)
+        )
+
+    def _collector_timeout(self, name: str, cfg: Dict[str, Any]) -> float:
+        """采集项分级超时，避免单一 timeout 造成全链路误降级。"""
+        base = float(cfg.get("fetch_timeout_sec", 8.0) or 8.0)
+        hard_defaults = {
+            "exch.ticker": 6.0,
+            "exch.order_book": 8.0,
+            "exch.open_interest": 8.0,
+            "exch.funding_rate": 8.0,
+            "exch.positions": 14.0,
+            "exch.open_orders": 14.0,
+            "exch.liq_proxy": 12.0,
+            "exch.klines_1h": 10.0,
+            "third_party.sentiment": 8.0,
+            "third_party.news": 8.0,
+        }
+        env_key = f"OPENCLAW_DATA_HUB_TIMEOUT_{name.upper().replace('.', '_')}"
+        env_v = os.getenv(env_key)
+        if env_v:
+            try:
+                return max(1.5, float(env_v))
+            except Exception:
+                pass
+        return max(base, hard_defaults.get(name, base))
+
+    def _cache_get(self, key: str, ttl_sec: float) -> Any:
+        ts = float(self._collector_cache_ts.get(key, 0.0))
+        if ts <= 0:
+            return None
+        if (datetime.now().timestamp() - ts) > max(1.0, float(ttl_sec)):
+            return None
+        return self._collector_cache.get(key)
+
+    def _cache_set(self, key: str, value: Any) -> None:
+        self._collector_cache[key] = value
+        self._collector_cache_ts[key] = datetime.now().timestamp()
 
     async def _cfg(self) -> Dict[str, Any]:
         """
@@ -70,7 +159,10 @@ class DataSourceHub:
         if mc and hasattr(mc, "get_ai_managed_config"):
             try:
                 cfg = await mc.get_ai_managed_config("data_source_hub", defaults)
-                return cfg if isinstance(cfg, dict) else dict(defaults)
+                out = cfg if isinstance(cfg, dict) else dict(defaults)
+                out["fetch_timeout_sec"] = max(6.0, float(out.get("fetch_timeout_sec", defaults["fetch_timeout_sec"]) or defaults["fetch_timeout_sec"]))
+                out["snapshot_timeout_sec"] = max(20.0, float(out.get("snapshot_timeout_sec", defaults["snapshot_timeout_sec"]) or defaults["snapshot_timeout_sec"]))
+                return out
             except Exception:
                 return dict(defaults)
         return dict(defaults)
@@ -123,13 +215,25 @@ class DataSourceHub:
             return default
 
     def _get_exchange(self) -> Any:
+        if self._exchange_override is not None:
+            return self._exchange_override
         mc = self.main_controller
+        if mc is None:
+            mc = self._resolve_main_controller()
+            if mc is not None:
+                self.bind_main_controller(mc)
         if not mc:
             return None
         engine = getattr(mc, "ai_trading_engine", None)
         ex = getattr(engine, "exchange", None) if engine else None
-        # fallback: some deployments mount exchange directly on main_controller
-        return ex or getattr(mc, "okx_exchange", None) or getattr(mc, "exchange", None)
+        # fallback: deployment/runtime 差异下，交易所实例可能挂在不同引用点
+        return (
+            ex
+            or getattr(mc, "execution_exchange", None)
+            or getattr(mc, "market_data_exchange", None)
+            or getattr(mc, "okx_exchange", None)
+            or getattr(mc, "exchange", None)
+        )
 
     def _get_onchain_integrator(self) -> Any:
         mc = self.main_controller
@@ -238,7 +342,7 @@ class DataSourceHub:
         exchange = self._get_exchange()
         if not exchange:
             logger.warning(
-                "DataSourceHub.get_ticker(%s): main_controller 上无可用 exchange（检查 ai_trading_engine.exchange / okx_exchange）",
+                "DataSourceHub.get_ticker(%s): main_controller 上无可用 exchange（检查 ai_trading_engine/execution_exchange/market_data_exchange/okx_exchange）",
                 symbol,
             )
         if exchange and hasattr(exchange, "get_ticker"):
@@ -291,64 +395,95 @@ class DataSourceHub:
 
     async def get_order_book(self, symbol: str, depth: int = 20) -> Dict[str, Any]:
         exchange = self._get_exchange()
+        cache_key = f"order_book:{symbol}:{depth}"
         if exchange and hasattr(exchange, "get_order_book"):
             try:
                 ob = await exchange.get_order_book(symbol, depth=depth)
                 if ob:
                     bids = ob.bids if hasattr(ob, "bids") else ob.get("bids", [])
                     asks = ob.asks if hasattr(ob, "asks") else ob.get("asks", [])
-                    return {
+                    out = {
                         "symbol": symbol,
                         "bids": [[float(x[0]), float(x[1])] for x in bids[:depth]],
                         "asks": [[float(x[0]), float(x[1])] for x in asks[:depth]],
                         "timestamp": datetime.now().isoformat(),
                         "source": "exchange",
                     }
+                    if out["bids"] or out["asks"]:
+                        self._cache_set(cache_key, out)
+                    return out
             except Exception:
                 pass
+        cached = self._cache_get(cache_key, ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_ORDERBOOK_CACHE_TTL", "12") or "12"))
+        if isinstance(cached, dict):
+            out = dict(cached)
+            out["source"] = "cache"
+            return out
         return {"symbol": symbol, "bids": [], "asks": [], "timestamp": datetime.now().isoformat(), "source": "fallback"}
 
     async def get_positions(self) -> List[Dict[str, Any]]:
         exchange = self._get_exchange()
+        cache_key = "positions"
         if exchange and hasattr(exchange, "get_positions"):
             try:
                 positions = await exchange.get_positions()
                 if isinstance(positions, list):
+                    self._cache_set(cache_key, positions)
                     return self._sanitize(positions)
             except Exception:
                 pass
+        cached = self._cache_get(cache_key, ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_POSITIONS_CACHE_TTL", "20") or "20"))
+        if isinstance(cached, list):
+            return self._sanitize(cached)
         return []
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         exchange = self._get_exchange()
+        cache_key = f"open_orders:{symbol or '*'}"
         if exchange and hasattr(exchange, "get_open_orders"):
             try:
                 orders = await exchange.get_open_orders(symbol)
                 if isinstance(orders, list):
+                    self._cache_set(cache_key, orders)
                     return self._sanitize(orders)
             except Exception:
                 pass
+        cached = self._cache_get(cache_key, ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_OPEN_ORDERS_CACHE_TTL", "20") or "20"))
+        if isinstance(cached, list):
+            return self._sanitize(cached)
         return []
 
     async def get_open_interest(self, symbol: str) -> Dict[str, Any]:
         exchange = self._get_exchange()
+        cache_key = f"open_interest:{symbol}"
         if exchange and hasattr(exchange, "get_open_interest"):
             try:
                 oi = await exchange.get_open_interest(symbol)
                 if isinstance(oi, dict):
+                    self._cache_set(cache_key, oi)
                     return self._sanitize(oi)
             except Exception:
                 pass
+        cached = self._cache_get(cache_key, ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_OI_CACHE_TTL", "20") or "20"))
+        if isinstance(cached, dict):
+            return self._sanitize(cached)
         return {}
 
     async def get_funding_rate(self, symbol: str) -> Optional[float]:
         exchange = self._get_exchange()
+        cache_key = f"funding_rate:{symbol}"
         if exchange and hasattr(exchange, "get_funding_rate"):
             try:
                 fr = await exchange.get_funding_rate(symbol)
-                return float(fr) if fr is not None else None
+                out = float(fr) if fr is not None else None
+                if out is not None:
+                    self._cache_set(cache_key, out)
+                return out
             except Exception:
                 pass
+        cached = self._cache_get(cache_key, ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_FUNDING_CACHE_TTL", "20") or "20"))
+        if isinstance(cached, (int, float)):
+            return float(cached)
         return None
 
     async def get_liquidation_proxy(self, symbol: str) -> Dict[str, Any]:
@@ -514,18 +649,36 @@ class DataSourceHub:
 
         third = self._get_third_party_integrator()
         if third and any(k.startswith("third_party.") for k in enabled):
+            sentiment_key = f"third_party_sentiment:{symbol}"
             cs = await self._fetch_safe(
                 "third_party.sentiment",
                 third.get_comprehensive_sentiment(symbol),
+                timeout_sec=self._collector_timeout("third_party.sentiment", cfg),
                 default={},
                 health=health,
                 errors=errors,
             )
+            if isinstance(cs, dict) and cs:
+                self._cache_set(sentiment_key, cs)
+            else:
+                cached_cs = self._cache_get(
+                    sentiment_key,
+                    ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_THIRD_PARTY_SENTIMENT_CACHE_TTL", "900") or "900"),
+                )
+                if isinstance(cached_cs, dict) and cached_cs:
+                    cs = dict(cached_cs)
+                    if isinstance(health.get("third_party.sentiment"), dict):
+                        health["third_party.sentiment"]["status"] = "cache"
+                    try:
+                        errors.remove("third_party.sentiment:timeout")
+                    except ValueError:
+                        pass
             out["sentiment"] = self._sanitize(cs or {})
             out["health"]["third_party"] = "ok" if cs else "degraded"
             news = await self._fetch_safe(
                 "third_party.news",
                 third.get_news_sentiment(symbol),
+                timeout_sec=self._collector_timeout("third_party.news", cfg),
                 default={},
                 health=health,
                 errors=errors,
@@ -549,17 +702,113 @@ class DataSourceHub:
         enabled = set([str(x) for x in (cfg.get("exchange_collectors") or [])])
         errors: List[str] = []
         health: Dict[str, Any] = {}
-
-        # collect concurrently; keep best-effort semantics
-        ticker, orderbook, oi, fr, positions, orders, liq_proxy = await asyncio.gather(
-            self._fetch_safe("exch.ticker", self.get_ticker(symbol), default={}, health=health, errors=errors),
-            self._fetch_safe("exch.order_book", self.get_order_book(symbol, depth=20), default={}, health=health, errors=errors),
-            self._fetch_safe("exch.open_interest", self.get_open_interest(symbol), default={}, health=health, errors=errors),
-            self._fetch_safe("exch.funding_rate", self.get_funding_rate(symbol), default=None, health=health, errors=errors),
-            self._fetch_safe("exch.positions", self.get_positions(), default=[], health=health, errors=errors),
-            self._fetch_safe("exch.open_orders", self.get_open_orders(symbol=None), default=[], health=health, errors=errors),
-            self._fetch_safe("exch.liq_proxy", self.get_liquidation_proxy(symbol), default={}, health=health, errors=errors),
-        )
+        # 关键修复：不能让慢接口拖垮整条 exchange channel。
+        # 使用分任务并发 + 总预算收敛，优先保住 ticker/order_book 等核心实时字段。
+        defaults: Dict[str, Any] = {
+            "ticker": {},
+            "order_book": {},
+            "open_interest": {},
+            "funding_rate": None,
+            "positions": [],
+            "open_orders": [],
+            "liquidation_proxy": {},
+        }
+        task_specs = {
+            "ticker": asyncio.create_task(
+                self._fetch_safe(
+                    "exch.ticker",
+                    self.get_ticker(symbol),
+                    timeout_sec=self._collector_timeout("exch.ticker", cfg),
+                    default={},
+                    health=health,
+                    errors=errors,
+                )
+            ),
+            "order_book": asyncio.create_task(
+                self._fetch_safe(
+                    "exch.order_book",
+                    self.get_order_book(symbol, depth=20),
+                    timeout_sec=self._collector_timeout("exch.order_book", cfg),
+                    default={},
+                    health=health,
+                    errors=errors,
+                )
+            ),
+            "open_interest": asyncio.create_task(
+                self._fetch_safe(
+                    "exch.open_interest",
+                    self.get_open_interest(symbol),
+                    timeout_sec=self._collector_timeout("exch.open_interest", cfg),
+                    default={},
+                    health=health,
+                    errors=errors,
+                )
+            ),
+            "funding_rate": asyncio.create_task(
+                self._fetch_safe(
+                    "exch.funding_rate",
+                    self.get_funding_rate(symbol),
+                    timeout_sec=self._collector_timeout("exch.funding_rate", cfg),
+                    default=None,
+                    health=health,
+                    errors=errors,
+                )
+            ),
+            "positions": asyncio.create_task(
+                self._fetch_safe(
+                    "exch.positions",
+                    self.get_positions(),
+                    timeout_sec=self._collector_timeout("exch.positions", cfg),
+                    default=[],
+                    health=health,
+                    errors=errors,
+                )
+            ),
+            "open_orders": asyncio.create_task(
+                self._fetch_safe(
+                    "exch.open_orders",
+                    self.get_open_orders(symbol=None),
+                    timeout_sec=self._collector_timeout("exch.open_orders", cfg),
+                    default=[],
+                    health=health,
+                    errors=errors,
+                )
+            ),
+            "liquidation_proxy": asyncio.create_task(
+                self._fetch_safe(
+                    "exch.liq_proxy",
+                    self.get_liquidation_proxy(symbol),
+                    timeout_sec=self._collector_timeout("exch.liq_proxy", cfg),
+                    default={},
+                    health=health,
+                    errors=errors,
+                )
+            ),
+        }
+        budget_sec = float(os.getenv("OPENCLAW_DATA_HUB_EXCHANGE_BUDGET_SEC", "12") or "12")
+        budget_sec = max(4.0, min(budget_sec, 20.0))
+        done, pending = await asyncio.wait(set(task_specs.values()), timeout=budget_sec)
+        results: Dict[str, Any] = dict(defaults)
+        for name, task in task_specs.items():
+            if task in done:
+                try:
+                    results[name] = task.result()
+                except Exception:
+                    results[name] = defaults[name]
+            else:
+                task.cancel()
+                errors.append(f"exch.{name}:budget_timeout")
+                if isinstance(health.get(f"exch.{name}"), dict):
+                    health[f"exch.{name}"]["status"] = "budget_timeout"
+                else:
+                    health[f"exch.{name}"] = {"status": "budget_timeout", "latency_ms": int(budget_sec * 1000)}
+        ticker = results["ticker"]
+        orderbook = results["order_book"]
+        oi = results["open_interest"]
+        fr = results["funding_rate"]
+        positions = results["positions"]
+        orders = results["open_orders"]
+        liq_proxy = results["liquidation_proxy"]
 
         # Optional: include 1h klines so downstream analyzers (MI/gates) can reuse snapshot.
         klines_1h: List[Dict[str, Any]] = []
@@ -567,6 +816,7 @@ class DataSourceHub:
             klines_1h = await self._fetch_safe(
                 "exch.klines_1h",
                 self.get_klines(symbol, interval="1H", limit=int(cfg.get("klines_1h_limit", 64) or 64)),
+                timeout_sec=self._collector_timeout("exch.klines_1h", cfg),
                 default=[],
                 health=health,
                 errors=errors,
@@ -586,6 +836,30 @@ class DataSourceHub:
             orders = []
         if "liquidation_proxy" not in enabled:
             liq_proxy = {}
+        # 当 ticker 短暂超时但 order_book 可用时，用盘口中间价兜底，避免整包质量被误判为“无价格”。
+        if (not isinstance(ticker, dict) or not ticker.get("last")) and isinstance(orderbook, dict):
+            bids = orderbook.get("bids") or []
+            asks = orderbook.get("asks") or []
+            if bids and asks:
+                try:
+                    best_bid = float(bids[0][0])
+                    best_ask = float(asks[0][0])
+                    mid = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
+                    if mid > 0:
+                        ticker = {
+                            "symbol": symbol,
+                            "last": mid,
+                            "price": mid,
+                            "bid": best_bid,
+                            "ask": best_ask,
+                            "high": 0.0,
+                            "low": 0.0,
+                            "volume": 0.0,
+                            "timestamp": datetime.now().isoformat(),
+                            "source": "derived_order_book",
+                        }
+                except Exception:
+                    pass
         ticker_quality_notes = self._exchange_ticker_quality_notes(symbol, ticker)
         return {
             "symbol": symbol,
@@ -663,13 +937,20 @@ class DataSourceHub:
         cfg = await self._cfg()
         # bounded overall snapshot budget; per-field timeouts are handled inside collectors
         budget = float(cfg.get("snapshot_timeout_sec", 6.0) or 6.0)
+        budget_cap = float(os.getenv("OPENCLAW_DATA_HUB_SNAPSHOT_BUDGET_CAP", "18") or "18")
+        budget = max(4.0, min(budget, budget_cap))
         try:
-            exchange_channel, intel_channel = await asyncio.wait_for(
-                asyncio.gather(self.get_exchange_channel(symbol), self.get_intel_channel(symbol)),
-                timeout=budget,
-            )
-        except Exception:
-            # degraded: return minimal skeleton
+            # 全局 budget 仅作为保护上限，不阻断已完成子通道结果。
+            # 具体超时在各 collector 内部按字段分级处理，避免一次整体 timeout 导致整包清空。
+            exchange_task = asyncio.create_task(self.get_exchange_channel(symbol))
+            intel_task = asyncio.create_task(self.get_intel_channel(symbol))
+            done, pending = await asyncio.wait({exchange_task, intel_task}, timeout=budget)
+            exchange_channel = exchange_task.result() if exchange_task in done else {}
+            intel_channel = intel_task.result() if intel_task in done else {}
+            for task in pending:
+                task.cancel()
+        except Exception as e:
+            logger.warning("DataSourceHub unified snapshot degraded: %s", e)
             exchange_channel, intel_channel = {}, {}
         whale_summary = {
             "链上大户活跃条数": len(intel_channel.get("onchain", {}).get("whales", []) or []),

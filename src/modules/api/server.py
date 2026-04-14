@@ -771,6 +771,37 @@ class APIServer:
         main_controller = self.main_controller
         data_source_hub = DataSourceHub(main_controller)
 
+        def _resolve_data_source_hub() -> DataSourceHub:
+            """
+            运行时动态绑定 DataSourceHub <-> main_controller/exchange：
+            - 优先使用 main_controller 挂载的 data_source_hub
+            - 每次请求前刷新绑定，避免旧引用导致 exchange 断链
+            """
+            mc = self.main_controller
+            if mc is None:
+                # 兼容不同导入命名空间，尽可能恢复活动主控引用
+                for import_path in ("src.modules.main_controller", "modules.main_controller"):
+                    try:
+                        mod = __import__(import_path, fromlist=["MainController"])
+                        cls = getattr(mod, "MainController", None)
+                        if cls and hasattr(cls, "get_active_instance"):
+                            mc = cls.get_active_instance()
+                            if mc is not None:
+                                break
+                    except Exception:
+                        continue
+            hub = getattr(mc, "data_source_hub", None) if mc else None
+            if not hub:
+                hub = data_source_hub
+            if hasattr(hub, "bind_main_controller"):
+                try:
+                    hub.bind_main_controller(mc)
+                except Exception:
+                    hub.main_controller = mc
+            else:
+                hub.main_controller = mc
+            return hub
+
         # 根路由 - 仅在静态文件服务不存在时生效
         # 注意：静态文件服务会处理根路径的请求
 
@@ -1283,39 +1314,43 @@ class APIServer:
         @api_v1_router.get("/market/ticker/{symbol}", tags=["market"])
         async def get_market_ticker(symbol: str):
             """获取市场行情（统一数据源模块）"""
-            return await data_source_hub.get_ticker(symbol)
+            return await _resolve_data_source_hub().get_ticker(symbol)
 
         @api_v1_router.get("/market/ticker", tags=["market"])
         async def get_market_ticker_q(symbol: str):
             """兼容 query 参数形式：/market/ticker?symbol=BTC/USDT"""
-            return await data_source_hub.get_ticker(symbol)
+            return await _resolve_data_source_hub().get_ticker(symbol)
 
         # K线路由 - 支持 /api/v1/market/klines/{symbol}
         @api_v1_router.get("/market/klines/{symbol}", tags=["market"])
         async def get_market_klines(symbol: str, interval: str = "1H", limit: int = 100):
             """获取K线数据（统一数据源模块）"""
-            return await data_source_hub.get_klines(symbol, interval=interval, limit=limit)
+            return await _resolve_data_source_hub().get_klines(symbol, interval=interval, limit=limit)
 
         @api_v1_router.get("/market/klines", tags=["market"])
         async def get_market_klines_q(symbol: str, interval: str = "1H", limit: int = 100):
             """兼容 query 参数形式：/market/klines?symbol=BTC/USDT"""
-            return await data_source_hub.get_klines(symbol, interval=interval, limit=limit)
+            return await _resolve_data_source_hub().get_klines(symbol, interval=interval, limit=limit)
 
         # 订单簿路由 - 支持 /api/v1/market/orderbook/{symbol}
         @api_v1_router.get("/market/orderbook/{symbol}", tags=["market"])
         async def get_market_orderbook(symbol: str, depth: int = 20):
             """获取订单簿（统一数据源模块）"""
-            return await data_source_hub.get_order_book(symbol, depth=depth)
+            return await _resolve_data_source_hub().get_order_book(symbol, depth=depth)
 
         @api_v1_router.get("/market/orderbook", tags=["market"])
         async def get_market_orderbook_q(symbol: str, depth: int = 20):
             """兼容 query 参数形式：/market/orderbook?symbol=BTC/USDT"""
-            return await data_source_hub.get_order_book(symbol, depth=depth)
+            return await _resolve_data_source_hub().get_order_book(symbol, depth=depth)
 
         @api_v1_router.get("/market/symbols", tags=["market"])
         async def get_market_symbols():
             """获取可用交易对（统一数据源模块）"""
-            return {"status": "success", "data": await data_source_hub.get_symbols(), "timestamp": datetime.now().isoformat()}
+            return {
+                "status": "success",
+                "data": await _resolve_data_source_hub().get_symbols(),
+                "timestamp": datetime.now().isoformat(),
+            }
 
         # 风险指标路由 - 支持 /api/v1/risk/metrics
         @api_v1_router.get("/risk/metrics", tags=["risk"])
@@ -2728,7 +2763,7 @@ class APIServer:
         @api_v1_router.get("/data-hub/status", tags=["data-hub"])
         async def data_hub_status():
             """统一数据源中心状态（中文字段，便于前端展示）。"""
-            st = await data_source_hub.status()
+            st = await _resolve_data_source_hub().status()
             return {
                 "status": "success",
                 "data": {
@@ -2744,7 +2779,7 @@ class APIServer:
         async def data_hub_unified_snapshot(symbol: str = "BTC/USDT"):
             """统一双渠道数据快照（中文模块化输出）。"""
             try:
-                data = await asyncio.wait_for(data_source_hub.get_unified_snapshot(symbol), timeout=6.0)
+                data = await asyncio.wait_for(_resolve_data_source_hub().get_unified_snapshot(symbol), timeout=20.0)
                 return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
             except asyncio.TimeoutError:
                 return {
@@ -2771,11 +2806,11 @@ class APIServer:
             """
             try:
                 contract = (
-                    data_source_hub.get_collector_contract()
-                    if hasattr(data_source_hub, "get_collector_contract")
+                    _resolve_data_source_hub().get_collector_contract()
+                    if hasattr(_resolve_data_source_hub(), "get_collector_contract")
                     else {}
                 )
-                mc = getattr(data_source_hub, "main_controller", None)
+                mc = getattr(_resolve_data_source_hub(), "main_controller", None)
                 cfg = {}
                 if mc and hasattr(mc, "get_ai_managed_config"):
                     try:
@@ -2801,7 +2836,7 @@ class APIServer:
         async def data_hub_quality_advice(symbol: str = "BTC/USDT"):
             """数据质量与作用评分建议（插件化能力输出）。"""
             try:
-                data = await asyncio.wait_for(data_source_hub.get_unified_snapshot(symbol), timeout=6.0)
+                data = await asyncio.wait_for(_resolve_data_source_hub().get_unified_snapshot(symbol), timeout=20.0)
                 advice = data.get("数据质量与作用评分", {})
                 return {"status": "success", "data": advice, "timestamp": datetime.now().isoformat()}
             except asyncio.TimeoutError:
@@ -2821,7 +2856,7 @@ class APIServer:
         async def data_hub_ai_analysis(symbol: str = "BTC/USDT"):
             """统一数据快照的 AI 智能分析结果（已迁移到 MarketIntelligenceEngine）。"""
             try:
-                mc = getattr(data_source_hub, "main_controller", None)
+                mc = getattr(_resolve_data_source_hub(), "main_controller", None)
                 mi = getattr(mc, "market_intelligence", None) if mc else None
                 if mi and hasattr(mi, "get_symbol_view"):
                     view = await asyncio.wait_for(mi.get_symbol_view(symbol, include_snapshot=False), timeout=6.0)

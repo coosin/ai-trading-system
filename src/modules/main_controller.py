@@ -44,6 +44,7 @@ from src.modules.intelligence.anomaly_detection import AnomalyDetector, AnomalyD
 from src.modules.intelligence.natural_language_interface import NaturalLanguageInterface
 from src.modules.simulation.simulated_market import SimulatedMarket
 from src.modules.simulation.contract_simulator import ContractSimulator
+from src.modules.simulation.simulation_exchange import SimulationExchange
 from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 
 # 导入新增的升级模块
@@ -222,6 +223,7 @@ class MainController:
     5. 配置管理
     6. 事件驱动架构
     """
+    _active_instance = None
 
     def __init__(self, config_manager=None):
         """
@@ -232,6 +234,7 @@ class MainController:
         """
         self.config_manager = config_manager
         self._owns_config_manager = False
+        MainController._active_instance = self
 
         # 模块管理
         self.modules: Dict[str, ModuleInfo] = {}
@@ -322,6 +325,9 @@ class MainController:
         
         # 模拟交易市场
         self.simulated_market = None
+        self.simulation_exchange = None
+        self.market_data_exchange = None
+        self.execution_exchange = None
         
         # 数据库管理器
         self.database_manager = None
@@ -377,6 +383,11 @@ class MainController:
         self.event_history_limit = 1000
 
         logger.info("主控制器初始化完成")
+
+    @classmethod
+    def get_active_instance(cls):
+        """Return the latest live MainController instance (best-effort)."""
+        return cls._active_instance
 
     # --- lightweight accessors (reduce attribute coupling) ---
     def get_exchange(self):
@@ -824,15 +835,54 @@ class MainController:
         self.simulated_market = SimulatedMarket()
         await self.simulated_market.initialize()
         
-        # 初始化模拟合约交易管理器（如果配置为模拟模式）
+        # 初始化模拟合约交易管理器（若任一配置声明 simulation）
         trading_config = await self.config_manager.get_config("trading", {})
-        if trading_config.get("mode") == "simulation":
-            simulation_config = trading_config.get("simulation", {})
+        system_config = await self.config_manager.get_config("system", {})
+        exchanges_config = await self.config_manager.get_config("exchanges", {})
+        top_mode = await self.config_manager.get_config("mode", None)
+
+        is_simulation_mode = (
+            str(trading_config.get("mode", "")).lower() == "simulation"
+            or str(system_config.get("mode", "")).lower() == "simulation"
+            or str(top_mode or "").lower() == "simulation"
+            or bool(trading_config.get("paper_trading"))
+            or bool(await self.config_manager.get_config("simulation_mode", False))
+        )
+        use_real_market_data = bool(
+            (trading_config.get("simulation", {}) or {}).get("use_real_market_data", False)
+            or system_config.get("use_real_market_data", False)
+            or bool(await self.config_manager.get_config("use_real_market_data", False))
+        )
+        use_official_okx_demo = bool(
+            (trading_config.get("simulation", {}) or {}).get("use_official_okx_demo", False)
+            or system_config.get("use_official_okx_demo", False)
+            or bool(await self.config_manager.get_config("use_official_okx_demo", False))
+        )
+
+        if is_simulation_mode and (not use_official_okx_demo):
+            simulation_config = dict(trading_config.get("simulation", {}) or {})
+            mock_exchange_cfg = exchanges_config.get("mock", {}) if isinstance(exchanges_config, dict) else {}
+            env_initial_balance = os.getenv("INITIAL_BALANCE")
+            resolved_initial_capital = (
+                simulation_config.get("initial_capital")
+                or simulation_config.get("initial_balance")
+                or (mock_exchange_cfg.get("initial_balance") if isinstance(mock_exchange_cfg, dict) else None)
+                or env_initial_balance
+                or 10000
+            )
+            simulation_config["initial_capital"] = float(resolved_initial_capital)
+
             self.contract_simulator = ContractSimulator(simulation_config)
             await self.contract_simulator.initialize()
-            logger.info("模拟合约交易管理器已启动")
+            self.simulation_exchange = SimulationExchange(
+                simulation_config,
+                market=self.simulated_market,
+                contract_simulator=self.contract_simulator,
+            )
+            logger.info("模拟合约交易管理器已启动，初始资金=%.2f USDT", simulation_config["initial_capital"])
         else:
             self.contract_simulator = None
+            self.simulation_exchange = None
         
         # 初始化数据库管理器
         self.database_manager = DatabaseManager(self.config_manager)
@@ -957,8 +1007,23 @@ class MainController:
         
         # 设置便捷引用（用于AICommandExecutor等模块访问）
         if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'exchange'):
-            self.okx_exchange = self.ai_trading_engine.exchange
-            logger.info("✅ OKX交易所引用已设置")
+            self.market_data_exchange = self.ai_trading_engine.exchange
+            if is_simulation_mode and self.simulation_exchange and use_real_market_data:
+                # 混合模式：行情/分析走真实交易所，执行仍走模拟交易所
+                self.okx_exchange = self.market_data_exchange
+                self.execution_exchange = self.simulation_exchange
+                logger.info("✅ 混合模式已启用：真实行情 + 模拟执行")
+            elif is_simulation_mode and use_official_okx_demo:
+                # 官方模拟盘模式：走 OKX 官方模拟通道（x-simulated-trading: 1）
+                self.okx_exchange = self.market_data_exchange
+                self.execution_exchange = self.okx_exchange
+                logger.info("✅ 官方模拟盘模式：真实行情 + 官方模拟下单（OKX Demo）")
+            else:
+                self.okx_exchange = self.ai_trading_engine.exchange
+                self.execution_exchange = self.okx_exchange
+                logger.info("✅ OKX交易所引用已设置")
+            if getattr(self, "data_source_hub", None) and hasattr(self.data_source_hub, "bind_main_controller"):
+                self.data_source_hub.bind_main_controller(self)
 
         # S1：单一实盘执行出口（与 ai_brain.single_write_owner 协同）
         try:
@@ -1097,6 +1162,8 @@ class MainController:
         try:
             from src.modules.data.data_source_hub import DataSourceHub
             self.data_source_hub = DataSourceHub(self)
+            if hasattr(self.data_source_hub, "bind_main_controller"):
+                self.data_source_hub.bind_main_controller(self)
             logger.info("✅ 统一数据源中心已初始化")
         except Exception as e:
             logger.warning(f"⚠️ 统一数据源中心初始化失败: {e}")
@@ -1576,6 +1643,8 @@ class MainController:
                 # 复用已初始化的组件
                 if self.trading_monitor:
                     self.unified_trade_system.monitor = self.trading_monitor
+                if self.simulation_exchange:
+                    self.unified_trade_system.set_execution_backend(self.simulation_exchange)
                 await self.unified_trade_system.initialize()
                 logger.info("✅ 统一交易系统已初始化（复用现有组件）")
             except Exception as e:
