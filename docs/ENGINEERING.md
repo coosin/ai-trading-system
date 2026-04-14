@@ -79,8 +79,17 @@
 | 记忆 | `src/modules/memory/` |
 | 风控 / SLTP | `src/modules/core/risk_manager.py`，`stop_loss_take_profit.py` |
 | LLM | `src/modules/core/enhanced_llm_manager.py` 等 |
+| 交易监控（订单/行情/风险） | `src/modules/monitoring/trading_monitor.py`，经 `monitoring_api` 暴露 |
+| 增强告警（规则 + Telegram） | `src/modules/monitoring/enhanced_monitoring.py`，由 `MainController` 装配并与 SLTP 等联动 |
 
 OpenAPI 以运行实例 **`/openapi.json`** 为准。
+
+### 4.1 可观测性与进程内一致性
+
+- **健康与指标:** `GET /health`、`GET /api/v1/health`、`GET /metrics`（及 v1 等价路径）由 `APIServer` 提供；总控聚合见 `control-center` 相关路由。
+- **告警可读路径:** `GET /api/v1/monitoring/alerts` 合并 `TradingMonitor` 与 `EnhancedMonitoringSystem`（字段 `source` 区分）。增强监控实例通过 `set_enhanced_monitoring()` 注册到 `monitoring_api`，避免「Telegram 已报但 REST 列表为空」的割裂。
+- **单一 API 进程:** 生产应只存在一个 `APIServer` 活跃实例（`main.py` 复用 `MainController` 已创建的实例；重复构造会触发保护，调试可设 `OPENCLAW_API_ALLOW_MULTI_INSTANCE=1`）。绑定一致性探针：`GET /api/v1/debug/exchange-binding`。
+- **REST / WebSocket 响应形状:** HTTP JSON 经中间件补齐标准字段（见 `docs/API_REFERENCE.md`）；WebSocket 出站同样补齐，便于前端统一解析。
 
 ---
 

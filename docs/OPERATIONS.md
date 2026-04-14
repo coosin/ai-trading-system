@@ -123,9 +123,22 @@ curl -s -X POST http://localhost:8000/api/v1/ai/memory/recall \
 
 - `health` 为 `healthy`，`s1/verify` 为 `all_passed=true`。
 - `trade/events` 可持续返回 `market.update`/`trade.position`/`trade.fill` 等事件。
-- `monitoring/alerts` 接口可用（空列表等于“当前无活跃告警”）。
+- `monitoring/alerts` 接口可用（空列表等于“当前无活跃告警”；列表项含 `source`=`trading_monitor` 或 `enhanced_monitoring`，与 Telegram 规则告警一致）。
+- `monitoring/summary` 中 `sources` 与 `enhanced_monitoring` 块可确认两路监控均已注册。
+- `GET /api/v1/debug/exchange-binding` 返回当前进程内 MainController 与 DataSourceHub 绑定一致性与 ticker 探针（用于排除独立脚本与 API 进程状态不一致）。
 - 记忆写入返回 `memory_id`，召回结果包含刚写入探针内容。
 - `commander/memory/status` 显示分层统计与质量指标，`workspace` 读取成功。
+
+### 2.3 监控与报警巡检
+
+| 目标 | 命令或路径 |
+|------|------------|
+| 合并后的活跃告警 | `curl -s http://localhost:8000/api/v1/monitoring/alerts` |
+| 摘要（含增强监控状态） | `curl -s http://localhost:8000/api/v1/monitoring/summary` |
+| 告警历史 | `curl -s 'http://localhost:8000/api/v1/monitoring/alerts/history?limit=30'` |
+| 进程内绑定探针 | `curl -s http://localhost:8000/api/v1/debug/exchange-binding` |
+
+说明：**增强监控**（回撤、仓位、API 错误率等）在规则触发时会走 Telegram（若已配置）；**交易监控**侧重订单与市场数据时效。两者在 `monitoring/alerts` 中合并列出，按 `source` 区分。若 `summary.sources.enhanced_monitoring` 为 `false` 且初始化日志中有增强监控失败，应先修配置再验告警链路。
 
 ---
 
@@ -153,7 +166,15 @@ python3 scripts/proxy_mode_network_benchmark.py --label my_run --runs 7 --out /t
 
 Compose 已注入 `HTTP(S)_PROXY` / `OPENCLAW_*_PROXY` 与 `NO_PROXY=localhost,127.0.0.1,redis`。若自定义，请保持 **Redis 与 localhost 不走代理**，否则健康检查与内网会失败。
 
-### 3.4 OKX REST 超时 / `Server disconnected` / 余额始终 0
+### 3.4 OKX 余额/持仓与进程内同步
+
+- **密钥形态:** `config/config.yaml` 里 `exchanges.okx` 通常写 `api_key_env: OKX_API_KEY` 等指针，**真实密钥在 `.env`（或同名环境变量）**。引擎启动时会解析指针并连接 OKX；若仅写指针未导出环境变量，会报配置不完整。
+- **诊断（推荐）:** `GET /api/v1/modules/commander/account-diagnostics` — 拉取前会刷新 OKX 账户缓存，便于对照交易所 App。
+- **强制同步:** `POST /api/v1/modules/commander/account-sync/run`（body 可带 `reason`），会拉余额与持仓并尝试 SLTP 接管。
+- **缓存:** OKX REST 对余额/持仓有短 TTL（可用 `OPENCLAW_OKX_BALANCE_CACHE_TTL` / `OPENCLAW_OKX_POSITIONS_CACHE_TTL` 调整）。下单、撤单与上述同步入口会主动失效缓存。
+- **实时持仓推送（可选）:** 设置 `OPENCLAW_OKX_WS_ENABLED=1` 且 API 密钥有效时，私有频道 `positions` 推送会合并进进程内持仓视图，并触发余额缓存失效（钱包权益与仓位联动）。公共 tickers 仍用于行情快路径。
+
+### 3.5 OKX REST 超时 / `Server disconnected` / 余额始终 0
 
 1. **主配置必须存在**：仓库内须有 **`config/config.yaml`**（挂载到容器 `/app/config`）。若该文件缺失，`ConfigManager` 无法合并业务段，控制面可能显示「配置为空」，OKX 密钥环境变量也可能未与 `exchanges.okx` 对齐。从 Git 恢复：`git checkout HEAD -- config/config.yaml`。本机覆盖用 **`config/local.yaml`**（勿提交）。
 2. **密钥**：`.env` 中 `OKX_API_KEY`、`OKX_SECRET`、`OKX_PASSPHRASE` 须与 `config.yaml` 里 `exchanges.okx.*_env` 一致；缺密钥时 REST 会失败或返回空数据，界面表现为余额 0、无持仓。
@@ -162,7 +183,7 @@ Compose 已注入 `HTTP(S)_PROXY` / `OPENCLAW_*_PROXY` 与 `NO_PROXY=localhost,1
    - 在 Clash 侧为 `+.okx.com` 使用稳定线路，并确认 **`fake-ip-filter`** 包含 OKX 域名（见 3.1）。  
 4. **调参**：可通过 **`OPENCLAW_OKX_TIMEOUT_*`**、**`OPENCLAW_OKX_MAX_RETRIES`** 放宽超时与重试（见根目录 `.env.example`）。
 
-### 3.5 新代理 + TUN：怎么测「哪种最好」、和旧配置差多少
+### 3.6 新代理 + TUN：怎么测「哪种最好」、和旧配置差多少
 
 **旧配置（常见痛点）**：Docker **bridge** + 仅 **`HTTP_PROXY=http://host.docker.internal:7890`**。OKX 等走 **HTTP CONNECT**，易被掐、延迟高，应用里会出现 **`ticker`=`fallback`**、`unified-snapshot` 里 **`exch.*:timeout`**。
 

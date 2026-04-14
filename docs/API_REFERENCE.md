@@ -68,6 +68,31 @@
 - **用途:** 实时推送；连接后发送 JSON，支持 `subscribe` / `unsubscribe` / `heartbeat`（与 `WebSocketEventType` 一致，详见 `src/modules/api/server.py` 中 `_handle_websocket_connection`）。
 - **频道匹配:** 支持精确频道与前缀通配，例如 `trade.*`、`market.*`。
 - **建议生产基线:** WebSocket 与 `GET /api/v1/trade/events` 并用（前者实时、后者补偿与回放），避免前端因连接抖动丢关键成交/止损事件。
+- **出站消息约定（与 REST 对齐的兼容补齐）:** 服务端在保留原有字段（如 `type`、`channel`、`data`、`connection_id`、`channels`）的同时，为每条出站 JSON 补齐 `ok`、`success`、`status`、`timestamp` 等标准字段（实现上复用与 HTTP 相同的 `_normalize_api_payload` 逻辑）。
+
+### REST JSON 网关标准化
+
+- **范围:** 以 `/api` 为前缀的路径，响应体为 JSON 时，由中间件在**不删除原有字段**的前提下补齐 `ok`、`success`、`status`、`message`（按需）、`timestamp`。
+- **响应头:** `X-OpenClaw-Standardized: 1` 表示该响应已按上述规则规范化。
+
+### 调试：交易所与数据中心绑定一致性
+
+- **`GET /api/v1/debug/exchange-binding`**：在**当前 API 进程**内探测 `MainController` 与 `DataSourceHub` 是否为同一绑定、交易所类型及 `hub.get_ticker("BTC/USDT")` 探针。用于排除「脚本另起 Python 进程与线上 API 不一致」类问题。
+
+### 监控与告警 API
+
+系统内存在两路监控，REST 已做**合并展示**（便于总控与外部系统单一入口）：
+
+| 子系统 | 模块 | 典型场景 |
+|--------|------|----------|
+| `trading_monitor` | `TradingMonitor` | 订单长时间挂单、行情过期、点差/成交量异常、风险指标阈值等 |
+| `enhanced_monitoring` | `EnhancedMonitoringSystem` | 回撤、仓位比例、连续亏损、API 错误率、余额等；默认规则可发 **Telegram** /日志 |
+
+- **`GET /api/v1/monitoring/summary`**：在原有交易监控摘要基础上增加 `sources`（两路是否可用），并在增强监控可用时附带 `enhanced_monitoring` 状态块（`get_system_status()`）。
+- **`GET /api/v1/monitoring/alerts`**、**`GET /api/v1/monitoring/alerts/history`**：返回**合并后的列表**，按时间倒序；每条告警含 **`source`**：`trading_monitor` 或 `enhanced_monitoring`，以及统一可读的 `details` / `timestamp`（Unix 秒，另附 `timestamp_iso` 便于阅读）。
+- **`POST /api/v1/monitoring/alerts/{alert_id}/resolve`**：先在 `TradingMonitor` 活跃告警中查找，否则调用增强监控的 `resolve_alert`。
+
+其他监控子路径（策略表现、市场数据状态、异常检测、proactive-ai 等）仍以 **`/api/v1/monitoring/...`** 为准，详见 OpenAPI。
 
 ### 代码中存在但未挂到当前主应用的模块
 

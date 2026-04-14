@@ -9,7 +9,7 @@
 | [**DEVELOPMENT.md**](./DEVELOPMENT.md) | 开发环境、测试（含 Pytest 9）、目录结构 |
 | [**CHANGELOG.md**](./CHANGELOG.md) | 变更记录 |
 | [**memory/MEMORY_LIBRARY_GUIDE.md**](./memory/MEMORY_LIBRARY_GUIDE.md) | Memory：配置段与运维要点 |
-| [**API_REFERENCE.md**](./API_REFERENCE.md) | API 摘要（权威以运行时 `/openapi.json` 为准） |
+| [**API_REFERENCE.md**](./API_REFERENCE.md) | API 与 WebSocket 约定、监控告警合并说明（权威以运行时 `/openapi.json` 为准） |
 | [**OKX_SOURCE_REFERENCE_MAP.md**](./OKX_SOURCE_REFERENCE_MAP.md) | OKX 字段/端点参考 |
 | [**../deploy/HOST_CLASH_EGRESS.md**](../deploy/HOST_CLASH_EGRESS.md) | 宿主机 Clash 出站、容器代理与验收要点 |
 

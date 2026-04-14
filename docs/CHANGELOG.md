@@ -1,5 +1,18 @@
 # 变更记录
 
+## 2026-04-14 — 日志清理与运行维护
+
+- **日志清理:** 清空 `logs/` 下历史运行日志与临时诊断文件（保留 `logs/.gitkeep` 及目录结构），减少磁盘占用并避免旧日志干扰巡检。
+- **运行维护:** 保持账户链路优先策略，持续使用 OKX 代理优先与抖动降载保护，降低市场高频请求对钱包/持仓同步的影响。
+- **文档同步:** 更新变更记录，便于后续运维追溯与发布同步。
+
+## 2026-04-14 — 监控 API 与文档
+
+- **监控:** `GET /api/v1/monitoring/alerts` 与 `alerts/history` 合并 **TradingMonitor** 与 **EnhancedMonitoringSystem** 告警，条目含 `source` 字段；`summary` 增加 `sources` 及增强监控状态块；`resolve` 同时识别两路 ID。`MainController` 在增强监控初始化成功/失败/清理时调用 `set_enhanced_monitoring`，保证 REST 与 Telegram 规则告警一致。
+- **OKX 钱包/仓位同步:** `OKXExchange.invalidate_account_caches()`；`force_sync_account_state` 与 `get_account_sync_diagnostics` 在拉取前失效缓存；下单/撤单成功后失效缓存；私有 WebSocket `positions` 推送经 `merge_positions_ws_update` 合并进持仓缓存并失效余额缓存（需 `OPENCLAW_OKX_WS_ENABLED=1`）。
+- **OKX 凭证加载:** `AITradingEngine.initialize` 现与 `config/config.yaml` 中 `api_key_env` / `secret_env` / `passphrase_env` 一致，从对应环境变量解析后再构造 `OKXExchange`（此前仅从 `exchanges.okx` 取字典时缺少 `api_key` 字段，会导致引擎未接交易所却仍以为「已配密钥」）。
+- **文档:** 更新 `API_REFERENCE.md`（REST 标准化头、WebSocket 出站字段、`debug/exchange-binding`、监控合并说明）、`ENGINEERING.md`（可观测性与单实例 API）、`OPERATIONS.md`（监控巡检小节与验收字段）。
+
 ## 2026-04-13 — 文档与仓库卫生
 
 - **文档**：`ENGINEERING` 补充 Compose 挂载 `./scripts`、`./tests` 与 `HOST_CLASH_EGRESS` 引用；`OPERATIONS` 补充 `verify_full_stack_network.sh`、`/api/v1/system/acceptance`、`startup_acceptance.py` 与宿主机 Clash 文档链接；`docs/README`、根 `README` 同步索引与快速命令。

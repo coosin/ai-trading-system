@@ -453,6 +453,10 @@ docker compose run --rm --no-deps trading-system sh -c \
 
 ## 调试技巧
 
+### API 进程与监控
+
+本地服务启动后，应用内状态以 **HTTP API所在进程** 为准；独立 `python -c` 脚本导入的 `DataSourceHub` 可能与线上不一致。可调用 `GET /api/v1/debug/exchange-binding`；合并后的告警列表见 `GET /api/v1/monitoring/alerts`（条目含 `source`）。运维向巡检清单见 [OPERATIONS.md](./OPERATIONS.md) §2.3。
+
 ### 日志调试
 
 ```python
