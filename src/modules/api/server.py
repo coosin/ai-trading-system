@@ -269,6 +269,7 @@ class APIServer:
     5. 请求验证和速率限制
     """
     _shared_websocket_connections: Dict[str, WebSocketConnection] = {}
+    _active_instance: Optional["APIServer"] = None
 
     def __init__(self, config_manager=None, main_controller=None, host: str = "0.0.0.0", port: int = 8000):
         """
@@ -282,6 +283,20 @@ class APIServer:
         """
         self.config_manager = config_manager
         self.main_controller = main_controller
+        allow_multi = str(os.getenv("OPENCLAW_API_ALLOW_MULTI_INSTANCE", "0")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        existing = APIServer._active_instance
+        existing_alive = bool(
+            existing
+            and (getattr(existing, "_initialized", False) or getattr(existing, "_running", False) or getattr(existing, "app", None) is not None)
+        )
+        if existing is not None and existing is not self and existing_alive and (not allow_multi):
+            raise RuntimeError(
+                "检测到重复 APIServer 实例创建；默认禁止多实例。"
+                "请复用 main_controller.api_server，或设置 OPENCLAW_API_ALLOW_MULTI_INSTANCE=1（仅调试）"
+            )
+        APIServer._active_instance = self
         # In Docker, binding to 127.0.0.1 prevents host port publishing.
         in_docker = os.path.exists("/.dockerenv")
         if in_docker and (host or "").strip() in {"127.0.0.1", "localhost"}:
@@ -410,6 +425,8 @@ class APIServer:
             await self._close_websocket_connection(conn_id)
 
         self._initialized = False
+        if APIServer._active_instance is self:
+            APIServer._active_instance = None
         logger.info("API服务器清理完成")
 
     async def start(self) -> bool:
@@ -609,13 +626,16 @@ class APIServer:
             try:
                 # 检查连接是否订阅了该频道
                 if connection.is_subscribed(channel):
-                    # 准备消息
-                    message = {
-                        "type": WebSocketEventType.DATA.value,
-                        "channel": channel,
-                        "data": data,
-                        "timestamp": current_time.isoformat(),
-                    }
+                    # 准备消息（与 HTTP JSON 相同的标准字段，兼容保留 type/channel/data）
+                    message = self._normalize_api_payload(
+                        {
+                            "type": WebSocketEventType.DATA.value,
+                            "channel": channel,
+                            "data": data,
+                            "timestamp": current_time.isoformat(),
+                        },
+                        status.HTTP_200_OK,
+                    )
 
                     # 发送消息
                     await connection.websocket.send_json(message)
@@ -707,6 +727,46 @@ class APIServer:
 
         logger.info(f"加载API配置: {self.host}:{self.port}")
 
+    def _normalize_api_payload(self, payload: Dict[str, Any], status_code: int) -> Dict[str, Any]:
+        """
+        统一 API 返回结构（兼容模式）：
+        - 不移除原字段，只补齐标准字段，避免破坏旧前端/调用方
+        - 标准字段：ok/success/status/message/timestamp
+        """
+        out = dict(payload or {})
+        ok_v = out.get("ok")
+        if ok_v is None:
+            if "success" in out:
+                ok_v = bool(out.get("success"))
+            elif str(out.get("status", "")).lower() in {"success", "ok", "healthy", "running"}:
+                ok_v = True
+            elif status_code >= 400:
+                ok_v = False
+            elif "error" in out and out.get("error"):
+                ok_v = False
+            else:
+                ok_v = True
+
+        ok_b = bool(ok_v)
+        out.setdefault("ok", ok_b)
+        out.setdefault("success", ok_b)
+
+        if "status" not in out:
+            out["status"] = "success" if ok_b else "error"
+        else:
+            st = str(out.get("status", "")).strip()
+            if not st:
+                out["status"] = "success" if ok_b else "error"
+
+        if "message" not in out:
+            if isinstance(out.get("error"), str) and out.get("error"):
+                out["message"] = out.get("error")
+            elif not ok_b:
+                out["message"] = "request_failed"
+
+        out.setdefault("timestamp", datetime.now().isoformat())
+        return out
+
     async def _add_middleware(self) -> None:
         """添加中间件"""
         if not self.app:
@@ -744,6 +804,36 @@ class APIServer:
 
             # 处理请求
             response = await call_next(request)
+
+            # API响应统一标准化（仅 /api JSON 响应；保留原字段以兼容历史调用方）
+            try:
+                path = str(request.url.path or "")
+                ctype = str(response.headers.get("content-type", "")).lower()
+                if path.startswith("/api") and "application/json" in ctype and request.method.upper() != "OPTIONS":
+                    raw_body = b""
+                    async for chunk in response.body_iterator:
+                        raw_body += chunk
+                    if raw_body:
+                        try:
+                            body_obj = json.loads(raw_body.decode("utf-8"))
+                        except Exception:
+                            body_obj = None
+                        if isinstance(body_obj, dict):
+                            normalized = self._normalize_api_payload(body_obj, int(response.status_code))
+                            rebuilt = JSONResponse(status_code=response.status_code, content=normalized)
+                        else:
+                            rebuilt = Response(
+                                content=raw_body,
+                                status_code=response.status_code,
+                                media_type=response.media_type,
+                            )
+                        for k, v in response.headers.items():
+                            if k.lower() not in {"content-length", "content-type"}:
+                                rebuilt.headers[k] = v
+                        rebuilt.headers["X-OpenClaw-Standardized"] = "1"
+                        response = rebuilt
+            except Exception:
+                pass
 
             # 更新统计
             process_time = (datetime.now() - start_time).total_seconds() * 1000
@@ -966,6 +1056,61 @@ class APIServer:
                     "no_proxy_preview": no_preview,
                 },
                 "checklist": checklist,
+            }
+
+        @api_v1_router.get("/debug/exchange-binding", tags=["debug"])
+        async def debug_exchange_binding():
+            """
+            服务进程内的单一真相入口：
+            用于排查“脚本实例”和“运行实例”不一致导致的引用分叉问题。
+            """
+            mc = self.main_controller
+            hub = _resolve_data_source_hub()
+            hub_mc = getattr(hub, "main_controller", None) if hub else None
+            engine = getattr(mc, "ai_trading_engine", None) if mc else None
+            ticker_probe: Dict[str, Any] = {}
+            ticker_error: str = ""
+            if hub and hasattr(hub, "get_ticker"):
+                try:
+                    ticker_probe = await hub.get_ticker("BTC/USDT")
+                except Exception as e:
+                    ticker_error = str(e)
+
+            def _typ(x: Any) -> str:
+                return type(x).__name__ if x is not None else "None"
+
+            return {
+                "status": "ok",
+                "timestamp": datetime.now().isoformat(),
+                "binding": {
+                    "main_controller_present": mc is not None,
+                    "main_controller_type": _typ(mc),
+                    "main_controller_id": id(mc) if mc is not None else None,
+                    "data_source_hub_present": hub is not None,
+                    "data_source_hub_type": _typ(hub),
+                    "data_source_hub_id": id(hub) if hub is not None else None,
+                    "data_source_hub_main_controller_present": hub_mc is not None,
+                    "data_source_hub_main_controller_id": id(hub_mc) if hub_mc is not None else None,
+                    "same_main_controller_object": (mc is not None and hub_mc is mc),
+                },
+                "exchanges": {
+                    "ai_trading_engine_present": engine is not None,
+                    "ai_trading_engine_exchange_type": _typ(getattr(engine, "exchange", None) if engine else None),
+                    "okx_exchange_type": _typ(getattr(mc, "okx_exchange", None) if mc else None),
+                    "execution_exchange_type": _typ(getattr(mc, "execution_exchange", None) if mc else None),
+                    "market_data_exchange_type": _typ(getattr(mc, "market_data_exchange", None) if mc else None),
+                    "exchange_accessor_type": _typ(mc.get_exchange() if (mc and hasattr(mc, "get_exchange")) else None),
+                },
+                "ticker_probe": {
+                    "symbol": "BTC/USDT",
+                    "source": ticker_probe.get("source") if isinstance(ticker_probe, dict) else None,
+                    "last": (ticker_probe.get("last") or ticker_probe.get("price")) if isinstance(ticker_probe, dict) else None,
+                    "has_price": bool(
+                        isinstance(ticker_probe, dict)
+                        and float(ticker_probe.get("last") or ticker_probe.get("price") or 0) > 0
+                    ),
+                    "error": ticker_error,
+                },
             }
 
         # 指标端点 - 支持 /api/v1/metrics
@@ -3145,11 +3290,14 @@ class APIServer:
         try:
             # 发送连接确认
             await websocket.send_json(
-                {
-                    "type": WebSocketEventType.CONNECT.value,
-                    "connection_id": conn_id,
-                    "timestamp": datetime.now().isoformat(),
-                }
+                self._normalize_api_payload(
+                    {
+                        "type": WebSocketEventType.CONNECT.value,
+                        "connection_id": conn_id,
+                        "timestamp": datetime.now().isoformat(),
+                    },
+                    status.HTTP_200_OK,
+                )
             )
 
             # 处理消息
@@ -3175,11 +3323,14 @@ class APIServer:
                     logger.debug(f"WebSocket订阅: {conn_id} -> {channels}")
 
                     await websocket.send_json(
-                        {
-                            "type": WebSocketEventType.SUBSCRIBE.value,
-                            "channels": channels,
-                            "timestamp": datetime.now().isoformat(),
-                        }
+                        self._normalize_api_payload(
+                            {
+                                "type": WebSocketEventType.SUBSCRIBE.value,
+                                "channels": channels,
+                                "timestamp": datetime.now().isoformat(),
+                            },
+                            status.HTTP_200_OK,
+                        )
                     )
 
                 elif message_type == WebSocketEventType.UNSUBSCRIBE.value:
@@ -3193,20 +3344,26 @@ class APIServer:
                     logger.debug(f"WebSocket取消订阅: {conn_id} -> {channels}")
 
                     await websocket.send_json(
-                        {
-                            "type": WebSocketEventType.UNSUBSCRIBE.value,
-                            "channels": channels,
-                            "timestamp": datetime.now().isoformat(),
-                        }
+                        self._normalize_api_payload(
+                            {
+                                "type": WebSocketEventType.UNSUBSCRIBE.value,
+                                "channels": channels,
+                                "timestamp": datetime.now().isoformat(),
+                            },
+                            status.HTTP_200_OK,
+                        )
                     )
 
                 elif message_type == WebSocketEventType.HEARTBEAT.value:
                     # 心跳
                     await websocket.send_json(
-                        {
-                            "type": WebSocketEventType.HEARTBEAT.value,
-                            "timestamp": datetime.now().isoformat(),
-                        }
+                        self._normalize_api_payload(
+                            {
+                                "type": WebSocketEventType.HEARTBEAT.value,
+                                "timestamp": datetime.now().isoformat(),
+                            },
+                            status.HTTP_200_OK,
+                        )
                     )
 
         except WebSocketDisconnect:

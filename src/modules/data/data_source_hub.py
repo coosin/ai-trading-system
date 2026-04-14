@@ -90,8 +90,10 @@ class DataSourceHub:
         """采集项分级超时，避免单一 timeout 造成全链路误降级。"""
         base = float(cfg.get("fetch_timeout_sec", 8.0) or 8.0)
         hard_defaults = {
-            "exch.ticker": 6.0,
-            "exch.order_book": 8.0,
+            # 实盘网络抖动/代理链路下，ticker 与 order_book 常出现 6-8s 边界超时；
+            # 适度抬高默认预算，避免统一快照误判为 fallback。
+            "exch.ticker": 10.0,
+            "exch.order_book": 12.0,
             "exch.open_interest": 8.0,
             "exch.funding_rate": 8.0,
             "exch.positions": 14.0,

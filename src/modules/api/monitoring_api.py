@@ -5,7 +5,8 @@
 """
 
 import logging
-from typing import Dict, Any, List
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -18,12 +19,62 @@ router = APIRouter(prefix="/api/v1/monitoring", tags=["monitoring"])
 
 # 全局监控器实例
 _trading_monitor = None
+_enhanced_monitoring = None
 _anomaly_detector = None
 
 def set_trading_monitor(monitor: TradingMonitor):
     """设置交易监控器实例"""
     global _trading_monitor
     _trading_monitor = monitor
+
+
+def set_enhanced_monitoring(monitor: Optional[Any]) -> None:
+    """注册 MainController 的 EnhancedMonitoringSystem，供 /alerts 与摘要合并展示。"""
+    global _enhanced_monitoring
+    _enhanced_monitoring = monitor
+
+
+def _serialize_trading_alert(alert: TradingAlert) -> Dict[str, Any]:
+    return {
+        "alert_id": alert.alert_id,
+        "timestamp": float(alert.timestamp),
+        "timestamp_iso": datetime.fromtimestamp(float(alert.timestamp)).isoformat(),
+        "severity": alert.severity.value,
+        "alert_type": alert.alert_type,
+        "message": alert.message,
+        "details": alert.details,
+        "resolved": alert.resolved,
+        "source": "trading_monitor",
+    }
+
+
+def _serialize_enhanced_alert(alert: Any) -> Dict[str, Any]:
+    ts = alert.timestamp
+    if isinstance(ts, datetime):
+        ts_unix = ts.timestamp()
+        ts_iso = ts.isoformat()
+    else:
+        ts_unix = float(ts)
+        ts_iso = None
+    rule = alert.rule
+    return {
+        "alert_id": alert.alert_id,
+        "timestamp": ts_unix,
+        "timestamp_iso": ts_iso,
+        "severity": alert.level.value,
+        "alert_type": getattr(rule, "rule_id", "") or getattr(rule, "name", ""),
+        "message": alert.message,
+        "details": {
+            "metric": rule.metric,
+            "value": alert.metric_value,
+            "rule_name": rule.name,
+            "threshold": rule.threshold,
+            "condition": rule.condition,
+        },
+        "resolved": alert.resolved,
+        "source": "enhanced_monitoring",
+    }
+
 
 def set_anomaly_detector(detector: AnomalyDetector):
     """设置异常检测器实例"""
@@ -36,48 +87,78 @@ async def get_monitoring_summary():
     if not _trading_monitor:
         raise HTTPException(status_code=503, detail="Monitoring system not initialized")
     
-    return _trading_monitor.get_monitoring_summary()
+    out = dict(_trading_monitor.get_monitoring_summary())
+    out["sources"] = {
+        "trading_monitor": True,
+        "enhanced_monitoring": _enhanced_monitoring is not None,
+    }
+    if _enhanced_monitoring:
+        try:
+            out["enhanced_monitoring"] = await _enhanced_monitoring.get_system_status()
+        except Exception as e:
+            logger.debug("enhanced_monitoring.get_system_status failed: %s", e)
+            out["enhanced_monitoring"] = {"status": "error", "error": str(e)}
+    return out
 
 @router.get("/alerts")
 async def get_active_alerts():
-    """获取活跃告警"""
-    if not _trading_monitor:
+    """获取活跃告警（合并 TradingMonitor 与 EnhancedMonitoringSystem）"""
+    if not _trading_monitor and not _enhanced_monitoring:
         raise HTTPException(status_code=503, detail="Monitoring system not initialized")
     
-    alerts = _trading_monitor.get_active_alerts()
-    return [{
-        "alert_id": alert.alert_id,
-        "timestamp": alert.timestamp,
-        "severity": alert.severity.value,
-        "alert_type": alert.alert_type,
-        "message": alert.message,
-        "details": alert.details
-    } for alert in alerts]
+    rows: List[Dict[str, Any]] = []
+    if _trading_monitor:
+        for alert in _trading_monitor.get_active_alerts():
+            rows.append(_serialize_trading_alert(alert))
+    if _enhanced_monitoring:
+        try:
+            for alert in await _enhanced_monitoring.get_active_alerts():
+                rows.append(_serialize_enhanced_alert(alert))
+        except Exception as e:
+            logger.warning("get_active_alerts enhanced: %s", e)
+    rows.sort(key=lambda r: float(r.get("timestamp") or 0.0), reverse=True)
+    return rows
 
 @router.get("/alerts/history")
 async def get_alert_history(limit: int = Query(50, description="返回的历史记录数量")):
-    """获取告警历史"""
-    if not _trading_monitor:
+    """获取告警历史（两路监控合并后按时间倒序截取）"""
+    if not _trading_monitor and not _enhanced_monitoring:
         raise HTTPException(status_code=503, detail="Monitoring system not initialized")
-    
-    alerts = _trading_monitor.get_alert_history(limit)
-    return [{
-        "alert_id": alert.alert_id,
-        "timestamp": alert.timestamp,
-        "severity": alert.severity.value,
-        "alert_type": alert.alert_type,
-        "message": alert.message,
-        "details": alert.details,
-        "resolved": alert.resolved
-    } for alert in alerts]
+
+    rows: List[Dict[str, Any]] = []
+    if _trading_monitor:
+        for alert in _trading_monitor.get_alert_history(limit):
+            rows.append(_serialize_trading_alert(alert))
+    if _enhanced_monitoring:
+        try:
+            hist = sorted(
+                _enhanced_monitoring.alerts,
+                key=lambda a: a.timestamp.timestamp() if isinstance(a.timestamp, datetime) else float(a.timestamp),
+                reverse=True,
+            )[:limit]
+            for alert in hist:
+                rows.append(_serialize_enhanced_alert(alert))
+        except Exception as e:
+            logger.warning("get_alert_history enhanced: %s", e)
+    rows.sort(key=lambda r: float(r.get("timestamp") or 0.0), reverse=True)
+    return rows[:limit]
 
 @router.post("/alerts/{alert_id}/resolve")
 async def resolve_alert(alert_id: str):
-    """解决告警"""
-    if not _trading_monitor:
+    """解决告警（先在 TradingMonitor 中查找，再尝试 EnhancedMonitoringSystem）"""
+    if not _trading_monitor and not _enhanced_monitoring:
         raise HTTPException(status_code=503, detail="Monitoring system not initialized")
-    
-    _trading_monitor.resolve_alert(alert_id)
+
+    resolved = False
+    if _trading_monitor:
+        active_ids = {a.alert_id for a in _trading_monitor.get_active_alerts()}
+        if alert_id in active_ids:
+            _trading_monitor.resolve_alert(alert_id)
+            resolved = True
+    if not resolved and _enhanced_monitoring:
+        resolved = await _enhanced_monitoring.resolve_alert(alert_id)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Alert not found")
     return {"status": "success", "message": "Alert resolved"}
 
 @router.get("/trades")

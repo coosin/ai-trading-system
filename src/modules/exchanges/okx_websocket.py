@@ -37,6 +37,9 @@ class OKXWebSocketHub:
         self._ticker_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     def ws_private_url(self) -> str:
+        configured = str(getattr(self._ex, "ws_private_url", "") or "").strip()
+        if configured:
+            return configured
         if self._ex.testnet or getattr(self._ex, "simulated_order_only", False):
             return "wss://wspap.okx.com:8443/ws/v5/private"
         return "wss://ws.okx.com:8443/ws/v5/private"
@@ -219,8 +222,12 @@ class OKXWebSocketHub:
                                 if data.get("event") == "subscribe" and str(data.get("code")) != "0":
                                     logger.warning("OKX WS positions 订阅响应: %s", data)
                                 if data.get("arg", {}).get("channel") == "positions":
-                                    # 预留：后续可将 data["data"] 写入 exchange 级缓存供 get_positions 快路径
-                                    pass
+                                    rows = data.get("data")
+                                    if isinstance(rows, list):
+                                        try:
+                                            self._ex.merge_positions_ws_update(rows)
+                                        except Exception as e:
+                                            logger.debug("OKX WS positions merge: %s", e)
                                 if data.get("event") == "error":
                                     logger.warning("OKX WS 私有频道错误: %s", data)
                             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):

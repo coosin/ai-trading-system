@@ -32,7 +32,11 @@ from src.modules.core.database_manager import DatabaseManager
 from src.modules.core.business_process_manager import BusinessProcessManager
 from src.modules.notification.telegram_bot import TelegramBot
 from src.modules.monitoring.trading_monitor import TradingMonitor
-from src.modules.api.monitoring_api import set_trading_monitor, set_anomaly_detector
+from src.modules.api.monitoring_api import (
+    set_trading_monitor,
+    set_anomaly_detector,
+    set_enhanced_monitoring,
+)
 from src.modules.core.strategy_manager import StrategyManager
 from src.modules.strategies.portfolio_optimizer import PortfolioOptimizer
 from src.modules.strategies.parameter_optimizer import ParameterOptimizer
@@ -1402,9 +1406,11 @@ class MainController:
                     )
             self.enhanced_monitoring.register_callback("on_alert", on_alert)
             logger.info("✅ 增强监控系统已初始化")
+            set_enhanced_monitoring(self.enhanced_monitoring)
         except Exception as e:
             logger.warning(f"⚠️ 增强监控系统初始化失败: {e}")
             self.enhanced_monitoring = None
+            set_enhanced_monitoring(None)
         
         # 初始化止盈止损管理器（配置来自 openclaw.embedded.yml / 磁盘 openclaw.yml / local.* / 环境变量）
         try:
@@ -1821,6 +1827,7 @@ class MainController:
         
         if hasattr(self, 'enhanced_monitoring') and self.enhanced_monitoring:
             await self.enhanced_monitoring.cleanup()
+            set_enhanced_monitoring(None)
             self.enhanced_monitoring = None
         
         # 清理止盈止损管理器
@@ -1975,10 +1982,39 @@ class MainController:
             out["error"] = "exchange_missing"
             return out
 
-        # 1) balance
+        try:
+            inv = getattr(ex, "invalidate_account_caches", None)
+            if callable(inv):
+                inv()
+        except Exception:
+            pass
+
+        # 1) balance（可用余额简表 + 明细）
         try:
             bal = await ex.get_balance()
             out["balance"] = bal
+            if hasattr(ex, "get_balances"):
+                rows = await ex.get_balances()
+                details = []
+                usdt_free = 0.0
+                usdt_total = 0.0
+                for b in rows or []:
+                    try:
+                        asset = str(getattr(b, "asset", "") or "")
+                        free_v = float(getattr(b, "free", 0.0) or 0.0)
+                        total_v = float(getattr(b, "total", 0.0) or 0.0)
+                    except Exception:
+                        continue
+                    if not asset:
+                        continue
+                    details.append({"asset": asset, "free": free_v, "total": total_v})
+                    if asset.upper() == "USDT":
+                        usdt_free = free_v
+                        usdt_total = total_v
+                out["balance_details"] = details
+                out["balance_detail_count"] = len(details)
+                out["usdt_free"] = usdt_free
+                out["usdt_total"] = usdt_total
         except Exception as e:
             out["balance_error"] = str(e)
 
@@ -2048,6 +2084,7 @@ class MainController:
             "positions_error": None,
             "nonzero_positions": 0,
             "position_samples": [],
+            "account_config": None,
             "sltp": None,
             "sltp_config": None,
             "latest_cache": getattr(self, "_latest_account_state", None),
@@ -2060,8 +2097,47 @@ class MainController:
         diag["exchange"] = type(ex).__name__
 
         try:
+            inv = getattr(ex, "invalidate_account_caches", None)
+            if callable(inv):
+                inv()
+        except Exception:
+            pass
+
+        try:
+            req = getattr(ex, "_make_request", None)
+            if callable(req):
+                cfg_rows = await req("GET", "/api/v5/account/config")
+                if isinstance(cfg_rows, list) and cfg_rows:
+                    row = cfg_rows[0] if isinstance(cfg_rows[0], dict) else {}
+                    diag["account_config"] = {
+                        "uid": row.get("uid"),
+                        "mainUid": row.get("mainUid"),
+                        "acctLv": row.get("acctLv"),
+                        "posMode": row.get("posMode"),
+                        "perm": row.get("perm"),
+                        "level": row.get("level"),
+                    }
+        except Exception as e:
+            diag["account_config_error"] = str(e)
+
+        try:
             bal = await ex.get_balance()
             diag["balance_keys"] = list(bal.keys())[:20] if isinstance(bal, dict) else str(type(bal))
+            if hasattr(ex, "get_balances"):
+                rows = await ex.get_balances()
+                usdt_row = None
+                for b in rows or []:
+                    try:
+                        if str(getattr(b, "asset", "") or "").upper() == "USDT":
+                            usdt_row = {
+                                "free": float(getattr(b, "free", 0.0) or 0.0),
+                                "total": float(getattr(b, "total", 0.0) or 0.0),
+                            }
+                            break
+                    except Exception:
+                        continue
+                diag["balance_detail_count"] = len(rows or [])
+                diag["usdt_balance"] = usdt_row or {"free": 0.0, "total": 0.0}
         except Exception as e:
             diag["balance_error"] = str(e)
 

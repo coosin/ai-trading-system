@@ -1607,7 +1607,8 @@ def init_module_control_api(app, main_controller):
         if not hasattr(main_controller, "get_account_sync_diagnostics"):
             return {"success": False, "message": "诊断接口不可用", "timestamp": datetime.now().isoformat()}
         try:
-            data = await asyncio.wait_for(main_controller.get_account_sync_diagnostics(), timeout=20.0)
+            # 账户私有接口在代理抖动时可能接近 20s；放宽超时以减少误判降级。
+            data = await asyncio.wait_for(main_controller.get_account_sync_diagnostics(), timeout=45.0)
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
         except asyncio.TimeoutError:
             return {
@@ -1628,8 +1629,19 @@ def init_module_control_api(app, main_controller):
             return {"success": False, "message": "同步能力不可用", "timestamp": datetime.now().isoformat()}
         reason = str((payload or {}).get("reason") or "api")
         try:
-            data = await main_controller.force_sync_account_state(reason=reason)
+            # 与 diagnostics 对齐：账户私有接口偶发抖动时，避免 API 长时间悬挂。
+            data = await asyncio.wait_for(
+                main_controller.force_sync_account_state(reason=reason),
+                timeout=45.0,
+            )
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except asyncio.TimeoutError:
+            return {
+                "success": True,
+                "degraded": True,
+                "data": {"status": "timeout_degraded", "hint": "account_sync_timeout", "reason": reason},
+                "timestamp": datetime.now().isoformat(),
+            }
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 

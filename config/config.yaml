@@ -521,7 +521,7 @@ ai_trading:
     enabled: true
     model_id: astron-code-latest
     analysis_interval: 120
-    min_confidence: 0.75
+    min_confidence: 0.65
     max_positions: 5
     risk_per_trade: 0.01
     trade_mode: real

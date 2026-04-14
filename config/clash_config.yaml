@@ -7,7 +7,7 @@ proxies:
   name: 🇭🇰 移动-HKG-443-WS-TLS-01
   network: ws
   port: 443
-  server: 104.17.105.48
+  server: 104.25.252.153
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -21,7 +21,7 @@ proxies:
 - name: 🇭🇰 移动-HKG-80-WS-02
   network: ws
   port: 80
-  server: 104.17.105.48
+  server: 104.25.252.153
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -35,7 +35,7 @@ proxies:
   name: 🇭🇰 移动-HKG-443-WS-TLS-03
   network: ws
   port: 443
-  server: 104.17.178.160
+  server: 104.25.243.230
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -49,35 +49,7 @@ proxies:
 - name: 🇭🇰 移动-HKG-80-WS-04
   network: ws
   port: 80
-  server: 104.17.178.160
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 移动-SJC-443-WS-TLS-01
-  network: ws
-  port: 443
-  server: 162.159.32.64
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 移动-SJC-80-WS-02
-  network: ws
-  port: 80
-  server: 162.159.32.64
+  server: 104.25.243.230
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -91,7 +63,7 @@ proxies:
   name: 🇭🇰 移动-HKG-443-WS-TLS-05
   network: ws
   port: 443
-  server: 104.17.19.5
+  server: 104.25.243.200
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -105,7 +77,7 @@ proxies:
 - name: 🇭🇰 移动-HKG-80-WS-06
   network: ws
   port: 80
-  server: 104.17.19.5
+  server: 104.25.243.200
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -119,7 +91,7 @@ proxies:
   name: 🇭🇰 移动-HKG-443-WS-TLS-07
   network: ws
   port: 443
-  server: 104.16.156.126
+  server: 104.25.252.242
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -133,7 +105,35 @@ proxies:
 - name: 🇭🇰 移动-HKG-80-WS-08
   network: ws
   port: 80
-  server: 104.16.156.126
+  server: 104.25.252.242
+  skip-cert-verify: false
+  tfo: false
+  tls: false
+  type: vless
+  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
+  ws-opts:
+    headers:
+      Host: dy.qlsm.net
+    path: /?ed=2048
+- client-fingerprint: randomized
+  name: 🇭🇰 移动-HKG-443-WS-TLS-09
+  network: ws
+  port: 443
+  server: 104.25.245.139
+  servername: dy.qlsm.net
+  skip-cert-verify: false
+  tfo: false
+  tls: true
+  type: vless
+  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
+  ws-opts:
+    headers:
+      Host: dy.qlsm.net
+    path: /?ed=2048
+- name: 🇭🇰 移动-HKG-80-WS-10
+  network: ws
+  port: 80
+  server: 104.25.245.139
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -147,7 +147,7 @@ proxies:
   name: 联通-SJC-443-WS-TLS-01
   network: ws
   port: 443
-  server: 104.17.150.190
+  server: 104.17.135.241
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -161,7 +161,7 @@ proxies:
 - name: 联通-SJC-80-WS-02
   network: ws
   port: 80
-  server: 104.17.150.190
+  server: 104.17.135.241
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -175,7 +175,7 @@ proxies:
   name: 联通-SJC-443-WS-TLS-03
   network: ws
   port: 443
-  server: 104.17.144.200
+  server: 104.17.131.151
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -189,35 +189,7 @@ proxies:
 - name: 联通-SJC-80-WS-04
   network: ws
   port: 80
-  server: 104.17.144.200
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 联通-LAX-443-WS-TLS-01
-  network: ws
-  port: 443
-  server: 162.159.44.228
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 联通-LAX-80-WS-02
-  network: ws
-  port: 80
-  server: 162.159.44.228
+  server: 104.17.131.151
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -231,7 +203,7 @@ proxies:
   name: 联通-SJC-443-WS-TLS-05
   network: ws
   port: 443
-  server: 104.17.153.122
+  server: 104.17.154.130
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -245,7 +217,7 @@ proxies:
 - name: 联通-SJC-80-WS-06
   network: ws
   port: 80
-  server: 104.17.153.122
+  server: 104.17.154.130
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -259,7 +231,7 @@ proxies:
   name: 联通-SJC-443-WS-TLS-07
   network: ws
   port: 443
-  server: 104.17.153.113
+  server: 104.17.135.175
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -273,7 +245,35 @@ proxies:
 - name: 联通-SJC-80-WS-08
   network: ws
   port: 80
-  server: 104.17.153.113
+  server: 104.17.135.175
+  skip-cert-verify: false
+  tfo: false
+  tls: false
+  type: vless
+  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
+  ws-opts:
+    headers:
+      Host: dy.qlsm.net
+    path: /?ed=2048
+- client-fingerprint: randomized
+  name: 联通-SJC-443-WS-TLS-09
+  network: ws
+  port: 443
+  server: 172.64.79.185
+  servername: dy.qlsm.net
+  skip-cert-verify: false
+  tfo: false
+  tls: true
+  type: vless
+  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
+  ws-opts:
+    headers:
+      Host: dy.qlsm.net
+    path: /?ed=2048
+- name: 联通-SJC-80-WS-10
+  network: ws
+  port: 80
+  server: 172.64.79.185
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -287,7 +287,7 @@ proxies:
   name: 电信-SIN-443-WS-TLS-01
   network: ws
   port: 443
-  server: 172.64.34.170
+  server: 173.245.59.161
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -301,259 +301,7 @@ proxies:
 - name: 电信-SIN-80-WS-02
   network: ws
   port: 80
-  server: 172.64.34.170
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 电信-NRT-443-WS-TLS-01
-  network: ws
-  port: 443
-  server: 162.159.38.78
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 电信-NRT-80-WS-02
-  network: ws
-  port: 80
-  server: 162.159.38.78
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 电信-NRT-443-WS-TLS-03
-  network: ws
-  port: 443
-  server: 162.159.38.57
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 电信-NRT-80-WS-04
-  network: ws
-  port: 80
-  server: 162.159.38.57
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 电信-NRT-443-WS-TLS-05
-  network: ws
-  port: 443
-  server: 162.159.45.99
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 电信-NRT-80-WS-06
-  network: ws
-  port: 80
-  server: 162.159.45.99
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 电信-NRT-443-WS-TLS-07
-  network: ws
-  port: 443
-  server: 162.159.44.77
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 电信-NRT-80-WS-08
-  network: ws
-  port: 80
-  server: 162.159.44.77
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 移动-SJC-443-WS-TLS-03
-  network: ws
-  port: 443
-  server: 2606:4700:4408::ab46:bbc1
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 移动-SJC-80-WS-04
-  network: ws
-  port: 80
-  server: 2606:4700:4408::ab46:bbc1
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 移动-SJC-443-WS-TLS-05
-  network: ws
-  port: 443
-  server: 2606:4700:4700::e4ca:e2a4
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 移动-SJC-80-WS-06
-  network: ws
-  port: 80
-  server: 2606:4700:4700::e4ca:e2a4
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 移动-SJC-443-WS-TLS-07
-  network: ws
-  port: 443
-  server: 2a06:98c1:3108::5d3e:48e4
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 移动-SJC-80-WS-08
-  network: ws
-  port: 80
-  server: 2a06:98c1:3108::5d3e:48e4
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 移动-SJC-443-WS-TLS-09
-  network: ws
-  port: 443
-  server: 2803:f800:54::9ff2:fd05
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 移动-SJC-80-WS-10
-  network: ws
-  port: 80
-  server: 2803:f800:54::9ff2:fd05
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 移动-SJC-443-WS-TLS-11
-  network: ws
-  port: 443
-  server: 2606:4700:440c::a6eb:c74b
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 移动-SJC-80-WS-12
-  network: ws
-  port: 80
-  server: 2606:4700:440c::a6eb:c74b
+  server: 173.245.59.161
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -567,7 +315,7 @@ proxies:
   name: 电信-SIN-443-WS-TLS-03
   network: ws
   port: 443
-  server: 2606:4700:4700::6214:ed20
+  server: 162.159.22.251
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -581,7 +329,7 @@ proxies:
 - name: 电信-SIN-80-WS-04
   network: ws
   port: 80
-  server: 2606:4700:4700::6214:ed20
+  server: 162.159.22.251
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -595,7 +343,7 @@ proxies:
   name: 电信-SIN-443-WS-TLS-05
   network: ws
   port: 443
-  server: 2a06:98c1:3104::7468:baf2
+  server: 162.159.27.166
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -609,7 +357,7 @@ proxies:
 - name: 电信-SIN-80-WS-06
   network: ws
   port: 80
-  server: 2a06:98c1:3104::7468:baf2
+  server: 162.159.27.166
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -623,7 +371,7 @@ proxies:
   name: 电信-SIN-443-WS-TLS-07
   network: ws
   port: 443
-  server: 2606:4700:440c::a6eb:c74b
+  server: 162.159.3.230
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -637,7 +385,7 @@ proxies:
 - name: 电信-SIN-80-WS-08
   network: ws
   port: 80
-  server: 2606:4700:440c::a6eb:c74b
+  server: 162.159.3.230
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -651,7 +399,7 @@ proxies:
   name: 电信-SIN-443-WS-TLS-09
   network: ws
   port: 443
-  server: 2803:f800:54::9ff2:fd05
+  server: 162.159.6.101
   servername: dy.qlsm.net
   skip-cert-verify: false
   tfo: false
@@ -665,35 +413,7 @@ proxies:
 - name: 电信-SIN-80-WS-10
   network: ws
   port: 80
-  server: 2803:f800:54::9ff2:fd05
-  skip-cert-verify: false
-  tfo: false
-  tls: false
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- client-fingerprint: randomized
-  name: 电信-SIN-443-WS-TLS-11
-  network: ws
-  port: 443
-  server: 2a06:98c1:310e::59bb:ff9d
-  servername: dy.qlsm.net
-  skip-cert-verify: false
-  tfo: false
-  tls: true
-  type: vless
-  uuid: 7782bcd0-7448-4f69-8014-00f6c9867956
-  ws-opts:
-    headers:
-      Host: dy.qlsm.net
-    path: /?ed=2048
-- name: 电信-SIN-80-WS-12
-  network: ws
-  port: 80
-  server: 2a06:98c1:310e::59bb:ff9d
+  server: 162.159.6.101
   skip-cert-verify: false
   tfo: false
   tls: false
@@ -711,42 +431,24 @@ proxy-groups:
   - 🇭🇰 移动-HKG-80-WS-02
   - 🇭🇰 移动-HKG-443-WS-TLS-03
   - 🇭🇰 移动-HKG-80-WS-04
-  - 移动-SJC-443-WS-TLS-01
-  - 移动-SJC-80-WS-02
   - 🇭🇰 移动-HKG-443-WS-TLS-05
   - 🇭🇰 移动-HKG-80-WS-06
   - 🇭🇰 移动-HKG-443-WS-TLS-07
   - 🇭🇰 移动-HKG-80-WS-08
+  - 🇭🇰 移动-HKG-443-WS-TLS-09
+  - 🇭🇰 移动-HKG-80-WS-10
   - 联通-SJC-443-WS-TLS-01
   - 联通-SJC-80-WS-02
   - 联通-SJC-443-WS-TLS-03
   - 联通-SJC-80-WS-04
-  - 联通-LAX-443-WS-TLS-01
-  - 联通-LAX-80-WS-02
   - 联通-SJC-443-WS-TLS-05
   - 联通-SJC-80-WS-06
   - 联通-SJC-443-WS-TLS-07
   - 联通-SJC-80-WS-08
+  - 联通-SJC-443-WS-TLS-09
+  - 联通-SJC-80-WS-10
   - 电信-SIN-443-WS-TLS-01
   - 电信-SIN-80-WS-02
-  - 电信-NRT-443-WS-TLS-01
-  - 电信-NRT-80-WS-02
-  - 电信-NRT-443-WS-TLS-03
-  - 电信-NRT-80-WS-04
-  - 电信-NRT-443-WS-TLS-05
-  - 电信-NRT-80-WS-06
-  - 电信-NRT-443-WS-TLS-07
-  - 电信-NRT-80-WS-08
-  - 移动-SJC-443-WS-TLS-03
-  - 移动-SJC-80-WS-04
-  - 移动-SJC-443-WS-TLS-05
-  - 移动-SJC-80-WS-06
-  - 移动-SJC-443-WS-TLS-07
-  - 移动-SJC-80-WS-08
-  - 移动-SJC-443-WS-TLS-09
-  - 移动-SJC-80-WS-10
-  - 移动-SJC-443-WS-TLS-11
-  - 移动-SJC-80-WS-12
   - 电信-SIN-443-WS-TLS-03
   - 电信-SIN-80-WS-04
   - 电信-SIN-443-WS-TLS-05
@@ -755,8 +457,6 @@ proxy-groups:
   - 电信-SIN-80-WS-08
   - 电信-SIN-443-WS-TLS-09
   - 电信-SIN-80-WS-10
-  - 电信-SIN-443-WS-TLS-11
-  - 电信-SIN-80-WS-12
   - 🎯 全球直连
   type: select
 - interval: 300
@@ -766,42 +466,24 @@ proxy-groups:
   - 🇭🇰 移动-HKG-80-WS-02
   - 🇭🇰 移动-HKG-443-WS-TLS-03
   - 🇭🇰 移动-HKG-80-WS-04
-  - 移动-SJC-443-WS-TLS-01
-  - 移动-SJC-80-WS-02
   - 🇭🇰 移动-HKG-443-WS-TLS-05
   - 🇭🇰 移动-HKG-80-WS-06
   - 🇭🇰 移动-HKG-443-WS-TLS-07
   - 🇭🇰 移动-HKG-80-WS-08
+  - 🇭🇰 移动-HKG-443-WS-TLS-09
+  - 🇭🇰 移动-HKG-80-WS-10
   - 联通-SJC-443-WS-TLS-01
   - 联通-SJC-80-WS-02
   - 联通-SJC-443-WS-TLS-03
   - 联通-SJC-80-WS-04
-  - 联通-LAX-443-WS-TLS-01
-  - 联通-LAX-80-WS-02
   - 联通-SJC-443-WS-TLS-05
   - 联通-SJC-80-WS-06
   - 联通-SJC-443-WS-TLS-07
   - 联通-SJC-80-WS-08
+  - 联通-SJC-443-WS-TLS-09
+  - 联通-SJC-80-WS-10
   - 电信-SIN-443-WS-TLS-01
   - 电信-SIN-80-WS-02
-  - 电信-NRT-443-WS-TLS-01
-  - 电信-NRT-80-WS-02
-  - 电信-NRT-443-WS-TLS-03
-  - 电信-NRT-80-WS-04
-  - 电信-NRT-443-WS-TLS-05
-  - 电信-NRT-80-WS-06
-  - 电信-NRT-443-WS-TLS-07
-  - 电信-NRT-80-WS-08
-  - 移动-SJC-443-WS-TLS-03
-  - 移动-SJC-80-WS-04
-  - 移动-SJC-443-WS-TLS-05
-  - 移动-SJC-80-WS-06
-  - 移动-SJC-443-WS-TLS-07
-  - 移动-SJC-80-WS-08
-  - 移动-SJC-443-WS-TLS-09
-  - 移动-SJC-80-WS-10
-  - 移动-SJC-443-WS-TLS-11
-  - 移动-SJC-80-WS-12
   - 电信-SIN-443-WS-TLS-03
   - 电信-SIN-80-WS-04
   - 电信-SIN-443-WS-TLS-05
@@ -810,8 +492,6 @@ proxy-groups:
   - 电信-SIN-80-WS-08
   - 电信-SIN-443-WS-TLS-09
   - 电信-SIN-80-WS-10
-  - 电信-SIN-443-WS-TLS-11
-  - 电信-SIN-80-WS-12
   type: url-test
   url: http://www.gstatic.com/generate_204
 - name: 🎯 全球直连

@@ -109,13 +109,26 @@ class TradingSystem:
 
             logger.info("3. 初始化API服务器...")
             api_config = await self.config_manager.get_config("api", {})
-            self.api_server = APIServer(
-                config_manager=self.config_manager,
-                main_controller=self.main_controller,
-                host=api_config.get("host", "0.0.0.0"),
-                port=api_config.get("port", 8000)
-            )
-            await self.api_server.initialize()
+            existing_api_server = getattr(self.main_controller, "api_server", None)
+            if existing_api_server is not None:
+                # 复用 MainController 已初始化的实例，避免同进程出现多 APIServer/多 DataSourceHub 闭包。
+                self.api_server = existing_api_server
+                self.api_server.config_manager = self.config_manager
+                self.api_server.main_controller = self.main_controller
+                logger.info(
+                    "♻️ 复用MainController内的APIServer实例 host=%s port=%s",
+                    getattr(self.api_server, "host", "0.0.0.0"),
+                    getattr(self.api_server, "port", 8000),
+                )
+            else:
+                self.api_server = APIServer(
+                    config_manager=self.config_manager,
+                    main_controller=self.main_controller,
+                    host=api_config.get("host", "0.0.0.0"),
+                    port=api_config.get("port", 8000)
+                )
+                await self.api_server.initialize()
+                self.main_controller.api_server = self.api_server
 
             logger.info("4. 设置信号处理...")
             self._setup_signal_handlers()

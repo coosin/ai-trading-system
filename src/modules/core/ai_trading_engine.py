@@ -226,16 +226,15 @@ class AITradingEngine:
         
         # 连接交易所：simulation 模式优先复用主控制器注入的模拟交易所
         try:
-            okx_config = {}
+            import os
+
+            okx_config: Dict[str, Any] = {}
             trading_mode = ""
             sim_cfg = {}
             system_cfg = {}
-            
-            # 优先从环境变量读取配置
-            import os
-            api_key = os.getenv('OKX_API_KEY')
-            secret = os.getenv('OKX_SECRET')
-            passphrase = os.getenv('OKX_PASSPHRASE')
+            api_key = ""
+            api_secret = ""
+            api_passphrase = ""
 
             if self.main_controller and self.main_controller.config_manager:
                 trading_cfg = await self.main_controller.config_manager.get_config("trading", {})
@@ -264,21 +263,54 @@ class AITradingEngine:
             ):
                 self.exchange = self.main_controller.simulation_exchange
                 logger.info("✅ SimulationExchange 已连接（来自 MainController）")
-            elif api_key and secret and passphrase:
-                testnet_flag = str(os.getenv("OKX_TESTNET", "") or "").strip().lower() in ("1", "true", "yes")
-                okx_config = {
-                    'api_key': api_key,
-                    'api_secret': secret,  # 注意：ExchangeBase期望的键名是api_secret
-                    'api_passphrase': passphrase,  # 注意：ExchangeBase期望的键名是api_passphrase
-                    'testnet': testnet_flag,
-                }
-                logger.info("✅ 从环境变量加载OKX配置")
             else:
-                # 从配置管理器读取
+                exchanges_config: Dict[str, Any] = {}
                 if self.main_controller and self.main_controller.config_manager:
-                    exchanges_config = await self.main_controller.config_manager.get_config("exchanges", {})
-                    okx_config = exchanges_config.get("okx", {})
-                    logger.info(f"📋 从配置文件加载OKX配置")
+                    exchanges_config = await self.main_controller.config_manager.get_config("exchanges", {}) or {}
+                okx_yaml = dict(exchanges_config.get("okx", {}) or {})
+                okx_enabled = bool(okx_yaml.get("enabled", True))
+
+                def _env_lookup(env_key: Any) -> str:
+                    if not env_key:
+                        return ""
+                    return str(os.getenv(str(env_key).strip(), "") or "").strip()
+
+                api_key = (
+                    str(okx_yaml.get("api_key") or "").strip()
+                    or _env_lookup(okx_yaml.get("api_key_env"))
+                    or str(os.getenv("OKX_API_KEY", "") or "").strip()
+                )
+                api_secret = (
+                    str(okx_yaml.get("api_secret") or okx_yaml.get("secret") or "").strip()
+                    or _env_lookup(okx_yaml.get("secret_env"))
+                    or str(os.getenv("OKX_SECRET", "") or "").strip()
+                )
+                api_passphrase = (
+                    str(okx_yaml.get("api_passphrase") or okx_yaml.get("passphrase") or "").strip()
+                    or _env_lookup(okx_yaml.get("passphrase_env"))
+                    or str(os.getenv("OKX_PASSPHRASE", "") or "").strip()
+                )
+
+                testnet_flag = bool(okx_yaml.get("testnet", False))
+                env_testnet_raw = str(os.getenv("OKX_TESTNET", "") or "").strip().lower()
+                if env_testnet_raw in ("1", "true", "yes", "on"):
+                    testnet_flag = True
+                elif env_testnet_raw in ("0", "false", "no", "off"):
+                    # 显式环境变量应覆盖 YAML，避免误连 simulated-trading 账户。
+                    testnet_flag = False
+
+                if (not okx_enabled):
+                    logger.info("OKX disabled by exchanges.okx.enabled=false; skip OKXExchange init")
+                elif api_key and api_secret and api_passphrase:
+                    okx_config = {
+                        "api_key": api_key,
+                        "api_secret": api_secret,
+                        "api_passphrase": api_passphrase,
+                        "testnet": testnet_flag,
+                    }
+                    if "simulated_order_only" in okx_yaml:
+                        okx_config["simulated_order_only"] = bool(okx_yaml.get("simulated_order_only"))
+                    logger.info("OKX credentials resolved (YAML / api_key_env / OKX_* env)")
 
             if okx_config and str(os.getenv("OKX_TESTNET", "") or "").strip().lower() in ("1", "true", "yes"):
                 okx_config = dict(okx_config or {})
@@ -294,9 +326,9 @@ class AITradingEngine:
                 logger.info("✅ OKX交易所已连接")
             elif not self.exchange:
                 logger.warning("⚠️ OKX配置不完整，使用模拟数据")
-                logger.warning(f"   API Key: {'已设置' if api_key else '未设置'}")
-                logger.warning(f"   Secret: {'已设置' if secret else '未设置'}")
-                logger.warning(f"   Passphrase: {'已设置' if passphrase else '未设置'}")
+                logger.warning("   API Key: %s", "已设置" if bool(api_key) else "未设置")
+                logger.warning("   Secret: %s", "已设置" if bool(api_secret) else "未设置")
+                logger.warning("   Passphrase: %s", "已设置" if bool(api_passphrase) else "未设置")
         except Exception as e:
             logger.warning(f"⚠️ 交易所连接失败: {e}，将使用模拟数据")
             import traceback
