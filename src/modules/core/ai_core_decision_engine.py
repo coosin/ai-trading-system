@@ -109,22 +109,26 @@ class AICoreDecisionEngine:
             "default_leverage": 20,
             "max_positions": 5,
             # 中频档：在不激进放宽风控的前提下，适度提升开单频率
-            "min_trade_interval": 80,
+            # 用户要求：开仓最小间隔 5 秒
+            "min_trade_interval": 5,
             "strategy_check_interval": 300,
             "backtest_lookback_days": 30,
             "aggressive_mode": False,
             "auto_create_strategy": True,
-            "min_confidence_to_trade": 0.72,
+            # 开仓/交易置信度阈值（用户要求：>=65% 才允许开仓）
+            "min_confidence_to_trade": 0.65,
             # Explicit open gate: avoid low-confidence churn
-            "ai_core_min_confidence_to_open": 0.78,
+            "ai_core_min_confidence_to_open": 0.65,
             "min_data_quality_to_trade": 0.55,
             "min_rr_to_trade": 1.15,
             "max_spread_bps_to_trade": 40.0,
             "max_abs_depth_imbalance_to_trade": 0.92,
             "degraded_data_quantity_factor": 0.68,
             "low_balance_usdt_threshold": 25.0,
-            "default_max_margin_fraction": 0.30,
-            "low_balance_margin_fraction": 0.55,
+            # 单笔保证金预算（用户要求：总资金 5%~10%）
+            # 在 ai_core 执行层以“可用余额”为近似基准，避免因权益/净值读取抖动导致无法下单。
+            "default_max_margin_fraction": 0.10,
+            "low_balance_margin_fraction": 0.10,
             "boost_on_low_risk": True,
             "low_risk_rr_multiplier": 0.96,
             "low_risk_spread_multiplier": 1.08,
@@ -467,7 +471,8 @@ class AICoreDecisionEngine:
             if self.exchange:
                 try:
                     # 测试交易所连接
-                    await self.exchange.get_balance()
+                    # 交易所 REST 在网络抖动时可能长时间卡住；这里必须加超时，避免阻塞整条启动链路
+                    await asyncio.wait_for(self.exchange.get_balance(), timeout=2.8)
                     logger.info("✅ 交易所连接就绪")
                     break
                 except Exception as e:

@@ -388,6 +388,28 @@ def set_proactive_ai(proactive_ai):
     global _proactive_ai
     _proactive_ai = proactive_ai
 
+@router.post("/proactive-ai/start")
+async def start_proactive_ai():
+    """启动主动性AI系统（用于启动链路阻塞后的手动恢复）"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    try:
+        await _proactive_ai.start()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"start_failed:{type(e).__name__}:{e}")
+    return {"ok": True, "status": "started"}
+
+@router.post("/proactive-ai/stop")
+async def stop_proactive_ai():
+    """停止主动性AI系统"""
+    if not _proactive_ai:
+        raise HTTPException(status_code=503, detail="Proactive AI system not initialized")
+    try:
+        await _proactive_ai.stop()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"stop_failed:{type(e).__name__}:{e}")
+    return {"ok": True, "status": "stopped"}
+
 @router.get("/proactive-ai/status")
 async def get_proactive_ai_status():
     """获取主动性AI系统状态"""

@@ -1007,17 +1007,19 @@ class OKXExchange(ExchangeBase):
                     self._payload_sample_limit,
                 )
             logger.info(f"OKX交易所初始化成功")
-            if str(os.getenv("OPENCLAW_OKX_WS_ENABLED", "0")).strip().lower() in ("1", "true", "yes"):
-                if self.api_key and self.api_secret:
-                    try:
-                        from src.modules.exchanges.okx_websocket import OKXWebSocketHub
+            # 默认开启 WS tickers 快路径：在 REST 不稳定/限流时仍可保持行情可用。
+            if str(os.getenv("OPENCLAW_OKX_WS_ENABLED", "1")).strip().lower() in ("1", "true", "yes"):
+                # 公共 tickers 不需要 API key，必须始终启动以降低 REST 依赖；
+                # 私有 positions 订阅由 OKXWebSocketHub 内部自行判断 key 是否齐全。
+                try:
+                    from src.modules.exchanges.okx_websocket import OKXWebSocketHub
 
-                        self._ws_hub = OKXWebSocketHub(self)
-                        await self._ws_hub.start()
-                        logger.info("OKX WebSocket Hub 已启动（公共 tickers + 私有 positions）")
-                    except Exception as e:
-                        logger.warning("OKX WebSocket Hub 启动失败，继续使用 REST: %s", e)
-                        self._ws_hub = None
+                    self._ws_hub = OKXWebSocketHub(self)
+                    await self._ws_hub.start()
+                    logger.info("OKX WebSocket Hub 已启动（公共 tickers + 私有 positions）")
+                except Exception as e:
+                    logger.warning("OKX WebSocket Hub 启动失败，继续使用 REST: %s", e)
+                    self._ws_hub = None
             return True
         except Exception as e:
             logger.error(f"OKX交易所初始化失败: {e}")
@@ -1697,6 +1699,8 @@ class OKXExchange(ExchangeBase):
             _bid = float((row or {}).get("bidPx", 0) or 0)
             _ask = float((row or {}).get("askPx", 0) or 0)
             if row and (_last > 0 or _bid > 0 or _ask > 0):
+                sod = float((row or {}).get("sodUtc8", 0) or 0)
+                chg = ((_last - sod) / sod) if (sod > 0 and _last > 0) else 0.0
                 return {
                     "symbol": symbol,
                     "last": _last,
@@ -1705,25 +1709,35 @@ class OKXExchange(ExchangeBase):
                     "high": float(row.get("high24h", 0) or 0),
                     "low": float(row.get("low24h", 0) or 0),
                     "volume": float(row.get("vol24h", 0) or 0),
-                    "change": float(
-                        row.get("chgUtc", row.get("sodUtc8", row.get("change24h", 0))) or 0
-                    ),
+                    # OKX tickers channel doesn't provide change ratio directly; compute from sodUtc8.
+                    "change": chg,
+                    "change_24h": chg,
                     "timestamp": int(row.get("ts", 0) or 0),
                 }
+
+            # 若 WS 已启用但缓存暂未命中：默认不再回退 REST（REST 在不稳定网络下会拖死扫描/聚合线程）。
+            if str(os.getenv("OPENCLAW_OKX_WS_ONLY_TICKER", "1")).strip().lower() in ("1", "true", "yes"):
+                if cached_ticker:
+                    return dict(cached_ticker)
+                return {}
         
         try:
             data = await self._make_request("GET", endpoint, params)
             if data and len(data) > 0:
                 ticker = data[0]
+                last = float(ticker.get("last", 0) or 0)
+                sod = float(ticker.get("sodUtc8", 0) or 0)
+                chg = ((last - sod) / sod) if (sod > 0 and last > 0) else 0.0
                 out = {
                     "symbol": symbol,
-                    "last": float(ticker.get("last", 0)),
+                    "last": last,
                     "bid": float(ticker.get("bidPx", 0)),
                     "ask": float(ticker.get("askPx", 0)),
                     "high": float(ticker.get("high24h", 0)),
                     "low": float(ticker.get("low24h", 0)),
                     "volume": float(ticker.get("vol24h", 0)),
-                    "change": float(ticker.get("change24h", 0)),
+                    "change": chg,
+                    "change_24h": chg,
                     "timestamp": int(ticker.get("ts", 0))
                 }
                 self._ticker_cache[okx_symbol] = (time.time(), dict(out))

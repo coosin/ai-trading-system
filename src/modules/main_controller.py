@@ -1288,7 +1288,23 @@ class MainController:
                 "collect_interval": 300,
                 "action_cooldown": 60
             }
-            proactive_cfg = await self.get_ai_managed_config("proactive_ai", proactive_defaults)
+            # 配置优先级：
+            # 1) ai_managed_config("proactive_ai") 作为运行期可调覆盖
+            # 2) config.yaml 的 proactive_scanner 作为基准（包含 auto_execute 等关键开关）
+            # 3) proactive_defaults 兜底
+            file_cfg = {}
+            try:
+                if self.config_manager:
+                    file_cfg = await self.config_manager.get_config("proactive_scanner", {}) or {}
+            except Exception:
+                file_cfg = {}
+            proactive_cfg = await self.get_ai_managed_config(
+                "proactive_ai",
+                {**proactive_defaults, **(file_cfg if isinstance(file_cfg, dict) else {})},
+            )
+            if isinstance(file_cfg, dict):
+                # 确保 file_cfg 的关键字段不会被 defaults 盖掉（但仍允许 ai_managed 覆盖）
+                proactive_cfg = {**file_cfg, **(proactive_cfg if isinstance(proactive_cfg, dict) else {})}
             self.proactive_ai = ProactiveAIOrchestrator(
                 self,
                 proactive_cfg,
@@ -1901,7 +1917,8 @@ class MainController:
 
             # 重启动后的强制接管：同步余额/持仓，并把持仓接入 SLTP 跟踪与仓位管理。
             try:
-                await self.force_sync_account_state(reason="startup")
+                # OKX REST 在网络抖动时可能长时间阻塞；启动链路不能被这一步卡死
+                await asyncio.wait_for(self.force_sync_account_state(reason="startup"), timeout=12.0)
             except Exception as e:
                 logger.warning(f"⚠️ 启动同步余额/持仓失败（不阻塞启动）: {e}")
 

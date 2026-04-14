@@ -147,6 +147,16 @@ class MarketIntelligenceEngine:
         self._push_interval_sec = float(self._cfg.get("push_interval_sec", 15) or 15)
         self._watch_symbols: List[str] = list(self._cfg.get("watch_symbols") or [])
         self._contract_cache_ttl_sec = float(self._cfg.get("contract_cache_ttl_sec", 3600) or 3600)
+        # market state aggregation stability/perf guards
+        self._market_state_cache: Dict[str, Any] = {}
+        self._market_state_cache_ts: float = 0.0
+        self._market_state_cache_ttl_sec: float = float(self._cfg.get("market_state_cache_ttl_sec", 2.0) or 2.0)
+        self._market_state_concurrency: int = int(self._cfg.get("market_state_concurrency", 4) or 4)
+        self._market_state_symbol_timeout_s: float = float(self._cfg.get("market_state_symbol_timeout_s", 1.6) or 1.6)
+        self._market_state_debug_perf: bool = bool(self._cfg.get("market_state_debug_perf", True))
+        # upstream fetch timeouts (avoid control-plane hangs)
+        self._snapshot_timeout_s: float = float(self._cfg.get("snapshot_timeout_s", 2.2) or 2.2)
+        self._klines_timeout_s: float = float(self._cfg.get("klines_timeout_s", 1.2) or 1.2)
 
         # fee model (defaults align with backtest/research defaults in repo)
         self._fee_rate_taker = float(self._cfg.get("fee_rate_taker", 0.0005) or 0.0005)
@@ -414,6 +424,7 @@ class MarketIntelligenceEngine:
         """
         聚合市场状态（多 symbol 汇总）。用于前端面板/风控开关/日报。
         """
+        started_at = time.time()
         syms = symbols or list(self._watch_symbols)
         if not syms:
             hub = self._hub()
@@ -425,40 +436,154 @@ class MarketIntelligenceEngine:
             else:
                 syms = ["BTC/USDT", "ETH/USDT"]
 
+        # quick cache to prevent aggregation storms
+        try:
+            now = self._now()
+            if self._market_state_cache and (now - float(self._market_state_cache_ts or 0.0)) < self._market_state_cache_ttl_sec:
+                out = dict(self._market_state_cache)
+                out["cached"] = True
+                return out
+        except Exception:
+            pass
+
+        # Prefer cached symbol views to keep control-plane stable/fast.
         views: List[Dict[str, Any]] = []
+        try:
+            for s in [str(x) for x in (syms or []) if x][:20]:
+                cached = self.get_cached_symbol_view(s)
+                if cached:
+                    views.append(cached)
+        except Exception:
+            pass
         bull = bear = side = unknown = 0
         avg_q = []
         max_spread = 0.0
         high_risk = 0
 
-        for s in syms[:20]:
+        sem = asyncio.Semaphore(max(1, int(self._market_state_concurrency)))
+        perf_rows: List[Dict[str, Any]] = []
+
+        async def _one(sym: str) -> Optional[Dict[str, Any]]:
+            t0 = time.time()
             try:
-                v = await self.get_symbol_view(s, include_snapshot=False)
+                async with sem:
+                    v = await asyncio.wait_for(
+                        self.get_symbol_view(sym, include_snapshot=False),
+                        timeout=max(0.5, min(float(self._market_state_symbol_timeout_s), 1.8)),
+                    )
                 d = v.to_dict()
-                views.append(d)
-                tr = str(d.get("trend") or "unknown")
-                if tr == "bullish":
-                    bull += 1
-                elif tr == "bearish":
-                    bear += 1
-                elif tr == "sideways":
-                    side += 1
-                else:
-                    unknown += 1
-                q = d.get("quality_score")
-                if q is not None:
-                    avg_q.append(float(q))
-                sp = d.get("spread_bps")
-                if sp is not None:
-                    max_spread = max(max_spread, float(sp))
+                return d
+            except asyncio.TimeoutError:
+                perf_rows.append({"symbol": sym, "ok": False, "error": "timeout", "ms": int((time.time() - t0) * 1000)})
+                # Return a minimal degraded row so market_state is still informative.
+                return {
+                    "symbol": sym,
+                    "timestamp": _utc_iso(),
+                    "quality_score": 0.0,
+                    "provenance": "degraded",
+                    "schema_version": self._schema_version,
+                    "partial": True,
+                    "errors": ["snapshot_timeout"],
+                    "price": None,
+                    "spread_bps": None,
+                    "atr_pct_1h": None,
+                    "change_24h": 0.0,
+                    "trend": "unknown",
+                    "action_bias": "hold",
+                    "confidence": None,
+                    "summary": "",
+                    "conflicts": [],
+                    "exchange_support": {},
+                    "intel_support": {},
+                    "risk_support": {},
+                    "execution_support": {},
+                    "display_cn": {},
+                    "changeset": {},
+                }
+            except Exception as e:
+                perf_rows.append(
+                    {"symbol": sym, "ok": False, "error": type(e).__name__, "ms": int((time.time() - t0) * 1000)}
+                )
+                return {
+                    "symbol": sym,
+                    "timestamp": _utc_iso(),
+                    "quality_score": 0.0,
+                    "provenance": "degraded",
+                    "schema_version": self._schema_version,
+                    "partial": True,
+                    "errors": [f"symbol_view_failed:{type(e).__name__}"],
+                    "price": None,
+                    "spread_bps": None,
+                    "atr_pct_1h": None,
+                    "change_24h": 0.0,
+                    "trend": "unknown",
+                    "action_bias": "hold",
+                    "confidence": None,
+                    "summary": "",
+                    "conflicts": [],
+                    "exchange_support": {},
+                    "intel_support": {},
+                    "risk_support": {},
+                    "execution_support": {},
+                    "display_cn": {},
+                    "changeset": {},
+                }
+            finally:
+                # only record success timing if no error row exists
+                if not any(r.get("symbol") == sym for r in perf_rows):
+                    perf_rows.append({"symbol": sym, "ok": True, "ms": int((time.time() - t0) * 1000)})
+
+        # Only fetch a small bounded subset to avoid blocking (cached views already cover the rest).
+        syms_use = [str(s) for s in (syms or []) if s][: min(3, 20)]
+        results = await asyncio.gather(*[_one(s) for s in syms_use], return_exceptions=False)
+        # Merge fetched (prefer) + cached (fallback).
+        merged: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for d in results:
+            if not isinstance(d, dict):
+                continue
+            k = str(d.get("symbol") or "").upper()
+            if k:
+                seen.add(k)
+            merged.append(d)
+        for d in views:
+            if not isinstance(d, dict):
+                continue
+            k = str(d.get("symbol") or "").upper()
+            if k and k in seen:
+                continue
+            merged.append(d)
+        views = merged
+
+        for d in views:
+            tr = str(d.get("trend") or "unknown")
+            if tr == "bullish":
+                bull += 1
+            elif tr == "bearish":
+                bear += 1
+            elif tr == "sideways":
+                side += 1
+            else:
+                unknown += 1
+            q = d.get("quality_score")
+            if q is not None:
                 try:
-                    lp = (d.get("risk_support") or {}).get("liquidation_proxy") or {}
-                    high_risk += int(lp.get("high_risk_positions") or 0)
+                    avg_q.append(float(q))
                 except Exception:
                     pass
+            sp = d.get("spread_bps")
+            if sp is not None:
+                try:
+                    max_spread = max(max_spread, float(sp))
+                except Exception:
+                    pass
+            try:
+                lp = (d.get("risk_support") or {}).get("liquidation_proxy") or {}
+                high_risk += int(lp.get("high_risk_positions") or 0)
             except Exception:
-                continue
+                pass
 
+        attempted = len([s for s in (syms or []) if s][:20])
         trend = "mixed"
         total = max(1, len(views))
         if bull > total * 0.6:
@@ -470,14 +595,33 @@ class MarketIntelligenceEngine:
         out = {
             "timestamp": _utc_iso(),
             "symbols_considered": len(views),
+            "symbols_attempted": attempted,
+            "symbols_failed": max(0, attempted - len(views)),
             "trend": trend,
             "counts": {"bullish": bull, "bearish": bear, "sideways": side, "unknown": unknown},
             "avg_quality_score": (sum(avg_q) / len(avg_q)) if avg_q else None,
             "max_spread_bps": max_spread if max_spread > 0 else None,
             "high_risk_positions": high_risk,
             "symbol_views": views,
+            "cached": False,
         }
+        if self._market_state_debug_perf:
+            out["perf"] = {
+                "total_ms": int((time.time() - started_at) * 1000),
+                "concurrency": int(self._market_state_concurrency),
+                "symbol_timeout_s": float(self._market_state_symbol_timeout_s),
+                "per_symbol_top": sorted(perf_rows, key=lambda r: int(r.get("ms") or 0), reverse=True)[:8],
+            }
+
+        try:
+            self._market_state_cache = dict(out)
+            self._market_state_cache_ts = float(self._now())
+        except Exception:
+            pass
         return out
+
+    def get_cached_market_state(self) -> Dict[str, Any]:
+        return dict(self._market_state_cache or {})
 
     async def get_symbol_view(self, symbol: str, *, include_snapshot: bool = True) -> SymbolView:
         sym = str(symbol or "").strip()
@@ -500,7 +644,7 @@ class MarketIntelligenceEngine:
         providers = list(self._cfg.get("providers") or ["unified_snapshot"])
         if "unified_snapshot" in providers and hub and hasattr(hub, "get_unified_snapshot"):
             try:
-                snapshot = await hub.get_unified_snapshot(sym)
+                snapshot = await asyncio.wait_for(hub.get_unified_snapshot(sym), timeout=max(0.4, self._snapshot_timeout_s))
             except Exception as e:
                 errors.append(f"snapshot_fetch_failed:{type(e).__name__}")
                 snapshot = {}
@@ -537,7 +681,7 @@ class MarketIntelligenceEngine:
         kl = (exch.get("klines_1h") or []) if isinstance(exch, dict) else []
         if not kl and hub and hasattr(hub, "get_klines"):
             try:
-                kl = await hub.get_klines(sym, "1h", limit=64)
+                kl = await asyncio.wait_for(hub.get_klines(sym, "1h", limit=64), timeout=max(0.4, self._klines_timeout_s))
             except Exception as e:
                 errors.append(f"klines_fetch_failed:{type(e).__name__}")
                 kl = []

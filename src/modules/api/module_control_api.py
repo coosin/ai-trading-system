@@ -158,7 +158,8 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
-    @market_router.get("/symbol/{symbol}")
+    # NOTE: symbols contain '/', use :path to match the whole remainder.
+    @market_router.get("/symbol/{symbol:path}")
     async def get_market_symbol_view(
         symbol: str,
         include_snapshot: bool = False,
@@ -170,14 +171,34 @@ def init_module_control_api(app, main_controller):
         if not mi or not hasattr(mi, "get_symbol_view"):
             return {"ok": False, "message": "MarketIntelligenceEngine unavailable"}
         try:
-            view = await mi.get_symbol_view(symbol, include_snapshot=bool(include_snapshot))
+            # Avoid blocking the control-plane. Prefer cached view when upstream is unstable.
+            try:
+                cached = mi.get_cached_symbol_view(symbol) if hasattr(mi, "get_cached_symbol_view") else {}
+            except Exception:
+                cached = {}
+            if cached and not bool(include_snapshot):
+                out_view = dict(cached)
+                if fields:
+                    allow = {k.strip() for k in str(fields).split(",") if k.strip()}
+                    allow.add("symbol")
+                    allow.add("timestamp")
+                    out_view = {k: v for k, v in out_view.items() if k in allow}
+                return {"ok": True, "view": out_view, "snapshot": None, "degraded": True, "message": "symbol_view_cached"}
+
+            view = await asyncio.wait_for(mi.get_symbol_view(symbol, include_snapshot=bool(include_snapshot)), timeout=3.0)
             out_view = view.to_dict()
             if fields:
                 allow = {k.strip() for k in str(fields).split(",") if k.strip()}
                 allow.add("symbol")
                 allow.add("timestamp")
                 out_view = {k: v for k, v in out_view.items() if k in allow}
-            return {"ok": True, "view": out_view, "snapshot": view.snapshot if include_snapshot else None}
+            return {"ok": True, "view": out_view, "snapshot": view.snapshot if include_snapshot else None, "degraded": False}
+        except asyncio.TimeoutError:
+            try:
+                cached = mi.get_cached_symbol_view(symbol) if hasattr(mi, "get_cached_symbol_view") else {}
+            except Exception:
+                cached = {}
+            return {"ok": True, "view": cached or {}, "snapshot": None, "degraded": True, "message": "symbol_view_timeout_degraded"}
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
@@ -189,8 +210,21 @@ def init_module_control_api(app, main_controller):
         if not mi or not hasattr(mi, "get_market_state"):
             return {"ok": False, "message": "MarketIntelligenceEngine unavailable"}
         try:
-            state = await mi.get_market_state()
-            return {"ok": True, "state": state}
+            # 防止聚合计算/上游抖动导致 API 阻塞（前端/运维需要“快返回”）。
+            state = await asyncio.wait_for(mi.get_market_state(), timeout=2.0)
+            return {"ok": True, "state": state, "degraded": False}
+        except asyncio.TimeoutError:
+            cached = None
+            try:
+                cached = mi.get_cached_market_state() if hasattr(mi, "get_cached_market_state") else None
+            except Exception:
+                cached = None
+            return {
+                "ok": True,
+                "state": cached or {},
+                "degraded": True,
+                "message": "market_state_timeout_degraded",
+            }
         except Exception as e:
             return {"ok": False, "message": str(e)}
 

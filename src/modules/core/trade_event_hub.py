@@ -33,6 +33,92 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _side_zh(side: Optional[str]) -> str:
+    s = str(side or "").lower()
+    if s == "long":
+        return "做多"
+    if s == "short":
+        return "做空"
+    if s in ("buy", "bid"):
+        return "买入"
+    if s in ("sell", "ask"):
+        return "卖出"
+    if s in ("neutral", "hold"):
+        return "观望"
+    return s or "未知"
+
+
+def _action_zh(action: Optional[str]) -> str:
+    a = str(action or "").lower()
+    if a == "open":
+        return "开仓"
+    if a == "close":
+        return "平仓"
+    if a in ("modify", "update"):
+        return "修改"
+    if a in ("cancel", "cancel_order"):
+        return "撤单"
+    return a or "未知"
+
+
+def _type_zh(event_type: Optional[str]) -> str:
+    t = str(event_type or "")
+    return {
+        "trade.intent": "交易意图",
+        "trade.fill": "交易成交/拒绝",
+        "trade.position": "持仓/保护更新",
+        "market.update": "行情/分析更新",
+    }.get(t, t or "未知事件")
+
+
+def _translate_detail_zh(detail: Optional[str]) -> Optional[str]:
+    if detail is None:
+        return None
+    d = str(detail)
+    if not d:
+        return d
+
+    # common gate/policy reasons
+    if d.startswith("risk_reward_low:"):
+        return d.replace("risk_reward_low:", "风险回报比不足：", 1)
+    if d.startswith("cooldown_symbol:"):
+        return d.replace("cooldown_symbol:", "冷却中（同品种冷却）：", 1)
+    if d.startswith("mi_quality_low:"):
+        return d.replace("mi_quality_low:", "数据质量过低：", 1)
+    if d.startswith("spread_too_wide:"):
+        return d.replace("spread_too_wide:", "点差过大：", 1)
+    if d.startswith("slippage_too_high:"):
+        return d.replace("slippage_too_high:", "滑点过大：", 1)
+    if d.startswith("open_policy_denied"):
+        return "开仓策略拒绝（写权限/所有权策略）： " + d
+    if d.startswith("execute_exception:"):
+        return "执行异常： " + d
+    if d.startswith("no_engine"):
+        return "执行失败：交易引擎不可用"
+    return d
+
+
+def _enrich_zh(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Add Chinese-friendly aliases without breaking existing keys.
+    """
+    out = dict(payload or {})
+    try:
+        out.setdefault("type_zh", _type_zh(out.get("type")))
+        if "action" in out:
+            out.setdefault("action_zh", _action_zh(out.get("action")))
+        if "side" in out:
+            out.setdefault("side_zh", _side_zh(out.get("side")))
+        if "detail" in out:
+            out.setdefault("detail_zh", _translate_detail_zh(out.get("detail")))
+        if "reason" in out:
+            # reason is often already Chinese; still provide alias for UI
+            out.setdefault("reason_zh", str(out.get("reason") or ""))
+    except Exception:
+        return out
+    return out
+
+
 @dataclass
 class TradeIntent:
     trace_id: str
@@ -188,6 +274,7 @@ class TradeEventHub:
                 self._ring = self._ring[-self._buffer_size :]
 
     async def _fanout(self, channel: str, payload: Dict[str, Any]) -> None:
+        payload = _enrich_zh(payload)
         await self._append_ring(payload)
 
         if self._api and hasattr(self._api, "broadcast_websocket"):
@@ -240,7 +327,10 @@ class TradeEventHub:
                 "type": "trade.intent",
                 **intent.to_dict(),
                 "timestamp": intent.created_at,
-                "tg_message": f"🧭 意图 {intent.action}\n{intent.symbol} {intent.side}\ntrace_id={intent.trace_id}",
+                "tg_message": (
+                    f"🧭 交易意图 {_action_zh(intent.action)}\n"
+                    f"{intent.symbol} {_side_zh(intent.side)}\ntrace_id={intent.trace_id}"
+                ),
             },
         )
 
@@ -261,8 +351,8 @@ class TradeEventHub:
                 **fill.to_dict(),
                 "timestamp": fill.filled_at,
                 "tg_message": (
-                    f"{status} 成交 {fill.action}\n{fill.symbol} {fill.side}\n"
-                    f"qty={fill.quantity} px={fill.price}\ntrace_id={fill.trace_id}"
+                    f"{status} {_action_zh(fill.action)}\n{fill.symbol} {_side_zh(fill.side)}\n"
+                    f"数量={fill.quantity} 价格={fill.price}\ntrace_id={fill.trace_id}"
                 ),
             },
         )

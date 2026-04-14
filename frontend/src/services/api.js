@@ -30,6 +30,7 @@ export const api = {
     getStatus: () => request('/system/status'),
     getHealth: () => request('/system/health'),
     getMetrics: () => request('/system/metrics'),
+    getAcceptance: () => request('/system/acceptance'),
   },
   settings: {
     get: () => request('/settings'),
@@ -74,6 +75,13 @@ export const api = {
         request(`/trades${q ? `?${q}` : ''}`)
       );
     },
+    getExecutionSpine: () => request('/trade/execution_spine'),
+    simulateOrder: (data) =>
+      request('/modules/execution/simulate-order', { method: 'POST', body: JSON.stringify(data || {}) }),
+    getEvents: (params = {}) => {
+      const q = new URLSearchParams(params).toString();
+      return request(`/trade/events${q ? `?${q}` : ''}`);
+    },
   },
   market: {
     getSymbols: () => request('/market/symbols'),
@@ -81,6 +89,11 @@ export const api = {
     getKlines: (symbol, interval = '1m', limit = 60) =>
       request(`/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`),
     getOrderBook: (symbol) => request(`/market/orderbook?symbol=${encodeURIComponent(symbol)}`),
+    getSymbolView: (symbol, params = {}) => {
+      const query = new URLSearchParams({ ...params }).toString();
+      return request(`/market/symbol/${encodeURIComponent(symbol)}${query ? `?${query}` : ''}`);
+    },
+    getState: () => request('/market/state'),
   },
   externalData: {
     getIndicators: (symbol, indicators = []) =>
@@ -91,6 +104,7 @@ export const api = {
   dataFusion: {
     analyzeMarket: (symbol) => request(`/data-fusion/analyze?symbol=${encodeURIComponent(symbol)}`),
     getAnalysisHistory: () => request('/data-fusion/history'),
+    getSources: () => request('/data-fusion/sources'),
   },
   performance: {
     getMetrics: () => request('/performance/metrics'),
@@ -129,8 +143,6 @@ export const api = {
       request('/modules/commander/chores', { method: 'POST', body: JSON.stringify(body || {}) }),
     dispatchCommanderMessage: (message, source = 'control_hub') =>
       request('/modules/commander/dispatch', { method: 'POST', body: JSON.stringify({ message, source }) }),
-    getCommanderAudit: () =>
-      request('/modules/commander/audit'),
     getAiFrequencyProfile: () =>
       request('/modules/ai/frequency-profile'),
     setAiFrequencyProfile: (profile) =>
@@ -143,6 +155,16 @@ export const api = {
       request('/modules/risk/config'),
     updateRiskConfig: (data) =>
       request('/modules/risk/config', { method: 'POST', body: JSON.stringify(data || {}) }),
+    getAccountDiagnostics: () => request('/modules/commander/account-diagnostics'),
+    runAccountSync: (reason = 'ui') =>
+      request('/modules/commander/account-sync/run', { method: 'POST', body: JSON.stringify({ reason }) }),
+    getCommanderCapabilities: () => request('/modules/commander/capabilities'),
+    getCommanderAudit: (enrich = false) => request(`/modules/commander/audit?enrich=${enrich ? 'true' : 'false'}`),
+    getAiGuards: () => request('/modules/ai/guards'),
+    getStopLossStats: () => request('/modules/stop-loss/stats'),
+    getSurfaceRegistry: () => request('/modules/surface/registry'),
+    getDataIntegrationHealth: () => request('/modules/data/integration/health'),
+    getPluginsStatus: () => request('/modules/plugins/status'),
   },
   monitoring: {
     /** 若后端未实现则返回 404，总控会降级为空列表 */
@@ -150,6 +172,11 @@ export const api = {
       const q = new URLSearchParams(params).toString();
       return request(`/monitoring/logs${q ? `?${q}` : ''}`);
     },
+    getSummary: () => request('/monitoring/summary'),
+    getAlerts: () => request('/monitoring/alerts'),
+    getAlertsHistory: () => request('/monitoring/alerts/history'),
+    getMarketData: () => request('/monitoring/market-data'),
+    getRisk: () => request('/monitoring/risk'),
   },
   controlCenter: {
     getState: (params = {}) => {
@@ -165,6 +192,9 @@ export const api = {
       request(`/data-hub/quality-advice?symbol=${encodeURIComponent(symbol)}`),
     getAiAnalysis: (symbol = 'BTC/USDT') =>
       request(`/data-hub/ai-analysis?symbol=${encodeURIComponent(symbol)}`),
+  },
+  exchanges: {
+    getAll: () => request('/exchanges'),
   },
 };
 

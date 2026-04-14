@@ -18,6 +18,7 @@
 - **交易/风控事件流（前端与外部 API 推荐）**
   - `GET /api/v1/trade/events?limit=...`
   - 事件类型含：`trade.fill`（开平仓成交）、`trade.position`（含 `sltp.create` / `sltp_stop_loss_triggered` 等）、`market.update`（行情判断与质量摘要）。
+  - 事件已补齐中文别名字段（不破坏原字段）：`type_zh`、`action_zh`、`side_zh`、`detail_zh`/`reason_zh`，便于前端直接展示。
   - 该接口为环形缓冲读取，适合作为前端轮询与外部系统对账源。
 
 - **执行脊柱与审计快照**
@@ -26,7 +27,7 @@
   - 用途：读取最新一笔开平仓来源、原因、成败、策略单写入状态（S1）与 SLTP 统计。
 
 - **行情与判断输出**
-  - `GET /api/v1/market/symbol/{symbol}`
+  - `GET /api/v1/market/symbol/{symbol}`（**symbol 含 `/`**；推荐 URL 编码，例如 `BTC%2FUSDT`）
   - `GET /api/v1/market/state`
   - `GET /api/v1/modules/data/hub/unified-snapshot`
   - 用途：提供实时行情、质量分、执行成本、风险建议与“是否可交易”判断依据。
@@ -74,6 +75,22 @@
 
 - **范围:** 以 `/api` 为前缀的路径，响应体为 JSON 时，由中间件在**不删除原有字段**的前提下补齐 `ok`、`success`、`status`、`message`（按需）、`timestamp`。
 - **响应头:** `X-OpenClaw-Standardized: 1` 表示该响应已按上述规则规范化。
+
+---
+
+## 行情聚合接口的降级语义（重要）
+
+为了避免外部网络/交易所抖动导致控制面阻塞，以下接口采用“**快返回 + 降级标志**”：
+
+- **`GET /api/v1/market/state`**
+  - **正常**：`{"ok": true, "state": {...}, "degraded": false}`
+  - **降级**：`{"ok": true, "state": {...或{}}, "degraded": true, "message": "market_state_timeout_degraded"}`
+  - `state` 中包含：
+    - `symbols_attempted` / `symbols_considered` / `symbols_failed`
+    - `symbol_views`：即便上游超时也会返回最小降级行（`partial=true` + `errors=["snapshot_timeout"]`），用于可解释与前端提示
+
+- **`GET /api/v1/market/symbol/{symbol}`**
+  - 若上游慢/超时：会优先返回缓存视图（`degraded=true, message="symbol_view_cached"`），避免阻塞前端与运维面板。
 
 ### 调试：交易所与数据中心绑定一致性
 

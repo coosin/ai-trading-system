@@ -36,6 +36,7 @@ htmlcov/
 logs/*.log
 logs/**/*.log
 logs/*.log.*
+logs/_tmp*.json
 logs/audit/
 logs/okx_payload_matrix/
 logs/config-health.json
@@ -53,6 +54,10 @@ data/memory/
 # Local backups and ad-hoc DB tree
 backups/
 database/
+*.backup
+*.backup.*
+*.bak_*
+src/**/*.backup.*
 
 # Ephemeral memory shards (runtime; see docs/memory)
 workspace/memory/working/

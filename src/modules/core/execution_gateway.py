@@ -487,6 +487,30 @@ class ExecutionGateway:
             msg = f"open_policy_denied source={source} swo={swo}"
             logger.error("ExecutionGateway.open_swap: %s", msg)
             self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context)
+            # trade event fanout (best-effort)
+            try:
+                hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
+                trace_id = self._trace_id_from_context(context) or str(uuid.uuid4())
+                if hub and hasattr(hub, "publish_fill"):
+                    from src.modules.core.trade_event_hub import TradeFill
+
+                    await hub.publish_fill(
+                        TradeFill(
+                            trace_id=str(trace_id),
+                            source=str(source or "gateway"),
+                            symbol=str(symbol),
+                            side=str(side),
+                            action="open",
+                            success=False,
+                            order_id=None,
+                            price=None,
+                            quantity=float(size) if size is not None else None,
+                            detail=msg,
+                            raw={"error": msg, "reason": reason, "context": context or {}},
+                        )
+                    )
+            except Exception:
+                pass
             return {"success": False, "error": msg}
 
         ex = self._exchange()

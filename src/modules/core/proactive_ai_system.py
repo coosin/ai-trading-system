@@ -13,6 +13,7 @@ import logging
 import json
 import math
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
@@ -356,13 +357,19 @@ class ProactiveMarketScanner:
         """持续扫描循环 - 快速发现机会"""
         while self._running:
             try:
+                scan_started_at = datetime.now()
                 self._stats["total_scans"] += 1
+                self._stats["last_scan_started_at"] = scan_started_at.isoformat()
+                self._stats["last_scan_phase"] = "get_active_symbols"
                 
                 symbols = await self._get_active_symbols()
+                self._stats["last_scan_phase"] = "scan_symbols"
                 
                 for symbol in symbols:
                     try:
-                        opportunity = await self._quick_scan_symbol(symbol)
+                        self._stats["last_scan_symbol"] = str(symbol)
+                        # 单个交易对请求偶发超时/卡住会拖死整轮扫描；这里必须加超时兜底。
+                        opportunity = await asyncio.wait_for(self._quick_scan_symbol(symbol), timeout=10.0)
                         if opportunity:
                             self._upsert_opportunity(opportunity)
                             self._stats["opportunities_found"] += 1
@@ -373,6 +380,13 @@ class ProactiveMarketScanner:
                 
                 self._opportunities = [o for o in self._opportunities 
                                        if not o.expires_at or o.expires_at > datetime.now()]
+
+                scan_done_at = datetime.now()
+                self._stats["last_scan_phase"] = "sleep"
+                self._stats["last_scan_completed_at"] = scan_done_at.isoformat()
+                self._stats["last_scan_duration_ms"] = int(
+                    max(0.0, (scan_done_at - scan_started_at).total_seconds()) * 1000.0
+                )
                 
                 await asyncio.sleep(self._scan_interval)
                 
@@ -390,7 +404,7 @@ class ProactiveMarketScanner:
                 
                 for symbol in symbols[:10]:
                     try:
-                        insight = await self._deep_analyze_symbol(symbol)
+                        insight = await asyncio.wait_for(self._deep_analyze_symbol(symbol), timeout=20.0)
                         if insight:
                             self._insights[symbol] = insight
                             self._stats["insights_generated"] += 1
@@ -409,6 +423,8 @@ class ProactiveMarketScanner:
         """机会监控循环 - 监控并执行机会"""
         while self._running:
             try:
+                # 观测：用于定位“机会存在但未触发评估/执行”的问题
+                self._stats["last_opportunity_monitor_at"] = datetime.now().isoformat()
                 if self._opportunities:
                     sorted_opportunities = sorted(
                         self._opportunities,
@@ -452,7 +468,8 @@ class ProactiveMarketScanner:
         
         try:
             if hasattr(self.exchange, 'get_symbols'):
-                symbols = await self.exchange.get_symbols()
+                # 交易所拉取交易对偶发卡住会“冻结”扫描循环，必须加超时保护。
+                symbols = await asyncio.wait_for(self.exchange.get_symbols(), timeout=6.0)
                 usdt_symbols = [s for s in symbols if '/USDT' in s or '-USDT' in s]
                 if usdt_symbols:
                     return usdt_symbols[:20]
@@ -463,11 +480,45 @@ class ProactiveMarketScanner:
     
     async def _quick_scan_symbol(self, symbol: str) -> Optional[MarketOpportunity]:
         """快速扫描单个交易对"""
+        # 优先使用「统一行情分析层」的缓存快照：避免扫描器自身高频直连交易所导致卡顿/限流。
+        try:
+            mc = self.main_controller
+            mi = getattr(mc, "market_intelligence", None) if mc else None
+            if mi and hasattr(mi, "get_cached_symbol_view"):
+                cv = mi.get_cached_symbol_view(symbol) or {}
+                price = float(cv.get("price") or 0)
+                change_24h = float(cv.get("change_24h") or 0)
+                if price > 0 and abs(change_24h) > self._mean_reversion_min_abs_change:
+                    direction = "short" if change_24h > 0 else "long"
+                    confidence = min(0.9, abs(change_24h) * 10)
+                    return MarketOpportunity(
+                        symbol=symbol,
+                        opportunity_type=OpportunityType.MEAN_REVERSION,
+                        direction=direction,
+                        confidence=confidence,
+                        entry_price=price,
+                        stop_loss=price * (1 + 0.02 if direction == "short" else -0.02),
+                        take_profit=price * (1 - 0.05 if direction == "short" else 1.05),
+                        reasoning=(
+                            f"24小时{'涨幅' if change_24h > 0 else '跌幅'} "
+                            f"{abs(change_24h)*100:.1f}%，均值回归机会(来自统一快照缓存)"
+                        ),
+                        data_sources=["unified_snapshot_cache"],
+                        priority=int(confidence * 10),
+                        expires_at=datetime.now() + timedelta(minutes=30),
+                    )
+                # 缓存命中但无机会：直接返回，避免触发交易所直连请求拖慢扫描轮次
+                if cv:
+                    return None
+        except Exception:
+            pass
+
         if not self.exchange:
             return None
         
         try:
-            ticker = await self.exchange.get_ticker(symbol.replace('/', '-'))
+            # symbol 可能是 BTC/USDT/SWAP 或 BTC-USDT-SWAP，交给交易所适配层自行归一化。
+            ticker = await self.exchange.get_ticker(symbol)
             if not ticker:
                 return None
             
@@ -495,7 +546,7 @@ class ProactiveMarketScanner:
             
             if volume > 0:
                 try:
-                    klines = await self.exchange.get_klines(symbol.replace('/', '-'), '1h', limit=24)
+                    klines = await self.exchange.get_klines(symbol, '1h', limit=24)
                     if klines and len(klines) >= 20:
                         closes = self._extract_kline_values(klines, "close")
                         volumes = self._extract_kline_values(klines, "volume")
@@ -833,6 +884,35 @@ class ProactiveMarketScanner:
     async def _evaluate_and_execute(self, opportunity: MarketOpportunity) -> bool:
         """评估并执行机会（僅在 proactive_auto_execute_opportunities=true 時由監控迴圈調用）"""
         logger.info(f"⚡ 评估机会: {opportunity.symbol} {self._zh_direction(opportunity.direction)}")
+        trace_id = str(uuid.uuid4())
+        # best-effort: push "intent" so we can trace every attempt in event stream
+        try:
+            hub = getattr(self.main_controller, "trade_event_hub", None) if self.main_controller else None
+            if hub and hasattr(hub, "publish_intent"):
+                from src.modules.core.trade_event_hub import TradeIntent
+
+                await hub.publish_intent(
+                    TradeIntent(
+                        trace_id=trace_id,
+                        source="proactive_ai",
+                        symbol=str(opportunity.symbol),
+                        side=str(opportunity.direction),
+                        action="open",
+                        quantity=None,
+                        leverage=None,
+                        reason=str(opportunity.reasoning or "")[:220],
+                        context={
+                            "opportunity_type": str(getattr(opportunity.opportunity_type, "value", "") or ""),
+                            "confidence": float(getattr(opportunity, "confidence", 0.0) or 0.0),
+                            "priority": int(getattr(opportunity, "priority", 0) or 0),
+                            "entry_price": float(getattr(opportunity, "entry_price", 0) or 0),
+                            "stop_loss": float(getattr(opportunity, "stop_loss", 0) or 0),
+                            "take_profit": float(getattr(opportunity, "take_profit", 0) or 0),
+                        },
+                    )
+                )
+        except Exception:
+            pass
 
         sym_key = self._norm_symbol_key(opportunity.symbol)
         now = datetime.now()
@@ -843,6 +923,26 @@ class ProactiveMarketScanner:
                 int(self._proactive_symbol_cooldown_sec),
                 sym_key,
             )
+            try:
+                hub = getattr(self.main_controller, "trade_event_hub", None) if self.main_controller else None
+                if hub and hasattr(hub, "publish_fill"):
+                    from src.modules.core.trade_event_hub import TradeFill
+
+                    await hub.publish_fill(
+                        TradeFill(
+                            trace_id=trace_id,
+                            source="proactive_ai",
+                            symbol=str(opportunity.symbol),
+                            side=str(opportunity.direction),
+                            action="open",
+                            success=False,
+                            quantity=None,
+                            detail=f"cooldown_symbol:{int(self._proactive_symbol_cooldown_sec)}s",
+                            raw={"cooldown_key": f"sym:{sym_key}"},
+                        )
+                    )
+            except Exception:
+                pass
             return False
         if opportunity.opportunity_type == OpportunityType.BREAKOUT:
             last_bo = self._last_proactive_trade_at.get(f"breakout:{sym_key}")
@@ -883,6 +983,26 @@ class ProactiveMarketScanner:
                     opportunity.symbol,
                     gr.reason,
                 )
+                try:
+                    hub = getattr(self.main_controller, "trade_event_hub", None) if self.main_controller else None
+                    if hub and hasattr(hub, "publish_fill"):
+                        from src.modules.core.trade_event_hub import TradeFill
+
+                        await hub.publish_fill(
+                            TradeFill(
+                                trace_id=trace_id,
+                                source="proactive_ai",
+                                symbol=str(opportunity.symbol),
+                                side=str(opportunity.direction),
+                                action="open",
+                                success=False,
+                                quantity=None,
+                                detail=str(gr.reason)[:280],
+                                raw={"gate_metrics": dict(gr.metrics or {})},
+                            )
+                        )
+                except Exception:
+                    pass
                 return False
         
         if self.main_controller and hasattr(self.main_controller, 'ai_trading_engine'):
@@ -897,7 +1017,8 @@ class ProactiveMarketScanner:
                         take_profit=opportunity.take_profit,
                         reasoning=opportunity.reasoning
                     )
-                    if result:
+                    ok = bool(isinstance(result, dict) and result.get("success"))
+                    if ok:
                         self._stats["actions_taken"] += 1
                         ts = datetime.now()
                         self._last_proactive_trade_at[f"sym:{sym_key}"] = ts
@@ -905,8 +1026,50 @@ class ProactiveMarketScanner:
                             self._last_proactive_trade_at[f"breakout:{sym_key}"] = ts
                         logger.info(f"✅ 执行机会成功: {opportunity.symbol}")
                         return True
+                    if isinstance(result, dict) and result.get("error"):
+                        logger.info("❌ 执行机会未成交: %s — %s", opportunity.symbol, str(result.get("error"))[:220])
+                        try:
+                            hub = getattr(self.main_controller, "trade_event_hub", None) if self.main_controller else None
+                            if hub and hasattr(hub, "publish_fill"):
+                                from src.modules.core.trade_event_hub import TradeFill
+
+                                await hub.publish_fill(
+                                    TradeFill(
+                                        trace_id=trace_id,
+                                        source="proactive_ai",
+                                        symbol=str(opportunity.symbol),
+                                        side=str(opportunity.direction),
+                                        action="open",
+                                        success=False,
+                                        quantity=None,
+                                        detail=str(result.get("error"))[:280],
+                                        raw={"result": dict(result)},
+                                    )
+                                )
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.error(f"执行机会失败: {e}")
+                    try:
+                        hub = getattr(self.main_controller, "trade_event_hub", None) if self.main_controller else None
+                        if hub and hasattr(hub, "publish_fill"):
+                            from src.modules.core.trade_event_hub import TradeFill
+
+                            await hub.publish_fill(
+                                TradeFill(
+                                    trace_id=trace_id,
+                                    source="proactive_ai",
+                                    symbol=str(opportunity.symbol),
+                                    side=str(opportunity.direction),
+                                    action="open",
+                                    success=False,
+                                    quantity=None,
+                                    detail=f"execute_exception:{type(e).__name__}:{str(e)[:200]}",
+                                    raw={"error": str(e)},
+                                )
+                            )
+                    except Exception:
+                        pass
         
         return False
     
@@ -1603,7 +1766,11 @@ class ProactiveAIOrchestrator:
                 "opportunities": len(self.market_scanner.get_opportunities()),
                 "insights": len(self.market_scanner.get_insights()),
                 "market_state": self.market_scanner.get_market_state(),
-                "stats": self.market_scanner.get_stats()
+                "stats": self.market_scanner.get_stats(),
+                "runtime": {
+                    "auto_execute_opportunities": bool(getattr(self.market_scanner, "_auto_execute_opportunities", False)),
+                    "execute_min_confidence": float(getattr(self.market_scanner, "_execute_min_confidence", 0.0) or 0.0),
+                },
             },
             "info_collector": {
                 "news_count": len(self.info_collector.get_latest_news()),

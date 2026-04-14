@@ -363,6 +363,13 @@ class DataSourceHub:
                     if last <= 0.0 and bid > 0.0 and ask > 0.0:
                         last = (bid + ask) / 2.0
                     if last > 0.0 or bid > 0.0 or ask > 0.0:
+                        chg_24h = float(
+                            raw.get("change_24h")
+                            or raw.get("change24h")
+                            or raw.get("change")
+                            or raw.get("chgUtc")
+                            or 0.0
+                        )
                         return {
                             "symbol": symbol,
                             "last": last,
@@ -371,6 +378,10 @@ class DataSourceHub:
                             "ask": ask,
                             "high": float(raw.get("high") or raw.get("high24h") or 0.0),
                             "low": float(raw.get("low") or raw.get("low24h") or 0.0),
+                            # Provide both snake_case + legacy keys for downstream consumers.
+                            "change_24h": chg_24h,
+                            "change24h": chg_24h,
+                            "change": chg_24h,
                             "volume": float(
                                 raw.get("volume")
                                 or raw.get("quoteVolume")
@@ -715,8 +726,10 @@ class DataSourceHub:
             "open_orders": [],
             "liquidation_proxy": {},
         }
-        task_specs = {
-            "ticker": asyncio.create_task(
+        # 只为 enabled collector 创建任务，避免“已禁用的重接口”仍然被调用拖慢整包。
+        task_specs: Dict[str, asyncio.Task] = {}
+        if "ticker" in enabled:
+            task_specs["ticker"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.ticker",
                     self.get_ticker(symbol),
@@ -725,8 +738,9 @@ class DataSourceHub:
                     health=health,
                     errors=errors,
                 )
-            ),
-            "order_book": asyncio.create_task(
+            )
+        if "order_book" in enabled:
+            task_specs["order_book"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.order_book",
                     self.get_order_book(symbol, depth=20),
@@ -735,8 +749,9 @@ class DataSourceHub:
                     health=health,
                     errors=errors,
                 )
-            ),
-            "open_interest": asyncio.create_task(
+            )
+        if "open_interest" in enabled:
+            task_specs["open_interest"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.open_interest",
                     self.get_open_interest(symbol),
@@ -745,8 +760,9 @@ class DataSourceHub:
                     health=health,
                     errors=errors,
                 )
-            ),
-            "funding_rate": asyncio.create_task(
+            )
+        if "funding_rate" in enabled:
+            task_specs["funding_rate"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.funding_rate",
                     self.get_funding_rate(symbol),
@@ -755,8 +771,9 @@ class DataSourceHub:
                     health=health,
                     errors=errors,
                 )
-            ),
-            "positions": asyncio.create_task(
+            )
+        if "positions" in enabled:
+            task_specs["positions"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.positions",
                     self.get_positions(),
@@ -765,8 +782,9 @@ class DataSourceHub:
                     health=health,
                     errors=errors,
                 )
-            ),
-            "open_orders": asyncio.create_task(
+            )
+        if "open_orders" in enabled:
+            task_specs["open_orders"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.open_orders",
                     self.get_open_orders(symbol=None),
@@ -775,8 +793,9 @@ class DataSourceHub:
                     health=health,
                     errors=errors,
                 )
-            ),
-            "liquidation_proxy": asyncio.create_task(
+            )
+        if "liquidation_proxy" in enabled:
+            task_specs["liquidation_proxy"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.liq_proxy",
                     self.get_liquidation_proxy(symbol),
@@ -785,11 +804,10 @@ class DataSourceHub:
                     health=health,
                     errors=errors,
                 )
-            ),
-        }
+            )
         budget_sec = float(os.getenv("OPENCLAW_DATA_HUB_EXCHANGE_BUDGET_SEC", "12") or "12")
         budget_sec = max(4.0, min(budget_sec, 20.0))
-        done, pending = await asyncio.wait(set(task_specs.values()), timeout=budget_sec)
+        done, pending = await asyncio.wait(set(task_specs.values()), timeout=budget_sec) if task_specs else (set(), set())
         results: Dict[str, Any] = dict(defaults)
         for name, task in task_specs.items():
             if task in done:
@@ -907,20 +925,28 @@ class DataSourceHub:
     def _score_quality(self, exchange_channel: Dict[str, Any], intel_channel: Dict[str, Any]) -> Dict[str, Any]:
         score = 0.0
         reasons: List[str] = []
+        enabled = set()
+        try:
+            enabled = set([str(x) for x in ((exchange_channel.get("collector") or {}).get("enabled") or [])])
+        except Exception:
+            enabled = set()
         t = exchange_channel.get("ticker") or {}
         px = float(t.get("price") or t.get("last") or 0.0)
         if px > 0:
             score += 0.35
         else:
-            reasons.append("交易所行情缺失")
+            if (not enabled) or ("ticker" in enabled):
+                reasons.append("交易所行情缺失")
         ex_col = exchange_channel.get("collector") or {}
         for note in ex_col.get("ticker_quality_notes") or []:
             if isinstance(note, str) and note:
                 reasons.append(note)
-        if exchange_channel.get("order_book", {}).get("bids"):
-            score += 0.2
-        else:
-            reasons.append("订单簿深度不足")
+        # 订单簿深度：只有在 collector 启用时才作为扣分项，避免在“禁用重接口保活”时被误判为低质量
+        if (not enabled) or ("order_book" in enabled):
+            if exchange_channel.get("order_book", {}).get("bids"):
+                score += 0.2
+            else:
+                reasons.append("订单簿深度不足")
         if exchange_channel.get("positions") is not None:
             score += 0.15
         if intel_channel.get("health", {}).get("third_party", "").startswith("ok"):
@@ -938,9 +964,11 @@ class DataSourceHub:
         """统一快照：供策略/风控/执行/前端共享。"""
         cfg = await self._cfg()
         # bounded overall snapshot budget; per-field timeouts are handled inside collectors
-        budget = float(cfg.get("snapshot_timeout_sec", 6.0) or 6.0)
-        budget_cap = float(os.getenv("OPENCLAW_DATA_HUB_SNAPSHOT_BUDGET_CAP", "18") or "18")
-        budget = max(4.0, min(budget, budget_cap))
+        # NOTE: this is a control-plane API dependency (MarketIntelligenceEngine).
+        # Keep it responsive by default; heavy collectors are already protected by per-collector timeouts.
+        budget = float(cfg.get("snapshot_timeout_sec", 2.5) or 2.5)
+        budget_cap = float(os.getenv("OPENCLAW_DATA_HUB_SNAPSHOT_BUDGET_CAP", "6") or "6")
+        budget = max(1.5, min(budget, budget_cap))
         try:
             # 全局 budget 仅作为保护上限，不阻断已完成子通道结果。
             # 具体超时在各 collector 内部按字段分级处理，避免一次整体 timeout 导致整包清空。

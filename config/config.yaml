@@ -118,6 +118,9 @@ trading:
     leverage_min: 10
     leverage_max: 100
     default_leverage: 20
+    # 默认开仓数量（USDT 永续合约张数/数量，按交易所合约规则解释）
+    # 以前代码写死 0.01，这里改为配置项，便于按风险/账户规模调整
+    default_quantity: 0.01
     max_positions_oneway: 5
     max_positions_hedge: 8
     grid_trading: true
@@ -420,22 +423,30 @@ paths:
 timing:
   config_watch_interval: 30
 active_trader:
-  min_trade_interval: 300
+  # 用户要求：开仓最小间隔 5 秒
+  min_trade_interval: 5
 proactive_scanner:
   scan_interval: 30
   deep_scan_interval: 300
-  proactive_auto_execute_opportunities: false
-  proactive_ai_core_forward_cooldown_sec: 180
-  proactive_execute_min_confidence: 0.78
-  mean_reversion_min_abs_change: 0.08
+  # 开启后：扫描器对“高置信 + 通过实时数据预检”的机会会触发开仓（走 ExecutionGateway）
+  proactive_auto_execute_opportunities: true
+  # 用户要求：开仓最小间隔 5 秒（转发给 ai_core 的冷却也同步收敛）
+  proactive_ai_core_forward_cooldown_sec: 5
+  # 均值回归机会的 confidence 由 |24h涨跌幅|×10 推导；0.55≈5.5% 才会触发执行评估。
+  # 用户验收要求：置信度 >=65% 才允许自动开仓评估
+  proactive_execute_min_confidence: 0.65
+  # 原值 0.08(8%) 过于激进，会导致多数时间“无机会”，从而看起来系统不产生开仓线索。
+  mean_reversion_min_abs_change: 0.02
   breakout_min_volume_vs_prior_avg: 0
-  proactive_symbol_trade_cooldown_sec: 180
-  breakout_trade_cooldown_sec: 600
+  proactive_symbol_trade_cooldown_sec: 5
+  breakout_trade_cooldown_sec: 5
   proactive_skip_breakout_if_same_side_position: true
   scanner_opportunity_gate:
     enabled: true
     max_spread_bps: 45.0
-    max_entry_vs_last_slippage_pct: 0.015
+    # 允许入场价与最新价存在一定偏差（突破/均值回归会用K线收盘或关键价位作为entry），
+    # 过严会导致机会全部被门控拦截，从而看起来“系统不自动开仓”。
+    max_entry_vs_last_slippage_pct: 0.05
     min_risk_reward: 1.05
     min_abs_change_24h: 0.0
     require_insight_trend_alignment: true
@@ -453,7 +464,6 @@ proactive_scanner:
   - ADA/USDT
   - AVAX/USDT
   - DOT/USDT
-  - MATIC/USDT
   - LINK/USDT
   - ATOM/USDT
 market_intelligence:
@@ -464,6 +474,13 @@ market_intelligence:
   - ETH/USDT
   - SOL/USDT
   - BNB/USDT
+  - XRP/USDT
+  - DOGE/USDT
+  - ADA/USDT
+  - AVAX/USDT
+  - DOT/USDT
+  - LINK/USDT
+  - ATOM/USDT
   contract_cache_ttl_sec: 3600
   fee_rate_taker: 0.0005
   fee_rate_maker: 0.0002
@@ -480,12 +497,13 @@ data_source_hub:
   enable_legacy_external_analysis: false
   fetch_timeout_sec: 2.8
   snapshot_timeout_sec: 6.0
-  include_klines_1h: true
+  # 当前 OKX REST 深度/K线链路不稳定时，禁用重接口，优先保证“可交易最小集”(ticker/资金费率/持仓等)
+  include_klines_1h: false
   klines_1h_limit: 64
   exchange_collectors:
   - ticker
-  - order_book
-  - klines_1h
+  # - order_book
+  # - klines_1h
   - open_interest
   - funding_rate
   - positions
@@ -537,7 +555,8 @@ proactive_ai:
   scan_interval: 30
   deep_scan_interval: 300
   collect_interval: 300
-  action_cooldown: 60
+  # 用户要求：开仓最小间隔 5 秒（动作触发器节流同步收敛）
+  action_cooldown: 5
   notifications:
     opportunity_enabled: true
     opportunity_min_confidence: 0.9

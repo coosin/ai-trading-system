@@ -1,10 +1,10 @@
 import React from 'react';
-import ControlHubModule from './modules/control-hub/ControlHubModule';
+import UnifiedControlHubModule from './modules/control-hub/UnifiedControlHubModule';
 
 function App() {
   return (
-    <div style={{ minHeight: '100vh', background: '#f5f7fb' }}>
-      <ControlHubModule />
+    <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>
+      <UnifiedControlHubModule />
     </div>
   );
 }

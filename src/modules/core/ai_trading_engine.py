@@ -1343,8 +1343,8 @@ class AITradingEngine:
                     metadata={"ai_analysis": ai_decision, "market_context": context.__dict__},
                 )
             
-            # 计算仓位大小
-            quantity = await self._calculate_position_size(symbol, context, action)
+            # 计算仓位大小（按总资金 5%~10% 的保证金预算，自适应波动与置信度）
+            quantity = await self._calculate_position_size(symbol, context, action, confidence=float(confidence))
             
             # 计算止损止盈
             stop_loss, take_profit = self._calculate_stop_loss_take_profit(
@@ -1445,8 +1445,13 @@ class AITradingEngine:
         else:
             return TradeAction.HOLD
     
-    async def _calculate_position_size(self, symbol: str, context: MarketContext,
-                                      action: TradeAction) -> float:
+    async def _calculate_position_size(
+        self,
+        symbol: str,
+        context: MarketContext,
+        action: TradeAction,
+        confidence: Optional[float] = None,
+    ) -> float:
         """计算仓位大小"""
         try:
             # 获取账户余额
@@ -1464,16 +1469,49 @@ class AITradingEngine:
             total_exposure = self._estimate_total_exposure()
             symbol_exposure = self._estimate_symbol_exposure(symbol)
             
-            # 基于风险计算仓位
-            risk_amount = available * self.ai_config["risk_per_trade"]
-            
-            # 根据波动率调整
-            volatility_factor = 1 - min(context.volatility, 0.5)
-            
-            # 根据置信度调整
-            # 这里简化处理，实际应该传入confidence
-            
-            position_value = risk_amount * volatility_factor
+            # 单笔保证金预算：总资金 5%~10%（用户要求）
+            # 以 equity 为基准，结合波动率与置信度做自适应微调。
+            min_pct = float(self.ai_config.get("position_margin_pct_min", 0.05) or 0.05)
+            max_pct = float(self.ai_config.get("position_margin_pct_max", 0.10) or 0.10)
+            base_pct = float(self.ai_config.get("position_margin_pct_default", 0.07) or 0.07)
+            min_pct = max(0.01, min(min_pct, 0.50))
+            max_pct = max(min_pct, min(max_pct, 0.90))
+            base_pct = max(min_pct, min(base_pct, max_pct))
+
+            c = None
+            try:
+                c = float(confidence) if confidence is not None else None
+            except Exception:
+                c = None
+            if c is not None:
+                # 置信度越高，越接近上限；低于 0.65 则更保守（但通常已被门控拦截）
+                if c >= 0.85:
+                    base_pct = max(base_pct, max_pct)
+                elif c <= 0.65:
+                    base_pct = min(base_pct, min_pct)
+                else:
+                    # 0.65..0.85 线性插值到 0.05..0.10
+                    t = (c - 0.65) / max(1e-9, 0.20)
+                    base_pct = min_pct + (max_pct - min_pct) * max(0.0, min(1.0, t))
+
+            # 波动率越高，保证金预算越低（最多降到 60%）
+            vol = float(context.volatility or 0.0)
+            vol = max(0.0, min(vol, 0.50))
+            vol_factor = 1.0 - 0.8 * vol  # 0..0.5 => 1..0.6
+            margin_value = equity * base_pct * vol_factor
+
+            # 杠杆：10~100，自适应（低波动/高置信度可略提高）
+            lev_min = int(self.contract_config.get("leverage_min", 10) or 10)
+            lev_max = int(self.contract_config.get("leverage_max", 100) or 100)
+            lev0 = int(self.contract_config.get("default_leverage", 20) or 20)
+            lev = lev0
+            if c is not None and c >= 0.80 and vol <= 0.10:
+                lev = min(lev_max, max(lev, int(round(lev0 * 1.25))))
+            if vol >= 0.25:
+                lev = max(lev_min, int(round(lev * 0.75)))
+            lev = max(lev_min, min(lev, lev_max))
+
+            position_value = margin_value * float(lev)
             if action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
                 # 分散和资金链保护：单币和总敞口双限制
                 max_symbol_ratio = float(self.ai_config.get("max_symbol_position_ratio", 0.2) or 0.2)
@@ -2115,6 +2153,7 @@ class AITradingEngine:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         reasoning: str = "",
+        confidence: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         外部模块（主动性扫描、ProactiveActionTrigger 等）统一开仓入口。
@@ -2130,14 +2169,72 @@ class AITradingEngine:
             s = "long"
         if s in ("sell", "s"):
             s = "short"
-        qty = float(quantity or 0.01)
-        lev = int(self.contract_config.get("default_leverage", 20))
+        # 自适应杠杆（10-100）
+        lev_min = int(self.contract_config.get("leverage_min", 10) or 10)
+        lev_max = int(self.contract_config.get("leverage_max", 100) or 100)
+        lev0 = int(self.contract_config.get("default_leverage", 20) or 20)
+        lev = max(lev_min, min(lev0, lev_max))
+        try:
+            mc = self.main_controller
+            mi = getattr(mc, "market_intelligence", None) if mc else None
+            if mi and hasattr(mi, "get_symbol_view"):
+                view = await asyncio.wait_for(mi.get_symbol_view(symbol, include_snapshot=False), timeout=1.2)
+                vd = view.to_dict() if hasattr(view, "to_dict") else {}
+                atrp = vd.get("atr_pct_1h")
+                if atrp is not None:
+                    atr = float(atrp)
+                    # 以 1.5% ATR 为基准：更低波动→可适度提高杠杆；更高波动→降低杠杆
+                    target = lev0 * (0.015 / max(0.001, min(0.15, atr)))
+                    lev = int(round(max(lev_min, min(lev_max, target))))
+        except Exception:
+            pass
+        try:
+            c = float(confidence) if confidence is not None else None
+            if c is not None and c >= 0.85:
+                lev = min(lev_max, max(lev, int(round(lev0 * 1.25))))
+            if c is not None and c <= 0.65:
+                lev = max(lev_min, min(lev, lev0))
+        except Exception:
+            pass
+
+        default_qty = float(self.contract_config.get("default_quantity", 0.01) or 0.01)
+        qty = float(quantity if quantity is not None else default_qty)
+        # 若未指定 quantity，则按“单笔保证金=总资金 5%~10%”计算（近似用 USDT 可用余额）
+        if quantity is None:
+            try:
+                bal = await self.exchange.get_balance()
+                usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+                if isinstance(usdt, dict):
+                    available = float(usdt.get("free", usdt.get("available", 0)) or 0)
+                else:
+                    available = float(usdt or 0)
+                # margin fraction 5%..10%
+                min_pct = float(self.ai_config.get("position_margin_pct_min", 0.05) or 0.05)
+                max_pct = float(self.ai_config.get("position_margin_pct_max", 0.10) or 0.10)
+                base_pct = float(self.ai_config.get("position_margin_pct_default", 0.07) or 0.07)
+                base_pct = max(min_pct, min(base_pct, max_pct))
+                if confidence is not None:
+                    c = float(confidence)
+                    if c >= 0.85:
+                        base_pct = max_pct
+                    elif c <= 0.65:
+                        base_pct = min_pct
+                margin = max(0.0, available * base_pct)
+                t = await self.exchange.get_ticker(symbol if "/" in str(symbol) else str(symbol).replace("-", "/"))
+                px = float((t or {}).get("last") or (t or {}).get("price") or 0)
+                if px > 0 and margin > 0:
+                    notional = margin * float(lev)
+                    qty = max(default_qty, float(notional / px))
+            except Exception:
+                pass
+        # 重要：ExecutionGateway 默认禁止 source=system 开仓（见 ai_brain.policy.allow_system_open）。
+        # 主开仓权在 single_write_owner=ai_core，因此这里以 ai_core 作为 source，确保链路可执行且可审计。
         res = await gw.open_swap(
             symbol,
             s,
             qty,
             lev,
-            "system",
+            "ai_core",
             reasoning or "execute_trade",
             margin_mode="cross",
             price=None,
@@ -2145,6 +2242,8 @@ class AITradingEngine:
                 "requested_stop_loss": stop_loss,
                 "requested_take_profit": take_profit,
                 "reasoning": reasoning,
+                "confidence": confidence,
+                "origin": "ai_trading_engine.execute_trade",
             },
         )
         if not res.get("success"):

@@ -87,7 +87,15 @@ class OKXWebSocketHub:
         return data
 
     async def start(self) -> None:
-        raw = os.getenv("OPENCLAW_OKX_WS_TICKER_INSTIDS", "BTC-USDT-SWAP,ETH-USDT-SWAP")
+        raw = os.getenv(
+            "OPENCLAW_OKX_WS_TICKER_INSTIDS",
+            (
+                "BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP,BNB-USDT-SWAP,"
+                "XRP-USDT-SWAP,DOGE-USDT-SWAP,ADA-USDT-SWAP,AVAX-USDT-SWAP,"
+                # 备注：OKX USDT 永续并非所有“主流币现货”都有对应合约，避免订阅不存在的 instId 刷屏并拖慢重连。
+                "DOT-USDT-SWAP,LINK-USDT-SWAP,ATOM-USDT-SWAP"
+            ),
+        )
         instids = [x.strip() for x in raw.split(",") if x.strip()]
         self._stop.clear()
         self._tasks.append(asyncio.create_task(self._public_tickers_loop(instids), name="okx-ws-public-tickers"))

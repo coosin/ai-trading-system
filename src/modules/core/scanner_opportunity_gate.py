@@ -116,6 +116,12 @@ class ScannerOpportunityGate:
                 view = await mi.get_symbol_view(sym, include_snapshot=False)
                 es = getattr(view, "execution_support", None)
                 guards = (es.get("guards") or {}) if isinstance(es, dict) else {}
+                q = getattr(view, "quality_score", None)
+                if q is not None:
+                    try:
+                        metrics["mi_quality_score"] = float(q)
+                    except Exception:
+                        pass
                 if guards:
                     metrics["mi_guards"] = dict(guards)
                     # 若 gate 本身未显式配置，采用 MI 建议值
@@ -123,6 +129,14 @@ class ScannerOpportunityGate:
                         self.config["max_spread_bps"] = guards.get("max_spread_bps_to_trade", self._c("max_spread_bps", 45.0))
                     if "min_risk_reward" not in self.config:
                         self.config["min_risk_reward"] = guards.get("min_rr_to_trade", self._c("min_risk_reward", 1.05))
+                    # 数据质量门槛（若 MI 给出了质量分与阈值建议）
+                    try:
+                        min_q = float(guards.get("min_quality_score_to_trade", 0) or 0)
+                        qv = float(metrics.get("mi_quality_score")) if metrics.get("mi_quality_score") is not None else None
+                        if min_q > 0 and qv is not None and qv < min_q:
+                            return ScannerGateResult(False, f"mi_quality_low:{qv:.3f}<{min_q}", metrics)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -163,7 +177,9 @@ class ScannerOpportunityGate:
                 metrics,
             )
 
-        slip_max = float(self._c("max_entry_vs_last_slippage_pct", 0.015) or 0)
+        # 默认允许 5% 的 entry vs last 偏差：突破/均值回归机会的 entry_price 可能取自 K线收盘或关键价位，
+        # 在波动期与实时 last 存在偏差属正常；过严会导致机会全部被门控拦截而无法进入决策/执行链路。
+        slip_max = float(self._c("max_entry_vs_last_slippage_pct", 0.05) or 0)
         entry = float(getattr(opportunity, "entry_price", 0) or 0)
         if slip_max > 0 and last > 0 and entry > 0:
             slip = abs(entry - last) / last

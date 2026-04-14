@@ -6,6 +6,15 @@
 - **运行维护:** 保持账户链路优先策略，持续使用 OKX 代理优先与抖动降载保护，降低市场高频请求对钱包/持仓同步的影响。
 - **文档同步:** 更新变更记录，便于后续运维追溯与发布同步。
 
+## 2026-04-14 — API 文档与仓库同步
+
+- **API 文档对齐运行态:** `docs/API_REFERENCE.md` 明确：
+  - `GET /api/v1/market/symbol/{symbol}` 支持包含 `/` 的 symbol（建议 URL 编码如 `BTC%2FUSDT`）
+  - `market/state` 与 `market/symbol` 的超时降级语义（`degraded=true`、缓存回退）
+  - 事件流补齐中文别名字段（`type_zh`/`action_zh`/`side_zh`/`detail_zh`/`reason_zh`）
+- **OpenAPI 导出:** 从运行实例 `GET /openapi.json` 导出到 `docs/API_OPENAPI_FULL.json`（权威以该文件与线上 `/docs` 为准）。
+- **仓库卫生:** 扩展 `.gitignore` 以忽略 `logs/_tmp*.json` 与 `*.backup*`/`*.bak_*`，并移除本地备份残留文件，避免误提交。
+
 ## 2026-04-14 — 监控 API 与文档
 
 - **监控:** `GET /api/v1/monitoring/alerts` 与 `alerts/history` 合并 **TradingMonitor** 与 **EnhancedMonitoringSystem** 告警，条目含 `source` 字段；`summary` 增加 `sources` 及增强监控状态块；`resolve` 同时识别两路 ID。`MainController` 在增强监控初始化成功/失败/清理时调用 `set_enhanced_monitoring`，保证 REST 与 Telegram 规则告警一致。
