@@ -108,17 +108,16 @@ class AICoreDecisionEngine:
             "leverage_max": 100,
             "default_leverage": 20,
             "max_positions": 5,
-            # 中频档：在不激进放宽风控的前提下，适度提升开单频率
-            # 用户要求：开仓最小间隔 5 秒
-            "min_trade_interval": 5,
+            # 开仓最小间隔：收敛到 60 秒，降低噪声交易频率
+            "min_trade_interval": 60,
             "strategy_check_interval": 300,
             "backtest_lookback_days": 30,
             "aggressive_mode": False,
             "auto_create_strategy": True,
             # 开仓/交易置信度阈值（用户要求：>=65% 才允许开仓）
-            "min_confidence_to_trade": 0.65,
+            "min_confidence_to_trade": 0.75,
             # Explicit open gate: avoid low-confidence churn
-            "ai_core_min_confidence_to_open": 0.65,
+            "ai_core_min_confidence_to_open": 0.75,
             "min_data_quality_to_trade": 0.55,
             "min_rr_to_trade": 1.15,
             "max_spread_bps_to_trade": 40.0,
@@ -984,8 +983,8 @@ class AICoreDecisionEngine:
                 "high_risk_spread_multiplier": 0.88,
             },
             "balanced": {
-                "min_trade_interval": 80,
-                "min_confidence_to_trade": 0.72,
+                "min_trade_interval": 60,
+                "min_confidence_to_trade": 0.75,
                 "min_rr_to_trade": 1.15,
                 "max_spread_bps_to_trade": 40.0,
                 "degraded_data_quantity_factor": 0.68,
@@ -996,8 +995,8 @@ class AICoreDecisionEngine:
                 "high_risk_spread_multiplier": 0.90,
             },
             "aggressive": {
-                "min_trade_interval": 65,
-                "min_confidence_to_trade": 0.68,
+                "min_trade_interval": 60,
+                "min_confidence_to_trade": 0.75,
                 "min_rr_to_trade": 1.10,
                 "max_spread_bps_to_trade": 48.0,
                 "degraded_data_quantity_factor": 0.75,

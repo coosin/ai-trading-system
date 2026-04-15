@@ -398,7 +398,13 @@ class MainController:
         """Best-effort exchange accessor (keeps backward compatibility)."""
         if getattr(self, "okx_exchange", None) is not None:
             return self.okx_exchange
-        return getattr(self, "exchange", None)
+        if getattr(self, "exchange", None) is not None:
+            return self.exchange
+        # Fallback: in some startup/race windows, exchange is mounted only on ai_trading_engine.
+        brain = getattr(self, "ai_trading_engine", None)
+        if brain is not None and getattr(brain, "exchange", None) is not None:
+            return brain.exchange
+        return None
 
     def get_llm_integration(self):
         return getattr(self, "llm_integration", None)

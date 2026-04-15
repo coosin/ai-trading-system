@@ -62,6 +62,22 @@ pytest tests/
 python start.py
 ```
 
+### MCP 基础联调（新增）
+
+建议先阅读 [`docs/MCP_BASELINE.md`](./MCP_BASELINE.md)。开发联调顺序：
+
+1. 先跑本系统 API（`/health`、`/api/v1/modules/commander/snapshot`）
+2. 再接 MCP 客户端（Cursor / Claude Code）做只读工具验证
+3. 最后开放写路径并开启二次确认（下单/撤单）
+
+最小验收：
+
+```bash
+curl -s http://127.0.0.1:8000/health
+curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
+curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/account-diagnostics'
+```
+
 ### IDE配置
 
 推荐使用 VSCode 或 PyCharm

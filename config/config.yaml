@@ -423,23 +423,23 @@ paths:
 timing:
   config_watch_interval: 30
 active_trader:
-  # 用户要求：开仓最小间隔 5 秒
-  min_trade_interval: 5
+  # 开仓最小间隔提升到 60 秒，降低噪声交易
+  min_trade_interval: 60
 proactive_scanner:
   scan_interval: 30
   deep_scan_interval: 300
   # 开启后：扫描器对“高置信 + 通过实时数据预检”的机会会触发开仓（走 ExecutionGateway）
   proactive_auto_execute_opportunities: true
-  # 用户要求：开仓最小间隔 5 秒（转发给 ai_core 的冷却也同步收敛）
-  proactive_ai_core_forward_cooldown_sec: 5
+  # 转发给 ai_core 的冷却收敛到 60 秒
+  proactive_ai_core_forward_cooldown_sec: 60
   # 均值回归机会的 confidence 由 |24h涨跌幅|×10 推导；0.55≈5.5% 才会触发执行评估。
-  # 用户验收要求：置信度 >=65% 才允许自动开仓评估
-  proactive_execute_min_confidence: 0.65
+  # 统一提升开仓门槛：置信度 >=75% 才允许自动开仓评估
+  proactive_execute_min_confidence: 0.75
   # 原值 0.08(8%) 过于激进，会导致多数时间“无机会”，从而看起来系统不产生开仓线索。
   mean_reversion_min_abs_change: 0.02
   breakout_min_volume_vs_prior_avg: 0
-  proactive_symbol_trade_cooldown_sec: 5
-  breakout_trade_cooldown_sec: 5
+  proactive_symbol_trade_cooldown_sec: 60
+  breakout_trade_cooldown_sec: 60
   proactive_skip_breakout_if_same_side_position: true
   scanner_opportunity_gate:
     enabled: true
@@ -539,7 +539,7 @@ ai_trading:
     enabled: true
     model_id: astron-code-latest
     analysis_interval: 120
-    min_confidence: 0.65
+    min_confidence: 0.75
     max_positions: 5
     risk_per_trade: 0.01
     trade_mode: real
@@ -555,8 +555,8 @@ proactive_ai:
   scan_interval: 30
   deep_scan_interval: 300
   collect_interval: 300
-  # 用户要求：开仓最小间隔 5 秒（动作触发器节流同步收敛）
-  action_cooldown: 5
+  # 动作触发器节流同步收敛到 60 秒
+  action_cooldown: 60
   notifications:
     opportunity_enabled: true
     opportunity_min_confidence: 0.9
@@ -569,19 +569,35 @@ stop_loss_take_profit:
   trailing_only_mode: true
   trailing_only_coerce_inputs: true
   trailing_active_on_open: true
-  initial_trailing_offset: 0.01
-  profit_tier2_pnl_threshold: 0.5
-  tier2_trailing_offset: 0.005
+  initial_trailing_offset: 0.1
+  profit_tier2_pnl_threshold: 0.3
+  tier2_trailing_offset: 0.05
   trailing_momentum_adjust_enable: true
-  default_stop_loss_percent: 0.03
+  default_stop_loss_percent: 0.1
   default_take_profit_percent: 0.0
   open_rr_synthetic_reward_multiple: 1.5
   enable_trailing_stop: true
-  trailing_stop_offset: 0.01
+  trailing_stop_offset: 0.1
   trailing_stop_trigger: 0.0
   enable_breakeven: false
   breakeven_trigger: 0.02
-  enable_partial_tp: false
+  enable_partial_tp: true
+  layered_partial_tp_enable: true
+  layered_partial_tp_levels:
+  - - 0.3
+    - 0.3
+  - - 0.5
+    - 0.2
+  layered_trailing_tp_enable: true
+  layered_trailing_tp_drawdown_levels:
+  - - 0.3
+    - 0.05
+  - - 0.5
+    - 0.1
+  - - 0.6
+    - 0.15
+  min_trailing_offset: 0.005
+  max_trailing_offset: 0.2
   check_interval: 5
   execute_exchange_on_trigger: true
 system_monitor: {}

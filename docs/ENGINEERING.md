@@ -91,6 +91,18 @@ OpenAPI 以运行实例 **`/openapi.json`** 为准。
 - **单一 API 进程:** 生产应只存在一个 `APIServer` 活跃实例（`main.py` 复用 `MainController` 已创建的实例；重复构造会触发保护，调试可设 `OPENCLAW_API_ALLOW_MULTI_INSTANCE=1`）。绑定一致性探针：`GET /api/v1/debug/exchange-binding`。
 - **REST / WebSocket 响应形状:** HTTP JSON 经中间件补齐标准字段（见 `docs/API_REFERENCE.md`）；WebSocket 出站同样补齐，便于前端统一解析。
 
+### 4.2 账户/持仓同步一致性（2026-04-15）
+
+- `MainController.get_exchange()` 采用多级兜底：
+  1. `okx_exchange`
+  2. `self.exchange`
+  3. `ai_trading_engine.exchange`
+- 快照接口 `GET /api/v1/modules/commander/snapshot` 的账户持仓为多级回退：
+  1. `_latest_account_state.positions`
+  2. `ai_trading_engine.positions`（进程内已接管仓位）
+  3. 交易所 `get_positions()`（短超时直拉）
+- 目标：避免出现“交易所有持仓但控制面显示 0”的误判，优先保证控制面可解释与风控一致性。
+
 ---
 
 ## 5. 与 ARCHITECTURE 的关系

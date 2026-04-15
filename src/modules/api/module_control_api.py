@@ -778,6 +778,61 @@ def init_module_control_api(app, main_controller):
             "applied": applied,
         }
 
+    @router.get("/ai/learning-feedback")
+    async def get_ai_learning_feedback():
+        """
+        获取 AI 交易引擎的止损复盘与信号惩罚状态（验收可视化接口）。
+        说明：
+        - stop_loss_hits 每累计 3 次，会将该信号额外开仓门槛 +0.05（上限 +0.15）
+        """
+        if not main_controller or not hasattr(main_controller, "ai_trading_engine") or not main_controller.ai_trading_engine:
+            return {"success": False, "message": "AI交易引擎未初始化"}
+        engine = main_controller.ai_trading_engine
+        try:
+            stats_raw = getattr(engine, "_signal_stop_loss_stats", {}) or {}
+            if not isinstance(stats_raw, dict):
+                stats_raw = {}
+
+            rows: List[Dict[str, Any]] = []
+            for signal_key, item in stats_raw.items():
+                it = item if isinstance(item, dict) else {}
+                hits = int(it.get("stop_loss_hits", 0) or 0)
+                steps = hits // 3
+                extra = min(0.15, 0.05 * steps)
+                rows.append(
+                    {
+                        "signal_key": str(signal_key),
+                        "stop_loss_hits": hits,
+                        "penalty_steps": steps,
+                        "extra_confidence_threshold": float(round(extra, 4)),
+                        "last_at": it.get("last_at"),
+                    }
+                )
+
+            rows.sort(key=lambda x: (x.get("stop_loss_hits", 0), x.get("last_at") or ""), reverse=True)
+
+            ai_cfg = getattr(engine, "ai_config", {}) or {}
+            base_min_conf = float(ai_cfg.get("min_confidence", 0.75) or 0.75)
+            max_pos_ratio = float(ai_cfg.get("max_position_value_ratio", 0.05) or 0.05)
+            hard_max_positions = int(ai_cfg.get("hard_max_positions", 5) or 5)
+            require_trend_for_open = bool(ai_cfg.get("require_trend_for_open", True))
+
+            return {
+                "success": True,
+                "summary": {
+                    "tracked_signals": len(rows),
+                    "penalized_signals": sum(1 for r in rows if float(r.get("extra_confidence_threshold", 0)) > 0),
+                    "base_min_confidence": base_min_conf,
+                    "max_position_value_ratio": max_pos_ratio,
+                    "hard_max_positions": hard_max_positions,
+                    "require_trend_for_open": require_trend_for_open,
+                },
+                "signals": rows[:200],
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": f"读取学习反馈失败: {e}"}
+
     @router.get("/ai/frequency-profile")
     async def get_ai_frequency_profile():
         """读取当前开单频率档位（根据关键门控参数推断）"""
@@ -1316,6 +1371,63 @@ def init_module_control_api(app, main_controller):
                 "positions": st.get("positions"),
                 "synced_at": st.get("timestamp"),
             }
+            # Fallback: when cache is stale/empty, use ai_trading_engine in-memory positions to avoid false "0 positions".
+            if not isinstance(out["account"].get("positions"), list):
+                out["account"]["positions"] = []
+            if len(out["account"]["positions"]) == 0:
+                te = getattr(mc, "ai_trading_engine", None)
+                te_pos = getattr(te, "positions", {}) if te else {}
+                if isinstance(te_pos, dict) and te_pos:
+                    rebuilt: List[Dict[str, Any]] = []
+                    for sym, p in te_pos.items():
+                        try:
+                            rebuilt.append(
+                                {
+                                    "symbol": getattr(p, "symbol", sym),
+                                    "side": getattr(p, "side", None),
+                                    "size": float(getattr(p, "quantity", 0.0) or 0.0),
+                                    "entry_price": float(getattr(p, "entry_price", 0.0) or 0.0),
+                                    "mark_price": float(getattr(p, "current_price", 0.0) or 0.0),
+                                    "unrealized_pnl": float(getattr(p, "unrealized_pnl", 0.0) or 0.0),
+                                }
+                            )
+                        except Exception:
+                            continue
+                    out["account"]["positions"] = rebuilt
+                    out["account"]["synced_at"] = datetime.now().isoformat()
+                    out["alerts"].append("account_positions_from_ai_trading_engine_fallback")
+            # Last fallback: short direct exchange pull (non-blocking timeout) for fast snapshot correctness.
+            if len(out["account"]["positions"]) == 0:
+                try:
+                    ex = mc.get_exchange() if hasattr(mc, "get_exchange") else None
+                    if ex and hasattr(ex, "get_positions"):
+                        raw_positions = await asyncio.wait_for(ex.get_positions(), timeout=2.5)
+                        rebuilt2: List[Dict[str, Any]] = []
+                        for p in raw_positions or []:
+                            if not isinstance(p, dict):
+                                continue
+                            try:
+                                sz = float(p.get("size", p.get("pos", 0)) or 0)
+                            except Exception:
+                                sz = 0.0
+                            if abs(sz) <= 1e-12:
+                                continue
+                            rebuilt2.append(
+                                {
+                                    "symbol": p.get("symbol") or p.get("instId"),
+                                    "side": p.get("side"),
+                                    "size": sz,
+                                    "entry_price": p.get("entry_price"),
+                                    "mark_price": p.get("mark_px") or p.get("mark_price"),
+                                    "unrealized_pnl": p.get("unrealized_pnl"),
+                                }
+                            )
+                        if rebuilt2:
+                            out["account"]["positions"] = rebuilt2
+                            out["account"]["synced_at"] = datetime.now().isoformat()
+                            out["alerts"].append("account_positions_from_exchange_fallback")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1645,10 +1757,31 @@ def init_module_control_api(app, main_controller):
             data = await asyncio.wait_for(main_controller.get_account_sync_diagnostics(), timeout=45.0)
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
         except asyncio.TimeoutError:
+            # 降级时也返回关键事实，避免前端误判为 exchange=None / positions=0。
+            ex_name = None
+            try:
+                ex = main_controller.get_exchange() if hasattr(main_controller, "get_exchange") else None
+                ex_name = type(ex).__name__ if ex is not None else None
+            except Exception:
+                ex_name = None
+            st = getattr(main_controller, "_latest_account_state", None)
+            cached_positions = []
+            if isinstance(st, dict) and isinstance(st.get("positions"), list):
+                cached_positions = st.get("positions") or []
+            elif (
+                getattr(main_controller, "ai_trading_engine", None) is not None
+                and isinstance(getattr(main_controller.ai_trading_engine, "positions", None), dict)
+            ):
+                cached_positions = list(main_controller.ai_trading_engine.positions.values())
             return {
                 "success": True,
                 "degraded": True,
-                "data": {"status": "timeout_degraded", "hint": "account_diagnostics_timeout"},
+                "data": {
+                    "status": "timeout_degraded",
+                    "hint": "account_diagnostics_timeout",
+                    "exchange": ex_name,
+                    "cached_position_count": len(cached_positions),
+                },
                 "timestamp": datetime.now().isoformat(),
             }
         except Exception as e:

@@ -158,11 +158,11 @@ class StopLossTakeProfitOrder:
 @dataclass
 class StopLossTakeProfitConfig:
     """止盈止损管理器配置 - 移动止损模式"""
-    default_stop_loss_percent: float = 0.05  # 固定止损5%（兜底）
+    default_stop_loss_percent: float = 0.10  # 固定止损10%（兜底）
     default_take_profit_percent: float = 0.0  # 不设固定止盈
     enable_trailing_stop: bool = True
-    trailing_stop_offset: float = 0.045
-    trailing_stop_trigger: float = 0.035  # 3.5%触发二档
+    trailing_stop_offset: float = 0.10
+    trailing_stop_trigger: float = 0.06  # 3.5%触发二档
     # --- 移动止盈止损模式：开仓即2.3%追踪；浮盈达2.3%后收紧到1.3%；不设固定止盈 ---
     trailing_only_mode: bool = True
     """为 True 时：新建单使用 TRAILING 止损 + 无固定止盈价，仅依赖移动止损出场。"""
@@ -170,11 +170,11 @@ class StopLossTakeProfitConfig:
     """为 True 且 trailing_only_mode 时：忽略外部传入的固定/百分比 SLTP，强制移动止损 + 无止盈价。"""
     trailing_active_on_open: bool = True
     """开仓即启用移动止损逻辑（不等浮盈达到 trailing_stop_trigger）。"""
-    initial_trailing_offset: float = 0.045  # 4.5% 初始移动止损
+    initial_trailing_offset: float = 0.10  # 10% 初始移动止损
     """初始移动止损相对峰值/入场的回撤比例（2.3%）。"""
-    profit_tier2_pnl_threshold: float = 0.035
+    profit_tier2_pnl_threshold: float = 0.06
     """二档：相对入场的浮盈比例达到2.3%后，将移动带宽收紧为 tier2_trailing_offset。"""
-    tier2_trailing_offset: float = 0.025  # 2.5%二档移动带宽
+    tier2_trailing_offset: float = 0.04  # 2.5%二档移动带宽
     """二档移动带宽（1.3%），浮盈2.3%后启用，更严格锁利。"""
     # 动能微调：趋势+短周期变化在「中性带」内则不改变 trailing_offset；转弱收紧，顺势略放宽
     trailing_momentum_adjust_enable: bool = True
@@ -184,7 +184,23 @@ class StopLossTakeProfitConfig:
     trailing_momentum_loosen_factor: float = 1.05
     enable_breakeven: bool = True  # 启用保本止损
     breakeven_trigger: float = 0.02
-    enable_partial_tp: bool = False
+    # 分层固定止盈（锁仓）
+    # 1) 浮盈>=30% 平30%
+    # 2) 浮盈>=50% 再平20%
+    # 剩余50%继续持有
+    enable_partial_tp: bool = True
+    layered_partial_tp_enable: bool = True
+    layered_partial_tp_levels: List[Tuple[float, float]] = field(
+        default_factory=lambda: [(0.30, 0.30), (0.50, 0.20)]
+    )
+    # 分层移动止盈（按峰值回撤触发）：
+    # 峰值浮盈>=30% -> 回撤5%
+    # 峰值浮盈>=50% -> 回撤10%
+    # 峰值浮盈>=60% -> 回撤15%
+    layered_trailing_tp_enable: bool = True
+    layered_trailing_tp_drawdown_levels: List[Tuple[float, float]] = field(
+        default_factory=lambda: [(0.30, 0.05), (0.50, 0.10), (0.60, 0.15)]
+    )
     check_interval: int = 5
     # 仅限制「活跃跟踪」数量；已触发/已取消的历史单不计入（否则会误伤 sync_open_positions）
     max_orders: int = 100
@@ -204,7 +220,7 @@ class StopLossTakeProfitConfig:
     volatility_tighten_threshold: float = 0.02
     trend_extend_threshold: float = 0.005
     min_trailing_offset: float = 0.005
-    max_trailing_offset: float = 0.025
+    max_trailing_offset: float = 0.20
     # SLTP trigger close confirmation / retry
     pending_close_max_retries: int = 6
     pending_close_backoff_base_sec: float = 2.0
@@ -502,6 +518,7 @@ class StopLossTakeProfitManager:
         self,
         order: StopLossTakeProfitOrder,
         reason: str,
+        close_size: Optional[float] = None,
     ) -> bool:
         if not getattr(self.config, "execute_exchange_on_trigger", True):
             return True
@@ -517,11 +534,12 @@ class StopLossTakeProfitManager:
             return False
 
         gw = getattr(mc, "execution_gateway", None) if mc else None
-        close_sz: Optional[float] = None
-        try:
-            close_sz = await self._fetch_live_position_size(order.symbol, order.side)
-        except Exception:
-            close_sz = None
+        close_sz: Optional[float] = close_size
+        if close_sz is None or close_sz <= 0:
+            try:
+                close_sz = await self._fetch_live_position_size(order.symbol, order.side)
+            except Exception:
+                close_sz = None
         if close_sz is None or close_sz <= 0:
             close_sz = float(order.remaining_quantity or order.quantity or 0) or None
         try:
@@ -553,10 +571,15 @@ class StopLossTakeProfitManager:
             ok = bool(isinstance(res, dict) and res.get("success"))
             if ok:
                 logger.info("✅ 止盈止损实盘平仓已提交: %s reason=%s", order.symbol, reason)
+                # 仅当全平时清理索引；部分平仓保持 ACTIVE 跟踪。
                 try:
-                    for k in self._order_index_keys_to_clear(order):
-                        if self.order_index.get(k) == order.order_id:
-                            del self.order_index[k]
+                    rem = float(order.remaining_quantity or 0)
+                    csz = float(close_sz or 0)
+                    full_close = csz >= max(rem, 1e-12) - 1e-12
+                    if full_close:
+                        for k in self._order_index_keys_to_clear(order):
+                            if self.order_index.get(k) == order.order_id:
+                                del self.order_index[k]
                     await self._save_orders()
                 except Exception:
                     pass
@@ -1243,6 +1266,9 @@ class StopLossTakeProfitManager:
             if current_price < order.lowest_price:
                 order.lowest_price = current_price
 
+        await self._apply_layered_trailing_take_profit(order, current_price)
+        await self._check_layered_partial_take_profit(order, current_price)
+
         await self._apply_profit_tier2_trailing(order, current_price)
         await self._update_trailing_stop(order, current_price)
         
@@ -1253,6 +1279,130 @@ class StopLossTakeProfitManager:
         await self._check_time_stop(order)
         
         return triggered
+
+    async def _apply_layered_trailing_take_profit(self, order: StopLossTakeProfitOrder, current_price: float) -> None:
+        """按峰值浮盈分层调整回撤带宽（移动止盈层）。"""
+        if not bool(getattr(self.config, "layered_trailing_tp_enable", True)):
+            return
+        levels = list(getattr(self.config, "layered_trailing_tp_drawdown_levels", []) or [])
+        if not levels:
+            return
+        try:
+            levels = sorted(
+                [(float(p), float(dd)) for p, dd in levels if float(p) > 0 and float(dd) > 0],
+                key=lambda x: x[0],
+            )
+        except Exception:
+            return
+        if not levels:
+            return
+
+        # 峰值浮盈（相对入场）
+        if order.side == "long":
+            peak_pnl = (float(order.highest_price or current_price) - float(order.entry_price)) / max(1e-12, float(order.entry_price))
+        else:
+            peak_pnl = (float(order.entry_price) - float(order.lowest_price or current_price)) / max(1e-12, float(order.entry_price))
+
+        target_dd = None
+        for pnl_thr, dd in levels:
+            if peak_pnl >= pnl_thr:
+                target_dd = dd
+        if target_dd is None:
+            return
+        old_off = float(order.trailing_stop_offset or self.config.initial_trailing_offset)
+        new_off = min(max(float(target_dd), float(self.config.min_trailing_offset)), float(self.config.max_trailing_offset))
+        if abs(new_off - old_off) < 1e-9:
+            return
+
+        order.trailing_stop_offset = new_off
+        meta = dict(order.metadata or {})
+        meta["layered_trailing_peak_pnl"] = float(peak_pnl)
+        meta["layered_trailing_offset"] = float(new_off)
+        meta["layered_trailing_last_at"] = datetime.now().isoformat()
+        order.metadata = meta
+        logger.info(
+            "📐 分层移动止盈调整: %s peak_pnl=%.2f%% trailing_off %.4f -> %.4f",
+            order.symbol,
+            peak_pnl * 100.0,
+            old_off,
+            new_off,
+        )
+
+    async def _check_layered_partial_take_profit(self, order: StopLossTakeProfitOrder, current_price: float) -> None:
+        """分层固定止盈（部分平仓锁利）。"""
+        if not bool(getattr(self.config, "enable_partial_tp", False)):
+            return
+        if not bool(getattr(self.config, "layered_partial_tp_enable", True)):
+            return
+        if float(order.remaining_quantity or 0) <= 1e-12:
+            return
+        levels = list(getattr(self.config, "layered_partial_tp_levels", []) or [])
+        if not levels:
+            return
+        try:
+            levels = sorted(
+                [(float(p), float(r)) for p, r in levels if float(p) > 0 and float(r) > 0],
+                key=lambda x: x[0],
+            )
+        except Exception:
+            return
+        if not levels:
+            return
+
+        pnl_percent = self._calculate_pnl_percent(order, current_price)
+        if pnl_percent <= 0:
+            return
+        meta = dict(order.metadata or {})
+        done = set(float(x) for x in (meta.get("layered_partial_done_levels") or []))
+
+        for level_percent, level_ratio in levels:
+            if level_percent in done:
+                continue
+            if pnl_percent < level_percent:
+                continue
+            base_qty = float(order.quantity or 0)
+            close_qty = min(base_qty * level_ratio, float(order.remaining_quantity or 0))
+            if close_qty <= 1e-12:
+                done.add(level_percent)
+                continue
+
+            # 实盘部分平仓：通过 ExecutionGateway/Exchange 真正减仓，避免仅本地变更造成漂移。
+            ok = await self._execute_exchange_close_on_trigger(
+                order,
+                reason=f"partial_take_profit_{int(level_percent * 100)}",
+                close_size=close_qty,
+            )
+            if not ok:
+                logger.warning(
+                    "⚠️ 分层止盈执行失败，保留仓位不标记已完成: %s level=%.2f%% qty=%.6f",
+                    order.symbol,
+                    level_percent * 100.0,
+                    close_qty,
+                )
+                continue
+
+            order.remaining_quantity = max(0.0, float(order.remaining_quantity or 0) - close_qty)
+            order.partial_tp_executed.append((level_percent, close_qty))
+            self._stats["partial_tp_executed"] += 1
+            done.add(level_percent)
+            meta["layered_partial_done_levels"] = sorted(list(done))
+            meta["layered_partial_last_at"] = datetime.now().isoformat()
+            order.metadata = meta
+            logger.info(
+                "🎯 分层止盈执行: %s level=%.2f%% close=%.2f%% qty=%.6f remain=%.6f",
+                order.symbol,
+                level_percent * 100.0,
+                level_ratio * 100.0,
+                close_qty,
+                float(order.remaining_quantity or 0),
+            )
+            await self._notify_callbacks("on_partial_tp", order, level_percent, close_qty)
+
+            if float(order.remaining_quantity or 0) <= 1e-12:
+                order.status = StopLossTakeProfitStatus.TRIGGERED
+                order.triggered_at = datetime.now()
+                order.trigger_reason = "partial_take_profit_final"
+                break
 
     async def _dynamic_market_adjust(self, order: StopLossTakeProfitOrder, current_price: float) -> None:
         """根据实时行情动态微调止盈止损。"""

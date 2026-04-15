@@ -63,6 +63,30 @@
   - `GET /api/v1/data-fusion/analyze{,/symbol}` 当前为兼容路由，返回 `status=deprecated` 与迁移提示。
   - 生产调用请切换至：`GET /api/v1/market/symbol/{symbol}` 与 `POST /api/v1/modules/intelligence/batch-analyze`。
 
+### 账户与持仓同步接口（2026-04-15 更新）
+
+- **`GET /api/v1/modules/commander/snapshot`**
+  - 用于司令部统一快照。
+  - `data.account.positions` 在缓存为空时会自动回退到：
+    1. 进程内 `ai_trading_engine.positions`
+    2. 交易所短超时直拉 `get_positions()`
+  - 若使用了回退，会在 `data.alerts` 增加提示（如 `account_positions_from_exchange_fallback`）。
+
+- **`GET /api/v1/modules/commander/account-diagnostics`**
+  - 权威同步诊断接口（交易所实时持仓/余额 vs 本地状态）。
+  - 在上游慢时可能返回：
+    - `success=true`
+    - `degraded=true`
+    - `data.hint=account_diagnostics_timeout`
+  - 即使超时降级，也会返回关键字段（如 `exchange`、`cached_position_count`），避免误判为“无交易所连接”。
+
+- **`GET /api/v1/modules/ai/learning-feedback`**
+  - 返回止损复盘与信号惩罚状态：
+    - `stop_loss_hits`
+    - `penalty_steps`
+    - `extra_confidence_threshold`
+  - 用于验收“连续止损后提高开仓门槛”的学习反馈机制。
+
 ### WebSocket（OpenAPI 中不展开）
 
 - **URL:** `ws://<host>:8000/ws`（生产若走 HTTPS 则为 `wss://`）

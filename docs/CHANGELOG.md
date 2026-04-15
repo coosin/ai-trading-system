@@ -1,5 +1,21 @@
 # 变更记录
 
+## 2026-04-15 — 文档全量同步（API/MCP/工程）与同步一致性说明
+
+- **文档结构更新:**
+  - 新增 `docs/MCP_BASELINE.md`，统一 MCP 基础概念、OKX Agent Trade Kit 对标结论与落地方向。
+  - `docs/README.md` 与根 `README.md` 增加 MCP 基线文档入口。
+- **工程文档更新:**
+  - `docs/ENGINEERING.md` 新增“账户/持仓同步一致性”章节，明确 `get_exchange()` 多级兜底与 `commander/snapshot` 持仓回退策略。
+- **API 文档更新:**
+  - `docs/API_REFERENCE.md` 补充：
+    - `GET /api/v1/modules/commander/snapshot` 的持仓回退语义；
+    - `GET /api/v1/modules/commander/account-diagnostics` 的超时降级字段语义；
+    - `GET /api/v1/modules/ai/learning-feedback` 的学习反馈用途。
+- **运维与开发文档更新:**
+  - `docs/OPERATIONS.md` 增加账户/持仓一致性巡检命令与降级判读说明。
+  - `docs/DEVELOPMENT.md` 增加 MCP 基础联调步骤与最小验收命令。
+
 ## 2026-04-14 — 日志清理与运行维护
 
 - **日志清理:** 清空 `logs/` 下历史运行日志与临时诊断文件（保留 `logs/.gitkeep` 及目录结构），减少磁盘占用并避免旧日志干扰巡检。

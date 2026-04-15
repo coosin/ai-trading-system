@@ -170,7 +170,13 @@ class AITradingEngine:
             "max_hedged_positions": 8,
             "risk_per_trade": 0.01,
             "max_symbol_position_ratio": 0.2,
+            # 单笔名义价值硬上限（占账户权益比例）
+            "max_position_value_ratio": 0.05,
             "max_total_exposure_ratio": 0.8,
+            # 硬限制总持仓数，避免对冲放宽导致持仓数失控
+            "hard_max_positions": 5,
+            # 仅在趋势明确(bullish/bearish)时允许新开仓
+            "require_trend_for_open": True,
             "trade_mode": "real",
             "auto_risk_management": True,
             # False：关闭自动平仓，由主逻辑判断是否平仓
@@ -201,6 +207,10 @@ class AITradingEngine:
         self._empty_position_reads = 0
         self._wallet_snapshot: Dict[str, Any] = {}
         self._sltp_bound_keys: set[str] = set()
+        # 开仓风控前的持仓对账闸门：避免本地持仓缓存短时为 0 导致硬限制失效
+        self._position_gate_sync_cooldown_sec: float = 3.0
+        self._last_position_gate_sync_ts: float = 0.0
+        self._position_gate_sync_lock = asyncio.Lock()
         self._last_market_route: Dict[str, Dict[str, Any]] = {}
         self._execution_observability: Dict[str, Any] = {
             "reconcile_total": 0,
@@ -212,6 +222,8 @@ class AITradingEngine:
             "last_reconcile_symbol": None,
             "last_reconcile_action": None,
         }
+        # 止损复盘统计：连续止损达到阈值后，对该信号提高开仓门槛
+        self._signal_stop_loss_stats: Dict[str, Dict[str, Any]] = {}
         
         logger.info("全智能AI交易引擎初始化完成")
     
@@ -1315,6 +1327,21 @@ class AITradingEngine:
             # 确定交易动作
             action = self._parse_action(signal, current_position)
 
+            # 趋势门控：只在趋势明确时开仓，减少噪音期无效交易
+            if action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
+                if bool(self.ai_config.get("require_trend_for_open", True)):
+                    if context.trend not in ("bullish", "bearish"):
+                        return AIDecision(
+                            action=TradeAction.HOLD,
+                            symbol=symbol,
+                            price=context.price,
+                            quantity=0.0,
+                            confidence=confidence,
+                            reasoning=f"趋势不明确({context.trend})，跳过开仓",
+                            risk_level=ai_decision.get("risk_level", "medium"),
+                            metadata={"ai_analysis": ai_decision, "market_context": context.__dict__},
+                        )
+
             # 数据质量软门控：保留 AI 决策自由，仅降低置信度并记录风险提示。
             snap = context.metadata.get("unified_snapshot", {}) if isinstance(context.metadata, dict) else {}
             quality = ((snap.get("数据质量评估") or {}).get("score")) if isinstance(snap, dict) else None
@@ -1330,6 +1357,30 @@ class AITradingEngine:
                     ai_decision["reasoning"] = (
                         f"{ai_decision.get('reasoning', '')} | 数据质量偏低({q:.2f}<{min_q:.2f})，已降权但继续由AI自主决策"
                     )
+
+            # 信号惩罚门控：同类信号连续止损>=3后，自动提高该信号的最小置信度
+            if action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
+                signal_key = self._build_signal_key(symbol, action, context)
+                stat = self._signal_stop_loss_stats.get(signal_key, {})
+                stop_loss_hits = int(stat.get("stop_loss_hits", 0) or 0)
+                penalty_steps = stop_loss_hits // 3
+                if penalty_steps > 0:
+                    extra_threshold = min(0.15, 0.05 * penalty_steps)
+                    threshold = float(self.ai_config["min_confidence"]) + extra_threshold
+                    if float(confidence) < threshold:
+                        return AIDecision(
+                            action=TradeAction.HOLD,
+                            symbol=symbol,
+                            price=context.price,
+                            quantity=0.0,
+                            confidence=confidence,
+                            reasoning=(
+                                f"信号 {signal_key} 近期止损{stop_loss_hits}次，"
+                                f"门槛提升至{threshold:.2f}，当前{float(confidence):.2f}，跳过开仓"
+                            ),
+                            risk_level=ai_decision.get("risk_level", "high"),
+                            metadata={"ai_analysis": ai_decision, "market_context": context.__dict__},
+                        )
             
             if action == TradeAction.HOLD:
                 return AIDecision(
@@ -1471,9 +1522,9 @@ class AITradingEngine:
             
             # 单笔保证金预算：总资金 5%~10%（用户要求）
             # 以 equity 为基准，结合波动率与置信度做自适应微调。
-            min_pct = float(self.ai_config.get("position_margin_pct_min", 0.05) or 0.05)
-            max_pct = float(self.ai_config.get("position_margin_pct_max", 0.10) or 0.10)
-            base_pct = float(self.ai_config.get("position_margin_pct_default", 0.07) or 0.07)
+            min_pct = float(self.ai_config.get("position_margin_pct_min", 0.03) or 0.05)
+            max_pct = float(self.ai_config.get("position_margin_pct_max", 0.05) or 0.10)
+            base_pct = float(self.ai_config.get("position_margin_pct_default", 0.04) or 0.07)
             min_pct = max(0.01, min(min_pct, 0.50))
             max_pct = max(min_pct, min(max_pct, 0.90))
             base_pct = max(min_pct, min(base_pct, max_pct))
@@ -1501,9 +1552,9 @@ class AITradingEngine:
             margin_value = equity * base_pct * vol_factor
 
             # 杠杆：10~100，自适应（低波动/高置信度可略提高）
-            lev_min = int(self.contract_config.get("leverage_min", 10) or 10)
-            lev_max = int(self.contract_config.get("leverage_max", 100) or 100)
-            lev0 = int(self.contract_config.get("default_leverage", 20) or 20)
+            lev_min = int(self.contract_config.get("leverage_min", 1) or 10)
+            lev_max = int(self.contract_config.get("leverage_max", 2) or 100)
+            lev0 = int(self.contract_config.get("default_leverage", 1) or 20)
             lev = lev0
             if c is not None and c >= 0.80 and vol <= 0.10:
                 lev = min(lev_max, max(lev, int(round(lev0 * 1.25))))
@@ -1556,6 +1607,7 @@ class AITradingEngine:
         try:
             # 对新开仓执行最大持仓数限制（优先读取外部配置，兼容测试）
             if decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
+                await self._refresh_positions_for_risk_gate()
                 # 数据路由联动硬门控：当处于回退通道且质量过低时，短时阻断开仓。
                 md = decision.metadata or {}
                 mc = md.get("market_context", {}) if isinstance(md, dict) else {}
@@ -1604,6 +1656,10 @@ class AITradingEngine:
                 # 仅单方向时使用基础上限；双方向对冲并存时可放宽到 max_hedged
                 has_both_directions = long_cnt > 0 and short_cnt > 0
                 total_cap = max_hedged if has_both_directions else max_positions
+                hard_max_positions = int(self.ai_config.get("hard_max_positions", 5) or 5)
+                if len(self.positions) >= hard_max_positions and decision.symbol not in self.positions:
+                    logger.info(f"📊 硬限制持仓数已达上限({hard_max_positions})，拒绝新开仓: {decision.symbol}")
+                    return False
                 if len(self.positions) >= total_cap and decision.symbol not in self.positions:
                     logger.info(f"📊 持仓数已达上限({total_cap})，拒绝新开仓: {decision.symbol}")
                     return False
@@ -1623,6 +1679,16 @@ class AITradingEngine:
                         except Exception:
                             pass
                     equity = max(available, self._estimate_total_equity_fallback(available))
+                    max_position_value_ratio = float(self.ai_config.get("max_position_value_ratio", 0.05) or 0.05)
+                    if projected_value > equity * max_position_value_ratio:
+                        logger.info(
+                            "📊 单笔仓位超限，拒绝开仓: symbol=%s projected=%.2f equity=%.2f limit=%.2f%%",
+                            decision.symbol,
+                            projected_value,
+                            equity,
+                            max_position_value_ratio * 100.0,
+                        )
+                        return False
                     max_total_ratio = float(self.ai_config.get("max_total_exposure_ratio", 0.8) or 0.8)
                     if self._estimate_total_exposure() + projected_value > equity * max_total_ratio:
                         logger.info("📊 总敞口保护触发，拒绝开仓: %s", decision.symbol)
@@ -1646,6 +1712,28 @@ class AITradingEngine:
         except Exception as e:
             logger.error(f"风险检查失败: {e}")
             return True
+
+    async def _refresh_positions_for_risk_gate(self) -> None:
+        """开仓前短冷却刷新持仓，确保硬限制基于交易所权威数据。"""
+        if not self.exchange:
+            return
+        now_ts = time.time()
+        if now_ts - float(self._last_position_gate_sync_ts or 0.0) < float(self._position_gate_sync_cooldown_sec or 0.0):
+            return
+        async with self._position_gate_sync_lock:
+            now_ts = time.time()
+            if now_ts - float(self._last_position_gate_sync_ts or 0.0) < float(self._position_gate_sync_cooldown_sec or 0.0):
+                return
+            before_cnt = len(self.positions)
+            await self._update_positions()
+            self._last_position_gate_sync_ts = time.time()
+            after_cnt = len(self.positions)
+            if before_cnt == 0 and after_cnt > 0:
+                logger.info(
+                    "🧭 开仓前持仓对账已纠偏: local_before=%d -> exchange_now=%d",
+                    before_cnt,
+                    after_cnt,
+                )
 
     def _count_open_directions(self) -> tuple:
         long_cnt = 0
@@ -1677,6 +1765,52 @@ class AITradingEngine:
     def _estimate_total_equity_fallback(self, available: float) -> float:
         # 没有完整账户权益时，使用可用余额 + 持仓名义价值作为保守估算。
         return float(available or 0.0) + self._estimate_total_exposure()
+
+    def _build_signal_key(self, symbol: str, action: TradeAction, context: MarketContext) -> str:
+        side = "long" if action == TradeAction.OPEN_LONG else "short" if action == TradeAction.OPEN_SHORT else "hold"
+        trend = str(getattr(context, "trend", "unknown") or "unknown")
+        return f"{symbol}:{side}:{trend}"
+
+    async def _record_stop_loss_feedback(self, symbol: str, side: str, current_price: float, stop_loss: float) -> None:
+        signal_key = f"{symbol}:{side}:{'bullish' if side == 'long' else 'bearish'}"
+        stat = self._signal_stop_loss_stats.setdefault(signal_key, {"stop_loss_hits": 0, "last_at": None})
+        stat["stop_loss_hits"] = int(stat.get("stop_loss_hits", 0) or 0) + 1
+        stat["last_at"] = datetime.now().isoformat()
+        logger.warning(
+            "📘 止损复盘记录: key=%s hits=%s price=%.4f stop_loss=%.4f",
+            signal_key,
+            stat["stop_loss_hits"],
+            current_price,
+            stop_loss,
+        )
+
+        if self.llm_integration and hasattr(self.llm_integration, "enhanced_memory"):
+            memory = self.llm_integration.enhanced_memory
+            if memory:
+                try:
+                    await memory.add_memory(
+                        memory_type="trade_record",
+                        content=f"止损复盘: {symbol} {side} price={current_price} stop={stop_loss} key={signal_key}",
+                        summary=f"🧾 止损复盘 {symbol} {side}",
+                        metadata=base_metadata(
+                            source_module="ai_trading_engine",
+                            kind="stop_loss_postmortem",
+                            symbol=symbol,
+                            extra={
+                                "signal_key": signal_key,
+                                "side": side,
+                                "current_price": current_price,
+                                "stop_loss": stop_loss,
+                                "stop_loss_hits": stat["stop_loss_hits"],
+                                "occurred_at": stat["last_at"],
+                            },
+                        ),
+                        importance=0.88,
+                        source_module="ai_trading_engine",
+                        tags=tags(kind_tag("trade"), kind_tag("stop_loss"), symbol_tag(symbol)),
+                    )
+                except Exception:
+                    pass
 
     async def _recall_trade_lessons(self, symbol: str, limit: int = 3) -> List[str]:
         """读取近期交易经验/教训，注入到决策上下文。"""
@@ -1763,7 +1897,7 @@ class AITradingEngine:
             # S1：优先经 ExecutionGateway，与 ai_core 策略一致；无 Gateway 时再直连交易所
             result = None
             gw = getattr(mc, "execution_gateway", None) if mc else None
-            lev = int(self.contract_config.get("default_leverage", 20))
+            lev = int(self.contract_config.get("default_leverage", 1))
             if gw:
                 try:
                     if is_close:
@@ -1864,7 +1998,7 @@ class AITradingEngine:
                             "strategy": decision.metadata.get("strategy", "AI智能决策"),
                             "stop_loss": decision.stop_loss,
                             "take_profit": decision.take_profit,
-                            "leverage": self.contract_config.get("default_leverage", 20),
+                            "leverage": self.contract_config.get("default_leverage", 1),
                             "status": "filled",
                             "metadata": {
                                 "decision_action": decision.action.value,
@@ -2194,9 +2328,9 @@ class AITradingEngine:
         if s in ("sell", "s"):
             s = "short"
         # 自适应杠杆（10-100）
-        lev_min = int(self.contract_config.get("leverage_min", 10) or 10)
-        lev_max = int(self.contract_config.get("leverage_max", 100) or 100)
-        lev0 = int(self.contract_config.get("default_leverage", 20) or 20)
+        lev_min = int(self.contract_config.get("leverage_min", 1) or 10)
+        lev_max = int(self.contract_config.get("leverage_max", 2) or 100)
+        lev0 = int(self.contract_config.get("default_leverage", 1) or 20)
         lev = max(lev_min, min(lev0, lev_max))
         try:
             mc = self.main_controller
@@ -2233,9 +2367,9 @@ class AITradingEngine:
                 else:
                     available = float(usdt or 0)
                 # margin fraction 5%..10%
-                min_pct = float(self.ai_config.get("position_margin_pct_min", 0.05) or 0.05)
-                max_pct = float(self.ai_config.get("position_margin_pct_max", 0.10) or 0.10)
-                base_pct = float(self.ai_config.get("position_margin_pct_default", 0.07) or 0.07)
+                min_pct = float(self.ai_config.get("position_margin_pct_min", 0.03) or 0.05)
+                max_pct = float(self.ai_config.get("position_margin_pct_max", 0.05) or 0.10)
+                base_pct = float(self.ai_config.get("position_margin_pct_default", 0.04) or 0.07)
                 base_pct = max(min_pct, min(base_pct, max_pct))
                 if confidence is not None:
                     c = float(confidence)
@@ -2547,6 +2681,12 @@ class AITradingEngine:
                     
                     if stop_loss_triggered:
                         logger.warning(f"🚨 {symbol} 触发止损! {side}单 当前价={current_price:.4f} 止损价={stop_loss:.4f}")
+                        await self._record_stop_loss_feedback(
+                            symbol=symbol,
+                            side=side,
+                            current_price=float(current_price),
+                            stop_loss=float(stop_loss),
+                        )
                         await self._execute_decision(AIDecision(
                             action=TradeAction.CLOSE_LONG if side == "long" else TradeAction.CLOSE_SHORT,
                             symbol=symbol,

@@ -58,6 +58,16 @@ docker compose restart trading-system
 4. `curl -s "http://localhost:8000/api/v1/modules/commander/audit?enrich=true"` — 司令部与第三方诊断  
 5. 日志: `docker logs openclaw-trading --tail 80` — 无持续 Traceback  
 
+补充（账户与持仓一致性）：
+
+```bash
+curl -s 'http://localhost:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
+curl -s 'http://localhost:8000/api/v1/modules/commander/account-diagnostics'
+```
+
+- 若 `snapshot.data.account.positions` 为空，应检查 `snapshot.data.alerts` 是否含回退提示。
+- 若 `account-diagnostics` 返回 `degraded=true` 且 `hint=account_diagnostics_timeout`，属于超时降级，不等价于“交易所断连”。
+
 ### 2.1 实时通知链路巡检（升级后必做）
 
 > 目标：确认“行情判断、开平仓、止盈止损、告警”可同步到司令部、前端与 API 对接端。
