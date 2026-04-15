@@ -128,20 +128,29 @@ class AILearningEngine:
     
     async def _learning_loop(self) -> None:
         """学习循环"""
+        first = True
+        interval_sec = float(self.config["learning_interval_hours"]) * 3600.0
         while self._running:
             try:
-                await asyncio.sleep(self.config["learning_interval_hours"] * 3600)
-                
-                logger.info("🧠 开始AI自动学习...")
-                
+                # 首周期短等待，便于验收与排障；之后按 learning_interval_hours
+                wait = min(120.0, max(45.0, interval_sec)) if first else interval_sec
+                first = False
+                await asyncio.sleep(wait)
+
+                logger.info(
+                    "🧠 开始AI自动学习... (间隔=%.0fs, min_trades=%s)",
+                    wait,
+                    self.config.get("min_trades_for_learning", 5),
+                )
+
                 await self._analyze_and_learn()
-                
+
                 await self._generate_learning_report()
-                
+
                 await self._optimize_decision_rules()
-                
+
                 logger.info("✅ AI学习周期完成")
-                
+
             except Exception as e:
                 logger.error(f"学习循环错误: {e}")
                 await asyncio.sleep(300)
@@ -181,27 +190,103 @@ class AILearningEngine:
         except Exception as e:
             logger.error(f"记录交易结果失败: {e}")
     
+    def _collect_recent_close_trades(self) -> List[Any]:
+        """
+        统一收集「平仓」记忆：兼容旧版 enhanced_memory，以及当前 MemoryGateway→OptimizedMemorySystem。
+        返回对象需具备 .metadata (dict) 与 .created_at (datetime)；供 _analyze_successful_trades 使用。
+        """
+        from types import SimpleNamespace
+
+        window_h = int(self.config.get("learning_interval_hours", 6) or 6)
+        cutoff = datetime.now() - timedelta(hours=max(1, window_h))
+        out: List[Any] = []
+        mm = self.memory_manager
+        if mm is None:
+            return out
+
+        # --- 旧路径：LLM 集成里挂的 enhanced_memory + long_term_memory ---
+        em = getattr(mm, "enhanced_memory", None)
+        if em is not None:
+            ltm = getattr(em, "long_term_memory", None)
+            if ltm:
+                for m in ltm:
+                    try:
+                        cat_v = getattr(getattr(m, "category", None), "value", m.category)
+                        if str(cat_v) != "trade_close":
+                            continue
+                        ca = getattr(m, "created_at", None)
+                        if ca is not None and ca < cutoff:
+                            continue
+                        out.append(m)
+                    except Exception:
+                        continue
+                if out:
+                    return out
+
+        # --- 现网：MemoryGateway.memory_backend._memories，metadata.kind == trade_close ---
+        try:
+            from src.modules.core.optimized_memory_system import MemoryCategory
+
+            backend = getattr(mm, "memory_backend", None)
+            memories = getattr(backend, "_memories", None) if backend is not None else None
+            if isinstance(memories, dict):
+                for entry in memories.values():
+                    try:
+                        if getattr(entry, "category", None) != MemoryCategory.TRADE_RECORD:
+                            continue
+                        md_raw = getattr(entry, "metadata", None) or {}
+                        md = dict(md_raw)
+                        if str(md.get("kind", "")).lower() != "trade_close":
+                            continue
+                        created = getattr(entry, "created_at", None)
+                        if created is None:
+                            continue
+                        if created < cutoff:
+                            continue
+                        pnl = float(md.get("pnl", 0) or 0)
+                        if "is_profitable" not in md:
+                            md["is_profitable"] = pnl > 0
+                        if "pnl" not in md:
+                            md["pnl"] = pnl
+                        out.append(
+                            SimpleNamespace(
+                                metadata=md,
+                                created_at=created,
+                                content=getattr(entry, "content", ""),
+                            )
+                        )
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        return out
+
     async def _analyze_and_learn(self) -> None:
         """分析和学习"""
         if not self.memory_manager:
             return
         
         try:
-            close_trades = []
-            
-            if hasattr(self.memory_manager, 'enhanced_memory') and self.memory_manager.enhanced_memory:
-                close_trades = [
-                    m for m in self.memory_manager.enhanced_memory.long_term_memory 
-                    if hasattr(m, 'category') and str(m.category.value) == "trade_close"
-                    and m.created_at >= datetime.now() - timedelta(hours=self.config["learning_interval_hours"])
-                ]
+            close_trades = self._collect_recent_close_trades()
             
             if not close_trades or len(close_trades) < self.config["min_trades_for_learning"]:
                 logger.info(f"交易数量不足，跳过学习 (需要{self.config['min_trades_for_learning']}笔，当前{len(close_trades)}笔)")
                 return
             
-            profitable_trades = [t for t in close_trades if t.metadata.get("is_profitable", False)]
-            losing_trades = [t for t in close_trades if not t.metadata.get("is_profitable", False)]
+            def _is_win(t: Any) -> bool:
+                md = getattr(t, "metadata", None) or {}
+                if not isinstance(md, dict):
+                    return False
+                if "is_profitable" in md:
+                    return bool(md.get("is_profitable"))
+                try:
+                    return float(md.get("pnl", 0) or 0) > 0
+                except (TypeError, ValueError):
+                    return False
+
+            profitable_trades = [t for t in close_trades if _is_win(t)]
+            losing_trades = [t for t in close_trades if not _is_win(t)]
             
             if profitable_trades:
                 success_lessons = await self._analyze_successful_trades(profitable_trades)

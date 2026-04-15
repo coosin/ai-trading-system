@@ -1239,6 +1239,9 @@ class AICoreDecisionEngine:
             
             # 4. 学习并优化
             await self._learn_from_trade(trade_analysis)
+
+            # 5. 写入学习引擎逐笔缓存（与 AILearningEngine 周期分析共用数据源）
+            await self._push_trade_to_learning_engine(trade_analysis)
             
             logger.info(f"✅ 交易后分析完成: {decision.symbol}")
             
@@ -1281,6 +1284,55 @@ class AICoreDecisionEngine:
             perf["trades"] = perf["trades"][-50:]
         
         logger.info(f"📊 更新策略表现: {strategy_id} (总交易: {perf['total_trades']})")
+
+        # 同步到 MainController → StrategyManager.apply_trade_feedback（生产闭环）
+        mc = getattr(self, "main_controller", None)
+        if mc and hasattr(mc, "update_strategy_performance"):
+            try:
+                total = int(perf["total_trades"])
+                wins = int(perf["wins"])
+                losses = int(perf["losses"])
+                wr = (wins / total) if total > 0 else 0.0
+                await mc.update_strategy_performance(
+                    strategy_name=str(strategy_id),
+                    total_trades=total,
+                    win_trades=wins,
+                    loss_trades=losses,
+                    win_rate=wr,
+                    total_pnl=float(perf.get("total_pnl", 0) or 0),
+                    max_drawdown=0.0,
+                    sharpe_ratio=0.0,
+                )
+            except Exception as e:
+                logger.warning(f"同步策略表现到 StrategyManager 失败({strategy_id}): {e}")
+
+    async def _push_trade_to_learning_engine(self, trade_analysis: Dict) -> None:
+        """将单笔交易摘要推送到 AILearningEngine.record_trade_result（与记忆库平仓记录互补）。"""
+        mc = getattr(self, "main_controller", None)
+        le = getattr(mc, "ai_learning_engine", None) if mc else None
+        if le is None or not hasattr(le, "record_trade_result"):
+            return
+        try:
+            res = trade_analysis.get("result") if isinstance(trade_analysis.get("result"), dict) else {}
+            pnl = float(res.get("pnl", trade_analysis.get("pnl", 0)) or 0)
+            exit_px = res.get("exit_price") or res.get("price") or res.get("close_price")
+            entry_px = trade_analysis.get("entry_price")
+            if exit_px is None:
+                exit_px = entry_px
+            payload = {
+                "symbol": trade_analysis.get("symbol") or "unknown",
+                "side": trade_analysis.get("side") or "long",
+                "entry_price": float(entry_px or 0),
+                "exit_price": float(exit_px or 0),
+                "pnl": pnl,
+                "pnl_percent": float(res.get("pnl_percent", trade_analysis.get("pnl_percent", 0)) or 0),
+                "strategy": trade_analysis.get("strategy_used") or "ai_core",
+                "reason": str(trade_analysis.get("reasoning") or ""),
+                "timestamp": trade_analysis.get("timestamp"),
+            }
+            await le.record_trade_result(payload)
+        except Exception as e:
+            logger.debug(f"AILearningEngine.record_trade_result 跳过: {e}")
     
     async def _learn_from_trade(self, trade_analysis: Dict) -> None:
         """从交易中学习"""

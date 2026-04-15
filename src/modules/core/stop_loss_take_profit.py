@@ -161,8 +161,8 @@ class StopLossTakeProfitConfig:
     default_stop_loss_percent: float = 0.05  # 固定止损5%（兜底）
     default_take_profit_percent: float = 0.0  # 不设固定止盈
     enable_trailing_stop: bool = True
-    trailing_stop_offset: float = 0.023
-    trailing_stop_trigger: float = 0.023
+    trailing_stop_offset: float = 0.045
+    trailing_stop_trigger: float = 0.035  # 3.5%触发二档
     # --- 移动止盈止损模式：开仓即2.3%追踪；浮盈达2.3%后收紧到1.3%；不设固定止盈 ---
     trailing_only_mode: bool = True
     """为 True 时：新建单使用 TRAILING 止损 + 无固定止盈价，仅依赖移动止损出场。"""
@@ -170,11 +170,11 @@ class StopLossTakeProfitConfig:
     """为 True 且 trailing_only_mode 时：忽略外部传入的固定/百分比 SLTP，强制移动止损 + 无止盈价。"""
     trailing_active_on_open: bool = True
     """开仓即启用移动止损逻辑（不等浮盈达到 trailing_stop_trigger）。"""
-    initial_trailing_offset: float = 0.023
+    initial_trailing_offset: float = 0.045  # 4.5% 初始移动止损
     """初始移动止损相对峰值/入场的回撤比例（2.3%）。"""
-    profit_tier2_pnl_threshold: float = 0.023
+    profit_tier2_pnl_threshold: float = 0.035
     """二档：相对入场的浮盈比例达到2.3%后，将移动带宽收紧为 tier2_trailing_offset。"""
-    tier2_trailing_offset: float = 0.013
+    tier2_trailing_offset: float = 0.025  # 2.5%二档移动带宽
     """二档移动带宽（1.3%），浮盈2.3%后启用，更严格锁利。"""
     # 动能微调：趋势+短周期变化在「中性带」内则不改变 trailing_offset；转弱收紧，顺势略放宽
     trailing_momentum_adjust_enable: bool = True
@@ -182,7 +182,7 @@ class StopLossTakeProfitConfig:
     trailing_momentum_short_neutral_abs: float = 0.0015
     trailing_momentum_tighten_factor: float = 0.92
     trailing_momentum_loosen_factor: float = 1.05
-    enable_breakeven: bool = False
+    enable_breakeven: bool = True  # 启用保本止损
     breakeven_trigger: float = 0.02
     enable_partial_tp: bool = False
     check_interval: int = 5

@@ -30,6 +30,9 @@ class StrategyPerformance:
 class StrategyOptimizer:
     """Backward-compatible no-op optimizer."""
 
+    #: 供 AITradingEngine 识别：真优化在 StrategyManager / API，勿走本类空实现分支
+    is_compat_shim: bool = True
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._running = False
 

@@ -2067,6 +2067,8 @@ class AITradingEngine:
                     else:
                         pnl = (open_price - decision.price) * decision.quantity
                         pnl_percent = (open_price - decision.price) / open_price * 100
+
+                strat_name = (getattr(decision, "metadata", {}) or {}).get("strategy", "ai_trading_engine")
                 
                 await memory.add_memory(
                     memory_type="trade_record",
@@ -2083,6 +2085,8 @@ class AITradingEngine:
                             "quantity": decision.quantity,
                             "pnl": pnl,
                             "pnl_percent": pnl_percent,
+                            "is_profitable": pnl > 0,
+                            "strategy": strat_name,
                             "reason": decision.reasoning,
                             "result": result,
                         },
@@ -2093,6 +2097,26 @@ class AITradingEngine:
                 )
                 
                 logger.info(f"💾 交易记录已保存到记忆库")
+
+                mc = self.main_controller
+                le = getattr(mc, "ai_learning_engine", None) if mc else None
+                if le is not None and hasattr(le, "record_trade_result"):
+                    try:
+                        await le.record_trade_result(
+                            {
+                                "symbol": decision.symbol,
+                                "side": side,
+                                "entry_price": open_price,
+                                "exit_price": decision.price,
+                                "pnl": pnl,
+                                "pnl_percent": pnl_percent,
+                                "strategy": strat_name,
+                                "reason": decision.reasoning,
+                                "timestamp": datetime.now().isoformat(),
+                            }
+                        )
+                    except Exception as ex:
+                        logger.debug(f"AILearningEngine.record_trade_result 跳过: {ex}")
                 
         except Exception as e:
             logger.error(f"保存交易到记忆失败: {e}")
@@ -2570,8 +2594,15 @@ class AITradingEngine:
                 logger.info("🔄 开始策略自我优化...")
                 
                 # 分析交易历史
-                if len(self.trade_history) >= 10:
+                n_hist = len(self.trade_history)
+                if n_hist >= 10:
                     await self._optimize_strategy()
+                else:
+                    logger.info(
+                        "⏭️ 跳过本周期策略优化：trade_history 不足 10 条（当前 %s）；"
+                        " 学习引擎与记忆平仓另计。",
+                        n_hist,
+                    )
                 
             except Exception as e:
                 logger.error(f"优化循环错误: {e}")
@@ -2579,29 +2610,26 @@ class AITradingEngine:
     async def _optimize_strategy(self) -> None:
         """策略优化"""
         try:
-            # 使用策略优化器进行分析
-            if self.strategy_optimizer:
+            # 兼容壳 StrategyOptimizer 无实质分析；若走该分支会提前 return，导致下方胜率统计永不执行
+            opt = self.strategy_optimizer
+            if opt and not getattr(opt, "is_compat_shim", False):
                 logger.info("📊 使用策略优化器分析交易表现...")
-                
-                # 分析所有策略
-                performances = await self.strategy_optimizer._analyze_all_strategies()
-                
-                # 发现新策略
-                new_proposals = await self.strategy_optimizer._discover_new_patterns()
-                
+                performances = await opt._analyze_all_strategies()
+                new_proposals = await opt._discover_new_patterns()
                 if new_proposals:
                     logger.info(f"💡 发现 {len(new_proposals)} 个新策略提案")
-                
-                # 处理新策略提案
-                await self.strategy_optimizer._process_new_strategy_proposals()
-                
-                # 保存优化结果
-                await self.strategy_optimizer._save_optimization_results()
-                
+                await opt._process_new_strategy_proposals()
+                await opt._save_optimization_results()
                 logger.info("✅ 策略优化完成")
                 return
-            
-            # 备用：原有的简单优化逻辑
+
+            if opt and getattr(opt, "is_compat_shim", False):
+                logger.info(
+                    "📌 策略优化器为兼容 shim（无全量分析）；本周期使用 trade_history 内置统计。"
+                    " 生产级参数收敛见 StrategyManager / apply_trade_feedback 与 API optimize-now。"
+                )
+
+            # 备用：原有的简单优化逻辑（胜率 → min_confidence 微调 + 记忆落库）
             profitable_trades = sum(1 for t in self.trade_history 
                                    if t.get("decision", {}).get("pnl", 0) > 0)
             total_trades = len(self.trade_history)
