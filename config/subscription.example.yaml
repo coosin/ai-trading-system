@@ -1,0 +1,29 @@
+settings:
+  auto_update: true
+  update_interval: 3600
+  retry_count: 3
+  timeout: 30
+  fetch_via_system_proxy: true
+  deduplicate_proxies: true
+  require_tls: true
+  allowed_ports: [443]
+  allowed_types: ["vless"]
+  url_test_url: "https://www.okx.com/api/v5/public/time"
+  url_test_interval: 180
+  proxy_groups:
+    - name: "🚀 节点选择"
+      type: "select"
+      use_all_proxies: true
+    - name: "♻️ 自动选择"
+      type: "url-test"
+      use_all_proxies: true
+      url: "https://www.okx.com/api/v5/public/time"
+      interval: 300
+
+# 示例订阅（已脱敏）
+# 请把你的真实订阅保存为 config/subscription.yaml（该文件已被 .gitignore 忽略）
+subscriptions:
+  - enabled: true
+    name: "主订阅"
+    update_interval: 3600
+    url: "https://example.com/your/subscription/url"

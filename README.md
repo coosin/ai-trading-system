@@ -19,7 +19,7 @@ curl -s http://127.0.0.1:8000/health
 
 ## 文档
 
-**正式文档索引**：[docs/README.md](./docs/README.md)（工程总览 **[docs/ENGINEERING.md](./docs/ENGINEERING.md)**、运维 **[docs/OPERATIONS.md](./docs/OPERATIONS.md)**、MCP 基线 **[docs/MCP_BASELINE.md](./docs/MCP_BASELINE.md)**）。
+**正式文档索引**：[docs/README.md](./docs/README.md)（工程总览 **[docs/ENGINEERING.md](./docs/ENGINEERING.md)**、运维 **[docs/OPERATIONS.md](./docs/OPERATIONS.md)**、MCP 基线 **[docs/MCP_BASELINE.md](./docs/MCP_BASELINE.md)**、OpenClaw 对接 **[docs/OPENCLAW_INTEGRATION_GUIDE.md](./docs/OPENCLAW_INTEGRATION_GUIDE.md)**）。
 
 ## 说明
 

@@ -58,6 +58,8 @@ docker compose restart trading-system
 4. `curl -s "http://localhost:8000/api/v1/modules/commander/audit?enrich=true"` — 司令部与第三方诊断  
 5. 日志: `docker logs openclaw-trading --tail 80` — 无持续 Traceback  
 
+> 日常托管建议直接按 `docs/DAILY_HOSTING_ACCEPTANCE.md` 执行“3~5 步”快验收。
+
 补充（账户与持仓一致性）：
 
 ```bash
@@ -150,6 +152,23 @@ curl -s -X POST http://localhost:8000/api/v1/ai/memory/recall \
 
 说明：**增强监控**（回撤、仓位、API 错误率等）在规则触发时会走 Telegram（若已配置）；**交易监控**侧重订单与市场数据时效。两者在 `monitoring/alerts` 中合并列出，按 `source` 区分。若 `summary.sources.enhanced_monitoring` 为 `false` 且初始化日志中有增强监控失败，应先修配置再验告警链路。
 
+### 2.4 OpenClaw 对接上线核对（新增）
+
+上线前建议执行：
+
+```bash
+curl -s http://localhost:8000/api/v1/modules/commander/capabilities
+curl -s http://localhost:8000/api/v1/modules/commander/tool-contract
+curl -s http://localhost:8000/api/v1/modules/surface/channels
+curl -s http://localhost:8000/api/v1/modules/surface/registry
+curl -s 'http://localhost:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
+curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"系统巡检","source":"openclaw"}'
+```
+
+完整流程见：`docs/OPENCLAW_INTEGRATION_GUIDE.md`。
+
 ---
 
 ## 3. 网络与代理基线（Clash / 生产）
@@ -222,6 +241,23 @@ python3 scripts/full_system_integration_check.py
 ```
 
 **最优选择（当前仓库实践结论）**：**宿主机 TUN + 规则正确** 为基座；容器侧若仍大量 **CONNECT 超时**，则 **host 网络或 OKX 忽略环境代理** 二选一或组合，直到 **`/api/v1/market/ticker` 的 `source` 为 `exchange` 且有价格**。
+
+### 3.7 OKX 代理守护（可选）
+
+仓库新增 `scripts/okx_proxy_guard.py`，用于巡检并在异常时触发 mihomo 修复动作：
+
+```bash
+python3 scripts/okx_proxy_guard.py --runs 3 --max-latency-ms 1200 --repair
+```
+
+如需常驻定时执行，可使用模板：
+
+```bash
+sudo cp deploy/systemd/okx-proxy-guard.service /etc/systemd/system/
+sudo cp deploy/systemd/okx-proxy-guard.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now okx-proxy-guard.timer
+```
 
 ---
 

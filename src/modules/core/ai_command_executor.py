@@ -2069,6 +2069,28 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                 gw = getattr(mc, "execution_gateway", None)
                 if gw:
                     lev = int(getattr(engine, "contract_config", {}).get("default_leverage", 20))
+                    market_reasoning = ""
+                    try:
+                        mi = getattr(mc, "market_intelligence", None)
+                        if mi and hasattr(mi, "get_market_state"):
+                            st = await mi.get_market_state(symbol)
+                            if isinstance(st, dict):
+                                trend = str(st.get("trend") or st.get("market_regime") or "").strip()
+                                momentum = str(st.get("momentum") or "").strip()
+                                vol = st.get("volatility")
+                                pieces = []
+                                if trend:
+                                    pieces.append(f"趋势={trend}")
+                                if momentum:
+                                    pieces.append(f"动能={momentum}")
+                                if vol is not None:
+                                    try:
+                                        pieces.append(f"波动={float(vol):.4f}")
+                                    except Exception:
+                                        pieces.append(f"波动={vol}")
+                                market_reasoning = " | ".join(pieces)[:180]
+                    except Exception:
+                        market_reasoning = ""
                     res = await gw.open_swap(
                         symbol=symbol,
                         side=side,
@@ -2078,7 +2100,13 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                         reason=reason,
                         margin_mode="cross",
                         price=None,
-                        context={"via": "ai_command_executor", "user_input": str(user_input)[:240]},
+                        context={
+                            "via": "ai_command_executor",
+                            "user_input": str(user_input)[:240],
+                            "manual_approved": True,
+                            "strategy": "managed_manual_trade",
+                            "decision_reasoning": market_reasoning or str(reason)[:180],
+                        },
                     )
                 else:
                     res = await engine.execute_trade(

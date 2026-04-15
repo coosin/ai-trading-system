@@ -160,6 +160,25 @@ export const api = {
       request('/modules/commander/account-sync/run', { method: 'POST', body: JSON.stringify({ reason }) }),
     getCommanderCapabilities: () => request('/modules/commander/capabilities'),
     getCommanderAudit: (enrich = false) => request(`/modules/commander/audit?enrich=${enrich ? 'true' : 'false'}`),
+    getCommanderHostingMode: () => request('/modules/commander/hosting-mode'),
+    setCommanderHostingMode: (mode) =>
+      request('/modules/commander/hosting-mode', { method: 'POST', body: JSON.stringify({ mode }) }),
+    getCommanderHostingGuard: () => request('/modules/commander/hosting-guard'),
+    updateCommanderHostingGuard: (data) =>
+      request('/modules/commander/hosting-guard', { method: 'POST', body: JSON.stringify(data || {}) }),
+    getCommanderAutomationProfile: () => request('/modules/commander/automation-profile'),
+    setCommanderAutomationProfile: (profile) =>
+      request('/modules/commander/automation-profile', { method: 'POST', body: JSON.stringify({ profile }) }),
+    getCommanderRiskRedlines: () => request('/modules/commander/risk-redlines'),
+    updateCommanderRiskRedlines: (data) =>
+      request('/modules/commander/risk-redlines', { method: 'POST', body: JSON.stringify(data || {}) }),
+    getCommanderArchitectureLayers: () => request('/modules/commander/architecture/layers'),
+    getCommanderUpgradeBenchmark: () => request('/modules/commander/upgrade/benchmark'),
+    getCommanderToolContract: () => request('/modules/commander/tool-contract'),
+    getCommanderGovernanceAudit: (limit = 50) =>
+      request(`/modules/commander/governance-audit?limit=${Number(limit) || 50}`),
+    runCommanderUpgradePipeline: (data = {}) =>
+      request('/modules/commander/upgrade/run', { method: 'POST', body: JSON.stringify(data || {}) }),
     getAiGuards: () => request('/modules/ai/guards'),
     getStopLossStats: () => request('/modules/stop-loss/stats'),
     getSurfaceRegistry: () => request('/modules/surface/registry'),

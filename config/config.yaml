@@ -469,6 +469,13 @@ proactive_scanner:
 market_intelligence:
   cache_ttl_sec: 20
   push_interval_sec: 15
+  market_state_fetch_limit: 4
+  snapshot_timeout_s: 2.2
+  snapshot_timeout_min_s: 1.6
+  snapshot_timeout_max_s: 4.2
+  klines_timeout_s: 1.2
+  klines_timeout_min_s: 0.8
+  klines_timeout_max_s: 2.6
   watch_symbols:
   - BTC/USDT
   - ETH/USDT

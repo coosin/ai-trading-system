@@ -139,6 +139,85 @@ class ExecutionGateway:
         swo = str(p.get("single_write_owner") or p.get("primary_controller") or "ai_core").strip().lower()
         return swo
 
+    def _hosting_mode(self) -> str:
+        mc = self._mc
+        if mc and hasattr(mc, "get_hosting_mode"):
+            try:
+                m = str(mc.get_hosting_mode() or "full_auto").strip().lower()
+                if m in {"full_auto", "semi_auto"}:
+                    return m
+            except Exception:
+                pass
+        return "full_auto"
+
+    def _automation_profile(self) -> str:
+        mc = self._mc
+        if mc and hasattr(mc, "get_automation_profile"):
+            try:
+                p = str(mc.get_automation_profile() or "semi_auto").strip().lower()
+                if p in {"conservative", "semi_auto", "full_auto"}:
+                    return p
+            except Exception:
+                pass
+        return "semi_auto"
+
+    def _risk_redlines(self) -> Dict[str, Any]:
+        mc = self._mc
+        if mc and hasattr(mc, "get_risk_redlines"):
+            try:
+                out = mc.get_risk_redlines()
+                if isinstance(out, dict):
+                    return out
+            except Exception:
+                pass
+        return {}
+
+    @staticmethod
+    def _is_manual_approved(source: str, context: Optional[Dict[str, Any]]) -> bool:
+        src = str(source or "").strip().lower()
+        if src in {"manual", "user", "api_chat"}:
+            return True
+        if context and isinstance(context, dict):
+            return bool(context.get("manual_approved", False))
+        return False
+
+    async def _open_blocked_by_redlines(
+        self,
+        symbol: str,
+        size: float,
+        source: str,
+        context: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        red = self._risk_redlines()
+        if not red:
+            return None
+        # 保守模式：仅允许人工确认开仓
+        if self._automation_profile() == "conservative" and not self._is_manual_approved(source, context):
+            return "保守模式拦截：仅允许人工确认开仓"
+
+        ex = self._exchange()
+        if not ex:
+            return None
+        try:
+            max_positions = int(red.get("max_positions", 0) or 0)
+            if max_positions > 0 and hasattr(ex, "get_positions"):
+                ps = await ex.get_positions()
+                non_zero = 0
+                for p in ps or []:
+                    if not isinstance(p, dict):
+                        continue
+                    try:
+                        v = float(p.get("size", p.get("pos", 0)) or 0)
+                    except Exception:
+                        v = 0.0
+                    if abs(v) > 1e-12:
+                        non_zero += 1
+                if non_zero >= max_positions:
+                    return f"风控红线拦截：持仓数 {non_zero} 已达到上限 {max_positions}"
+        except Exception:
+            pass
+        return None
+
     def _allow_discretionary(self, source: str, swo: str) -> bool:
         src = (source or "").strip().lower()
         if src in _AUXILIARY_WRITE_SOURCES:
@@ -434,6 +513,27 @@ class ExecutionGateway:
                         )
                 except Exception:
                     pass
+                # trade history persistence (best-effort)
+                if ok:
+                    try:
+                        ths = getattr(self._mc, "trade_history_service", None) if self._mc else None
+                        if ths and hasattr(ths, "record_trade_dict"):
+                            await ths.record_trade_dict(
+                                {
+                                    "timestamp": self._snapshot.last_order_at,
+                                    "symbol": str(symbol),
+                                    "side": str(side),
+                                    "action": "close",
+                                    "source": str(source or "gateway"),
+                                    "reason": str(reason or ""),
+                                    "status": "filled",
+                                    "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
+                                    "price": float(res.get("average") or res.get("price") or 0) if isinstance(res, dict) and (res.get("average") or res.get("price")) else None,
+                                    "quantity": float(size) if size is not None else None,
+                                }
+                            )
+                    except Exception:
+                        pass
                 return res if isinstance(res, dict) else {"success": ok, "raw": res}
             except Exception as e:
                 self._metric_inc("close_fail")
@@ -481,6 +581,44 @@ class ExecutionGateway:
         """开永续仓位（经策略校验后的唯一入口之一）。"""
         swo = await self.single_write_owner()
         self._snapshot.single_write_owner = swo
+
+        # 托管模式门控：
+        # - full_auto: 按原有策略放行
+        # - semi_auto: 策略自动开仓默认拒绝，需人工确认（manual source 或 manual_approved）
+        if self._hosting_mode() == "semi_auto" and not self._is_manual_approved(source, context):
+            self._metric_inc("open_policy_denied")
+            msg = "托管模式拦截：当前为半自动，需人工确认后才允许开仓"
+            logger.warning("ExecutionGateway.open_swap: %s source=%s", msg, source)
+            self._record_order(
+                source,
+                "open",
+                False,
+                msg,
+                symbol=symbol,
+                side=side,
+                size=size,
+                leverage=leverage,
+                reason=reason,
+                context=context,
+            )
+            return {"success": False, "error": msg}
+
+        redline_err = await self._open_blocked_by_redlines(symbol=symbol, size=size, source=source, context=context)
+        if redline_err:
+            self._metric_inc("open_policy_denied")
+            self._record_order(
+                source,
+                "open",
+                False,
+                redline_err,
+                symbol=symbol,
+                side=side,
+                size=size,
+                leverage=leverage,
+                reason=reason,
+                context=context,
+            )
+            return {"success": False, "error": redline_err}
 
         if not self._allow_open(source, swo):
             self._metric_inc("open_policy_denied")
@@ -717,6 +855,28 @@ class ExecutionGateway:
                         )
                 except Exception:
                     pass
+                # trade history persistence (best-effort)
+                if ok:
+                    try:
+                        ths = getattr(self._mc, "trade_history_service", None) if self._mc else None
+                        if ths and hasattr(ths, "record_trade_dict"):
+                            await ths.record_trade_dict(
+                                {
+                                    "timestamp": self._snapshot.last_order_at,
+                                    "symbol": str(symbol),
+                                    "side": str(side),
+                                    "action": "open",
+                                    "source": str(source or "gateway"),
+                                    "reason": str(reason or ""),
+                                    "status": "filled",
+                                    "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
+                                    "price": float(res.get("average") or res.get("price") or 0) if isinstance(res, dict) and (res.get("average") or res.get("price")) else None,
+                                    "quantity": float(size) if size is not None else None,
+                                    "leverage": int(lev) if lev is not None else None,
+                                }
+                            )
+                    except Exception:
+                        pass
                 return res if isinstance(res, dict) else {"success": ok, "raw": res}
             except Exception as e:
                 self._metric_inc("open_fail")

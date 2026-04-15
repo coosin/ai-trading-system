@@ -208,6 +208,24 @@ class OKXExchange(ExchangeBase):
     def _proxy_temporarily_disabled(self) -> bool:
         return time.time() < float(self._proxy_disabled_until or 0.0)
 
+    def _allow_direct_fallback(self) -> bool:
+        """
+        Whether OKX is allowed to downgrade from proxy to direct.
+
+        IMPORTANT:
+        - If proxy is sourced from env (HTTP(S)_PROXY / OPENCLAW_HTTP(S)_PROXY), direct is often unavailable
+          on servers that require proxy to reach OKX. In that case, downgrading to direct will only create
+          long timeouts and cascading snapshot_timeout degradations.
+        - For proxy_manager-managed proxies, keeping the historical behavior (allow direct fallback) can be
+          useful as a last resort.
+        """
+        if self._proxy_only:
+            return False
+        if getattr(self, "_proxy_from_env", False):
+            return False
+        flag = str(os.getenv("OPENCLAW_OKX_ALLOW_DIRECT_FALLBACK", "1") or "1").strip().lower()
+        return flag in ("1", "true", "yes", "on")
+
     async def _mark_request_success(self) -> None:
         self._network_consecutive_failures = 0
         self._adaptive_min_request_interval = max(
@@ -273,8 +291,13 @@ class OKXExchange(ExchangeBase):
         代理链路异常时切换为直连会话。
         说明：不要求用户改配置；只在运行时降级，尽量保证 OKX API 可达。
         """
-        if self._proxy_only:
-            logger.warning("⚠️ 已启用 OPENCLAW_OKX_PROXY_ONLY，跳过直连降级: %s", reason)
+        if not self._allow_direct_fallback():
+            logger.warning(
+                "⚠️ OKX 已禁用直连降级（proxy_only=%s proxy_from_env=%s），保持走代理并尝试自愈: %s",
+                bool(self._proxy_only),
+                bool(getattr(self, "_proxy_from_env", False)),
+                reason,
+            )
             return
         async with self._session_recreate_lock:
             # 双重检查，避免重复重建
@@ -787,7 +810,7 @@ class OKXExchange(ExchangeBase):
                     await self._mark_request_failure(f"timeout {method} {endpoint}")
                     # 走代理时超时多为 CONNECT/隧道问题，与 ClientError 一样允许降级直连再试
                     if (
-                        (not self._proxy_only)
+                        self._allow_direct_fallback()
                         and proxy
                         and getattr(self, "_proxy_url", None)
                         and attempt < max_retries
@@ -861,7 +884,7 @@ class OKXExchange(ExchangeBase):
                         )
                     )
                     if (
-                        (not self._proxy_only)
+                        self._allow_direct_fallback()
                         and proxy_related
                         and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None))
                     ):
@@ -886,7 +909,7 @@ class OKXExchange(ExchangeBase):
                     error_str = str(e)
                     # 代理链路导致的“全失败”常见报错，自动降级直连再试
                     if (
-                        (not self._proxy_only)
+                        self._allow_direct_fallback()
                         and "All operations failed" in error_str
                         and (getattr(self, "_proxy_mode", "") in ("http", "socks") or getattr(self, "_proxy_url", None))
                     ):
@@ -917,6 +940,14 @@ class OKXExchange(ExchangeBase):
                     or os.getenv("HTTPS_PROXY")
                     or os.getenv("HTTP_PROXY")
                 )
+                # 若检测到环境代理，则默认启用“proxy-only”（可通过 OPENCLAW_OKX_AUTO_PROXY_ONLY=0 关闭）。
+                # 原因：在很多服务器环境里 OKX 直连不可达，任何降级直连都会制造长超时与数据降级。
+                auto_proxy_only = str(os.getenv("OPENCLAW_OKX_AUTO_PROXY_ONLY", "1") or "1").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
                 if self._ignore_env_proxy:
                     if self._proxy_only:
                         raise RuntimeError(
@@ -937,6 +968,9 @@ class OKXExchange(ExchangeBase):
                     self._proxy_from_env = False
                     logger.info("✅ OKX 已启用直连会话（容器/压测推荐路径）")
                 elif env_proxy:
+                    if auto_proxy_only and not self._proxy_only:
+                        self._proxy_only = True
+                        logger.info("✅ OKX 检测到环境代理，自动启用 proxy-only（避免降级直连超时）")
                     ssl_context = self._build_ssl_context()
                     connector = self._new_tcp_connector(ssl_context)
                     self._proxy_url = env_proxy

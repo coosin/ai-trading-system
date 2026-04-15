@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenClaw OKX Proxy Guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cool/.openclaw-trading
+ExecStart=/usr/bin/python3 /home/cool/.openclaw-trading/scripts/okx_proxy_guard.py --runs 3 --max-latency-ms 1200 --repair
+StandardOutput=append:/home/cool/.openclaw-trading/logs/okx_proxy_guard.log
+StandardError=append:/home/cool/.openclaw-trading/logs/okx_proxy_guard.log
+
+[Install]
+WantedBy=multi-user.target

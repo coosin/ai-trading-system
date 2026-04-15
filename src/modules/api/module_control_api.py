@@ -185,7 +185,13 @@ def init_module_control_api(app, main_controller):
                     out_view = {k: v for k, v in out_view.items() if k in allow}
                 return {"ok": True, "view": out_view, "snapshot": None, "degraded": True, "message": "symbol_view_cached"}
 
-            view = await asyncio.wait_for(mi.get_symbol_view(symbol, include_snapshot=bool(include_snapshot)), timeout=3.0)
+            # unified_snapshot has its own bounded budget (DataSourceHub.snapshot_timeout_sec, default ~2.5s).
+            # In proxy-only environments, scheduling + JSON + partial collectors can push the end-to-end
+            # call slightly above 3s. Use a slightly larger cap to avoid false "timeout_degraded".
+            view = await asyncio.wait_for(
+                mi.get_symbol_view(symbol, include_snapshot=bool(include_snapshot)),
+                timeout=4.5,
+            )
             out_view = view.to_dict()
             if fields:
                 allow = {k.strip() for k in str(fields).split(",") if k.strip()}
@@ -211,7 +217,8 @@ def init_module_control_api(app, main_controller):
             return {"ok": False, "message": "MarketIntelligenceEngine unavailable"}
         try:
             # 防止聚合计算/上游抖动导致 API 阻塞（前端/运维需要“快返回”）。
-            state = await asyncio.wait_for(mi.get_market_state(), timeout=2.0)
+            # market_state is a fan-out aggregation. Keep it bounded but avoid being too tight.
+            state = await asyncio.wait_for(mi.get_market_state(), timeout=4.0)
             return {"ok": True, "state": state, "degraded": False}
         except asyncio.TimeoutError:
             cached = None
@@ -942,6 +949,51 @@ def init_module_control_api(app, main_controller):
             return {"success": True, "stats": data or {}}
         except Exception as e:
             return {"success": False, "message": f"读取止盈止损统计失败: {e}"}
+
+    @router.get("/stop-loss/active-orders")
+    async def get_stop_loss_active_orders(limit: int = 50):
+        """获取当前活动 SLTP 订单明细（用于前端展示“有止损/止盈”）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        try:
+            slm = getattr(main_controller, "stop_loss_manager", None)
+            if not slm:
+                return {"success": False, "message": "止盈止损管理器未初始化"}
+            if not hasattr(slm, "get_all_active_orders"):
+                return {"success": False, "message": "止盈止损明细接口不可用"}
+            orders = await slm.get_all_active_orders()
+            rows = []
+            for o in (orders or [])[: max(0, int(limit or 50))]:
+                try:
+                    rows.append(o.to_dict() if hasattr(o, "to_dict") else dict(o))
+                except Exception:
+                    continue
+            return {"success": True, "data": rows, "count": len(rows), "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": f"读取活动 SLTP 订单失败: {e}"}
+
+    @router.get("/stop-loss/config")
+    async def get_stop_loss_config():
+        """获取 SLTP 配置（分层止盈/移动止盈/移动止损参数）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        try:
+            slm = getattr(main_controller, "stop_loss_manager", None)
+            if not slm:
+                return {"success": False, "message": "止盈止损管理器未初始化"}
+            cfg = getattr(slm, "config", None)
+            if cfg is None:
+                return {"success": True, "data": {}, "timestamp": datetime.now().isoformat()}
+            # dataclass friendly
+            try:
+                from dataclasses import asdict
+
+                data = asdict(cfg)
+            except Exception:
+                data = dict(cfg) if isinstance(cfg, dict) else {"repr": repr(cfg)}
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": f"读取 SLTP 配置失败: {e}"}
     
     @router.get("/system/health")
     async def get_system_health():
@@ -1324,6 +1376,8 @@ def init_module_control_api(app, main_controller):
                 "module_count": st.get("module_count"),
                 "running_modules": st.get("running_modules"),
             }
+            if hasattr(mc, "get_hosting_mode"):
+                out["system"]["hosting_mode"] = mc.get_hosting_mode()
         except Exception as e:
             out["alerts"].append(f"系统状态读取失败: {e}")
 
@@ -1537,6 +1591,234 @@ def init_module_control_api(app, main_controller):
                     "mode": "fast_degraded_timeout",
                     "alerts": ["snapshot_timeout_degraded"],
                 },
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/hosting-mode")
+    async def commander_get_hosting_mode():
+        """获取当前托管模式（full_auto / semi_auto）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_hosting_mode"):
+            return {"success": False, "message": "托管模式能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            mode = main_controller.get_hosting_mode()
+            return {
+                "success": True,
+                "data": {
+                    "mode": mode,
+                    "mode_zh": "全自动" if mode == "full_auto" else "半自动",
+                    "description": (
+                        "AI全自动托管：系统可自主开平仓并自动风控"
+                        if mode == "full_auto"
+                        else "半自动托管：策略开仓需人工确认，平仓风控仍自动执行"
+                    ),
+                    "allowed_values": [
+                        {"value": "full_auto", "label": "全自动"},
+                        {"value": "semi_auto", "label": "半自动"},
+                    ],
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/hosting-guard")
+    async def commander_get_hosting_guard():
+        """获取托管守护配置与状态（后端自动降级/恢复中枢）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_hosting_guard_status"):
+            return {"success": False, "message": "托管守护能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.get_hosting_guard_status()
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/automation-profile")
+    async def commander_get_automation_profile():
+        """获取自动化协同级别（conservative / semi_auto / full_auto）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_automation_profile"):
+            return {"success": False, "message": "自动化级别能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            p = main_controller.get_automation_profile()
+            return {"success": True, "data": {"profile": p}, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/automation-profile")
+    async def commander_set_automation_profile(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """设置自动化协同级别。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "set_automation_profile"):
+            return {"success": False, "message": "自动化级别能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            p = str((payload or {}).get("profile") or "").strip()
+            current = main_controller.set_automation_profile(p)
+            return {"success": True, "data": {"profile": current}, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/risk-redlines")
+    async def commander_get_risk_redlines():
+        """获取统一风控红线。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_risk_redlines"):
+            return {"success": False, "message": "风控红线能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.get_risk_redlines()
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/risk-redlines")
+    async def commander_update_risk_redlines(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """更新统一风控红线。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "update_risk_redlines"):
+            return {"success": False, "message": "风控红线能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.update_risk_redlines(payload or {})
+            return {"success": True, "data": data, "message": "风控红线已更新", "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/hosting-guard")
+    async def commander_update_hosting_guard(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """更新托管守护配置。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "update_hosting_guard_config"):
+            return {"success": False, "message": "托管守护能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.update_hosting_guard_config(payload or {})
+            return {"success": True, "data": data, "message": "托管守护配置已更新", "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/architecture/layers")
+    async def commander_architecture_layers():
+        """系统分层架构状态（L1-L5）与托管守护状态。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_architecture_layers_status"):
+            return {"success": False, "message": "分层架构状态能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.get_architecture_layers_status()
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/upgrade/benchmark")
+    async def commander_upgrade_benchmark():
+        """外部基线能力对照（Agent Trade Kit / Agent Skills 映射结果）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_external_benchmark_matrix"):
+            return {"success": False, "message": "基线对照能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.get_external_benchmark_matrix()
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/tool-contract")
+    async def commander_tool_contract():
+        """标准工具契约清单（供 OpenClaw/MCP/CLI 对接）。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_tool_contract_catalog"):
+            return {"success": False, "message": "工具契约能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.get_tool_contract_catalog()
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/governance-audit")
+    async def commander_governance_audit(limit: int = 100):
+        """治理审计流：托管切换、自动化分级、红线更新等变更回放。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "get_governance_audit"):
+            return {"success": False, "message": "治理审计能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            data = main_controller.get_governance_audit(limit=limit)
+            return {"success": True, "data": {"items": data}, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/upgrade/run")
+    async def commander_upgrade_run(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """
+        一键升级闭环执行：
+        - 账户同步
+        - 司令部任务/策略优化
+        - 分层验收
+        - 托管守护验收
+        - 回撤统计验收
+        - 外部基线对照
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "run_upgrade_pipeline"):
+            return {"success": False, "message": "一键升级能力不可用", "timestamp": datetime.now().isoformat()}
+        try:
+            symbol = str((payload or {}).get("symbol") or "BTC/USDT")
+            trigger_optimize = bool((payload or {}).get("trigger_optimize", True))
+            force_account_sync = bool((payload or {}).get("force_account_sync", True))
+            auto_fallback_to_semi = bool((payload or {}).get("auto_fallback_to_semi", True))
+            data = await main_controller.run_upgrade_pipeline(
+                symbol=symbol,
+                trigger_optimize=trigger_optimize,
+                force_account_sync=force_account_sync,
+                auto_fallback_to_semi=auto_fallback_to_semi,
+            )
+            return {"success": bool(data.get("success")), "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/hosting-mode")
+    async def commander_set_hosting_mode(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """切换托管模式。mode: full_auto / semi_auto"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        if not hasattr(main_controller, "set_hosting_mode"):
+            return {"success": False, "message": "托管模式能力不可用", "timestamp": datetime.now().isoformat()}
+        mode = str((payload or {}).get("mode") or "").strip()
+        mode_l = mode.lower()
+        normalized = mode_l
+        if mode in {"全自动", "自动"} or mode_l in {"full", "auto"}:
+            normalized = "full_auto"
+        elif mode in {"半自动"} or mode_l in {"semi", "semi-automatic", "semi_automatic"}:
+            normalized = "semi_auto"
+        if normalized not in {"full_auto", "semi_auto"}:
+            return {
+                "success": False,
+                "message": "mode 仅支持: full_auto/全自动 或 semi_auto/半自动",
+                "timestamp": datetime.now().isoformat(),
+            }
+        try:
+            current = main_controller.set_hosting_mode(normalized)
+            return {
+                "success": True,
+                "data": {
+                    "mode": current,
+                    "mode_zh": "全自动" if current == "full_auto" else "半自动",
+                },
+                "message": (
+                    "已切换为全自动托管（AI自主开平仓）"
+                    if current == "full_auto"
+                    else "已切换为半自动托管（开仓需人工确认）"
+                ),
                 "timestamp": datetime.now().isoformat(),
             }
         except Exception as e:

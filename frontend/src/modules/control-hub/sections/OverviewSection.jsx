@@ -5,8 +5,45 @@ function statusText(ok) {
   return ok ? '正常' : '异常';
 }
 
-export default function OverviewSection({ state, flowRows, updatedAt }) {
+function viewAutoGuard(view) {
+  const g = view?.autoHostingGuard || {};
+  return {
+    enabled: Boolean(g.enabled),
+    shouldDowngrade: Boolean(g.shouldDowngrade),
+    reasons: Array.isArray(g.reasons) ? g.reasons : [],
+    lastAction: g.lastAction || null,
+  };
+}
+
+export default function OverviewSection({ state, view, flowRows, updatedAt, actions, loading }) {
   const missingRows = flowRows.filter((r) => !r.ok);
+  const hosting = state.hostingMode?.data || {};
+  const currentMode = hosting.mode || state.commanderSnapshot?.system?.hosting_mode || 'full_auto';
+  const currentModeZh = hosting.mode_zh || (currentMode === 'semi_auto' ? '半自动' : '全自动');
+  const hostingDesc =
+    hosting.description ||
+    (currentMode === 'semi_auto'
+      ? '半自动托管：策略开仓需人工确认，平仓风控仍自动执行'
+      : '全自动托管：AI自主开平仓并自动执行风控');
+  const autoGuard = viewAutoGuard(view);
+  const automationProfile = state.automationProfile?.data?.profile || state.systemStatus?.automation_profile || 'semi_auto';
+  const red = state.riskRedlines?.data || state.systemStatus?.risk_redlines || {};
+  const [redlineDraft, setRedlineDraft] = React.useState({
+    max_positions: Number(red.max_positions || 5),
+    single_order_max_ratio: Number(red.single_order_max_ratio || 0.05),
+    max_total_exposure_ratio: Number(red.max_total_exposure_ratio || 0.8),
+    min_open_cooldown_sec: Number(red.min_open_cooldown_sec || 5),
+    max_drawdown_ratio: Number(red.max_drawdown_ratio || 0.15),
+  });
+  React.useEffect(() => {
+    setRedlineDraft({
+      max_positions: Number(red.max_positions || 5),
+      single_order_max_ratio: Number(red.single_order_max_ratio || 0.05),
+      max_total_exposure_ratio: Number(red.max_total_exposure_ratio || 0.8),
+      min_open_cooldown_sec: Number(red.min_open_cooldown_sec || 5),
+      max_drawdown_ratio: Number(red.max_drawdown_ratio || 0.15),
+    });
+  }, [red.max_drawdown_ratio, red.max_positions, red.max_total_exposure_ratio, red.min_open_cooldown_sec, red.single_order_max_ratio]);
   const controlRows = [
     {
       id: 'c1',
@@ -46,6 +83,7 @@ export default function OverviewSection({ state, flowRows, updatedAt }) {
     { label: '账户同步', value: statusText(!state.accountDiagnostics?.degraded) },
     { label: '活跃告警', value: state.monitoringSummary?.active_alerts ?? 0 },
     { label: '模块数', value: state.systemStatus?.module_count ?? '-' },
+    { label: '托管模式', value: currentModeZh },
   ];
   const watchRows = (state.watchTickers || []).map((row, idx) => {
     const t = row.ticker || {};
@@ -65,6 +103,82 @@ export default function OverviewSection({ state, flowRows, updatedAt }) {
       </div>
       <div className="panel-body">
         <MetricGrid items={metrics} />
+        <div className={`hosting-card ${currentMode === 'semi_auto' ? 'semi' : 'full'}`}>
+          <div className="hosting-title">托管模式（傻瓜化一键切换）</div>
+          <div className="hosting-current">
+            当前模式：<strong>{currentModeZh}</strong>
+          </div>
+          <div className="hosting-desc">{hostingDesc}</div>
+          <div className="hosting-actions">
+            <button
+              type="button"
+              className={`btn btn-sm ${currentMode === 'full_auto' ? 'btn-primary' : 'btn-outline'}`}
+              onClick={() => actions?.switchHostingMode?.('全自动')}
+              disabled={loading?.slow}
+            >
+              切到全自动（推荐）
+            </button>
+            <button
+              type="button"
+              className={`btn btn-sm ${currentMode === 'semi_auto' ? 'btn-primary' : 'btn-outline'}`}
+              onClick={() => actions?.switchHostingMode?.('半自动')}
+              disabled={loading?.slow}
+            >
+              切到半自动（更稳）
+            </button>
+          </div>
+          <div className="hosting-guard-row">
+            <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>自动化级别：</span>
+            <button type="button" className={`btn btn-sm ${automationProfile === 'conservative' ? 'btn-primary' : 'btn-outline'}`} onClick={() => actions?.setAutomationProfile?.('conservative')}>
+              保守
+            </button>
+            <button type="button" className={`btn btn-sm ${automationProfile === 'semi_auto' ? 'btn-primary' : 'btn-outline'}`} onClick={() => actions?.setAutomationProfile?.('semi_auto')}>
+              半自动
+            </button>
+            <button type="button" className={`btn btn-sm ${automationProfile === 'full_auto' ? 'btn-primary' : 'btn-outline'}`} onClick={() => actions?.setAutomationProfile?.('full_auto')}>
+              全自动
+            </button>
+            <button type="button" className="btn btn-sm btn-outline" onClick={() => actions?.runUpgradePipeline?.()}>
+              一键回归校验
+            </button>
+          </div>
+          <div className="hosting-guard-row">
+            <label className="confirm-toggle">
+              <input
+                type="checkbox"
+                checked={Boolean(autoGuard.enabled)}
+                onChange={(e) => actions?.toggleAutoHostingGuard?.(e.target.checked)}
+              />
+              自动安全降级（异常时自动切半自动）
+            </label>
+          </div>
+          <div className="hosting-guard-row" style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(120px, 1fr))', gap: 8 }}>
+            <input className="form-input" type="number" value={redlineDraft.max_positions} onChange={(e) => setRedlineDraft((p) => ({ ...p, max_positions: Number(e.target.value) }))} placeholder="最大持仓数" />
+            <input className="form-input" type="number" step="0.01" value={redlineDraft.single_order_max_ratio} onChange={(e) => setRedlineDraft((p) => ({ ...p, single_order_max_ratio: Number(e.target.value) }))} placeholder="单笔上限比例" />
+            <input className="form-input" type="number" step="0.01" value={redlineDraft.max_total_exposure_ratio} onChange={(e) => setRedlineDraft((p) => ({ ...p, max_total_exposure_ratio: Number(e.target.value) }))} placeholder="总暴露上限" />
+            <input className="form-input" type="number" value={redlineDraft.min_open_cooldown_sec} onChange={(e) => setRedlineDraft((p) => ({ ...p, min_open_cooldown_sec: Number(e.target.value) }))} placeholder="开仓冷却秒" />
+            <input className="form-input" type="number" step="0.01" value={redlineDraft.max_drawdown_ratio} onChange={(e) => setRedlineDraft((p) => ({ ...p, max_drawdown_ratio: Number(e.target.value) }))} placeholder="最大回撤比例" />
+          </div>
+          <div className="hosting-guard-row">
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              onClick={() => actions?.updateRiskRedlines?.(redlineDraft)}
+              disabled={loading?.slow}
+            >
+              应用统一风控红线
+            </button>
+          </div>
+          {autoGuard.enabled && autoGuard.shouldDowngrade && currentMode === 'full_auto' && (
+            <div className="hosting-tips">检测到异常：{autoGuard.reasons.join('；')}。系统将自动切到半自动。</div>
+          )}
+          {autoGuard.lastAction?.reason && (
+            <div className="hosting-tips">最近自动动作：{autoGuard.lastAction.reason}</div>
+          )}
+          <div className="hosting-tips">
+            提示：行情剧烈波动时建议先切“半自动”；链路稳定后再切回“全自动”。
+          </div>
+        </div>
         <InsightCard
           title="当前系统结论"
           content={`系统健康：${state.health?.overall || state.health?.status || '-'}；账户同步：${statusText(!state.accountDiagnostics?.degraded)}；活跃告警：${state.monitoringSummary?.active_alerts ?? 0}。`}

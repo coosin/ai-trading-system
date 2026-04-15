@@ -130,7 +130,7 @@ export default function UnifiedControlHubModule() {
           </div>
         </div>
 
-        {tab === 'overview' && <OverviewSection state={state} flowRows={flowRows} updatedAt={updatedAt} />}
+        {tab === 'overview' && <OverviewSection state={state} view={view} flowRows={flowRows} updatedAt={updatedAt} actions={actions} loading={loading} />}
       {tab === 'analysis' && <DataAnalysisSection state={state} view={view} updatedAt={updatedAt} actions={actions} loading={loading} />}
         {tab === 'trading' && (
           <TradingSection

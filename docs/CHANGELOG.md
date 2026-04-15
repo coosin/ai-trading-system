@@ -1,5 +1,34 @@
 # 变更记录
 
+## 2026-04-16 — OpenClaw 对接文档全量更新 + 网络守护文档同步
+
+- 新增 `docs/OPENCLAW_INTEGRATION_GUIDE.md`：
+  - 对接目标、最小读写接口集、上线前检查、事件补偿策略、治理审计要点、常见失败点。
+- 文档索引更新：
+  - `README.md`、`docs/README.md` 增加 OpenClaw 对接入口。
+- API 文档更新：
+  - `docs/API_REFERENCE.md` 新增“OpenClaw 对接最小接口集”。
+- 工程文档更新：
+  - `docs/ENGINEERING.md` 增加 `market.state` 缓存优先 + 缺失补拉 + 自适应超时设计说明；
+  - 增加 OpenClaw 对接契约说明（读写入口与 `source=openclaw` 审计建议）。
+- 运维与开发文档更新：
+  - `docs/OPERATIONS.md` 增加 OpenClaw 上线核对步骤；
+  - `docs/DEVELOPMENT.md` 增加 OpenClaw 本地联调最小命令集。
+- 网络守护能力文档化：
+  - `docs/OPERATIONS.md` 已同步 `scripts/okx_proxy_guard.py` 与 `deploy/systemd/okx-proxy-guard.{service,timer}` 的启用流程。
+
+## 2026-04-15 — 新增每日托管验收手册（3~5 步）
+
+- 新增 `docs/DAILY_HOSTING_ACCEPTANCE.md`，提供日常托管最小验收路径：
+  - 一键总验收（`scripts/one_click_upgrade_pipeline.py`）
+  - 托管模式/自动化档位检查
+  - 统一风控红线检查
+  - 账户持仓与事件流活性检查
+  - 失败时自动降级到半自动的固定处置动作
+- `docs/README.md` 增加该手册入口，便于值守快速定位。
+- `docs/OPERATIONS.md` 增加引用，统一“运行巡检”和“日常托管验收”入口。
+- `docs/API_REFERENCE.md` 补充治理与托管相关接口清单，并给出该手册作为日常验收建议。
+
 ## 2026-04-15 — 文档全量同步（API/MCP/工程）与同步一致性说明
 
 - **文档结构更新:**

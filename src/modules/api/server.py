@@ -944,6 +944,103 @@ class APIServer:
                 base["error"] = str(e)
             return base
 
+        # ---------------------------------------------------------------------
+        # Compatibility endpoints (legacy frontends / monitoring)
+        # ---------------------------------------------------------------------
+        @api_v1_router.get("/balance", tags=["account"])
+        async def legacy_balance():
+            """
+            兼容老前端：GET /api/v1/balance
+            - 返回简化余额字典（与 OKXExchange.get_balance 对齐）
+            - 失败时返回 ok=false + message
+            """
+            mc = self.main_controller
+            ex = mc.get_exchange() if (mc and hasattr(mc, "get_exchange")) else None
+            if not ex or not hasattr(ex, "get_balance"):
+                return {"ok": False, "message": "exchange unavailable", "balance": {}}
+            try:
+                bal = await asyncio.wait_for(ex.get_balance(), timeout=6.0)
+                if not isinstance(bal, dict):
+                    bal = {}
+                # Add "data" alias for older clients expecting a data envelope.
+                return {"ok": True, "balance": bal, "data": bal}
+            except Exception as e:
+                return {"ok": False, "message": str(e), "balance": {}, "data": {}}
+
+        @api_v1_router.get("/positions", tags=["account"])
+        async def legacy_positions():
+            """
+            兼容老前端：GET /api/v1/positions
+            - 返回 positions 列表（与 OKXExchange.get_positions 对齐）
+            - 失败时返回 ok=false + message
+            """
+            mc = self.main_controller
+            ex = mc.get_exchange() if (mc and hasattr(mc, "get_exchange")) else None
+            if not ex or not hasattr(ex, "get_positions"):
+                return {"ok": False, "message": "exchange unavailable", "positions": [], "data": []}
+            try:
+                pos = await asyncio.wait_for(ex.get_positions(), timeout=6.5)
+                if not isinstance(pos, list):
+                    pos = []
+                # best-effort: filter non-zero
+                out = []
+                for row in pos:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        sz = float(row.get("size") or row.get("quantity") or 0.0)
+                    except Exception:
+                        sz = 0.0
+                    if abs(sz) > 1e-12:
+                        out.append(row)
+                return {"ok": True, "positions": out, "count": len(out), "data": out}
+            except Exception as e:
+                return {"ok": False, "message": str(e), "positions": [], "count": 0, "data": []}
+
+        @api_v1_router.get("/engine/status", tags=["system"])
+        async def engine_status():
+            """
+            交易引擎状态（前端/监控友好）
+            """
+            mc = self.main_controller
+            if not mc:
+                return {"ok": False, "message": "main_controller unavailable"}
+            try:
+                s = await mc.get_system_status()
+                eng = (s or {}).get("module_statuses", {}).get("ai_trading_engine", {})
+                ex_ok = bool((s or {}).get("execution_spine", {}).get("exchange_connected"))
+                out = {"engine": eng, "exchange_connected": ex_ok}
+                return {"ok": True, **out, "data": out}
+            except Exception as e:
+                return {"ok": False, "message": str(e), "data": None}
+
+        # Compatibility aliases for module-style paths used by some frontends
+        @api_v1_router.get("/modules/engine/status", tags=["system"])
+        @api_v1_router.get("/modules/trading/engine/status", tags=["system"])
+        async def engine_status_alias():
+            return await engine_status()
+
+        @api_v1_router.get("/risk/status", tags=["risk"])
+        async def risk_status():
+            """
+            风险管理状态（红线 + SLTP 简要统计）
+            """
+            mc = self.main_controller
+            if not mc:
+                return {"ok": False, "message": "main_controller unavailable"}
+            try:
+                red = mc.get_risk_redlines() if hasattr(mc, "get_risk_redlines") else {}
+                sltp = {}
+                mgr = getattr(mc, "stop_loss_manager", None)
+                if mgr is not None and hasattr(mgr, "get_stats"):
+                    try:
+                        sltp = await asyncio.wait_for(mgr.get_stats(), timeout=2.5)
+                    except Exception:
+                        sltp = {}
+                return {"ok": True, "risk_redlines": red, "sltp": sltp}
+            except Exception as e:
+                return {"ok": False, "message": str(e)}
+
         # 健康检查 - 支持 /api/v1/health
         @api_v1_router.get("/health", tags=["health"])
         async def health_check_v1():
@@ -1663,6 +1760,17 @@ class APIServer:
                 "source": "compat:/trading/history",
                 "query_time": datetime.now().isoformat(),
             }
+
+        @api_v1_router.get("/trade/history", tags=["trades"])
+        async def get_trade_history_alias(
+            range: str = "7d",
+            symbol: Optional[str] = None,
+            side: Optional[str] = None,
+            limit: int = 100,
+            offset: int = 0,
+        ):
+            """兼容旧验收/前端：/api/v1/trade/history -> /api/v1/trading/history"""
+            return await get_trading_history_compat(range=range, symbol=symbol, side=side, limit=limit, offset=offset)
 
         @api_v1_router.get("/trades/statistics", tags=["trades"])
         async def get_trade_statistics(days: int = 30):

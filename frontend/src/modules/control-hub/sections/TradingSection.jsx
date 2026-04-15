@@ -10,6 +10,17 @@ export default function TradingSection({
   loading,
   updatedAt,
 }) {
+  const [ignoredSuggestionIds, setIgnoredSuggestionIds] = React.useState([]);
+  const [nowTs, setNowTs] = React.useState(Date.now());
+  const [secondConfirmEnabled, setSecondConfirmEnabled] = React.useState(() => {
+    try {
+      const raw = window.localStorage.getItem('semi_auto_second_confirm');
+      return raw == null ? true : raw === '1';
+    } catch {
+      return true;
+    }
+  });
+  const [highRiskOnly, setHighRiskOnly] = React.useState(false);
   const balanceRows = Object.entries(view.balances || {}).map(([asset, total]) => ({ id: asset, asset, total }));
   const detailRows = (view.balanceDetails || []).map((row, idx) => ({
     id: idx,
@@ -43,6 +54,61 @@ export default function TradingSection({
     status: row.status || '-',
     time: row.timestamp || row.ts || '-',
   }));
+  const hostingMode = state.hostingMode?.data?.mode || state.commanderSnapshot?.system?.hosting_mode || 'full_auto';
+  const pendingSuggestions = (view.tradeEvents || [])
+    .map((row, idx) => {
+      const rawText = String(row.detail || row.message || row.reason || row.status || '').toLowerCase();
+      const rawErr = String(row?.raw?.error || '').toLowerCase();
+      const blocked =
+        rawText.includes('半自动') ||
+        rawText.includes('hosting_mode_denied') ||
+        rawText.includes('requires_manual_approval') ||
+        rawErr.includes('hosting_mode_denied');
+      if (!blocked) return null;
+      const id = `${row.ts || row.timestamp || idx}-${row.symbol || '-'}-${row.side || '-'}`;
+      const rawTs = row.ts || row.timestamp || null;
+      const parsedTs = rawTs ? Date.parse(String(rawTs)) : NaN;
+      const createdAt = Number.isFinite(parsedTs) ? parsedTs : Date.now();
+      const expiresAt = createdAt + 120000;
+      const ttlSec = Math.max(0, Math.floor((expiresAt - nowTs) / 1000));
+      const sizeNum = Number(row.size || row.quantity || 0.01);
+      const reasonText = String(row.detail || row.message || '').toLowerCase();
+      let riskLevel = '中';
+      if (reasonText.includes('critical') || reasonText.includes('严重') || sizeNum >= 0.03) {
+        riskLevel = '高';
+      } else if (sizeNum <= 0.01) {
+        riskLevel = '低';
+      }
+      return {
+        id,
+        symbol: row.symbol || '-',
+        side: row.side || 'long',
+        size: row.size || row.quantity || 0.01,
+        reason: row.detail || row.message || '半自动模式拦截，需人工确认',
+        time: row.ts || row.timestamp || '-',
+        createdAt,
+        ttlSec,
+        riskLevel,
+      };
+    })
+    .filter((x) => x && !ignoredSuggestionIds.includes(x.id) && x.ttlSec > 0)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 5);
+  const visibleSuggestions = highRiskOnly
+    ? pendingSuggestions.filter((x) => x.riskLevel === '高')
+    : pendingSuggestions;
+
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNowTs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  React.useEffect(() => {
+    try {
+      window.localStorage.setItem('semi_auto_second_confirm', secondConfirmEnabled ? '1' : '0');
+    } catch {
+      // noop
+    }
+  }, [secondConfirmEnabled]);
   const applyPreset = (mode) => {
     const base = { ...simulatePayload };
     if (mode === 'conservative') {
@@ -124,6 +190,86 @@ export default function TradingSection({
           }
           tone={syncOk ? 'info' : 'warn'}
         />
+        {hostingMode === 'semi_auto' && (
+          <div className="confirm-card">
+            <div className="confirm-title">半自动待确认开仓（傻瓜化确认区）</div>
+            <div className="confirm-desc">
+              AI 给出开仓建议后会先拦截到这里，你只需要点“确认开仓”或“忽略”。
+            </div>
+            <div className="confirm-tools">
+              <label className="confirm-toggle">
+                <input
+                  type="checkbox"
+                  checked={secondConfirmEnabled}
+                  onChange={(e) => setSecondConfirmEnabled(e.target.checked)}
+                />
+                二次确认
+              </label>
+              <label className="confirm-toggle">
+                <input
+                  type="checkbox"
+                  checked={highRiskOnly}
+                  onChange={(e) => setHighRiskOnly(e.target.checked)}
+                />
+                只看高风险
+              </label>
+              <button
+                type="button"
+                className="btn btn-sm btn-outline"
+                onClick={() => setIgnoredSuggestionIds((prev) => [...prev, ...pendingSuggestions.map((x) => x.id)])}
+                disabled={!pendingSuggestions.length}
+              >
+                一键清空待确认
+              </button>
+            </div>
+            {!visibleSuggestions.length ? (
+              <div className="confirm-empty">当前没有待确认建议</div>
+            ) : (
+              <div className="confirm-list">
+                {visibleSuggestions.map((s) => (
+                  <div key={s.id} className="confirm-item">
+                    <div>
+                      <div className="confirm-item-title">
+                        {s.symbol} · {String(s.side || '').toUpperCase()} · 数量 {s.size}
+                      </div>
+                      <div className="confirm-item-sub">拦截原因: {s.reason}</div>
+                      <div className="confirm-item-sub">
+                        时间: {s.time} · 倒计时: {s.ttlSec}s · 风险:
+                        <span className={`confirm-risk ${s.riskLevel === '高' ? 'high' : s.riskLevel === '低' ? 'low' : 'mid'}`}>
+                          {s.riskLevel}
+                        </span>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-primary"
+                        onClick={() => {
+                          if (secondConfirmEnabled) {
+                            const ok = window.confirm(
+                              `确认开仓？\n标的: ${s.symbol}\n方向: ${String(s.side || '').toUpperCase()}\n数量: ${s.size}\n风险: ${s.riskLevel}`,
+                            );
+                            if (!ok) return;
+                          }
+                          actions?.confirmSuggestedOpen?.(s);
+                        }}
+                      >
+                        确认开仓
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-outline"
+                        onClick={() => setIgnoredSuggestionIds((prev) => [...prev, s.id])}
+                      >
+                        忽略
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'center' }}>
           <button type="button" className="btn btn-sm btn-outline" onClick={actions.loadSlow} disabled={loading.slow}>
             {loading.slow ? '刷新中' : '刷新交易状态'}

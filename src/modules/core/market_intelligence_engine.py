@@ -152,11 +152,25 @@ class MarketIntelligenceEngine:
         self._market_state_cache_ts: float = 0.0
         self._market_state_cache_ttl_sec: float = float(self._cfg.get("market_state_cache_ttl_sec", 2.0) or 2.0)
         self._market_state_concurrency: int = int(self._cfg.get("market_state_concurrency", 4) or 4)
-        self._market_state_symbol_timeout_s: float = float(self._cfg.get("market_state_symbol_timeout_s", 1.6) or 1.6)
+        # Per-symbol timeout for get_market_state fan-out.
+        # 1.6s is often too tight when unified_snapshot has its own ~2.5s budget (plus scheduling overhead),
+        # which causes systemic timeouts and "snapshot_timeout" degradations.
+        self._market_state_symbol_timeout_s: float = float(self._cfg.get("market_state_symbol_timeout_s", 3.0) or 3.0)
+        self._market_state_fetch_limit: int = int(self._cfg.get("market_state_fetch_limit", 4) or 4)
         self._market_state_debug_perf: bool = bool(self._cfg.get("market_state_debug_perf", True))
         # upstream fetch timeouts (avoid control-plane hangs)
         self._snapshot_timeout_s: float = float(self._cfg.get("snapshot_timeout_s", 2.2) or 2.2)
         self._klines_timeout_s: float = float(self._cfg.get("klines_timeout_s", 1.2) or 1.2)
+        self._snapshot_timeout_min_s: float = float(self._cfg.get("snapshot_timeout_min_s", 1.6) or 1.6)
+        self._snapshot_timeout_max_s: float = float(self._cfg.get("snapshot_timeout_max_s", 4.2) or 4.2)
+        self._klines_timeout_min_s: float = float(self._cfg.get("klines_timeout_min_s", 0.8) or 0.8)
+        self._klines_timeout_max_s: float = float(self._cfg.get("klines_timeout_max_s", 2.6) or 2.6)
+        self._snapshot_timeout_dynamic_s: float = float(self._snapshot_timeout_s)
+        self._klines_timeout_dynamic_s: float = float(self._klines_timeout_s)
+        self._timeout_stats: Dict[str, Dict[str, float]] = {
+            "snapshot": {"ok_streak": 0.0, "timeout_streak": 0.0},
+            "klines": {"ok_streak": 0.0, "timeout_streak": 0.0},
+        }
 
         # fee model (defaults align with backtest/research defaults in repo)
         self._fee_rate_taker = float(self._cfg.get("fee_rate_taker", 0.0005) or 0.0005)
@@ -286,6 +300,41 @@ class MarketIntelligenceEngine:
 
     def _now(self) -> float:
         return time.time()
+
+    def _record_timeout_result(self, kind: str, timeout_hit: bool) -> None:
+        try:
+            stats = self._timeout_stats.get(kind)
+            if not stats:
+                return
+            if timeout_hit:
+                stats["timeout_streak"] = float(stats.get("timeout_streak", 0.0)) + 1.0
+                stats["ok_streak"] = 0.0
+            else:
+                stats["ok_streak"] = float(stats.get("ok_streak", 0.0)) + 1.0
+                stats["timeout_streak"] = 0.0
+
+            if kind == "snapshot":
+                cur = float(self._snapshot_timeout_dynamic_s)
+                min_s = float(self._snapshot_timeout_min_s)
+                max_s = float(self._snapshot_timeout_max_s)
+            else:
+                cur = float(self._klines_timeout_dynamic_s)
+                min_s = float(self._klines_timeout_min_s)
+                max_s = float(self._klines_timeout_max_s)
+
+            if timeout_hit:
+                # 快速扩容，优先保证可用性
+                cur = min(max_s, cur * 1.2 + 0.05)
+            elif stats.get("ok_streak", 0.0) >= 3:
+                # 连续稳定后缓慢回落，避免抖动
+                cur = max(min_s, cur * 0.92)
+
+            if kind == "snapshot":
+                self._snapshot_timeout_dynamic_s = float(cur)
+            else:
+                self._klines_timeout_dynamic_s = float(cur)
+        except Exception:
+            return
 
     async def initialize(self) -> bool:
         return True
@@ -448,11 +497,14 @@ class MarketIntelligenceEngine:
 
         # Prefer cached symbol views to keep control-plane stable/fast.
         views: List[Dict[str, Any]] = []
+        cached_by_symbol: Dict[str, Dict[str, Any]] = {}
         try:
             for s in [str(x) for x in (syms or []) if x][:20]:
                 cached = self.get_cached_symbol_view(s)
                 if cached:
                     views.append(cached)
+                    key = str(cached.get("symbol") or s).upper()
+                    cached_by_symbol[key] = cached
         except Exception:
             pass
         bull = bear = side = unknown = 0
@@ -466,10 +518,16 @@ class MarketIntelligenceEngine:
         async def _one(sym: str) -> Optional[Dict[str, Any]]:
             t0 = time.time()
             try:
+                cached = cached_by_symbol.get(str(sym).upper())
+                if cached:
+                    perf_rows.append(
+                        {"symbol": sym, "ok": True, "ms": int((time.time() - t0) * 1000), "source": "cache"}
+                    )
+                    return cached
                 async with sem:
                     v = await asyncio.wait_for(
                         self.get_symbol_view(sym, include_snapshot=False),
-                        timeout=max(0.5, min(float(self._market_state_symbol_timeout_s), 1.8)),
+                        timeout=max(0.5, min(float(self._market_state_symbol_timeout_s), 3.2)),
                     )
                 d = v.to_dict()
                 return d
@@ -533,8 +591,10 @@ class MarketIntelligenceEngine:
                 if not any(r.get("symbol") == sym for r in perf_rows):
                     perf_rows.append({"symbol": sym, "ok": True, "ms": int((time.time() - t0) * 1000)})
 
-        # Only fetch a small bounded subset to avoid blocking (cached views already cover the rest).
-        syms_use = [str(s) for s in (syms or []) if s][: min(3, 20)]
+        # Only fetch symbols that are not already cached, and keep this bounded.
+        syms_all = [str(s) for s in (syms or []) if s][:20]
+        syms_missing = [s for s in syms_all if str(s).upper() not in cached_by_symbol]
+        syms_use = syms_missing[: max(1, min(int(self._market_state_fetch_limit), 8))]
         results = await asyncio.gather(*[_one(s) for s in syms_use], return_exceptions=False)
         # Merge fetched (prefer) + cached (fallback).
         merged: List[Dict[str, Any]] = []
@@ -583,7 +643,7 @@ class MarketIntelligenceEngine:
             except Exception:
                 pass
 
-        attempted = len([s for s in (syms or []) if s][:20])
+        attempted = len(syms_use) + len(cached_by_symbol)
         trend = "mixed"
         total = max(1, len(views))
         if bull > total * 0.6:
@@ -641,14 +701,60 @@ class MarketIntelligenceEngine:
         snapshot: Dict[str, Any] = {}
         errors: List[str] = []
         partial = False
+
+        # Fast path (control-plane friendly):
+        # When include_snapshot=False (used by /market/state fan-out and default /market/symbol view),
+        # avoid blocking on unified_snapshot which can be near its budget under proxy/collector load.
+        # Prefer exchange.get_ticker() (WS fast-path in OKXExchange) to keep endpoints responsive.
+        if not bool(include_snapshot):
+            ex = self._exchange()
+            if ex is not None and hasattr(ex, "get_ticker"):
+                try:
+                    t = await asyncio.wait_for(ex.get_ticker(sym), timeout=0.9)
+                    if isinstance(t, dict) and float(t.get("last") or t.get("price") or 0.0) > 0:
+                        snapshot = {
+                            "symbol": sym,
+                            "timestamp": datetime.now().isoformat(),
+                            "渠道A_交易所实时执行数据": {
+                                "ticker": {
+                                    "last": float(t.get("last") or t.get("price") or 0.0),
+                                    "bid": float(t.get("bid") or 0.0),
+                                    "ask": float(t.get("ask") or 0.0),
+                                    "high_24h": float(t.get("high") or t.get("high_24h") or 0.0),
+                                    "low_24h": float(t.get("low") or t.get("low_24h") or 0.0),
+                                    "volume_24h": float(t.get("volume") or t.get("volume_24h") or 0.0),
+                                    "change_24h": float(t.get("change_24h") or t.get("change") or 0.0),
+                                },
+                                "collector": {
+                                    "enabled": ["ticker"],
+                                    "health": {"ticker": "ok"},
+                                    "errors": [],
+                                    "snapshot_timeout_sec": None,
+                                },
+                            },
+                            "数据来源状态": {"provenance": "fastpath"},
+                        }
+                        errors.append("fastpath_ticker_only")
+                        partial = True
+                except Exception as e:
+                    errors.append(f"fastpath_ticker_failed:{type(e).__name__}")
+                    partial = True
         providers = list(self._cfg.get("providers") or ["unified_snapshot"])
         if "unified_snapshot" in providers and hub and hasattr(hub, "get_unified_snapshot"):
             try:
-                snapshot = await asyncio.wait_for(hub.get_unified_snapshot(sym), timeout=max(0.4, self._snapshot_timeout_s))
+                # DataSourceHub.get_unified_snapshot uses its own overall budget (default 2.5s).
+                # If we set a smaller outer timeout here, we will prematurely cancel the snapshot and
+                # consistently degrade to snapshot_timeout. Add a small slack for scheduling/JSON work.
+                snap_timeout = max(0.8, min(6.0, float(self._snapshot_timeout_dynamic_s) + 0.8))
+                if not snapshot:
+                    snapshot = await asyncio.wait_for(hub.get_unified_snapshot(sym), timeout=snap_timeout)
+                    self._record_timeout_result("snapshot", timeout_hit=False)
             except Exception as e:
                 errors.append(f"snapshot_fetch_failed:{type(e).__name__}")
-                snapshot = {}
+                if not snapshot:
+                    snapshot = {}
                 partial = True
+                self._record_timeout_result("snapshot", timeout_hit=isinstance(e, asyncio.TimeoutError))
         else:
             errors.append("snapshot_provider_missing")
             partial = True
@@ -679,12 +785,14 @@ class MarketIntelligenceEngine:
         change_24h = _safe_float(ticker.get("change24h") or ticker.get("change") or 0, 0.0)
         # 1h ATR proxy from hub klines if present
         kl = (exch.get("klines_1h") or []) if isinstance(exch, dict) else []
-        if not kl and hub and hasattr(hub, "get_klines"):
-            try:
-                kl = await asyncio.wait_for(hub.get_klines(sym, "1h", limit=64), timeout=max(0.4, self._klines_timeout_s))
-            except Exception as e:
-                errors.append(f"klines_fetch_failed:{type(e).__name__}")
-                kl = []
+        # NOTE:
+        # Do NOT block symbol_view on an extra klines call when unified_snapshot already consumed most of
+        # the control-plane budget (module_control_api puts a 3s upper bound on the whole call).
+        # If klines are missing from snapshot, we degrade gracefully (atr_pct_1h=None) instead of timing out.
+        if not kl:
+            if hub and hasattr(hub, "get_klines"):
+                errors.append("klines_missing_in_snapshot")
+            partial = True
         atrp = _atr_pct_from_klines(kl, 14)
 
         # Normalize trend/bias/confidence

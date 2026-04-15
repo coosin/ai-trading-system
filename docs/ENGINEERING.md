@@ -103,6 +103,25 @@ OpenAPI 以运行实例 **`/openapi.json`** 为准。
   3. 交易所 `get_positions()`（短超时直拉）
 - 目标：避免出现“交易所有持仓但控制面显示 0”的误判，优先保证控制面可解释与风控一致性。
 
+### 4.3 Market State 稳定性优化（2026-04-16）
+
+- `MarketIntelligenceEngine.get_market_state()` 已调整为“缓存优先 + 缺失补拉”：
+  - 优先复用 `get_cached_symbol_view()` 结果
+  - 仅对缓存缺失标的做实时拉取（受 `market_state_fetch_limit` 限制）
+- `symbols_attempted` 调整为“真实尝试数”，避免与全币池规模混淆。
+- 上游采集超时引入自适应：
+  - `snapshot_timeout_dynamic_s` / `klines_timeout_dynamic_s`
+  - 超时连续发生时放宽，连续稳定时回落
+  - 配置入口：`config/config.yaml -> market_intelligence` 段
+
+### 4.4 OpenClaw 对接契约（2026-04-16）
+
+- 对接优先入口：
+  - 读：`/modules/commander/capabilities`、`/modules/commander/tool-contract`、`/modules/surface/*`
+  - 写：`/modules/commander/dispatch`
+- 建议强制保留 `source=openclaw` 作为调用来源标识，以便治理审计追溯。
+- 对接操作手册：`docs/OPENCLAW_INTEGRATION_GUIDE.md`。
+
 ---
 
 ## 5. 与 ARCHITECTURE 的关系

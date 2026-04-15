@@ -1,0 +1,21 @@
+allow-lan: true
+log-level: info
+mixed-port: 7890
+mode: rule
+
+# 示例配置（已脱敏）
+# - 请把你的真实订阅生成结果保存为 config/clash_config.yaml（该文件已被 .gitignore 忽略）
+# - 或使用 scripts/subscription_updater.py + scripts/update_clash_subscriptions.sh 自动生成
+
+proxies: []
+
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies:
+      - DIRECT
+
+rules:
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,🚀 节点选择

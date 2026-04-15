@@ -9,11 +9,10 @@ import httpx
 import yaml
 import logging
 import os
-import re
 from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -27,6 +26,7 @@ class SubscriptionUpdater:
         self.clash_config_file = self.config_dir / "clash_config.yaml"
         self.subscriptions: Dict[str, Any] = {}
         self.proxies: List[Dict] = []
+        self.settings: Dict[str, Any] = {}
         
     async def load_subscription_config(self) -> bool:
         try:
@@ -36,6 +36,7 @@ class SubscriptionUpdater:
                 
             with open(self.subscription_file, 'r', encoding='utf-8') as f:
                 self.subscriptions = yaml.safe_load(f) or {}
+            self.settings = self.subscriptions.get('settings', {}) or {}
             
             logger.info(f"加载订阅配置: {len(self.subscriptions.get('subscriptions', []))} 个订阅")
             return True
@@ -43,15 +44,28 @@ class SubscriptionUpdater:
             logger.error(f"加载订阅配置失败: {e}")
             return False
     
-    async def fetch_subscription(self, url: str, timeout: int = 30) -> Optional[str]:
+    async def fetch_subscription(self, url: str, timeout: int = 30, use_system_proxy: bool = True) -> Optional[str]:
         try:
-            import os
+            if use_system_proxy:
+                # Prefer HTTP(S)_PROXY for compatibility; some hosts export ALL_PROXY=socks5
+                # but runtime may not have socks extras installed.
+                old_all_proxy = os.environ.pop("ALL_PROXY", None)
+                old_all_proxy_lc = os.environ.pop("all_proxy", None)
+                try:
+                    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+                        response = await client.get(url)
+                        response.raise_for_status()
+                        return response.text
+                finally:
+                    if old_all_proxy is not None:
+                        os.environ["ALL_PROXY"] = old_all_proxy
+                    if old_all_proxy_lc is not None:
+                        os.environ["all_proxy"] = old_all_proxy_lc
+
             proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']
-            old_values = {}
-            
+            old_values: Dict[str, Optional[str]] = {}
             for var in proxy_vars:
                 old_values[var] = os.environ.pop(var, None)
-            
             try:
                 async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
                     response = await client.get(url)
@@ -76,6 +90,8 @@ class SubscriptionUpdater:
     
     async def update_subscriptions(self) -> int:
         total_proxies = 0
+        timeout = int(self.settings.get('timeout', 30))
+        fetch_via_proxy = bool(self.settings.get('fetch_via_system_proxy', True))
         
         for sub in self.subscriptions.get('subscriptions', []):
             if not sub.get('enabled', True):
@@ -90,7 +106,9 @@ class SubscriptionUpdater:
             logger.info(f"更新订阅: {name}")
             logger.info(f"URL: {self._mask_url(url)}")
             
-            content = await self.fetch_subscription(url)
+            sub_timeout = int(sub.get('timeout', timeout))
+            sub_use_proxy = bool(sub.get('fetch_via_system_proxy', fetch_via_proxy))
+            content = await self.fetch_subscription(url, timeout=sub_timeout, use_system_proxy=sub_use_proxy)
             if content:
                 proxies = self.parse_clash_config(content)
                 if proxies:
@@ -102,6 +120,53 @@ class SubscriptionUpdater:
                     logger.warning(f"订阅 {name} 没有有效的代理节点")
         
         return total_proxies
+
+    def _filter_and_deduplicate_proxies(self, proxies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not proxies:
+            return []
+
+        deduplicate = bool(self.settings.get("deduplicate_proxies", True))
+        require_tls = bool(self.settings.get("require_tls", False))
+        allowed_ports = self.settings.get("allowed_ports", [])
+        allowed_types = self.settings.get("allowed_types", [])
+
+        allowed_ports_set: Set[int] = set()
+        for p in allowed_ports:
+            try:
+                allowed_ports_set.add(int(p))
+            except Exception:
+                continue
+        allowed_types_set = {str(t).strip().lower() for t in allowed_types if str(t).strip()}
+
+        result: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for proxy in proxies:
+            p_type = str(proxy.get("type", "")).lower()
+            p_port = proxy.get("port")
+            p_server = str(proxy.get("server", "")).strip().lower()
+            p_name = str(proxy.get("name", "")).strip()
+
+            if require_tls and not bool(proxy.get("tls", False)):
+                continue
+            if allowed_ports_set:
+                try:
+                    if int(p_port) not in allowed_ports_set:
+                        continue
+                except Exception:
+                    continue
+            if allowed_types_set and p_type not in allowed_types_set:
+                continue
+
+            if deduplicate:
+                dedup_key = f"{p_type}|{p_server}|{p_port}|{proxy.get('uuid','')}|{proxy.get('network','')}"
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+
+            if not p_name:
+                proxy["name"] = f"{proxy.get('type','proxy')}-{p_server}:{p_port}"
+            result.append(proxy)
+        return result
 
     @staticmethod
     def _mask_url(url: str) -> str:
@@ -119,14 +184,17 @@ class SubscriptionUpdater:
             with open(self.clash_config_file, 'r', encoding='utf-8') as f:
                 existing_config = yaml.safe_load(f) or {}
         
-        proxy_names = [p.get('name', f'proxy-{i}') for i, p in enumerate(self.proxies)]
+        optimized_proxies = self._filter_and_deduplicate_proxies(self.proxies)
+        proxy_names = [p.get('name', f'proxy-{i}') for i, p in enumerate(optimized_proxies)]
+        url_test_url = self.settings.get('url_test_url', 'http://www.gstatic.com/generate_204')
+        url_test_interval = int(self.settings.get('url_test_interval', 300))
         
         config = {
             'mixed-port': existing_config.get('mixed-port', 7890),
             'allow-lan': existing_config.get('allow-lan', True),
             'mode': existing_config.get('mode', 'rule'),
             'log-level': existing_config.get('log-level', 'info'),
-            'proxies': self.proxies,
+            'proxies': optimized_proxies,
             'proxy-groups': [
                 {
                     'name': '🚀 节点选择',
@@ -137,8 +205,8 @@ class SubscriptionUpdater:
                     'name': '♻️ 自动选择',
                     'type': 'url-test',
                     'proxies': proxy_names,
-                    'url': 'http://www.gstatic.com/generate_204',
-                    'interval': 300
+                    'url': url_test_url,
+                    'interval': url_test_interval
                 },
                 {
                     'name': '🎯 全球直连',

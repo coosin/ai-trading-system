@@ -385,6 +385,38 @@ class MainController:
         self.max_restart_attempts = 3
         self.health_check_interval = 30  # 秒
         self.event_history_limit = 1000
+        # 托管模式：full_auto / semi_auto（可运行期切换）
+        self._hosting_mode = "full_auto"
+        # 托管守护（后端中枢，非前端临时逻辑）
+        self._hosting_guard_config: Dict[str, Any] = {
+            "enabled": True,
+            "interval_sec": 8,
+            "stale_account_state_sec": 60,
+            "open_fail_threshold": 5,
+            "auto_recover_enabled": True,
+            "recover_stable_sec": 120,
+        }
+        # 自动化协同级别（保守/半自动/全自动）
+        # 默认与 hosting_mode 对齐：full_auto → full_auto
+        self._automation_profile: str = "full_auto"
+        # 统一风控红线（执行层统一读取）
+        self._risk_redlines: Dict[str, Any] = {
+            "max_positions": 5,
+            "single_order_max_ratio": 0.05,   # 单笔不超过权益 5%
+            "max_total_exposure_ratio": 0.80,  # 总暴露不超过权益 80%
+            "min_open_cooldown_sec": 5,       # 最小开仓间隔
+            "max_drawdown_ratio": 0.15,       # 最大回撤阈值
+            "force_manual_confirm_high_risk": True,
+        }
+        self._governance_audit: List[Dict[str, Any]] = []
+        self._hosting_guard_status: Dict[str, Any] = {
+            "running": False,
+            "last_check_at": None,
+            "last_action": None,
+            "last_reason": "",
+            "last_risky_at": None,
+            "last_recover_candidate_at": None,
+        }
 
         logger.info("主控制器初始化完成")
 
@@ -405,6 +437,167 @@ class MainController:
         if brain is not None and getattr(brain, "exchange", None) is not None:
             return brain.exchange
         return None
+
+    def get_hosting_mode(self) -> str:
+        """
+        托管模式（可运行期切换）:
+        - full_auto: 全自动托管（默认）
+        - semi_auto: 半自动（策略开仓需人工确认）
+        """
+        raw = str(getattr(self, "_hosting_mode", "full_auto") or "full_auto").strip().lower()
+        return raw if raw in {"full_auto", "semi_auto"} else "full_auto"
+
+    def set_hosting_mode(self, mode: str) -> str:
+        before = self.get_hosting_mode()
+        m = str(mode or "").strip().lower()
+        if m in {"全自动", "自动", "full", "auto"}:
+            m = "full_auto"
+        elif m in {"半自动", "semi", "semi-automatic", "semi_automatic"}:
+            m = "semi_auto"
+        if m not in {"full_auto", "semi_auto"}:
+            raise ValueError("invalid hosting mode, expected: full_auto or semi_auto")
+        self._hosting_mode = m
+        # 保持 profile 与 mode 一致，避免控制面显示“全自动模式 + 半自动 profile”造成误解。
+        # conservative 仍属于“需要人工确认”范畴，因此仅当显式切换 mode 时，强制对齐到同名 profile。
+        if m == "full_auto":
+            self._automation_profile = "full_auto"
+        else:
+            self._automation_profile = "semi_auto"
+        self._append_governance_audit(
+            event="set_hosting_mode",
+            detail={
+                "before": before,
+                "after": self._hosting_mode,
+                "automation_profile": self.get_automation_profile(),
+            },
+        )
+        return self._hosting_mode
+
+    def get_automation_profile(self) -> str:
+        p = str(getattr(self, "_automation_profile", "semi_auto") or "semi_auto").strip().lower()
+        if p not in {"conservative", "semi_auto", "full_auto"}:
+            p = "semi_auto"
+        return p
+
+    def set_automation_profile(self, profile: str) -> str:
+        before_profile = self.get_automation_profile()
+        before_mode = self.get_hosting_mode()
+        p = str(profile or "").strip().lower()
+        if p in {"保守", "conservative"}:
+            p = "conservative"
+        elif p in {"半自动", "semi_auto", "semi"}:
+            p = "semi_auto"
+        elif p in {"全自动", "full_auto", "auto"}:
+            p = "full_auto"
+        if p not in {"conservative", "semi_auto", "full_auto"}:
+            raise ValueError("invalid automation profile")
+        self._automation_profile = p
+        # 同步托管模式（保守仍按 semi_auto 托管，保证需要人工确认）
+        if p == "full_auto":
+            self._hosting_mode = "full_auto"
+        else:
+            self._hosting_mode = "semi_auto"
+        self._append_governance_audit(
+            event="set_automation_profile",
+            detail={
+                "before_profile": before_profile,
+                "after_profile": self._automation_profile,
+                "before_mode": before_mode,
+                "after_mode": self._hosting_mode,
+            },
+        )
+        return self._automation_profile
+
+    def get_risk_redlines(self) -> Dict[str, Any]:
+        return dict(self._risk_redlines or {})
+
+    def update_risk_redlines(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        p = dict(self._risk_redlines or {})
+        before = dict(p)
+        u = dict(patch or {})
+        if "force_manual_confirm_high_risk" in u:
+            p["force_manual_confirm_high_risk"] = bool(u.get("force_manual_confirm_high_risk"))
+        for k in ("max_positions", "min_open_cooldown_sec"):
+            if k in u:
+                try:
+                    p[k] = max(0, int(float(u.get(k))))
+                except Exception:
+                    pass
+        for k in ("single_order_max_ratio", "max_total_exposure_ratio", "max_drawdown_ratio"):
+            if k in u:
+                try:
+                    v = float(u.get(k))
+                    p[k] = max(0.0, min(1.0, v))
+                except Exception:
+                    pass
+        self._risk_redlines = p
+        self._append_governance_audit(
+            event="update_risk_redlines",
+            detail={"before": before, "after": dict(self._risk_redlines)},
+        )
+        return dict(self._risk_redlines)
+
+    def _append_governance_audit(self, event: str, detail: Dict[str, Any]) -> None:
+        row = {
+            "ts": datetime.now().isoformat(),
+            "event": str(event or ""),
+            "detail": detail or {},
+        }
+        self._governance_audit.append(row)
+        if len(self._governance_audit) > 300:
+            self._governance_audit = self._governance_audit[-300:]
+
+    def get_governance_audit(self, limit: int = 100) -> List[Dict[str, Any]]:
+        n = max(1, min(500, int(limit or 100)))
+        return list(reversed(self._governance_audit[-n:]))
+
+    def get_hosting_guard_config(self) -> Dict[str, Any]:
+        return dict(self._hosting_guard_config or {})
+
+    def update_hosting_guard_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        p = dict(self._hosting_guard_config or {})
+        u = dict(patch or {})
+        if "enabled" in u:
+            p["enabled"] = bool(u.get("enabled"))
+        if "auto_recover_enabled" in u:
+            p["auto_recover_enabled"] = bool(u.get("auto_recover_enabled"))
+        for k in ("interval_sec", "stale_account_state_sec", "open_fail_threshold", "recover_stable_sec"):
+            if k in u:
+                try:
+                    p[k] = max(1, int(float(u.get(k))))
+                except Exception:
+                    pass
+        self._hosting_guard_config = p
+        return dict(self._hosting_guard_config)
+
+    def get_hosting_guard_status(self) -> Dict[str, Any]:
+        out = dict(self._hosting_guard_status or {})
+        out["mode"] = self.get_hosting_mode()
+        out["config"] = self.get_hosting_guard_config()
+        return out
+
+    def get_architecture_layers_status(self) -> Dict[str, Any]:
+        """
+        系统分层状态快照（用于验证“整体架构升级”是否到位）:
+        L1 数据采集 -> L2 分析决策 -> L3 执行网关 -> L4 风控与SLTP -> L5 账户同步与审计
+        """
+        l1_ok = bool(getattr(self, "data_source_hub", None) or getattr(self, "data_integration", None))
+        l2_ok = bool(getattr(self, "ai_core", None) or getattr(self, "ai_trading_engine", None))
+        l3_ok = bool(getattr(self, "execution_gateway", None))
+        l4_ok = bool(getattr(self, "risk_manager", None) or getattr(self, "stop_loss_manager", None))
+        acct = getattr(self, "_latest_account_state", None)
+        l5_ok = bool(isinstance(acct, dict) and acct.get("timestamp"))
+        return {
+            "mode": self.get_hosting_mode(),
+            "layers": [
+                {"id": "L1", "name": "数据采集层", "ok": l1_ok, "modules": ["data_source_hub", "data_integration"]},
+                {"id": "L2", "name": "分析决策层", "ok": l2_ok, "modules": ["ai_core", "ai_trading_engine"]},
+                {"id": "L3", "name": "执行网关层", "ok": l3_ok, "modules": ["execution_gateway", "execution_verifier"]},
+                {"id": "L4", "name": "风险控制层", "ok": l4_ok, "modules": ["risk_manager", "stop_loss_manager"]},
+                {"id": "L5", "name": "账户回执层", "ok": l5_ok, "modules": ["_latest_account_state", "trade_event_hub"]},
+            ],
+            "guard": self.get_hosting_guard_status(),
+        }
 
     def get_llm_integration(self):
         return getattr(self, "llm_integration", None)
@@ -1978,6 +2171,14 @@ class MainController:
                 except Exception as e:
                     logger.error(f"心跳监控器启动失败: {e}")
 
+            # 启动托管守护任务（后端自动降级/恢复）
+            try:
+                hosting_guard_task = asyncio.create_task(self._hosting_guard_worker())
+                self._tasks.append(hosting_guard_task)
+                logger.info("🛡️ 托管守护器已启动")
+            except Exception as e:
+                logger.error(f"托管守护器启动失败: {e}")
+
             # 发送心跳事件
             await self.emit_event(
                 EventType.HEARTBEAT, "controller", {"status": "running", "uptime": 0}
@@ -2808,6 +3009,9 @@ class MainController:
                 "running_modules": running_modules,
                 "module_statuses": module_statuses if module_statuses else fallback_statuses,
                 "metrics": self.metrics.copy(),
+                "automation_profile": self.get_automation_profile(),
+                "hosting_mode": self.get_hosting_mode(),
+                "risk_redlines": self.get_risk_redlines(),
             }
             if getattr(self, "execution_gateway", None):
                 try:
@@ -4310,6 +4514,91 @@ class MainController:
 
         logger.info("健康检查工作线程停止")
 
+    async def _hosting_guard_worker(self) -> None:
+        """
+        托管守护工作线程（架构中台能力）：
+        - 风险/链路异常时：full_auto -> semi_auto
+        - 稳定期满足时：semi_auto -> full_auto（可配置）
+        """
+        self._hosting_guard_status["running"] = True
+        logger.info("托管守护工作线程启动")
+        while self._running:
+            try:
+                cfg = self.get_hosting_guard_config()
+                interval_sec = max(2, int(cfg.get("interval_sec", 8) or 8))
+                await asyncio.sleep(interval_sec)
+                self._hosting_guard_status["last_check_at"] = datetime.now().isoformat()
+                if not bool(cfg.get("enabled", True)):
+                    continue
+
+                reasons: List[str] = []
+                # 1) 账户状态新鲜度
+                stale_limit = max(10, int(cfg.get("stale_account_state_sec", 60) or 60))
+                st = getattr(self, "_latest_account_state", None)
+                if not isinstance(st, dict) or not st.get("timestamp"):
+                    reasons.append("账户状态缺失")
+                else:
+                    try:
+                        raw = str(st.get("timestamp") or "").replace("Z", "")
+                        t0 = datetime.fromisoformat(raw[:26])
+                        if (datetime.now() - t0).total_seconds() > stale_limit:
+                            reasons.append(f"账户状态过期>{stale_limit}s")
+                    except Exception:
+                        reasons.append("账户状态时间戳异常")
+
+                # 2) 执行失败压力
+                try:
+                    gw = getattr(self, "execution_gateway", None)
+                    if gw and hasattr(gw, "get_policy_metrics"):
+                        m = gw.get_policy_metrics() or {}
+                        open_fail = int(m.get("open_fail", 0) or 0)
+                        den = int(m.get("open_policy_denied", 0) or 0)
+                        fail_score = open_fail + den
+                        if fail_score >= max(1, int(cfg.get("open_fail_threshold", 5) or 5)):
+                            reasons.append(f"执行失败压力={fail_score}")
+                except Exception:
+                    pass
+
+                # 3) 交易所连接可用性
+                if self.get_exchange() is None:
+                    reasons.append("交易所连接缺失")
+
+                mode = self.get_hosting_mode()
+                now = datetime.now()
+                if reasons:
+                    self._hosting_guard_status["last_risky_at"] = now.isoformat()
+                    self._hosting_guard_status["last_reason"] = "；".join(reasons)
+                    if mode == "full_auto":
+                        self.set_hosting_mode("semi_auto")
+                        self._hosting_guard_status["last_action"] = "auto_downgrade_to_semi_auto"
+                        logger.warning("🛡️ 托管守护触发降级: %s", self._hosting_guard_status["last_reason"])
+                else:
+                    self._hosting_guard_status["last_recover_candidate_at"] = now.isoformat()
+                    if mode == "semi_auto" and bool(cfg.get("auto_recover_enabled", True)):
+                        stable_sec = max(30, int(cfg.get("recover_stable_sec", 120) or 120))
+                        risky_at_raw = self._hosting_guard_status.get("last_risky_at")
+                        can_recover = False
+                        if not risky_at_raw:
+                            can_recover = True
+                        else:
+                            try:
+                                risky_at = datetime.fromisoformat(str(risky_at_raw)[:26])
+                                can_recover = (now - risky_at).total_seconds() >= stable_sec
+                            except Exception:
+                                can_recover = True
+                        if can_recover:
+                            self.set_hosting_mode("full_auto")
+                            self._hosting_guard_status["last_action"] = "auto_recover_to_full_auto"
+                            self._hosting_guard_status["last_reason"] = f"稳定运行>={stable_sec}s"
+                            logger.info("🛡️ 托管守护触发恢复: %s", self._hosting_guard_status["last_reason"])
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("托管守护工作线程异常: %s", e)
+                await asyncio.sleep(5)
+        self._hosting_guard_status["running"] = False
+        logger.info("托管守护工作线程停止")
+
     async def _strategy_research_worker(self) -> None:
         """
         自动策略研发工作线程：
@@ -4629,6 +4918,193 @@ class MainController:
             else:
                 report["chores"]["optimize_result"] = {"success": False, "message": "策略管理器不可用"}
         return report
+
+    def get_external_benchmark_matrix(self) -> Dict[str, Any]:
+        """
+        对照外部两套能力基线（Agent Trade Kit + Agent Skills）的整合映射。
+        说明：这里输出的是“能力对齐结果”，用于持续验收，而不是直接拷贝外部代码。
+        """
+        return {
+            "baseline": [
+                {
+                    "source": "okx-agent-trade-kit",
+                    "strength": "标准化工具接口与模块化交易能力",
+                    "our_mapping": [
+                        "ExecutionGateway 单一执行出口",
+                        "Commander dispatch 统一入口",
+                        "hosting_mode/hosting_guard 运行期治理",
+                    ],
+                    "status": "integrated",
+                },
+                {
+                    "source": "okx-agent-skills",
+                    "strength": "可组合技能与自动化任务编排",
+                    "our_mapping": [
+                        "SkillManager + CommanderAgentRuntime",
+                        "run_ai_commander_chores 任务化编排",
+                        "architecture/layers 可观测验收",
+                    ],
+                    "status": "integrated",
+                },
+            ],
+            "next_actions": [
+                "继续收敛读写权限分级（read-only / guarded-write / full-auto）",
+                "在审计层补齐每次托管切换与开平仓链路 trace_id 关联",
+                "增加上线前的一键验收门禁（API + 风控 + 回撤）",
+            ],
+        }
+
+    def get_tool_contract_catalog(self) -> Dict[str, Any]:
+        """
+        标准工具契约清单（面向 OpenClaw/MCP/CLI 对接）：
+        - read_tools: 只读能力
+        - write_tools: 写入能力（需治理）
+        """
+        return {
+            "version": "v1",
+            "read_tools": [
+                "/api/v1/modules/commander/snapshot",
+                "/api/v1/modules/commander/architecture/layers",
+                "/api/v1/modules/commander/hosting-mode",
+                "/api/v1/modules/commander/hosting-guard",
+                "/api/v1/modules/commander/automation-profile",
+                "/api/v1/modules/commander/risk-redlines",
+                "/api/v1/modules/commander/upgrade/benchmark",
+            ],
+            "write_tools": [
+                "/api/v1/modules/commander/dispatch",
+                "/api/v1/modules/commander/hosting-mode",
+                "/api/v1/modules/commander/hosting-guard",
+                "/api/v1/modules/commander/automation-profile",
+                "/api/v1/modules/commander/risk-redlines",
+                "/api/v1/modules/commander/upgrade/run",
+            ],
+            "guards": {
+                "execution_single_entry": "ExecutionGateway",
+                "hosting_profiles": ["conservative", "semi_auto", "full_auto"],
+                "fallback_on_failure": "semi_auto",
+            },
+        }
+
+    async def run_upgrade_pipeline(
+        self,
+        symbol: str = "BTC/USDT",
+        trigger_optimize: bool = True,
+        force_account_sync: bool = True,
+        auto_fallback_to_semi: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        一键升级闭环执行器（后端）：
+        1) 账户同步接管
+        2) 司令部任务与策略优化
+        3) 分层架构状态验收
+        4) 托管守护状态验收
+        5) 回撤/交易统计验收
+        6) 外部基线能力对照输出
+        """
+        started = datetime.now()
+        stages: List[Dict[str, Any]] = []
+
+        def push_stage(name: str, ok: bool, detail: Any = None) -> None:
+            stages.append({"name": name, "ok": bool(ok), "detail": detail})
+
+        # stage-1: force account sync
+        if force_account_sync:
+            try:
+                sync = await asyncio.wait_for(self.force_sync_account_state(reason="upgrade_pipeline"), timeout=18.0)
+                push_stage("force_sync_account_state", True, sync)
+            except asyncio.TimeoutError:
+                st = getattr(self, "_latest_account_state", None)
+                cached_ok = bool(isinstance(st, dict) and st.get("timestamp"))
+                push_stage(
+                    "force_sync_account_state",
+                    cached_ok,
+                    {
+                        "degraded": True,
+                        "reason": "force_sync_timeout",
+                        "cached_timestamp": (st or {}).get("timestamp") if isinstance(st, dict) else None,
+                    },
+                )
+            except Exception as e:
+                push_stage("force_sync_account_state", False, {"error": str(e)})
+        else:
+            push_stage("force_sync_account_state", True, {"skipped": True})
+
+        # stage-2: commander chores
+        try:
+            chores = await asyncio.wait_for(
+                self.run_ai_commander_chores(symbol=symbol, trigger_optimize=bool(trigger_optimize)),
+                timeout=35.0,
+            )
+            push_stage("run_ai_commander_chores", True, chores)
+        except Exception as e:
+            push_stage("run_ai_commander_chores", False, {"error": str(e)})
+
+        # stage-3: architecture acceptance
+        try:
+            layers = self.get_architecture_layers_status()
+            all_layers_ok = all(bool(x.get("ok")) for x in (layers.get("layers") or []))
+            push_stage("architecture_layers_check", all_layers_ok, layers)
+        except Exception as e:
+            push_stage("architecture_layers_check", False, {"error": str(e)})
+
+        # stage-4: hosting guard status
+        try:
+            guard = self.get_hosting_guard_status()
+            push_stage("hosting_guard_status", bool(guard.get("running") is not False), guard)
+        except Exception as e:
+            push_stage("hosting_guard_status", False, {"error": str(e)})
+
+        # stage-5: drawdown / trade stats (回撤验收)
+        try:
+            ths = getattr(self, "trade_history_service", None)
+            if ths and hasattr(ths, "get_statistics"):
+                stats = await ths.get_statistics(days=30, force_refresh=True)
+                ok = isinstance(stats, dict) and not stats.get("error")
+                push_stage("drawdown_and_trade_stats", ok, stats)
+            else:
+                push_stage("drawdown_and_trade_stats", False, {"error": "trade_history_service_unavailable"})
+        except Exception as e:
+            push_stage("drawdown_and_trade_stats", False, {"error": str(e)})
+
+        # stage-6: external benchmark matrix
+        try:
+            benchmark = self.get_external_benchmark_matrix()
+            push_stage("external_benchmark_matrix", True, benchmark)
+        except Exception as e:
+            push_stage("external_benchmark_matrix", False, {"error": str(e)})
+
+        # stage-7: governance profile check
+        try:
+            gov = {
+                "automation_profile": self.get_automation_profile(),
+                "hosting_mode": self.get_hosting_mode(),
+                "risk_redlines": self.get_risk_redlines(),
+            }
+            ok = bool(gov["automation_profile"] in {"conservative", "semi_auto", "full_auto"})
+            push_stage("governance_profile_check", ok, gov)
+        except Exception as e:
+            push_stage("governance_profile_check", False, {"error": str(e)})
+
+        success = all(bool(s.get("ok")) for s in stages)
+        fallback_action: Optional[str] = None
+        if (not success) and auto_fallback_to_semi:
+            try:
+                self.set_hosting_mode("semi_auto")
+                fallback_action = "fallback_to_semi_auto"
+            except Exception:
+                fallback_action = "fallback_failed"
+
+        return {
+            "success": success,
+            "started_at": started.isoformat(),
+            "finished_at": datetime.now().isoformat(),
+            "elapsed_sec": round((datetime.now() - started).total_seconds(), 3),
+            "symbol": symbol,
+            "mode": self.get_hosting_mode(),
+            "fallback_action": fallback_action,
+            "stages": stages,
+        }
 
     def _register_default_handlers(self) -> None:
         """注册默认事件处理器"""

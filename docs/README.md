@@ -11,6 +11,8 @@
 | [**memory/MEMORY_LIBRARY_GUIDE.md**](./memory/MEMORY_LIBRARY_GUIDE.md) | Memory：配置段与运维要点 |
 | [**API_REFERENCE.md**](./API_REFERENCE.md) | API 与 WebSocket 约定、监控告警合并说明（权威以运行时 `/openapi.json` 为准） |
 | [**MCP_BASELINE.md**](./MCP_BASELINE.md) | MCP 基础、OKX Agent Trade Kit 对标与落地方向 |
+| [**DAILY_HOSTING_ACCEPTANCE.md**](./DAILY_HOSTING_ACCEPTANCE.md) | 每日托管验收清单（3~5 步快速确认） |
+| [**OPENCLAW_INTEGRATION_GUIDE.md**](./OPENCLAW_INTEGRATION_GUIDE.md) | OpenClaw 对接手册（读写接口、验收与审计） |
 | [**OKX_SOURCE_REFERENCE_MAP.md**](./OKX_SOURCE_REFERENCE_MAP.md) | OKX 字段/端点参考 |
 | [**../deploy/HOST_CLASH_EGRESS.md**](../deploy/HOST_CLASH_EGRESS.md) | 宿主机 Clash 出站、容器代理与验收要点 |
 

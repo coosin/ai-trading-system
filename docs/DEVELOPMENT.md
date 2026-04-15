@@ -78,6 +78,28 @@ curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT
 curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/account-diagnostics'
 ```
 
+### OpenClaw 本地联调（新增）
+
+最小联调顺序：
+
+1. 读取能力与契约：`capabilities` + `tool-contract`
+2. 读取快照与事件：`snapshot` + `trade/events`
+3. 指令写入：`commander/dispatch`（`source=openclaw`）
+
+最小命令：
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/modules/commander/capabilities
+curl -s http://127.0.0.1:8000/api/v1/modules/commander/tool-contract
+curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
+curl -s 'http://127.0.0.1:8000/api/v1/trade/events?limit=20'
+curl -s -X POST http://127.0.0.1:8000/api/v1/modules/commander/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"系统巡检","source":"openclaw"}'
+```
+
+详细见：`docs/OPENCLAW_INTEGRATION_GUIDE.md`。
+
 ### IDE配置
 
 推荐使用 VSCode 或 PyCharm

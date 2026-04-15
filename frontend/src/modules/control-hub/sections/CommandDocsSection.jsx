@@ -96,6 +96,17 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
   });
   const connected = coverageRows.filter((r) => r.status === '已对接').length;
   const smokeRows = Array.isArray(state.apiSmoke) ? state.apiSmoke : [];
+  const contract = state.toolContract?.data || {};
+  const toolRows = [
+    ...(Array.isArray(contract.read_tools) ? contract.read_tools.map((x, i) => ({ id: `r-${i}`, kind: '只读', path: x })) : []),
+    ...(Array.isArray(contract.write_tools) ? contract.write_tools.map((x, i) => ({ id: `w-${i}`, kind: '写入', path: x })) : []),
+  ];
+  const govAuditRows = (Array.isArray(state.governanceAudit) ? state.governanceAudit : []).slice(0, 30).map((x, i) => ({
+    id: i,
+    ts: x.ts || '-',
+    event: x.event || '-',
+    detail: JSON.stringify(x.detail || {}, null, 0),
+  }));
 
   const loadDoc = async () => {
     const loader = resolve(selected.path);
@@ -158,6 +169,25 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
             columns={[{ key: 'module', title: '模块' }, { key: 'endpoint', title: '接口路径' }, { key: 'status', title: '联调' }, { key: 'latency_ms', title: '耗时(ms)' }, { key: 'hint', title: '结果' }]}
             rows={smokeRows}
             emptyText="点击“一键联调关键API”开始验收"
+          />
+          <div className="sub-title" style={{ marginTop: 12 }}>标准工具契约清单（OpenClaw/MCP）</div>
+          <DataTable
+            columns={[
+              { key: 'kind', title: '类型' },
+              { key: 'path', title: '接口路径' },
+            ]}
+            rows={toolRows}
+            emptyText="暂无工具契约数据"
+          />
+          <div className="sub-title" style={{ marginTop: 12 }}>治理审计流（最近变更）</div>
+          <DataTable
+            columns={[
+              { key: 'ts', title: '时间' },
+              { key: 'event', title: '变更事件' },
+              { key: 'detail', title: '详情' },
+            ]}
+            rows={govAuditRows}
+            emptyText="暂无治理审计记录"
           />
           <input className="form-input" value={commandInput} onChange={(e) => setCommandInput(e.target.value)} placeholder="发送司令部指令" />
           <button type="button" className="btn btn-sm btn-primary" style={{ marginTop: 8 }} onClick={actions.sendCommanderMessage}>

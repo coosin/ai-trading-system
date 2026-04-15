@@ -87,6 +87,45 @@
     - `extra_confidence_threshold`
   - 用于验收“连续止损后提高开仓门槛”的学习反馈机制。
 
+### 治理与托管接口（2026-04-15 更新）
+
+- **托管与自动化**
+  - `GET /api/v1/modules/commander/hosting-mode`
+  - `POST /api/v1/modules/commander/hosting-mode`
+  - `GET /api/v1/modules/commander/automation-profile`
+  - `POST /api/v1/modules/commander/automation-profile`
+
+- **统一风控红线**
+  - `GET /api/v1/modules/commander/risk-redlines`
+  - `POST /api/v1/modules/commander/risk-redlines`
+
+- **治理审计与工具契约**
+  - `GET /api/v1/modules/commander/governance-audit`
+  - `GET /api/v1/modules/commander/tool-contract`
+
+- **验收建议**
+  - 日常值守可直接执行 `docs/DAILY_HOSTING_ACCEPTANCE.md`，以最少命令完成托管可用性确认。
+
+### OpenClaw 对接最小接口集（2026-04-16 更新）
+
+- **读取能力/契约**
+  - `GET /api/v1/modules/commander/capabilities`
+  - `GET /api/v1/modules/commander/tool-contract`
+  - `GET /api/v1/modules/surface/channels`
+  - `GET /api/v1/modules/surface/registry`
+
+- **读取状态/对账**
+  - `GET /api/v1/modules/commander/snapshot`
+  - `GET /api/v1/modules/commander/account-diagnostics`
+  - `GET /api/v1/trade/events`
+
+- **写入入口**
+  - `POST /api/v1/modules/commander/dispatch`
+  - 建议 body 带 `source=openclaw`，便于治理审计与链路追踪
+
+- **完整操作流程**
+  - 见 `docs/OPENCLAW_INTEGRATION_GUIDE.md`。
+
 ### WebSocket（OpenAPI 中不展开）
 
 - **URL:** `ws://<host>:8000/ws`（生产若走 HTTPS 则为 `wss://`）
