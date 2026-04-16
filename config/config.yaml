@@ -586,12 +586,12 @@ stop_loss_take_profit:
   trailing_only_mode: true
   trailing_only_coerce_inputs: true
   trailing_active_on_open: true
-  initial_trailing_offset: 0.1
+  initial_trailing_offset: 0.05
   profit_tier2_pnl_threshold: 0.3
   tier2_trailing_offset: 0.05
   trailing_momentum_adjust_enable: true
-  default_stop_loss_percent: 0.1
-  default_take_profit_percent: 0.0
+  default_stop_loss_percent: 0.05
+  default_take_profit_percent: 0.08
   open_rr_synthetic_reward_multiple: 1.5
   enable_trailing_stop: true
   trailing_stop_offset: 0.1
