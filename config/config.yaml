@@ -288,6 +288,16 @@ messaging:
     channels:
     - telegram
     - log
+openclaw_push:
+  # 默认开启 OpenClaw 实时推送（交易/风控/系统告警）
+  enabled: true
+  # 默认标准接入点；若你的 OpenClaw 网关地址不同，请在 local.yaml 覆盖。
+  url: http://127.0.0.1:18789/api/events/ingest
+  token: ''
+  timeout_sec: 3.0
+  min_interval_sec: 0.1
+  max_queue: 5000
+  retry: 3
 api:
   enabled: true
   host: 0.0.0.0

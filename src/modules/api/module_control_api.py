@@ -1837,6 +1837,47 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
+    @router.get("/commander/openclaw-integration")
+    async def commander_openclaw_integration():
+        """OpenClaw 对接状态：读取入口、实时通道、推送配置就绪度。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            hub = getattr(main_controller, "trade_event_hub", None)
+            push_enabled = bool(getattr(hub, "_openclaw_push_enabled", False)) if hub else False
+            push_url = str(getattr(hub, "_openclaw_push_url", "") or "") if hub else ""
+            queue_size = 0
+            queue_max = 0
+            if hub and getattr(hub, "_openclaw_push_queue", None) is not None:
+                q = getattr(hub, "_openclaw_push_queue")
+                queue_size = int(q.qsize())
+                queue_max = int(getattr(q, "maxsize", 0))
+            data = {
+                "dispatch_ready": bool(hasattr(main_controller, "process_user_command")),
+                "capabilities_ready": bool(hasattr(main_controller, "get_commander_capabilities")),
+                "tool_contract_ready": bool(hasattr(main_controller, "get_tool_contract_catalog")),
+                "event_hub_ready": bool(hub is not None),
+                "event_stream_replay_ready": bool(hub and hasattr(hub, "query_recent")),
+                "system_alert_bridge_ready": bool(hub and hasattr(hub, "publish_system_alert")),
+                "openclaw_push": {
+                    "enabled": push_enabled,
+                    "url_configured": bool(push_url),
+                    "queue_size": queue_size,
+                    "queue_max": queue_max,
+                },
+                "required_realtime_channels": ["trade.intent", "trade.fill", "trade.position", "market.update", "system.alert"],
+                "required_read_endpoints": [
+                    "/api/v1/modules/commander/capabilities",
+                    "/api/v1/modules/commander/tool-contract",
+                    "/api/v1/modules/commander/snapshot",
+                    "/api/v1/modules/commander/account-diagnostics",
+                    "/api/v1/trade/events",
+                ],
+            }
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
     @router.post("/commander/chores")
     async def commander_chores(payload: Dict[str, Any] = Body(default_factory=dict)):
         """触发司令部日常任务。"""

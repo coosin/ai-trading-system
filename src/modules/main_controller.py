@@ -393,6 +393,13 @@ class MainController:
             "interval_sec": 8,
             "stale_account_state_sec": 60,
             "open_fail_threshold": 5,
+            # 仅统计 execution_gateway.open_fail（真实执行失败）。
+            # policy_denied 在半自动模式下会自然累积，默认不作为降级依据，避免“切全自动后秒回半自动”。
+            "count_policy_denied_as_fail": False,
+            # 使用“增量失败计分”而不是累计绝对值，避免历史计数永久放大触发守护误判。
+            "use_fail_delta": True,
+            # 仅告警不自动切换托管模式（用户要求：不要自动切换）。
+            "auto_switch_mode_enabled": False,
             "auto_recover_enabled": True,
             "recover_stable_sec": 120,
         }
@@ -417,6 +424,9 @@ class MainController:
             "last_risky_at": None,
             "last_recover_candidate_at": None,
         }
+        # Hosting guard fail-score baseline (for delta mode)
+        self._hosting_guard_last_open_fail: int = 0
+        self._hosting_guard_last_open_denied: int = 0
 
         logger.info("主控制器初始化完成")
 
@@ -561,6 +571,12 @@ class MainController:
             p["enabled"] = bool(u.get("enabled"))
         if "auto_recover_enabled" in u:
             p["auto_recover_enabled"] = bool(u.get("auto_recover_enabled"))
+        if "count_policy_denied_as_fail" in u:
+            p["count_policy_denied_as_fail"] = bool(u.get("count_policy_denied_as_fail"))
+        if "use_fail_delta" in u:
+            p["use_fail_delta"] = bool(u.get("use_fail_delta"))
+        if "auto_switch_mode_enabled" in u:
+            p["auto_switch_mode_enabled"] = bool(u.get("auto_switch_mode_enabled"))
         for k in ("interval_sec", "stale_account_state_sec", "open_fail_threshold", "recover_stable_sec"):
             if k in u:
                 try:
@@ -1776,6 +1792,12 @@ class MainController:
         try:
             if self.event_system:
                 from src.modules.core.trade_event_hub import TradeEventHub
+                openclaw_push_cfg: Dict[str, Any] = {}
+                try:
+                    if self.config_manager:
+                        openclaw_push_cfg = await self.config_manager.get_config("openclaw_push", {}) or {}
+                except Exception:
+                    openclaw_push_cfg = {}
 
                 self.trade_event_hub = TradeEventHub(
                     self.event_system,
@@ -1785,6 +1807,13 @@ class MainController:
                     buffer_size=800,
                     tg_enabled=True,
                     tg_min_interval_sec=2.0,
+                    openclaw_push_enabled=bool(openclaw_push_cfg.get("enabled", False)),
+                    openclaw_push_url=str(openclaw_push_cfg.get("url") or ""),
+                    openclaw_push_token=str(openclaw_push_cfg.get("token") or ""),
+                    openclaw_push_timeout_sec=float(openclaw_push_cfg.get("timeout_sec", 3.0) or 3.0),
+                    openclaw_push_min_interval_sec=float(openclaw_push_cfg.get("min_interval_sec", 0.15) or 0.15),
+                    openclaw_push_max_queue=int(openclaw_push_cfg.get("max_queue", 2000) or 2000),
+                    openclaw_push_retry=int(openclaw_push_cfg.get("retry", 2) or 2),
                 )
                 logger.info("✅ TradeEventHub 已初始化")
         except Exception as e:
@@ -4553,7 +4582,16 @@ class MainController:
                         m = gw.get_policy_metrics() or {}
                         open_fail = int(m.get("open_fail", 0) or 0)
                         den = int(m.get("open_policy_denied", 0) or 0)
-                        fail_score = open_fail + den
+                        include_denied = bool(cfg.get("count_policy_denied_as_fail", False))
+                        use_delta = bool(cfg.get("use_fail_delta", True))
+                        if use_delta:
+                            fail_inc = max(0, open_fail - int(getattr(self, "_hosting_guard_last_open_fail", 0) or 0))
+                            den_inc = max(0, den - int(getattr(self, "_hosting_guard_last_open_denied", 0) or 0))
+                            fail_score = int(fail_inc + (den_inc if include_denied else 0))
+                        else:
+                            fail_score = int(open_fail + (den if include_denied else 0))
+                        self._hosting_guard_last_open_fail = open_fail
+                        self._hosting_guard_last_open_denied = den
                         if fail_score >= max(1, int(cfg.get("open_fail_threshold", 5) or 5)):
                             reasons.append(f"执行失败压力={fail_score}")
                 except Exception:
@@ -4568,13 +4606,18 @@ class MainController:
                 if reasons:
                     self._hosting_guard_status["last_risky_at"] = now.isoformat()
                     self._hosting_guard_status["last_reason"] = "；".join(reasons)
-                    if mode == "full_auto":
+                    auto_switch = bool(cfg.get("auto_switch_mode_enabled", False))
+                    if auto_switch and mode == "full_auto":
                         self.set_hosting_mode("semi_auto")
                         self._hosting_guard_status["last_action"] = "auto_downgrade_to_semi_auto"
                         logger.warning("🛡️ 托管守护触发降级: %s", self._hosting_guard_status["last_reason"])
+                    else:
+                        self._hosting_guard_status["last_action"] = "alert_only_risky"
+                        logger.warning("🛡️ 托管守护风险告警（仅告警不切换）: %s", self._hosting_guard_status["last_reason"])
                 else:
                     self._hosting_guard_status["last_recover_candidate_at"] = now.isoformat()
-                    if mode == "semi_auto" and bool(cfg.get("auto_recover_enabled", True)):
+                    auto_switch = bool(cfg.get("auto_switch_mode_enabled", False))
+                    if auto_switch and mode == "semi_auto" and bool(cfg.get("auto_recover_enabled", True)):
                         stable_sec = max(30, int(cfg.get("recover_stable_sec", 120) or 120))
                         risky_at_raw = self._hosting_guard_status.get("last_risky_at")
                         can_recover = False
@@ -4591,6 +4634,8 @@ class MainController:
                             self._hosting_guard_status["last_action"] = "auto_recover_to_full_auto"
                             self._hosting_guard_status["last_reason"] = f"稳定运行>={stable_sec}s"
                             logger.info("🛡️ 托管守护触发恢复: %s", self._hosting_guard_status["last_reason"])
+                    elif not auto_switch:
+                        self._hosting_guard_status["last_action"] = "alert_only_stable"
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -4777,9 +4822,23 @@ class MainController:
                 except Exception:
                     pass
                 await self.smart_notification.send(title, message, priority=priority, category="general")
-                return
+            else:
+                await self._send_notification_direct(title, message, priority)
 
-            await self._send_notification_direct(title, message, priority)
+            # Mirror all system notifications to TradeEventHub => WS + OpenClaw push
+            hub = getattr(self, "trade_event_hub", None)
+            if hub and hasattr(hub, "publish_system_alert"):
+                try:
+                    await hub.publish_system_alert(
+                        source="main_controller",
+                        title=str(title or ""),
+                        message=str(message or ""),
+                        priority=str(priority or "medium"),
+                        kind="system.notification",
+                        data={},
+                    )
+                except Exception as e:
+                    logger.debug("system alert mirror to TradeEventHub failed: %s", e)
             
         except Exception as e:
             logger.error(f"通知处理失败: {e}")

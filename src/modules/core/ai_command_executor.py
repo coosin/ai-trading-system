@@ -604,10 +604,22 @@ class AICommandExecutor:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
+            # common cleanup: full-width punctuation + trailing commas
+            cleaned = (
+                raw.replace("，", ",")
+                .replace("：", ":")
+                .replace("（", "(")
+                .replace("）", ")")
+            )
+            cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
             try:
-                i, j = raw.find("{"), raw.rfind("}")
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                pass
+            try:
+                i, j = cleaned.find("{"), cleaned.rfind("}")
                 if i != -1 and j != -1 and j > i:
-                    return json.loads(raw[i : j + 1])
+                    return json.loads(cleaned[i : j + 1])
             except json.JSONDecodeError:
                 return None
         return None

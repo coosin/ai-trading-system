@@ -10,6 +10,7 @@ import asyncio
 import logging
 import json
 import re
+import ast
 import math
 import uuid
 from datetime import datetime, timedelta
@@ -3089,28 +3090,58 @@ class AICoreDecisionEngine:
     def _parse_ai_decision(self, response: str, symbol: str) -> Optional[TradeDecision]:
         """解析AI决策"""
         try:
-            json_str = response.strip()
-            
-            if json_str.startswith('```json'):
-                json_str = json_str[7:]
-            if json_str.startswith('```'):
-                json_str = json_str[3:]
-            if json_str.endswith('```'):
-                json_str = json_str[:-3]
-            json_str = json_str.strip()
-            
-            if json_str.startswith('{') and json_str.endswith('}'):
-                pass
-            else:
-                start = json_str.find('{')
-                end = json_str.rfind('}')
-                if start != -1 and end != -1:
-                    json_str = json_str[start:end+1]
-                else:
-                    logger.warning(f"AI响应中没有找到JSON: {response[:100]}")
+            raw = str(response or "").strip()
+            if not raw:
+                logger.warning("AI响应为空，无法解析决策")
+                return None
+
+            if "```" in raw:
+                m = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+                if m:
+                    raw = m.group(1).strip()
+
+            if not (raw.startswith("{") and raw.endswith("}")):
+                start = raw.find("{")
+                if start == -1:
+                    logger.warning(f"AI响应中没有找到JSON对象: {raw[:120]}")
                     return None
-            
-            data = json.loads(json_str)
+                depth = 0
+                end = -1
+                for i in range(start, len(raw)):
+                    ch = raw[i]
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+                if end == -1:
+                    logger.warning(f"AI响应JSON括号不闭合: {raw[:120]}")
+                    return None
+                raw = raw[start : end + 1]
+
+            normalized = (
+                raw.replace("，", ",")
+                .replace("：", ":")
+                .replace("（", "(")
+                .replace("）", ")")
+            )
+            normalized = re.sub(r",\s*([}\]])", r"\1", normalized)
+
+            data: Optional[Dict[str, Any]] = None
+            try:
+                data = json.loads(normalized)
+            except json.JSONDecodeError:
+                try:
+                    maybe = ast.literal_eval(normalized)
+                    if isinstance(maybe, dict):
+                        data = maybe
+                except Exception:
+                    data = None
+            if not isinstance(data, dict):
+                logger.error("解析AI决策失败: 非法JSON格式")
+                return None
             
             action = data.get('action', 'hold')
             if action == 'hold':

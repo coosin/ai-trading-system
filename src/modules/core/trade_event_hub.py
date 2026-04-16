@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import aiohttp
+
 from src.modules.core.event_system import (
     EnhancedEventSystem,
     Event,
@@ -194,6 +196,13 @@ class TradeEventHub:
         buffer_size: int = 500,
         tg_enabled: bool = True,
         tg_min_interval_sec: float = 2.0,
+        openclaw_push_enabled: bool = False,
+        openclaw_push_url: Optional[str] = None,
+        openclaw_push_token: Optional[str] = None,
+        openclaw_push_timeout_sec: float = 3.0,
+        openclaw_push_min_interval_sec: float = 0.15,
+        openclaw_push_max_queue: int = 2000,
+        openclaw_push_retry: int = 2,
     ) -> None:
         self._es = event_system
         self._api = api_server
@@ -206,6 +215,16 @@ class TradeEventHub:
         self._tg_enabled = bool(tg_enabled)
         self._tg_min_interval_sec = float(max(0.0, tg_min_interval_sec))
         self._last_tg_at: float = 0.0
+        # OpenClaw realtime push (optional webhook sink)
+        self._openclaw_push_enabled = bool(openclaw_push_enabled and openclaw_push_url)
+        self._openclaw_push_url = str(openclaw_push_url or "").strip()
+        self._openclaw_push_token = str(openclaw_push_token or "").strip()
+        self._openclaw_push_timeout_sec = float(max(0.5, openclaw_push_timeout_sec))
+        self._openclaw_push_min_interval_sec = float(max(0.0, openclaw_push_min_interval_sec))
+        self._openclaw_push_retry = int(max(0, openclaw_push_retry))
+        self._openclaw_push_queue: asyncio.Queue = asyncio.Queue(maxsize=int(max(100, openclaw_push_max_queue)))
+        self._openclaw_push_task: Optional[asyncio.Task] = None
+        self._openclaw_last_push_at: float = 0.0
 
     def get_recent(self, limit: int = 100) -> List[Dict[str, Any]]:
         lim = int(max(1, min(limit or 100, self._buffer_size)))
@@ -311,6 +330,54 @@ class TradeEventHub:
                         await self._tg.send_message(str(msg)[:3500])
                 except Exception as e:
                     logger.debug("TradeEventHub telegram fanout failed: %s", e)
+
+        # OpenClaw realtime webhook push (best-effort, queued, non-blocking)
+        if self._openclaw_push_enabled and self._openclaw_push_url:
+            evt = {
+                "channel": str(channel or "unknown"),
+                "event": dict(payload or {}),
+                "timestamp": _utc_now_iso(),
+            }
+            try:
+                self._openclaw_push_queue.put_nowait(evt)
+                if self._openclaw_push_task is None or self._openclaw_push_task.done():
+                    self._openclaw_push_task = asyncio.create_task(self._openclaw_push_worker())
+            except asyncio.QueueFull:
+                logger.warning("TradeEventHub OpenClaw push queue is full, dropping oldest event")
+                try:
+                    _ = self._openclaw_push_queue.get_nowait()
+                    self._openclaw_push_queue.put_nowait(evt)
+                except Exception:
+                    pass
+
+    async def _openclaw_push_worker(self) -> None:
+        if not self._openclaw_push_enabled or not self._openclaw_push_url:
+            return
+        timeout = aiohttp.ClientTimeout(total=self._openclaw_push_timeout_sec)
+        headers = {"Content-Type": "application/json"}
+        if self._openclaw_push_token:
+            headers["Authorization"] = f"Bearer {self._openclaw_push_token}"
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while not self._openclaw_push_queue.empty():
+                row = await self._openclaw_push_queue.get()
+                # rate-limit
+                wait_s = self._openclaw_push_min_interval_sec - (time.time() - self._openclaw_last_push_at)
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+                ok = False
+                for i in range(self._openclaw_push_retry + 1):
+                    try:
+                        async with session.post(self._openclaw_push_url, json=row, headers=headers) as resp:
+                            if 200 <= int(resp.status) < 300:
+                                ok = True
+                                break
+                    except Exception as e:
+                        if i >= self._openclaw_push_retry:
+                            logger.debug("TradeEventHub OpenClaw push failed: %s", e)
+                    await asyncio.sleep(min(0.4 * (i + 1), 1.2))
+                self._openclaw_last_push_at = time.time()
+                if not ok:
+                    logger.warning("TradeEventHub OpenClaw push failed after retries: channel=%s", row.get("channel"))
 
     async def publish_intent(self, intent: TradeIntent) -> None:
         ev = Event(
@@ -428,6 +495,42 @@ class TradeEventHub:
                 "type": "market.update",
                 **data,
                 "tg_message": tg_message,
+            },
+        )
+
+    async def publish_system_alert(
+        self,
+        *,
+        source: str,
+        title: str,
+        message: str,
+        priority: str = "medium",
+        kind: str = "system.alert",
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload = {
+            "kind": str(kind or "system.alert"),
+            "source": str(source or "system"),
+            "title": str(title or ""),
+            "message": str(message or ""),
+            "priority": str(priority or "medium"),
+            "data": dict(data or {}),
+            "timestamp": _utc_now_iso(),
+        }
+        ev = Event(
+            type=EventType.RISK_ALERT,
+            source=str(source or "system"),
+            priority=EventPriority.HIGH if str(priority).lower() in {"high", "critical"} else EventPriority.NORMAL,
+            data=payload,
+            metadata={"kind": payload["kind"]},
+        )
+        await self._publish_event(ev, persist=True)
+        await self._fanout(
+            "system.alert",
+            {
+                "type": "system.alert",
+                **payload,
+                "tg_message": f"📢 [{str(priority).upper()}] {title}\n{message[:1000]}",
             },
         )
 

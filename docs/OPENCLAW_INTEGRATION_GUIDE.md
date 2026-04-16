@@ -39,6 +39,7 @@ curl -s http://localhost:8000/api/v1/modules/surface/registry
 curl -s 'http://localhost:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
 curl -s 'http://localhost:8000/api/v1/modules/commander/account-diagnostics'
 curl -s 'http://localhost:8000/api/v1/trade/events?limit=20'
+curl -s 'http://localhost:8000/api/v1/modules/commander/openclaw-integration'
 ```
 
 用途：
@@ -49,6 +50,7 @@ curl -s 'http://localhost:8000/api/v1/trade/events?limit=20'
 - `snapshot`：统一运行态快照
 - `account-diagnostics`：账户/持仓权威对账
 - `trade/events`：事件补偿与回放
+- `openclaw-integration`：OpenClaw 对接就绪度与推送链路状态
 
 ---
 
@@ -82,6 +84,30 @@ curl -s http://localhost:8000/api/v1/modules/commander/risk-redlines
 - 实时：WebSocket 订阅 `trade.*` / `market.*`
 - 补偿：定时拉取 `GET /api/v1/trade/events`
 - 规则：发生重连或网络抖动时，以事件流补齐缺口，避免丢成交/风控触发事件
+- 新增：可启用 OpenClaw Webhook 推送通道，系统将把 `trade.intent/trade.fill/trade.position/market.update/system.alert` 推送到 OpenClaw。
+
+### 5.1 OpenClaw Webhook 推送配置（可选，推荐）
+
+在配置中心加入 `openclaw_push`：
+
+```yaml
+openclaw_push:
+  enabled: true
+  url: "http://<openclaw-host>/api/events/ingest"
+  token: "<your-bearer-token>"
+  timeout_sec: 3.0
+  min_interval_sec: 0.15
+  max_queue: 2000
+  retry: 2
+```
+
+说明：
+
+- `enabled/url`：开启并指定 OpenClaw 接收端
+- `token`：可选 Bearer 鉴权
+- `retry`：失败重试次数（总尝试次数 = retry + 1）
+- `max_queue`：突发事件缓冲，避免瞬时丢失
+- 即使 Webhook 暂时不可用，`trade/events` 仍可回放补偿
 
 ---
 

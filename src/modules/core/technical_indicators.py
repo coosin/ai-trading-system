@@ -8,6 +8,7 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import numpy as np
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,24 @@ class TechnicalIndicators:
 
 class TechnicalIndicatorCalculator:
     """技术指标计算器"""
+
+    @staticmethod
+    def _safe_float(v: Any) -> Optional[float]:
+        """Best-effort numeric conversion; rejects NaN/inf/None/empty."""
+        try:
+            if v is None:
+                return None
+            if isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    return None
+                v = s
+            x = float(v)
+            if not math.isfinite(x):
+                return None
+            return x
+        except (TypeError, ValueError):
+            return None
     
     @staticmethod
     def calculate_sma(prices: List[float], period: int) -> Optional[float]:
@@ -257,11 +276,35 @@ class TechnicalIndicatorCalculator:
         """计算所有技术指标"""
         if not klines or len(klines) < 50:
             return TechnicalIndicators()
-        
-        closes = [float(k.get("close", 0)) for k in klines]
-        highs = [float(k.get("high", 0)) for k in klines]
-        lows = [float(k.get("low", 0)) for k in klines]
-        volumes = [float(k.get("volume", 0)) for k in klines]
+
+        cleaned_rows: List[Dict[str, float]] = []
+        dropped = 0
+        for k in klines:
+            if not isinstance(k, dict):
+                dropped += 1
+                continue
+            c = TechnicalIndicatorCalculator._safe_float(k.get("close"))
+            h = TechnicalIndicatorCalculator._safe_float(k.get("high"))
+            l = TechnicalIndicatorCalculator._safe_float(k.get("low"))
+            v = TechnicalIndicatorCalculator._safe_float(k.get("volume"))
+            if c is None or h is None or l is None:
+                dropped += 1
+                continue
+            # volume can be missing in some degraded feeds; fall back to 0 for volume indicators.
+            cleaned_rows.append({"close": c, "high": h, "low": l, "volume": v if v is not None else 0.0})
+
+        if len(cleaned_rows) < 50:
+            if dropped > 0:
+                logger.warning("技术指标计算可用K线不足: raw=%d cleaned=%d dropped=%d", len(klines), len(cleaned_rows), dropped)
+            return TechnicalIndicators()
+
+        if dropped > 0:
+            logger.warning("技术指标计算已跳过异常K线: raw=%d cleaned=%d dropped=%d", len(klines), len(cleaned_rows), dropped)
+
+        closes = [r["close"] for r in cleaned_rows]
+        highs = [r["high"] for r in cleaned_rows]
+        lows = [r["low"] for r in cleaned_rows]
+        volumes = [r["volume"] for r in cleaned_rows]
         
         # 趋势指标
         ma5 = TechnicalIndicatorCalculator.calculate_sma(closes, 5)
