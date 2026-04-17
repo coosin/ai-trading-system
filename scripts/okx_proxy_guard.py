@@ -18,6 +18,7 @@ import json
 import statistics
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -46,10 +47,26 @@ def _mihomo_call(url: str, secret: str, method: str = "GET", body: str = "") -> 
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read(2048).decode("utf-8", errors="replace")
+            data = resp.read().decode("utf-8", errors="replace")
             return True, data
     except Exception as e:
         return False, str(e)
+
+
+def _discover_provider_names(controller: str, secret: str) -> list[str]:
+    """Read available provider names from mihomo controller."""
+    url = f"{controller.rstrip('/')}/providers/proxies"
+    ok, msg = _mihomo_call(url, secret, method="GET")
+    if not ok:
+        return []
+    try:
+        data = json.loads(msg)
+    except Exception:
+        return []
+    providers = data.get("providers") if isinstance(data, dict) else {}
+    if not isinstance(providers, dict):
+        return []
+    return [str(k) for k in providers.keys() if str(k).strip()]
 
 
 def _run_probe(runs: int, timeout: float) -> dict:
@@ -75,7 +92,7 @@ def main() -> int:
     p.add_argument("--mihomo-controller", default="http://127.0.0.1:9090")
     p.add_argument("--mihomo-secret", default="a930ed80f2cfed1c19d49140fa3cffe2")
     p.add_argument("--provider", default="sub_v1mk")
-    p.add_argument("--reload-path", default="/etc/mihomo/config.yaml")
+    p.add_argument("--reload-path", default="/etc/mihomo/generated_from_openclaw.yaml")
     args = p.parse_args()
 
     probe = _run_probe(args.runs, args.timeout)
@@ -91,14 +108,72 @@ def main() -> int:
 
     if args.repair and not healthy:
         report["repair_attempted"] = True
-        hc_url = f"{args.mihomo_controller.rstrip('/')}/providers/proxies/{args.provider}/healthcheck"
-        ok1, msg1 = _mihomo_call(hc_url, args.mihomo_secret, method="GET")
-        report["repair_steps"].append({"step": "provider_healthcheck", "ok": ok1, "detail": msg1[:300]})
+        # 1) provider healthcheck (auto-discover + fallback)
+        discovered = _discover_provider_names(args.mihomo_controller, args.mihomo_secret)
+        provider_candidates: list[str] = []
+        if str(args.provider or "").strip():
+            provider_candidates.append(str(args.provider).strip())
+        for name in discovered:
+            if name not in provider_candidates:
+                provider_candidates.append(name)
+        # prefer common routing groups if they exist
+        preferred = ["🚀 节点选择", "♻️ 自动选择", "default"]
+        provider_candidates = [x for x in preferred if x in provider_candidates] + [
+            x for x in provider_candidates if x not in preferred
+        ]
+        ok1 = False
+        msg1 = "no provider available"
+        used_provider = ""
+        for prov in provider_candidates[:8]:
+            quoted = urllib.parse.quote(prov, safe="")
+            hc_url = f"{args.mihomo_controller.rstrip('/')}/providers/proxies/{quoted}/healthcheck"
+            ok_try, msg_try = _mihomo_call(hc_url, args.mihomo_secret, method="GET")
+            if ok_try:
+                ok1 = True
+                msg1 = msg_try
+                used_provider = prov
+                break
+            msg1 = msg_try
+        report["repair_steps"].append(
+            {
+                "step": "provider_healthcheck",
+                "ok": ok1,
+                "provider": used_provider,
+                "detail": (msg1 or "")[:300],
+            }
+        )
 
+        # 2) config reload with fallback paths
         reload_url = f"{args.mihomo_controller.rstrip('/')}/configs"
-        body = json.dumps({"path": args.reload_path}, ensure_ascii=False)
-        ok2, msg2 = _mihomo_call(reload_url, args.mihomo_secret, method="PUT", body=body)
-        report["repair_steps"].append({"step": "reload_config", "ok": ok2, "detail": msg2[:300]})
+        reload_candidates = [
+            str(args.reload_path or "").strip(),
+            "/etc/mihomo/generated_from_openclaw.yaml",
+            "/etc/mihomo/final_best_integrated.yaml",
+            "/etc/mihomo/final_best_from_vip.yaml",
+            "/etc/mihomo/config.yaml",
+        ]
+        seen = set()
+        reload_candidates = [p for p in reload_candidates if p and not (p in seen or seen.add(p))]
+        ok2 = False
+        msg2 = "no reload path succeeded"
+        used_path = ""
+        for path in reload_candidates:
+            body = json.dumps({"path": path}, ensure_ascii=False)
+            ok_try, msg_try = _mihomo_call(reload_url, args.mihomo_secret, method="PUT", body=body)
+            if ok_try:
+                ok2 = True
+                msg2 = msg_try
+                used_path = path
+                break
+            msg2 = msg_try
+        report["repair_steps"].append(
+            {
+                "step": "reload_config",
+                "ok": ok2,
+                "path": used_path,
+                "detail": (msg2 or "")[:300],
+            }
+        )
 
         probe2 = _run_probe(max(2, args.runs), args.timeout)
         report["okx_probe_after_repair"] = probe2

@@ -1,0 +1,54 @@
+# AI交易经验配置
+# 供交易系统学习参考
+
+experience:
+  version: "1.0"
+  updated: "2026-04-17 11:15 Beijing Time"
+  
+  # 止损止盈最佳实践
+  stop_loss_take_profit:
+    optimal_stop_loss: 0.12      # 12% - 给市场足够波动空间
+    optimal_take_profit: 0.20    # 20% - 保护更多盈利
+    trailing_offset: 0.03        # 3% - 快速锁定利润
+    breakeven_enabled: true      # 启用保本
+    breakeven_trigger: 0.02      # 2%盈利后保本
+    
+  # 交易频率建议
+  trading_frequency:
+    max_daily_opens: 10          # 每日最多开仓10次
+    min_open_interval: 1800      # 开仓间隔至少30分钟
+    quality_over_quantity: true  # 质量优先于数量
+    
+  # 盈利模式
+  profitable_patterns:
+    - name: "DOT波段操作"
+      description: "多次开仓，分批止盈"
+      max_profit: 339
+    - name: "跌破前低开空"
+      description: "关键位置开空，成功率高"
+      
+  # 亏损模式（需避免）
+  loss_patterns:
+    - name: "频繁止损"
+      cause: "止损太紧，5-8%"
+      solution: "扩大到12%"
+    - name: "止盈不触发"
+      cause: "止盈目标太低"
+      solution: "提高到20%"
+    - name: "开仓太频繁"
+      cause: "没有筛选信号"
+      solution: "添加过滤条件"
+
+  # 监控指标
+  monitoring:
+    target_stop_loss_triggers: "< 50次/天"
+    target_take_profit_triggers: "> 5次/天"
+    target_win_rate: "30-50%"
+    
+  # 优化建议
+  optimization_advice:
+    - "减少开仓频率，提高信号质量"
+    - "扩大止损范围到12%"
+    - "提高止盈目标到20%"
+    - "添加开仓冷却时间"
+    - "只在趋势明确时开仓"

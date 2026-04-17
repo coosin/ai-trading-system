@@ -17,6 +17,7 @@ import logging
 import os
 import secrets
 import traceback
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -958,13 +959,87 @@ class APIServer:
             ex = mc.get_exchange() if (mc and hasattr(mc, "get_exchange")) else None
             if not ex or not hasattr(ex, "get_balance"):
                 return {"ok": False, "message": "exchange unavailable", "balance": {}}
+
+            # Best-effort cache fallback:
+            # - OKXExchange 内部实现了余额/持仓缓存降级
+            # - 但 legacy 路由外层用了较短 wait_for，OKX 抖动时会被外层取消，导致 ok:false
+            # - 因此这里优先读缓存；失败/超时也优先回退缓存
+            cached_balance_data: Dict[str, float] = {}
+            cached_balance_age_s: Optional[float] = None
             try:
-                bal = await asyncio.wait_for(ex.get_balance(), timeout=6.0)
+                cached_ts, cached_balances = getattr(ex, "_balances_cache", (0.0, []))
+                if isinstance(cached_balances, list) and cached_balances:
+                    cached_balance_age_s = time.time() - float(cached_ts or 0.0)
+                    for b in cached_balances:
+                        # Balance dataclass (asset, free) or dict-like
+                        asset = getattr(b, "asset", None) or (b.get("asset") if isinstance(b, dict) else None)
+                        free = getattr(b, "free", None) if not isinstance(b, dict) else b.get("free")
+                        if asset:
+                            try:
+                                f = float(free or 0.0)
+                            except Exception:
+                                f = 0.0
+                            if f > 0:
+                                cached_balance_data[str(asset)] = f
+            except Exception:
+                cached_balance_data = {}
+                cached_balance_age_s = None
+
+            # If cache exists and is "fresh enough", skip network entirely.
+            try:
+                ttl_s = float(getattr(ex, "_balance_cache_ttl_s", 12.0) or 12.0)
+            except Exception:
+                ttl_s = 12.0
+            max_stale_age_s = max(60.0, ttl_s * 10.0)
+            if cached_balance_data and cached_balance_age_s is not None and cached_balance_age_s <= max_stale_age_s:
+                return {
+                    "ok": True,
+                    "balance": cached_balance_data,
+                    "data": cached_balance_data,
+                    "source": "cache",
+                    "stale": bool(cached_balance_age_s > (ttl_s or 0.0)),
+                    "stale_age_s": cached_balance_age_s,
+                }
+            try:
+                # 外层 wait_for 控制：网络抖动时允许 OKXExchange 先尝试返回/更新缓存；
+                # 超过该时间就回退为空余额但保证 ok=true，避免前端被判“接口错误”。
+                bal = await asyncio.wait_for(ex.get_balance(), timeout=12.0)
                 if not isinstance(bal, dict):
                     bal = {}
                 # Add "data" alias for older clients expecting a data envelope.
                 return {"ok": True, "balance": bal, "data": bal}
+            except asyncio.TimeoutError as e:
+                if cached_balance_data:
+                    return {
+                        "ok": True,
+                        "balance": cached_balance_data,
+                        "data": cached_balance_data,
+                        "source": "cache",
+                        "stale": True,
+                        "stale_age_s": cached_balance_age_s,
+                        "message": f"timeout; fallback to cache: {str(e) or 'timeout'}",
+                    }
+                # 没有缓存时就直接返回 ok:true（避免前端把它当“不可用错误”），
+                # 下一轮请求通常就能拿到余额/缓存。
+                return {
+                    "ok": True,
+                    "balance": {},
+                    "data": {},
+                    "source": "timeout_no_cache",
+                    "stale": True,
+                    "message": str(e) or "timeout",
+                }
             except Exception as e:
+                if cached_balance_data:
+                    return {
+                        "ok": True,
+                        "balance": cached_balance_data,
+                        "data": cached_balance_data,
+                        "source": "cache",
+                        "stale": True,
+                        "stale_age_s": cached_balance_age_s,
+                        "message": f"{type(e).__name__}; fallback to cache",
+                    }
                 return {"ok": False, "message": str(e), "balance": {}, "data": {}}
 
         @api_v1_router.get("/positions", tags=["account"])
@@ -978,8 +1053,46 @@ class APIServer:
             ex = mc.get_exchange() if (mc and hasattr(mc, "get_exchange")) else None
             if not ex or not hasattr(ex, "get_positions"):
                 return {"ok": False, "message": "exchange unavailable", "positions": [], "data": []}
+
+            # Prefer OKXExchange internal positions cache.
+            cached_positions: List[Dict[str, Any]] = []
+            cached_positions_age_s: Optional[float] = None
             try:
-                pos = await asyncio.wait_for(ex.get_positions(), timeout=6.5)
+                cached_ts, cached_pos_list = getattr(ex, "_positions_cache", (0.0, []))
+                if isinstance(cached_pos_list, list) and cached_pos_list:
+                    cached_positions_age_s = time.time() - float(cached_ts or 0.0)
+                    # cache rows already contain "size" and "side" fields (best-effort)
+                    for row in cached_pos_list:
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            sz = float(row.get("size") or row.get("quantity") or 0.0)
+                        except Exception:
+                            sz = 0.0
+                        if abs(sz) > 1e-12:
+                            cached_positions.append(row)
+            except Exception:
+                cached_positions = []
+                cached_positions_age_s = None
+
+            try:
+                ttl_s = float(getattr(ex, "_positions_cache_ttl_s", 15.0) or 15.0)
+            except Exception:
+                ttl_s = 15.0
+            max_stale_age_s = max(60.0, ttl_s * 10.0)
+            if cached_positions and cached_positions_age_s is not None and cached_positions_age_s <= max_stale_age_s:
+                return {
+                    "ok": True,
+                    "positions": cached_positions,
+                    "count": len(cached_positions),
+                    "data": cached_positions,
+                    "source": "cache",
+                    "stale": bool(cached_positions_age_s > (ttl_s or 0.0)),
+                    "stale_age_s": cached_positions_age_s,
+                }
+
+            try:
+                pos = await asyncio.wait_for(ex.get_positions(), timeout=12.0)
                 if not isinstance(pos, list):
                     pos = []
                 # best-effort: filter non-zero
@@ -994,8 +1107,70 @@ class APIServer:
                     if abs(sz) > 1e-12:
                         out.append(row)
                 return {"ok": True, "positions": out, "count": len(out), "data": out}
+            except asyncio.TimeoutError as e:
+                if cached_positions:
+                    return {
+                        "ok": True,
+                        "positions": cached_positions,
+                        "count": len(cached_positions),
+                        "data": cached_positions,
+                        "source": "cache",
+                        "stale": True,
+                        "stale_age_s": cached_positions_age_s,
+                        "message": f"timeout; fallback to cache: {str(e) or 'timeout'}",
+                    }
             except Exception as e:
-                return {"ok": False, "message": str(e), "positions": [], "count": 0, "data": []}
+                if cached_positions:
+                    return {
+                        "ok": True,
+                        "positions": cached_positions,
+                        "count": len(cached_positions),
+                        "data": cached_positions,
+                        "source": "cache",
+                        "stale": True,
+                        "stale_age_s": cached_positions_age_s,
+                        "message": f"{type(e).__name__}; fallback to cache",
+                    }
+
+            # Last-resort fallback: use SLTP active orders as a derived position view.
+            try:
+                mgr = getattr(mc, "stop_loss_manager", None)
+                if mgr is not None and hasattr(mgr, "get_all_active_orders"):
+                    orders = await mgr.get_all_active_orders()
+                    out: List[Dict[str, Any]] = []
+                    for o in (orders or []):
+                        try:
+                            row = o.to_dict() if hasattr(o, "to_dict") else dict(o)
+                            side = str(row.get("side") or "").lower().strip() or "long"
+                            symbol = row.get("symbol") or ""
+                            size = row.get("remaining_quantity") or row.get("quantity") or 0.0
+                            size = float(size or 0.0)
+                            if abs(size) <= 1e-12:
+                                continue
+                            out.append(
+                                {
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "size": abs(size),
+                                    "entry_price": float(row.get("entry_price") or 0.0),
+                                    "timestamp": row.get("created_at"),
+                                }
+                            )
+                        except Exception:
+                            continue
+                    if out:
+                        return {
+                            "ok": True,
+                            "positions": out,
+                            "count": len(out),
+                            "data": out,
+                            "source": "stop_loss_active_orders",
+                            "stale": True,
+                        }
+            except Exception:
+                pass
+
+            return {"ok": False, "message": "exchange unavailable", "positions": [], "count": 0, "data": []}
 
         @api_v1_router.get("/engine/status", tags=["system"])
         async def engine_status():
