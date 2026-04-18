@@ -16,7 +16,7 @@ experience:
   # 交易频率建议
   trading_frequency:
     max_daily_opens: 10          # 每日最多开仓10次
-    min_open_interval: 1800      # 开仓间隔至少30分钟
+    min_open_interval: 120      # 开仓间隔至少2分钟
     quality_over_quantity: true  # 质量优先于数量
     
   # 盈利模式

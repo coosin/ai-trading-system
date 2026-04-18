@@ -437,7 +437,7 @@ active_trader:
   min_trade_interval: 60
 proactive_scanner:
   scan_interval: 30
-  deep_scan_interval: 300
+  deep_scan_interval: 120
   # 开启后：扫描器对“高置信 + 通过实时数据预检”的机会会触发开仓（走 ExecutionGateway）
   proactive_auto_execute_opportunities: true
   # 转发给 ai_core 的冷却收敛到 60 秒
@@ -457,7 +457,7 @@ proactive_scanner:
     # 允许入场价与最新价存在一定偏差（突破/均值回归会用K线收盘或关键价位作为entry），
     # 过严会导致机会全部被门控拦截，从而看起来“系统不自动开仓”。
     max_entry_vs_last_slippage_pct: 0.05
-    min_risk_reward: 1.05
+    min_risk_reward: 1.0
     min_abs_change_24h: 0.0
     require_insight_trend_alignment: true
     min_volume_vs_avg_ratio: 0.0
@@ -570,7 +570,7 @@ ai_trading:
     max_drawdown_limit: 0.15
 proactive_ai:
   scan_interval: 30
-  deep_scan_interval: 300
+  deep_scan_interval: 120
   collect_interval: 300
   # 动作触发器节流同步收敛到 60 秒
   action_cooldown: 60
