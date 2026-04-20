@@ -1,0 +1,14 @@
+
+{
+    "database": {
+        "type": "sqlite",
+        "path": "data/trading.db"
+    },
+    "api": {
+        "host": "0.0.0.0",
+        "port": 8000
+    },
+    "logging": {
+        "level": "INFO"
+    }
+}

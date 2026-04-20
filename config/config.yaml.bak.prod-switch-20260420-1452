@@ -1,0 +1,704 @@
+# OpenClaw Trading — 唯一主配置文件 config/config.yaml
+# 勿在 config/ 下再增加业务 YAML/JSON 片段；本机差异请用同目录 local.yaml（见 config.local.example.yaml）。
+# 密钥仍使用仓库根目录 .env；环境变量覆盖：OPENCLAW__section__key__nested
+
+system:
+  name: OpenClaw Trading
+  version: 1.0.0
+  mode: simulation
+  debug: false
+  log_level: INFO
+  environment: development
+llm:
+  # Ark(OpenAI 兼容) 直连配置：建议在 local.yaml/.env 中设置 ARK_API_KEY
+  default_model: doubao-seed-2.0-pro
+  models:
+  - provider: openai
+    model_id: doubao-seed-2.0-pro
+    display_name: Volcengine Ark Doubao Seed 2.0 Pro
+    api_key_env: ARK_API_KEY
+    base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+    temperature: 0.7
+    max_tokens: 8000
+    timeout: 120.0
+    max_retries: 3
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 32768
+    supports_vision: false
+    supports_reasoning: true
+    enabled: true
+    priority: 20
+    fallback_models: []
+  task_model_mapping:
+    general:
+    - doubao-seed-2.0-pro
+    market_analysis:
+    - doubao-seed-2.0-pro
+    strategy_generation:
+    - doubao-seed-2.0-pro
+    signal_generation:
+    - doubao-seed-2.0-pro
+    risk_assessment:
+    - doubao-seed-2.0-pro
+    news_analysis:
+    - doubao-seed-2.0-pro
+    code_generation:
+    - doubao-seed-2.0-pro
+    natural_language:
+    - doubao-seed-2.0-pro
+trading:
+  # 默认关注列表（动态选币开启时仍作 always_include 候选）
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  # 永续 USDT 合约 + 网格；AI 在规则内自选交易对
+  contract:
+    products:
+    - perpetual_swap
+    - grid
+    trade_type: swap
+    margin_mode: cross
+    symbol_universe: full_exchange
+    allowed_symbols: []
+    position_mode: oneway
+    leverage_min: 10
+    leverage_max: 100
+    default_leverage: 20
+    # 默认开仓数量（USDT 永续合约张数/数量，按交易所合约规则解释）
+    # 以前代码写死 0.01，这里改为配置项，便于按风险/账户规模调整
+    default_quantity: 0.01
+    max_positions_oneway: 5
+    max_positions_hedge: 8
+    grid_trading: true
+    grid_levels: 5
+    grid_spacing: 0.02
+    enabled: true
+  dynamic_symbols:
+    max_symbols: 12
+    min_symbols: 2
+    selection_interval: 300
+    min_24h_volume: 10000000
+    enable_auto_discovery: true
+    always_exclude: []
+  analysis_interval: 60
+  min_confidence: 0.65
+  max_positions: 5
+  risk_per_trade: 0.02
+  order:
+    type: market
+    time_in_force: GTC
+    post_only: false
+  # 旧版固定百分比止盈止损（已弃用；实盘出场由 stop_loss_take_profit 移动止损负责）
+  stop_loss:
+    enabled: false
+    percent: 0.03
+    trailing: false
+  take_profit:
+    enabled: false
+    percent: 0.06
+    partial:
+      enabled: false
+      levels:
+      - percent: 0.03
+        close_percent: 0.5
+      - percent: 0.06
+        close_percent: 0.5
+  commission_rate: 0.001
+  enabled: true
+  max_daily_loss: 0.02
+  max_position_count: 10
+  max_position_size: 0.1
+  paper_trading: true
+  slippage_rate: 0.0005
+risk:
+  max_drawdown: 0.15
+  max_leverage: 100
+  margin_call_level: 0.8
+  liquidation_level: 0.9
+  max_position_size_percent: 0.2
+  max_correlation: 0.7
+  monitoring:
+    enabled: true
+    interval: 10
+    alert_channels:
+    - telegram
+    - log
+  limits:
+    daily_loss_limit: 0.05
+    weekly_loss_limit: 0.1
+    monthly_loss_limit: 0.15
+  enabled: true
+  position_limit: 0.2
+  var_limit: 0.05
+exchanges:
+  okx:
+    enabled: true
+    api_key_env: OKX_API_KEY
+    secret_env: OKX_SECRET
+    passphrase_env: OKX_PASSPHRASE
+    testnet: true
+    rate_limit: 20
+    timeout: 30
+  binance:
+    enabled: false
+    api_key_env: BINANCE_API_KEY
+    secret_env: BINANCE_SECRET
+    testnet: true
+    rate_limit: 20
+    timeout: 30
+data:
+  historical:
+    enabled: true
+    storage_path: data/historical
+    max_days: 365
+    cleanup_interval: 86400
+  realtime:
+    enabled: true
+    buffer_size: 1000
+    update_interval: 1
+  timeframes:
+  - 1m
+  - 5m
+  - 15m
+  - 1h
+  - 4h
+  - 1d
+  sources:
+  - provider: binance
+    enabled: true
+    priority: 1
+  - provider: coingecko
+    enabled: true
+    priority: 2
+  history_days: 365
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  update_interval: 60
+strategies:
+  max_strategies: 10
+  optimization_interval: 3600
+  default:
+    name: AI智能策略
+    enabled: true
+    type: ai_driven
+  evaluation:
+    min_trades: 10
+    lookback_days: 30
+    metrics:
+    - sharpe_ratio
+    - win_rate
+    - max_drawdown
+    - profit_factor
+monitoring:
+  performance:
+    enabled: true
+    interval: 60
+    metrics:
+    - cpu_usage
+    - memory_usage
+    - network_io
+    - disk_io
+  trading:
+    enabled: true
+    track_positions: true
+    track_orders: true
+    track_pnl: true
+  alerts:
+    enabled: true
+    channels:
+      telegram:
+        enabled: true
+        bot_token_env: TELEGRAM_BOT_TOKEN
+        chat_id_env: TELEGRAM_CHAT_ID
+      email:
+        enabled: false
+        smtp_host: smtp.gmail.com
+        smtp_port: 587
+        smtp_user_env: SMTP_USER
+        smtp_password_env: SMTP_PASSWORD
+        from_addr: noreply@openclaw-trading.com
+        to_addrs: []
+  enabled: true
+  health_check_interval: 30
+  metrics_interval: 60
+telegram:
+  enabled: true
+  bot_token_env: TELEGRAM_BOT_TOKEN
+  chat_ids_env: TELEGRAM_CHAT_ID
+  proxy: null
+# 即时消息总开关（覆盖 SmartNotification 与直连 TG）
+messaging:
+  instant:
+    enabled: true
+    channels:
+    - telegram
+    - log
+openclaw_push:
+  # 默认开启 OpenClaw 实时推送（交易/风控/系统告警）
+  enabled: true
+  # 默认标准接入点；若你的 OpenClaw 网关地址不同，请在 local.yaml 覆盖。
+  url: http://127.0.0.1:18789/api/events/ingest
+  token: ''
+  timeout_sec: 3.0
+  min_interval_sec: 0.1
+  max_queue: 5000
+  retry: 3
+api:
+  enabled: true
+  host: 0.0.0.0
+  port: 8000
+  workers: 1
+  reload: false
+  debug: false
+  cors:
+    enabled: true
+    allow_origins:
+    - '*'
+    allow_methods:
+    - '*'
+    allow_headers:
+    - '*'
+  auth:
+    enabled: false
+    api_key_header: X-API-Key
+    api_key_env: API_KEY
+  enable_cors: true
+  enable_swagger: true
+database:
+  type: sqlite
+  path: data/trading.db
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+cache:
+  enabled: true
+  type: memory
+  redis:
+    # Docker Compose 默认服务名；本机非容器请用 local.yaml 改为 localhost
+    host: redis
+    port: 6379
+    db: 0
+    password_env: REDIS_PASSWORD
+  default_ttl: 300
+  max_size: 1000
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  file:
+    enabled: true
+    path: logs/trading.log
+    max_size: 10MB
+    backup_count: 5
+  console:
+    enabled: true
+    colorize: true
+proxy:
+  enabled: true
+  # 网卡级强制分流：在「服务器宿主机」Clash/mihomo 上开 TUN + rules（见 deploy/HOST_CLASH_EGRESS.md）。
+  # 此处 egress_model=process_env 表示应用内 HTTP 客户端与 NO_PROXY 合并；与宿主机 TUN 互补。
+  egress_model: process_env
+  apply_to_process_env: true
+  respect_existing_env: true
+  force_override_env: false
+  merge_no_proxy_from_config: true
+  use_global_proxy: true
+  # OKX 专用：HTTP 代理经 Clash CONNECT 频繁断开时，可将 ignore_env_proxy 设为 true（OKX REST 直连，需容器出口可达 www.okx.com）
+  okx:
+    proxy_only: false
+    ignore_env_proxy: false
+  no_proxy_extra:
+  - redis
+  - localhost
+  - 127.0.0.1
+  - host.docker.internal
+  global_proxy:
+    enabled: true
+    proxy_type: http
+    # 默认本机 Mihomo/Clash mixed-port；Docker bridge 可改为 host.docker.internal（见 config/local.example 或部署文档）
+    host: 127.0.0.1
+    port: 7890
+    username_env: PROXY_USER
+    password_env: PROXY_PASSWORD
+  clash:
+    auto_detect: true
+    port: 7890
+    socks_port: 7891
+    api_port: 9090
+  domain_proxies: []
+  bypass_domains:
+  - localhost
+  - 127.0.0.1
+  - '*.local'
+  - '*.internal'
+backup:
+  enabled: true
+  interval: 86400
+  retention_days: 30
+  include:
+  - data
+  - config
+  - logs
+  exclude:
+  - '*.tmp'
+  - '*.log'
+plugins:
+  enabled: true
+  auto_load: true
+  directory: plugins
+  loaded: []
+development:
+  debug: false
+  use_mock_data: false
+  mock_data_size: 1000
+  testing:
+    enabled: false
+    mock_exchange: true
+    mock_llm: true
+controller:
+  auto_restart_modules: true
+  max_restart_attempts: 3
+  health_check_interval: 30
+  event_history_limit: 1000
+ai_brain:
+  primary_controller: ai_core
+  single_write_owner: ai_core
+  enable_secondary_controller: false
+  enable_autonomous_executor: true
+  policy:
+    allow_system_open: false
+    gateway_sets_leverage: false
+paths:
+  base_path: /app
+  data_path: /app/data
+  log_path: /app/logs
+  workspace_path: /app/workspace
+  trade_history_path: data/trade_history
+  templates_dir: /app/templates
+  models_path: /app/data/models
+  memory_path: /app/workspace/memory
+  trading_path: /app
+timing:
+  config_watch_interval: 30
+active_trader:
+  # 开仓最小间隔提升到 60 秒，降低噪声交易
+  min_trade_interval: 60
+proactive_scanner:
+  scan_interval: 30
+  deep_scan_interval: 120
+  # 开启后：扫描器对“高置信 + 通过实时数据预检”的机会会触发开仓（走 ExecutionGateway）
+  proactive_auto_execute_opportunities: true
+  # 转发给 ai_core 的冷却收敛到 60 秒
+  proactive_ai_core_forward_cooldown_sec: 60
+  # 均值回归机会的 confidence 由 |24h涨跌幅|×10 推导；0.55≈5.5% 才会触发执行评估。
+  # 统一提升开仓门槛：置信度 >=75% 才允许自动开仓评估
+  proactive_execute_min_confidence: 0.75
+  # 原值 0.08(8%) 过于激进，会导致多数时间“无机会”，从而看起来系统不产生开仓线索。
+  mean_reversion_min_abs_change: 0.02
+  breakout_min_volume_vs_prior_avg: 0
+  proactive_symbol_trade_cooldown_sec: 60
+  breakout_trade_cooldown_sec: 60
+  proactive_skip_breakout_if_same_side_position: true
+  scanner_opportunity_gate:
+    enabled: true
+    max_spread_bps: 45.0
+    # 允许入场价与最新价存在一定偏差（突破/均值回归会用K线收盘或关键价位作为entry），
+    # 过严会导致机会全部被门控拦截，从而看起来“系统不自动开仓”。
+    max_entry_vs_last_slippage_pct: 0.05
+    min_risk_reward: 1.0
+    min_abs_change_24h: 0.0
+    require_insight_trend_alignment: true
+    min_volume_vs_avg_ratio: 0.0
+    volume_avg_lookback_bars: 12
+    min_atr_pct_1h: 0.00025
+    max_atr_pct_1h: 0.15
+  default_symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  - XRP/USDT
+  - DOGE/USDT
+  - ADA/USDT
+  - AVAX/USDT
+  - DOT/USDT
+  - LINK/USDT
+  - ATOM/USDT
+market_intelligence:
+  cache_ttl_sec: 20
+  push_interval_sec: 15
+  market_state_fetch_limit: 4
+  snapshot_timeout_s: 2.2
+  snapshot_timeout_min_s: 1.6
+  snapshot_timeout_max_s: 4.2
+  klines_timeout_s: 1.2
+  klines_timeout_min_s: 0.8
+  klines_timeout_max_s: 2.6
+  watch_symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  - XRP/USDT
+  - DOGE/USDT
+  - ADA/USDT
+  - AVAX/USDT
+  - DOT/USDT
+  - LINK/USDT
+  - ATOM/USDT
+  contract_cache_ttl_sec: 3600
+  fee_rate_taker: 0.0005
+  fee_rate_maker: 0.0002
+  slippage_spread_multiplier: 1.0
+  funding_rate_extreme_abs: 0.001
+  funding_rate_high_abs: 0.0005
+  open_interest_high: 0
+  providers:
+  - unified_snapshot
+  enable_llm_analysis: false
+  llm_timeout_sec: 3.5
+  min_quality_score_for_llm: 0.55
+data_source_hub:
+  enable_legacy_external_analysis: false
+  fetch_timeout_sec: 2.8
+  snapshot_timeout_sec: 6.0
+  # 当前 OKX REST 深度/K线链路不稳定时，禁用重接口，优先保证“可交易最小集”(ticker/资金费率/持仓等)
+  include_klines_1h: false
+  klines_1h_limit: 64
+  exchange_collectors:
+  - ticker
+  # - order_book
+  # - klines_1h
+  - open_interest
+  - funding_rate
+  - positions
+  - open_orders
+  - liquidation_proxy
+  intel_collectors:
+  - onchain.sentiment
+  - onchain.flows
+  - onchain.whales
+  - third_party.sentiment
+  - third_party.news
+  extra_providers: []
+system_maintenance:
+  health_thresholds:
+    cpu_warning: 70
+    cpu_critical: 90
+    memory_warning: 75
+    memory_critical: 90
+    disk_warning: 80
+    disk_critical: 95
+    error_rate_warning: 0.05
+    error_rate_critical: 0.15
+ai_trading:
+  dynamic_symbol_universe: true
+  dynamic_symbol_refresh_seconds: 300
+  max_dynamic_symbols: 12
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  ai_config:
+    enabled: true
+    model_id: doubao-seed-2.0-pro
+    analysis_interval: 120
+    min_confidence: 0.75
+    max_positions: 5
+    risk_per_trade: 0.01
+    trade_mode: real
+    auto_risk_management: true
+    critical_risk_auto_close: false
+    critical_risk_auto_close_liq_only: true
+    critical_risk_auto_close_max_liq_distance: 0.08
+    critical_risk_auto_close_min_loss_pct: 25.0
+    max_loss_per_position: 0.05
+    daily_loss_limit: 0.1
+    max_drawdown_limit: 0.15
+proactive_ai:
+  scan_interval: 30
+  deep_scan_interval: 120
+  collect_interval: 300
+  # 动作触发器节流同步收敛到 60 秒
+  action_cooldown: 60
+  notifications:
+    opportunity_enabled: true
+    opportunity_min_confidence: 0.9
+    opportunity_min_priority: 8
+    opportunity_min_risk_reward: 1.8
+    opportunity_require_trend_alignment: true
+    opportunity_trend_strength_threshold: 0.04
+    opportunity_cooldown_sec: 14400
+stop_loss_take_profit:
+  trailing_only_mode: true
+  trailing_only_coerce_inputs: true
+  trailing_active_on_open: true
+  initial_trailing_offset: 0.03
+  profit_tier2_pnl_threshold: 0.3
+  tier2_trailing_offset: 0.05
+  trailing_momentum_adjust_enable: true
+  default_stop_loss_percent: 0.12
+  default_take_profit_percent: 0.20
+  open_rr_synthetic_reward_multiple: 1.5
+  enable_trailing_stop: true
+  trailing_stop_offset: 0.03
+  trailing_stop_trigger: 0.0
+  enable_breakeven: true
+  breakeven_trigger: 0.02
+  enable_partial_tp: true
+  layered_partial_tp_enable: true
+  layered_partial_tp_levels:
+  - - 0.3
+    - 0.3
+  - - 0.5
+    - 0.2
+  layered_trailing_tp_enable: true
+  layered_trailing_tp_drawdown_levels:
+  - - 0.3
+    - 0.05
+  - - 0.5
+    - 0.1
+  - - 0.6
+    - 0.15
+  min_trailing_offset: 0.005
+  max_trailing_offset: 0.2
+  check_interval: 5
+  execute_exchange_on_trigger: true
+system_monitor: {}
+intelligent_monitoring: {}
+enhanced_monitoring: {}
+unified_data_manager: {}
+# 统一信息收集器：symbols 可选；省略则使用 trading.symbols
+unified_info_collector:
+  enabled: true
+  update_interval: 60
+unified_strategy_system: {}
+unified_trade_system: {}
+unified_risk_system: {}
+memory:
+  provider: native
+  default_scope: global
+  scopes:
+    enabled: true
+  dual_layer:
+    structured_enabled: true
+    workspace_markdown_enabled: true
+  retrieval:
+    mode: hybrid
+    vector_weight: 0.7
+    bm25_weight: 0.3
+    min_score: 0.3
+    max_results: 10
+    rerank:
+      enabled: false
+      candidate_pool_size: 12
+      min_score: 0.0
+  auto_capture:
+    enabled: true
+    policy:
+      deny_tags:
+      - noise
+      - low_value
+      deny_categories:
+      - notification_hint
+      - market_opportunity_hint
+      deny_content_contains:
+      - 当前持仓较少
+      - 市场机会
+      - 系统启动时持仓同步
+      - 保证金占用率0.0%
+      - 浮亏-0.0%
+      deny_memory_ids: []
+      min_importance_by_category:
+        conversation: 0.2
+        config: 0.5
+        strategy: 0.6
+        risk_setting: 0.6
+  auto_recall:
+    enabled: true
+  disk_policy:
+    max_bytes: 0
+    min_importance: 0.6
+  dedup:
+    enabled: true
+    window_sec: 172800
+    categories:
+    - trade_record
+    - risk_event
+  quality_metrics:
+    short_content_threshold: 8
+  context_policy:
+    conversation_recent_limit: 12
+    conversation_recall_limit: 8
+    rules_recall_limit: 5
+    line_max_chars: 220
+    recall_line_max_chars: 240
+    startup_bundle_max_total_chars: 12000
+    startup_max_chars_per_file: 4000
+    decision_engine_recall:
+      trade_experience_limit: 12
+      strategy_performance_limit: 6
+      lesson_query: 经验教训 止损 止盈 滑点
+      lesson_limit: 8
+notifications:
+  enabled: true
+  smart:
+    block_phrases: []
+    quiet_hours_start: '23:00'
+    quiet_hours_end: 07:00
+    batch_interval_sec: 3600
+    rate_limits_per_hour:
+      low: 10
+      medium: 20
+      high: 50
+      critical: 100
+    dedup_windows_sec:
+      critical: 60
+      high: 600
+      medium: 3600
+      low: 21600
+    dedup_max_keys: 2000
+  telegram:
+    failure_dedup_window_sec: 1800
+heartbeat:
+  enabled: true
+  interval_sec: 1800
+  market_opportunity_notice_cooldown_sec: 21600
+  market_opportunity_notice_enabled: false
+research:
+  enabled: true
+  auto_run: true
+  auto_interval_minutes: 360
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  dynamic_scan_for_research: true
+  symbol_scan_limit: 12
+  timeframe: 1h
+  lookback_days: 30
+  gates:
+    min_sharpe: 0.8
+    max_drawdown: 0.25
+    min_trades: 8
+  governance:
+    publish_min_score: 0.55
+    promote_small_score: 1.1
+    redevelop_below_score: 0.35
+    discard_below_score: 0.1
+  cost_model:
+    fee_rate: 0.0005
+    slippage_rate: 0.0003
+  walk_forward:
+    enabled: true
+    folds: 3
+    train_ratio: 0.7
+strategy:
+  risk_management:
+    stop_loss: 0.03
+    take_profit: 0.06
