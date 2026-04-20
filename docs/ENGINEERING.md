@@ -9,7 +9,7 @@
 | 组件 | 路径 / 说明 |
 |------|-------------|
 | 进程入口 | `src/main.py` → `TradingSystem`：初始化 `ConfigManager` → `MainController` → `APIServer`（FastAPI），先起 API 再跑主循环 |
-| HTTP API | `src/modules/api/server.py`（容器内监听 `0.0.0.0:8000` 以便端口映射） |
+| HTTP API | `src/modules/api/server.py`（默认监听 `0.0.0.0:8000`；本地常用 `127.0.0.1:8000` 访问） |
 | 主控制器 | `src/modules/main_controller.py`：装配交易所、风控、记忆、AI 引擎等 |
 | 配置 | `src/modules/core/config_manager.py` |
 

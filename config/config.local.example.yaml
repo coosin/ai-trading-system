@@ -3,6 +3,14 @@
 #
 # 示例（取消注释并修改）：
 # llm:
-#   default_model: your-local-default
+#   default_model: doubao-seed-2.0-pro
+#   models:
+#   - provider: openai
+#     model_id: doubao-seed-2.0-pro
+#     api_key_env: ARK_API_KEY
+#     base_url: https://ark.cn-beijing.volces.com/api/coding/v3
 # trading:
 #   paper_trading: true
+#
+# 建议在 .env 或服务环境变量中设置：
+#   ARK_API_KEY=ark-xxxx

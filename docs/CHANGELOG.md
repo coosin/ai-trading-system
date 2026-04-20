@@ -1,5 +1,18 @@
 # 变更记录
 
+## 2026-04-20 — 超时治理与可观测性增强（文档同步）
+
+- **AI 对话链路可观测性：**
+  - `POST /api/v1/ai/chat` 增加分段耗时 `trace`（`core_router_ms` / `executor_ms` / `llm_direct_ms`）与 `latency_ms_total`；
+  - 超时响应同样返回 `trace`，用于快速定位瓶颈阶段。
+- **行情聚合快路径优化：**
+  - `GET /api/v1/market/state` 支持 `timeout_sec`（1.5~8.0），成功响应新增 `latency_ms`，降级响应新增 `timeout_sec`；
+  - `market/state` 扇出聚合优先快路径，降低 `snapshot_timeout` 触发概率。
+- **学习反馈观测增强：**
+  - `GET /api/v1/modules/ai/learning-feedback` 的 `summary` 新增 `penalized_ratio`、`total_stop_loss_hits`、`penalty_rule`。
+- **文档同步：**
+  - 更新 `docs/API_REFERENCE.md`、`docs/DEVELOPMENT.md`、`docs/OPERATIONS.md`、`docs/OPENCLAW_INTEGRATION_GUIDE.md`，对齐当前运行行为与验收口径。
+
 ## 2026-04-16 — OpenClaw 对接文档全量更新 + 网络守护文档同步
 
 - 新增 `docs/OPENCLAW_INTEGRATION_GUIDE.md`：

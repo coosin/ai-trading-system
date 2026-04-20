@@ -115,7 +115,7 @@ class BusinessProcessManager:
             "max_pending_signals": 10,
             "risk_check_enabled": True,
             "ai_enabled": True,
-            "ai_model_id": "astron-code-latest",
+            "ai_model_id": "gemini-2.5-flash",
         }
 
         # 状态管理
@@ -317,7 +317,7 @@ class BusinessProcessManager:
             # ============================================
             if self.config.get('ai_enabled', True) and self.llm_integration:
                 try:
-                    model_id = self.config.get('ai_model_id', 'astron-code-latest')
+                    model_id = self.config.get('ai_model_id', 'gemini-2.5-flash')
                     
                     # 1. AI 市场分析
                     logger.info(f"AI 正在分析 {symbol} 市场...")

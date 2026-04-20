@@ -41,14 +41,11 @@ async def main():
     
     # 检查必需的环境变量
     from src.utils.env_config import EnvConfig
-    required_keys = ["XUNFEI_API_KEY"]
-    missing_keys = EnvConfig.validate_required_keys(required_keys)
-    
-    if missing_keys:
-        logger.error(f"❌ 缺少必需的环境变量: {missing_keys}")
-        logger.error("请检查.env文件或设置环境变量")
-        logger.info("提示: 复制.env.example为.env并填写配置")
-        sys.exit(1)
+    if not os.getenv("AICLIENT_API_KEY", "").strip():
+        logger.warning(
+            "未检测到 AICLIENT_API_KEY：与 AIClient-2-API 的 REQUIRED_API_KEY 一致，"
+            "否则默认 LLM（gemini-2.5-flash）无法完成鉴权。"
+        )
     
     # 打印环境变量摘要
     EnvConfig.print_env_summary()
@@ -73,7 +70,7 @@ async def main():
         logger.info("\n📊 系统状态:")
         logger.info(f"  - 运行模式: {os.getenv('MODE', 'simulation')}")
         logger.info(f"  - 交易对: {os.getenv('TRADING_SYMBOLS', 'BTC/USDT,ETH/USDT')}")
-        logger.info(f"  - AI模型: 讯飞 astron-code-latest")
+        logger.info("  - AI模型: gemini-2.5-flash（经本地 AIClient OpenAI 兼容端点）")
         logger.info(f"  - API端口: {os.getenv('API_PORT', '8000')}")
         logger.info("\n💡 提示:")
         logger.info("  - 访问 http://localhost:8000/docs 查看API文档")

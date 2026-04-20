@@ -4,7 +4,7 @@
 
 **在线文档（若服务已启动）:** `http://<host>:8000/docs`（Swagger UI）、`http://<host>:8000/redoc`
 
-**机器可读规范（与线上一致，由运行中服务导出）:** 同目录下 [`API_OPENAPI_FULL.json`](./API_OPENAPI_FULL.json)（OpenAPI 3.1，约 160 条路径；含请求体、查询参数、422 校验模型等）。
+**机器可读规范（与线上一致，由运行中服务导出）:** 同目录下 [`API_OPENAPI_FULL.json`](./API_OPENAPI_FULL.json)（OpenAPI 3.1，当前约 185 条路径；含请求体、查询参数、422 校验模型等）。
 
 ## 升级后实时链路（2026-04-13）
 
@@ -14,6 +14,13 @@
   - `POST /api/v1/modules/commander/dispatch`
   - body: `{"message":"...", "source":"api_chat|telegram|control_hub|..." }`
   - 用途：统一接收开仓/平仓/行情问询/巡检指令。
+  - 超时治理（2026-04-20 更新）：
+    - 同步模式支持 `timeout_sec`（默认 12 秒，范围 2~90 秒）
+    - 若同步超时返回 `status=timeout`，建议改用 `async_mode=true`
+    - 异步任务查询：`GET /api/v1/modules/commander/dispatch/jobs/{job_id}`
+  - 调用建议（值守脚本）：
+    - `python3 scripts/commander_dispatch_client.py "请返回当前系统运行摘要"`
+    - 该脚本默认采用“同步优先，超时自动异步并轮询”策略
 
 - **交易/风控事件流（前端与外部 API 推荐）**
   - `GET /api/v1/trade/events?limit=...`
@@ -31,6 +38,11 @@
   - `GET /api/v1/market/state`
   - `GET /api/v1/modules/data/hub/unified-snapshot`
   - 用途：提供实时行情、质量分、执行成本、风险建议与“是否可交易”判断依据。
+  - 2026-04-20 补充：
+    - `market/state` 支持 `timeout_sec`（1.5~8.0，默认 3.2）；
+    - 成功响应附带 `latency_ms`；
+    - 超时降级响应附带 `timeout_sec`；
+    - 聚合过程优先快路径（ticker-only）以减少 `snapshot_timeout`。
 
 - **模拟盘联调入口（升级验证用）**
   - `POST /api/v1/modules/execution/simulate-order`
@@ -85,7 +97,23 @@
     - `stop_loss_hits`
     - `penalty_steps`
     - `extra_confidence_threshold`
+  - 2026-04-20 补充 summary 可观测字段：
+    - `penalized_ratio`
+    - `total_stop_loss_hits`
+    - `penalty_rule.step_hits`
+    - `penalty_rule.step_threshold`
+    - `penalty_rule.max_threshold`
   - 用于验收“连续止损后提高开仓门槛”的学习反馈机制。
+
+### AI 对话接口时延定位（2026-04-20 更新）
+
+- **`POST /api/v1/ai/chat`**
+  - 请求体支持 `timeout_sec`（5~90，默认 20）。
+  - 成功响应新增：
+    - `data.trace.path`：实际命中路径（`core_brain_router` / `ai_command_executor` / `llm_direct`）
+    - `data.trace.core_router_ms` / `executor_ms` / `llm_direct_ms`：分段耗时
+    - `latency_ms_total`：本次接口总耗时
+  - 超时响应 `status=timeout` 时仍返回 `trace` 与 `latency_ms_total`，用于快速定位卡点阶段。
 
 ### 治理与托管接口（2026-04-15 更新）
 
@@ -102,6 +130,15 @@
 - **治理审计与工具契约**
   - `GET /api/v1/modules/commander/governance-audit`
   - `GET /api/v1/modules/commander/tool-contract`
+
+- **托管守护与架构/升级闭环（补充）**
+  - `GET /api/v1/modules/commander/hosting-guard`
+  - `POST /api/v1/modules/commander/hosting-guard`
+  - `GET /api/v1/modules/commander/architecture/layers`
+  - `GET /api/v1/modules/commander/upgrade/benchmark`
+  - `POST /api/v1/modules/commander/upgrade/run`
+  - `GET /api/v1/modules/commander/openclaw-integration`
+  - 用途：用于托管守护参数巡检、L1-L5 分层状态验收、升级闭环执行与 OpenClaw 推送链路就绪度检查。
 
 - **验收建议**
   - 日常值守可直接执行 `docs/DAILY_HOSTING_ACCEPTANCE.md`，以最少命令完成托管可用性确认。
@@ -121,6 +158,7 @@
 
 - **写入入口**
   - `POST /api/v1/modules/commander/dispatch`
+  - `GET /api/v1/modules/commander/dispatch/jobs/{job_id}`
   - 建议 body 带 `source=openclaw`，便于治理审计与链路追踪
 
 - **完整操作流程**
@@ -139,6 +177,25 @@
 - **范围:** 以 `/api` 为前缀的路径，响应体为 JSON 时，由中间件在**不删除原有字段**的前提下补齐 `ok`、`success`、`status`、`message`（按需）、`timestamp`。
 - **响应头:** `X-OpenClaw-Standardized: 1` 表示该响应已按上述规则规范化。
 
+### 运行模式兼容说明（Docker / 裸机）
+
+为避免历史容器化配置与当前裸机运行冲突，接口调用与代理请按以下基线区分：
+
+- **API 基址**
+  - Docker 常见：`http://localhost:8000`
+  - 裸机（systemd/supervisor/python 直跑）常见：`http://127.0.0.1:8000`
+- **代理变量**
+  - 仅在需要外网代理时设置 `HTTP_PROXY` / `HTTPS_PROXY`。
+  - `NO_PROXY` 必须包含 `127.0.0.1,localhost,redis`，避免本地 API/Redis 被错误走代理。
+- **Docker 专属域名提示**
+  - `host.docker.internal` 仅用于容器访问宿主机；裸机模式不应写入该地址。
+- **文档权威顺序**
+  - 以运行实例 `GET /openapi.json` 为准；
+  - `docs/API_OPENAPI_FULL.json` 为当前仓库快照；
+  - 本文用于链路与语义说明。
+- **调用地址建议**
+  - 推荐在脚本中统一声明：`BASE_URL=${BASE_URL:-http://127.0.0.1:8000}`，再用 `"$BASE_URL/..."` 访问接口，减少 Docker/裸机切换时的手工修改。
+
 ---
 
 ## 行情聚合接口的降级语义（重要）
@@ -146,11 +203,12 @@
 为了避免外部网络/交易所抖动导致控制面阻塞，以下接口采用“**快返回 + 降级标志**”：
 
 - **`GET /api/v1/market/state`**
-  - **正常**：`{"ok": true, "state": {...}, "degraded": false}`
-  - **降级**：`{"ok": true, "state": {...或{}}, "degraded": true, "message": "market_state_timeout_degraded"}`
+  - **正常**：`{"ok": true, "state": {...}, "degraded": false, "latency_ms": 123}`
+  - **降级**：`{"ok": true, "state": {...或{}}, "degraded": true, "message": "market_state_timeout_degraded", "timeout_sec": 3.2}`
   - `state` 中包含：
     - `symbols_attempted` / `symbols_considered` / `symbols_failed`
     - `symbol_views`：即便上游超时也会返回最小降级行（`partial=true` + `errors=["snapshot_timeout"]`），用于可解释与前端提示
+    - 2026-04-20 起聚合优先快路径，降级行可能包含 `errors=["snapshot_skipped_fast_mode"]`（属于主动限时策略，不等同于交易所断连）
 
 - **`GET /api/v1/market/symbol/{symbol}`**
   - 若上游慢/超时：会优先返回缓存视图（`degraded=true, message="symbol_view_cached"`），避免阻塞前端与运维面板。
@@ -276,6 +334,7 @@
 | GET | `/api/v1/modules/commander/capabilities` | Commander Capabilities | modules |
 | POST | `/api/v1/modules/commander/chores` | Commander Chores | modules |
 | POST | `/api/v1/modules/commander/dispatch` | Commander Dispatch | modules |
+| GET | `/api/v1/modules/commander/dispatch/jobs/{job_id}` | Commander Dispatch Job | modules |
 | GET | `/api/v1/modules/commander/memory/persona-preview` | Commander Memory Persona Preview | modules |
 | GET | `/api/v1/modules/commander/memory/status` | Commander Memory Status | modules |
 | GET | `/api/v1/modules/commander/memory/workspace` | Commander Memory Workspace | modules |

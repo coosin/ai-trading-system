@@ -21,6 +21,8 @@ def init_module_control_api(app, main_controller):
     research_jobs: Dict[str, Dict[str, Any]] = {}
     research_jobs_lock = asyncio.Lock()
     research_semaphore = asyncio.Semaphore(1)
+    dispatch_jobs: Dict[str, Dict[str, Any]] = {}
+    dispatch_jobs_lock = asyncio.Lock()
 
     async def _check_unified_data_quality(
         symbol: str = "BTC/USDT",
@@ -209,17 +211,20 @@ def init_module_control_api(app, main_controller):
             return {"ok": False, "message": str(e)}
 
     @market_router.get("/state")
-    async def get_market_state() -> Dict[str, Any]:
+    async def get_market_state(timeout_sec: float = 3.2) -> Dict[str, Any]:
         """统一行情汇总：全局市场状态（多 symbol 聚合）。"""
         mc = main_controller
         mi = getattr(mc, "market_intelligence", None) if mc else None
         if not mi or not hasattr(mi, "get_market_state"):
             return {"ok": False, "message": "MarketIntelligenceEngine unavailable"}
+        timeout_sec = max(1.5, min(float(timeout_sec or 3.2), 8.0))
         try:
             # 防止聚合计算/上游抖动导致 API 阻塞（前端/运维需要“快返回”）。
             # market_state is a fan-out aggregation. Keep it bounded but avoid being too tight.
-            state = await asyncio.wait_for(mi.get_market_state(), timeout=4.0)
-            return {"ok": True, "state": state, "degraded": False}
+            started_at = datetime.now()
+            state = await asyncio.wait_for(mi.get_market_state(), timeout=timeout_sec)
+            latency_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+            return {"ok": True, "state": state, "degraded": False, "latency_ms": latency_ms}
         except asyncio.TimeoutError:
             cached = None
             try:
@@ -231,6 +236,7 @@ def init_module_control_api(app, main_controller):
                 "state": cached or {},
                 "degraded": True,
                 "message": "market_state_timeout_degraded",
+                "timeout_sec": timeout_sec,
             }
         except Exception as e:
             return {"ok": False, "message": str(e)}
@@ -820,16 +826,39 @@ def init_module_control_api(app, main_controller):
 
             ai_cfg = getattr(engine, "ai_config", {}) or {}
             base_min_conf = float(ai_cfg.get("min_confidence", 0.75) or 0.75)
+            penalty_step_hits = int(ai_cfg.get("penalty_step_hits", 3) or 3)
+            penalty_step_threshold = float(ai_cfg.get("penalty_step_threshold", 0.05) or 0.05)
+            penalty_max_threshold = float(ai_cfg.get("penalty_max_threshold", 0.15) or 0.15)
             max_pos_ratio = float(ai_cfg.get("max_position_value_ratio", 0.05) or 0.05)
             hard_max_positions = int(ai_cfg.get("hard_max_positions", 5) or 5)
             require_trend_for_open = bool(ai_cfg.get("require_trend_for_open", True))
+            tracked_signals = len(rows)
+            penalized_signals = sum(1 for r in rows if float(r.get("extra_confidence_threshold", 0)) > 0)
+            total_stop_loss_hits = sum(int(r.get("stop_loss_hits", 0) or 0) for r in rows)
+            max_extra_threshold = float(
+                round(max((float(r.get("extra_confidence_threshold", 0) or 0) for r in rows), default=0.0), 4)
+            )
 
             return {
                 "success": True,
                 "summary": {
-                    "tracked_signals": len(rows),
-                    "penalized_signals": sum(1 for r in rows if float(r.get("extra_confidence_threshold", 0)) > 0),
+                    "tracked_signals": tracked_signals,
+                    "penalized_signals": penalized_signals,
+                    "penalized_ratio": float(round((penalized_signals / tracked_signals), 4)) if tracked_signals else 0.0,
+                    "total_stop_loss_hits": total_stop_loss_hits,
                     "base_min_confidence": base_min_conf,
+                    "max_extra_confidence_threshold": max_extra_threshold,
+                    "effective_min_confidence_upper_bound": float(
+                        round(
+                            base_min_conf + max_extra_threshold,
+                            4,
+                        )
+                    ),
+                    "penalty_rule": {
+                        "step_hits": penalty_step_hits,
+                        "step_threshold": penalty_step_threshold,
+                        "max_threshold": penalty_max_threshold,
+                    },
                     "max_position_value_ratio": max_pos_ratio,
                     "hard_max_positions": hard_max_positions,
                     "require_trend_for_open": require_trend_for_open,
@@ -1906,11 +1935,80 @@ def init_module_control_api(app, main_controller):
         if not text:
             return {"success": False, "message": "message 不能为空"}
         source = str((payload or {}).get("source") or "control_hub")
+        async_mode = bool((payload or {}).get("async_mode", False))
         try:
-            out = await main_controller.process_user_command(text, source=source)
-            return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
+            timeout_s = float((payload or {}).get("timeout_sec", 12.0) or 12.0)
+        except Exception:
+            timeout_s = 12.0
+        timeout_s = max(2.0, min(timeout_s, 90.0))
+        try:
+            if async_mode:
+                job_id = str(uuid.uuid4())
+                async with dispatch_jobs_lock:
+                    dispatch_jobs[job_id] = {
+                        "job_id": job_id,
+                        "status": "queued",
+                        "created_at": datetime.now().isoformat(),
+                        "source": source,
+                        "message_preview": text[:120],
+                        "result": None,
+                        "error": None,
+                    }
+
+                async def _run_dispatch_job() -> None:
+                    async with dispatch_jobs_lock:
+                        if job_id in dispatch_jobs:
+                            dispatch_jobs[job_id]["status"] = "running"
+                            dispatch_jobs[job_id]["started_at"] = datetime.now().isoformat()
+                    try:
+                        out = await main_controller.process_user_command(text, source=source)
+                        async with dispatch_jobs_lock:
+                            if job_id in dispatch_jobs:
+                                dispatch_jobs[job_id]["status"] = "completed"
+                                dispatch_jobs[job_id]["finished_at"] = datetime.now().isoformat()
+                                dispatch_jobs[job_id]["result"] = out
+                    except Exception as e:
+                        async with dispatch_jobs_lock:
+                            if job_id in dispatch_jobs:
+                                dispatch_jobs[job_id]["status"] = "failed"
+                                dispatch_jobs[job_id]["finished_at"] = datetime.now().isoformat()
+                                dispatch_jobs[job_id]["error"] = str(e)
+
+                asyncio.create_task(_run_dispatch_job())
+                return {
+                    "success": True,
+                    "accepted": True,
+                    "status": "queued",
+                    "job_id": job_id,
+                    "message": "指令已受理，后台执行中",
+                    "timestamp": datetime.now().isoformat(),
+                }
+
+            out = await asyncio.wait_for(
+                main_controller.process_user_command(text, source=source),
+                timeout=timeout_s,
+            )
+            return {"success": True, "data": out, "timeout_sec": timeout_s, "timestamp": datetime.now().isoformat()}
+        except asyncio.TimeoutError:
+            # 避免前端超时卡死；建议客户端改用 async_mode=true 拉取结果。
+            return {
+                "success": False,
+                "status": "timeout",
+                "timeout_sec": timeout_s,
+                "message": "司令部处理超时，请使用 async_mode=true 重试并轮询 job 结果",
+                "timestamp": datetime.now().isoformat(),
+            }
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/dispatch/jobs/{job_id}")
+    async def commander_dispatch_job(job_id: str):
+        """查询异步 dispatch 任务状态。"""
+        async with dispatch_jobs_lock:
+            job = dispatch_jobs.get(job_id)
+            if not job:
+                return {"success": False, "message": "job 不存在", "job_id": job_id, "timestamp": datetime.now().isoformat()}
+            return {"success": True, "data": job, "timestamp": datetime.now().isoformat()}
 
     @router.get("/commander/audit")
     async def commander_audit(enrich: bool = False):

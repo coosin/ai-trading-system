@@ -49,8 +49,8 @@ class TradingConstants:
 class AIConstants:
     """AI常量"""
     
-    # 默认模型
-    DEFAULT_MODEL: Final[str] = "astron-code-latest"
+    # 默认模型（与 config/config.yaml llm.default_model 对齐）
+    DEFAULT_MODEL: Final[str] = "gemini-2.5-flash"
     
     # 最大Token数
     MAX_TOKENS: Final[int] = 2000

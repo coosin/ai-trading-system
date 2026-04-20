@@ -2,6 +2,13 @@
 
 本目录为**正式文档集**。根目录 [README.md](../README.md) 仅保留简介与快速开始。
 
+当前仓库默认维护两种运行模式：
+
+- **本地化运行（当前主路径）**：`.venv` + `python -m src.main`
+- **Docker 运行（兼容路径）**：`docker compose ...`
+
+涉及地址/代理的说明请优先看 `docs/OPERATIONS.md` 的“运行模式选择”章节。
+
 | 文档 | 说明 |
 |------|------|
 | [**ENGINEERING.md**](./ENGINEERING.md) | **工程主文档**：架构、配置模型、Docker、模块索引 |

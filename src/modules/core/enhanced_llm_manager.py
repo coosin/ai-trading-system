@@ -16,6 +16,7 @@ import json
 import os
 import random
 import time
+from urllib.parse import urlparse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -118,13 +119,25 @@ class BaseLLMProvider(ABC):
         # OPENCLAW_LLM_DIRECT_FALLBACK=1 且代理连续失败时，切换为直连客户端（容器须能直达各模型 base_url）
         self._httpx_force_direct: bool = False
 
+    def _base_host_bypasses_process_proxy(self) -> bool:
+        """本机 / 宿主机网关上的 OpenAI 兼容端点不走 HTTP(S)_PROXY，避免 Mihomo 无法转发环回流量。"""
+        raw = (self.config.base_url or "").strip()
+        if not raw:
+            return False
+        try:
+            host = (urlparse(raw).hostname or "").strip().lower()
+            return host in ("127.0.0.1", "localhost", "::1", "host.docker.internal")
+        except Exception:
+            return False
+
     def _build_httpx_client(self) -> httpx.AsyncClient:
         """创建 httpx 客户端（显式超时与连接池，降低复用死连接导致的 Server disconnected）"""
-        proxy = (
+        env_proxy = (
             None
             if self._httpx_force_direct
             else (os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"))
         )
+        proxy = None if self._base_host_bypasses_process_proxy() else env_proxy
         total = float(self.config.timeout or 60.0)
         connect_cap = min(30.0, max(5.0, total))
         timeout = httpx.Timeout(total, connect=connect_cap, read=total, write=total, pool=connect_cap)
@@ -153,6 +166,8 @@ class BaseLLMProvider(ABC):
             logger.info(
                 f"LLM Provider 使用代理: {proxy}（keep-alive: {'开' if use_keepalive else '关'}）"
             )
+        elif self._base_host_bypasses_process_proxy():
+            logger.info("LLM Provider: base_url 为本机/网关主机，跳过进程 HTTP 代理直连")
         elif ka_force_off:
             logger.debug("LLM Provider: keep-alive 已禁用 (OPENCLAW_LLM_DISABLE_KEEPALIVE)")
         elif use_keepalive:
@@ -221,7 +236,9 @@ class OpenAIProvider(BaseLLMProvider):
             )
         
         direct_fb = os.getenv("OPENCLAW_LLM_DIRECT_FALLBACK", "").strip().lower() in ("1", "true", "yes")
-        proxy_env_set = bool(os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"))
+        proxy_env_set = bool(os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")) and (
+            not self._base_host_bypasses_process_proxy()
+        )
         tried_direct_fallback = False
 
         for retry in range(max_retries):
@@ -587,90 +604,8 @@ class EnhancedLLMManager:
         logger.info(f"增强大模型管理器初始化完成，加载了 {len(self.models)} 个模型")
 
     def _load_predefined_models(self):
-        """加载预定义模型"""
-        import os
-        
-        # 从环境变量读取API密钥
-        xunfei_api_key = os.getenv("XUNFEI_API_KEY", "").strip()
-        qianfan_api_key = os.getenv("QIANFAN_API_KEY", "").strip()
-        
-        predefined = [
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="astron-code-latest",
-                display_name="讯飞 Astron Code Latest",
-                base_url="https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
-                api_key=xunfei_api_key,
-                cost_per_input_token=0.0,
-                cost_per_output_token=0.0,
-                context_window=32768,
-                priority=15,
-                fallback_models=["deepseek-v3.2", "lite"]
-            ),
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="lite",
-                display_name="讯飞星火 Spark Lite",
-                base_url="https://spark-api-open.xf-yun.com/v1/chat/completions",
-                api_key=xunfei_api_key,
-                cost_per_input_token=0.0,
-                cost_per_output_token=0.0,
-                context_window=32768,
-                priority=14,
-                fallback_models=["astron-code-latest", "deepseek-v3.2"]
-            ),
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="generalv3.5",
-                display_name="讯飞星火 Spark Max",
-                base_url="https://spark-api-open.xf-yun.com/v1/chat/completions",
-                api_key=xunfei_api_key,
-                cost_per_input_token=0.0,
-                cost_per_output_token=0.0,
-                context_window=98304,
-                priority=13,
-                fallback_models=["astron-code-latest", "lite"]
-            ),
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="deepseek-v3.2",
-                display_name="百度千帆 DeepSeek V3.2",
-                base_url="https://qianfan.baidubce.com/v2/coding/chat/completions",
-                api_key=qianfan_api_key,
-                cost_per_input_token=0.0,
-                cost_per_output_token=0.0,
-                context_window=98304,
-                priority=12,
-                fallback_models=["astron-code-latest", "lite"]
-            ),
-            ModelConfig(
-                provider=ModelProvider.OPENAI,
-                model_id="qianfan-code-latest",
-                display_name="百度千帆 qianfan-code-latest",
-                base_url="https://qianfan.baidubce.com/v2/coding/chat/completions",
-                api_key=qianfan_api_key,
-                cost_per_input_token=0.0,
-                cost_per_output_token=0.0,
-                context_window=98304,
-                priority=11,
-                fallback_models=["astron-code-latest", "deepseek-v3.2"]
-            ),
-            ModelConfig(
-                provider=ModelProvider.LOCAL,
-                model_id="llama3",
-                display_name="Llama 3 (本地)",
-                base_url="http://localhost:11434/api/chat",
-                cost_per_input_token=0.0,
-                cost_per_output_token=0.0,
-                context_window=8192,
-                priority=5,
-                fallback_models=[]
-            )
-        ]
-        
-        for model in predefined:
-            self.models[model.model_id] = model
-            self.usage_stats[model.model_id] = ModelUsageStats(model_id=model.model_id)
+        """不再注册历史内置模型（讯飞/千帆/Ollama 等）；一律由合并配置 ``llm.models`` 声明。"""
+        logger.info("LLM：已停用内置旧模型表，仅使用配置文件中的模型列表")
 
     async def _register_model_from_config(self, model_config: Dict[str, Any]):
         """从配置注册模型"""
@@ -683,12 +618,18 @@ class EnhancedLLMManager:
                 return
             
             provider = ModelProvider(model_config.get("provider", "custom"))
+
+            api_key = str(model_config.get("api_key", "") or "").strip()
+            if not api_key:
+                env_name = model_config.get("api_key_env")
+                if env_name:
+                    api_key = os.getenv(str(env_name), "").strip()
             
             model = ModelConfig(
                 provider=provider,
                 model_id=model_id,
                 display_name=model_config.get("display_name", model_id),
-                api_key=str(model_config.get("api_key", "") or "").strip(),
+                api_key=api_key,
                 base_url=model_config.get("base_url", ""),
                 temperature=model_config.get("temperature", 0.7),
                 max_tokens=model_config.get("max_tokens", 2000),

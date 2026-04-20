@@ -526,7 +526,7 @@ class MarketIntelligenceEngine:
                     return cached
                 async with sem:
                     v = await asyncio.wait_for(
-                        self.get_symbol_view(sym, include_snapshot=False),
+                        self.get_symbol_view(sym, include_snapshot=False, prefer_fast_only=True),
                         timeout=max(0.5, min(float(self._market_state_symbol_timeout_s), 3.2)),
                     )
                 d = v.to_dict()
@@ -683,7 +683,13 @@ class MarketIntelligenceEngine:
     def get_cached_market_state(self) -> Dict[str, Any]:
         return dict(self._market_state_cache or {})
 
-    async def get_symbol_view(self, symbol: str, *, include_snapshot: bool = True) -> SymbolView:
+    async def get_symbol_view(
+        self,
+        symbol: str,
+        *,
+        include_snapshot: bool = True,
+        prefer_fast_only: bool = False,
+    ) -> SymbolView:
         sym = str(symbol or "").strip()
         ts = _utc_iso()
         cache_key = sym.upper()
@@ -740,6 +746,10 @@ class MarketIntelligenceEngine:
                     errors.append(f"fastpath_ticker_failed:{type(e).__name__}")
                     partial = True
         providers = list(self._cfg.get("providers") or ["unified_snapshot"])
+        if bool(prefer_fast_only) and snapshot:
+            # Control-plane fast mode: market/state fan-out prefers bounded ticker-only data
+            # over potentially slow unified snapshot fetches.
+            providers = []
         if "unified_snapshot" in providers and hub and hasattr(hub, "get_unified_snapshot"):
             try:
                 # DataSourceHub.get_unified_snapshot uses its own overall budget (default 2.5s).
@@ -756,8 +766,12 @@ class MarketIntelligenceEngine:
                 partial = True
                 self._record_timeout_result("snapshot", timeout_hit=isinstance(e, asyncio.TimeoutError))
         else:
-            errors.append("snapshot_provider_missing")
-            partial = True
+            if bool(prefer_fast_only):
+                errors.append("snapshot_skipped_fast_mode")
+                partial = True
+            else:
+                errors.append("snapshot_provider_missing")
+                partial = True
 
         # Pull core fields (统一快照字段)
         exch = (snapshot.get("渠道A_交易所实时执行数据") or {}) if isinstance(snapshot, dict) else {}

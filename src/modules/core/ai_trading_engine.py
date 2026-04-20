@@ -101,6 +101,7 @@ class Position:
     unrealized_pnl_percent: float
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
     opened_at: datetime = field(default_factory=datetime.now)
 
 
@@ -162,7 +163,7 @@ class AITradingEngine:
         
         self.ai_config = {
             "enabled": True,
-            "model_id": "astron-code-latest",
+            "model_id": "gemini-2.5-flash",
             "analysis_interval": DEFAULT_ANALYSIS_INTERVAL_SECONDS,
             "min_confidence": 0.75,
             "max_positions": DEFAULT_MAX_POSITIONS,
@@ -1702,9 +1703,23 @@ class AITradingEngine:
                     logger.info(f"📊 {decision.symbol} 已有空仓，AI自主决定是否加仓")
             
             if self.risk_manager:
-                risk_ok = await self.risk_manager.check_trade(decision.__dict__)
-                if not risk_ok:
-                    logger.info(f"📊 风险检查提示，AI自主评估是否继续")
+                try:
+                    if hasattr(self.risk_manager, "check_order"):
+                        res = await self.risk_manager.check_order(decision.__dict__)
+                        if isinstance(res, dict) and not bool(res.get("passed", True)):
+                            logger.warning(
+                                "📊 风险管理器拒绝该订单: symbol=%s violations=%s",
+                                decision.symbol,
+                                res.get("violations") or [],
+                            )
+                            return False
+                    elif hasattr(self.risk_manager, "check_trade"):
+                        risk_ok = await self.risk_manager.check_trade(decision.__dict__)
+                        if not risk_ok:
+                            logger.warning("📊 风险管理器拒绝该订单: symbol=%s", decision.symbol)
+                            return False
+                except Exception as e:
+                    logger.warning("风险管理器检查异常（fail-open）: %s", e)
             
             logger.info(f"✅ AI自主决策通过: {decision.action.value} {decision.symbol}")
             return True
@@ -2460,14 +2475,22 @@ class AITradingEngine:
             
             for pos in positions:
                 symbol = (
-                    pos.get("symbol")
-                    or pos.get("instId")
+                    pos.get("instId")
+                    or pos.get("symbol")
                     or pos.get("instrument_id")
                     or pos.get("inst_id")
                 )
                 if not symbol:
                     continue
-                symbol = str(symbol).replace("-", "/")
+                raw_symbol = str(symbol)
+                symbol = raw_symbol.replace("-", "/")
+                # Normalize common OKX swap suffix so positions map keys match decision symbols.
+                # Example: BTC-USDT-SWAP -> BTC/USDT (keep raw instId in metadata).
+                if symbol.endswith("/SWAP"):
+                    symbol = symbol[: -len("/SWAP")]
+                # Some adapters may produce BTC/USDT/SWAP after naive replace.
+                if symbol.endswith("/USDT/SWAP"):
+                    symbol = symbol.replace("/USDT/SWAP", "/USDT")
                 
                 size = float(pos.get("size", 0) or pos.get("quantity", 0) or 0)
                 
@@ -2529,8 +2552,13 @@ class AITradingEngine:
                         or 0
                     ),
                     stop_loss=old_stop_loss,
-                    take_profit=old_take_profit
+                    take_profit=old_take_profit,
                 )
+                # Preserve raw instrument id for audit/debug without breaking symbol keying.
+                try:
+                    self.positions[symbol].metadata["instId"] = raw_symbol
+                except Exception:
+                    pass
 
             if valid_rows == 0 and existing_symbols:
                 self._empty_position_reads += 1

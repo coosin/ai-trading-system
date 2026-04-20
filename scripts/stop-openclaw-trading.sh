@@ -2,7 +2,7 @@
 # OpenClaw Trading System - Stop Script
 
 APP_NAME="openclaw-trading"
-APP_DIR="/home/cool/.openclaw-trading"
+APP_DIR="/home/cool/ai-trading-system"
 PID_FILE="/tmp/${APP_NAME}.pid"
 LOCK_FILE="/tmp/${APP_NAME}.lock"
 
@@ -17,7 +17,7 @@ if [ -f "$PID_FILE" ]; then
         sleep 3
         
         # Check if still running
-        if pgrep -f "python3 -m src.main" > /dev/null; then
+        if pgrep -f "src.main" > /dev/null; then
             echo "Process not responding, force killing..."
             kill -9 "$PID" 2>/dev/null
             sleep 1
@@ -31,7 +31,7 @@ else
 fi
 
 # Kill all related processes
-pkill -f "python3 -m src.main" 2>/dev/null
+pkill -f "src.main" 2>/dev/null
 
 # Clean up lock and PID files
 rm -f "$PID_FILE" "$LOCK_FILE" 2>/dev/null

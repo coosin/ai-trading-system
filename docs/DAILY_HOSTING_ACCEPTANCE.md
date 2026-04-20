@@ -7,7 +7,7 @@
 
 ## 0) 验收前提
 
-- API 服务地址：`http://localhost:8000`
+- API 服务地址：默认 `http://127.0.0.1:8000`（可通过 `BASE_URL` 覆盖）
 - 控制面已部署最新版本（含治理审计与工具契约接口）
 - 如为生产环境，先确保网络与 OKX 连通性基础正常
 
@@ -119,11 +119,12 @@ python3 scripts/network_connectivity_smoke.py
 ## 5) 每日最小执行模板（建议直接照抄）
 
 ```bash
+BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
 python3 scripts/one_click_upgrade_pipeline.py BTC/USDT
-curl -s http://localhost:8000/api/v1/modules/commander/hosting-mode
-curl -s http://localhost:8000/api/v1/modules/commander/risk-redlines
-curl -s 'http://localhost:8000/api/v1/modules/commander/account-diagnostics'
-curl -s 'http://localhost:8000/api/v1/trade/events?limit=20'
+curl -s "$BASE_URL/api/v1/modules/commander/hosting-mode"
+curl -s "$BASE_URL/api/v1/modules/commander/risk-redlines"
+curl -s "$BASE_URL/api/v1/modules/commander/account-diagnostics"
+curl -s "$BASE_URL/api/v1/trade/events?limit=20"
 ```
 
 全部通过后，再保持或切回 `full_auto`。

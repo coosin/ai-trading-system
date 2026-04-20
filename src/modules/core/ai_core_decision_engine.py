@@ -112,6 +112,8 @@ class AICoreDecisionEngine:
             # 开仓最小间隔：收敛到 60 秒，降低噪声交易频率
             "min_trade_interval": 60,
             "strategy_check_interval": 300,
+            "max_backtest_strategies_per_cycle": 1,
+            "max_optimize_strategies_per_cycle": 1,
             "backtest_lookback_days": 30,
             "aggressive_mode": False,
             "auto_create_strategy": True,
@@ -304,6 +306,54 @@ class AICoreDecisionEngine:
         
         # 加载用户规则
         await self._load_user_rules()
+
+        # 运行态开关覆盖（优先于记忆中的“全权负责”默认值）
+        if self.main_controller.config_manager:
+            try:
+                ai_core_cfg = await self.main_controller.config_manager.get_config("ai_core", {}) or {}
+                if isinstance(ai_core_cfg, dict):
+                    auth_cfg = ai_core_cfg.get("authorization", {})
+                    if isinstance(auth_cfg, dict):
+                        if "auto_backtest" in auth_cfg:
+                            self.authorization["auto_backtest"] = bool(auth_cfg.get("auto_backtest"))
+                        if "auto_optimize" in auth_cfg:
+                            self.authorization["auto_optimize"] = bool(auth_cfg.get("auto_optimize"))
+                        if "auto_strategy" in auth_cfg:
+                            self.authorization["auto_strategy"] = bool(auth_cfg.get("auto_strategy"))
+                        if "auto_trading" in auth_cfg:
+                            self.authorization["auto_trading"] = bool(auth_cfg.get("auto_trading"))
+                    runtime_cfg = ai_core_cfg.get("runtime", {})
+                    if isinstance(runtime_cfg, dict):
+                        if "strategy_check_interval" in runtime_cfg:
+                            self.config["strategy_check_interval"] = int(
+                                runtime_cfg.get("strategy_check_interval") or self.config["strategy_check_interval"]
+                            )
+                        if "max_backtest_strategies_per_cycle" in runtime_cfg:
+                            self.config["max_backtest_strategies_per_cycle"] = max(
+                                1,
+                                int(
+                                    runtime_cfg.get("max_backtest_strategies_per_cycle")
+                                    or self.config["max_backtest_strategies_per_cycle"]
+                                ),
+                            )
+                        if "max_optimize_strategies_per_cycle" in runtime_cfg:
+                            self.config["max_optimize_strategies_per_cycle"] = max(
+                                1,
+                                int(
+                                    runtime_cfg.get("max_optimize_strategies_per_cycle")
+                                    or self.config["max_optimize_strategies_per_cycle"]
+                                ),
+                            )
+                        if "skip_backtest_if_cpu_above" in runtime_cfg:
+                            self.config["skip_backtest_if_cpu_above"] = float(
+                                runtime_cfg.get("skip_backtest_if_cpu_above")
+                            )
+                        if "skip_optimize_if_cpu_above" in runtime_cfg:
+                            self.config["skip_optimize_if_cpu_above"] = float(
+                                runtime_cfg.get("skip_optimize_if_cpu_above")
+                            )
+            except Exception as e:
+                logger.warning("AI核心加载 ai_core 运行开关失败: %s", e)
 
         if self.main_controller.config_manager:
             try:
@@ -1843,9 +1893,22 @@ class AICoreDecisionEngine:
             return
         
         try:
+            cpu_guard = float(self.config.get("skip_backtest_if_cpu_above", 85.0) or 85.0)
+            try:
+                import psutil  # type: ignore
+
+                if float(psutil.cpu_percent(interval=0.0)) >= cpu_guard:
+                    logger.warning("📉 跳过本轮自动回测：CPU 负载过高 (>= %.1f%%)", cpu_guard)
+                    return
+            except Exception:
+                pass
             strategies = getattr(self.strategy_manager, 'strategy_configs', {})
+            max_backtests = int(self.config.get("max_backtest_strategies_per_cycle", 1) or 1)
+            backtested = 0
             
             for strategy_id, config in strategies.items():
+                if backtested >= max_backtests:
+                    break
                 if strategy_id not in self._strategy_performance:
                     logger.info(f"📈 AI开始回测策略: {getattr(config, 'name', strategy_id)}")
                     
@@ -1861,6 +1924,7 @@ class AICoreDecisionEngine:
                             "trades": [],
                             **result,
                         }
+                        backtested += 1
                         logger.info(f"✅ 回测完成: {result.get('total_return', 0):.2%} 收益")
         
         except Exception as e:
@@ -1921,13 +1985,27 @@ class AICoreDecisionEngine:
             return
         
         try:
+            cpu_guard = float(self.config.get("skip_optimize_if_cpu_above", 85.0) or 85.0)
+            try:
+                import psutil  # type: ignore
+
+                if float(psutil.cpu_percent(interval=0.0)) >= cpu_guard:
+                    logger.warning("📉 跳过本轮自动优化：CPU 负载过高 (>= %.1f%%)", cpu_guard)
+                    return
+            except Exception:
+                pass
+            max_optimizes = int(self.config.get("max_optimize_strategies_per_cycle", 1) or 1)
+            optimized = 0
             for strategy_id, performance in self._strategy_performance.items():
+                if optimized >= max_optimizes:
+                    break
                 if performance.get('sharpe_ratio', 0) < 1.0:
                     logger.info(f"🔧 AI开始优化策略: {strategy_id}")
                     
                     result = await self._optimize_strategy(strategy_id)
                     
                     if result:
+                        optimized += 1
                         logger.info(f"✅ 策略优化完成: {result}")
         
         except Exception as e:

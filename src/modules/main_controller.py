@@ -4657,17 +4657,51 @@ class MainController:
                 cfg = cfg if isinstance(cfg, dict) else {}
                 enabled = bool(cfg.get("enabled", True))
                 auto_run = bool(cfg.get("auto_run", True))
+                run_on_startup = bool(cfg.get("run_on_startup", False))
                 interval_minutes = float(cfg.get("auto_interval_minutes", 360) or 360)
                 interval_seconds = max(300, int(interval_minutes * 60))
                 loop_sleep = min(60, max(20, self.health_check_interval))
+                dyn = cfg.get("dynamic_throttle", {}) if isinstance(cfg.get("dynamic_throttle"), dict) else {}
+                dyn_enabled = bool(dyn.get("enabled", True))
+                cpu_warn = float(dyn.get("cpu_warning", 70.0) or 70.0)
+                cpu_critical = float(dyn.get("cpu_critical", 85.0) or 85.0)
+                interval_mul = max(1.0, float(dyn.get("interval_multiplier_under_pressure", 2.0) or 2.0))
+                scan_ratio = min(1.0, max(0.2, float(dyn.get("scan_ratio_under_pressure", 0.5) or 0.5)))
+                skip_cycle_on_critical = bool(dyn.get("skip_cycle_on_critical", True))
+                cpu_usage: Optional[float] = None
+                if dyn_enabled:
+                    try:
+                        import psutil  # type: ignore
+
+                        cpu_usage = float(psutil.cpu_percent(interval=0.0))
+                    except Exception:
+                        cpu_usage = None
 
                 if not enabled or not auto_run:
                     await asyncio.sleep(loop_sleep)
                     continue
 
+                effective_interval_seconds = interval_seconds
+                if cpu_usage is not None:
+                    if cpu_usage >= cpu_critical and skip_cycle_on_critical:
+                        logger.warning(
+                            "策略研发动态降载：CPU %.1f%% >= %.1f%%，本轮跳过",
+                            cpu_usage,
+                            cpu_critical,
+                        )
+                        await asyncio.sleep(loop_sleep)
+                        continue
+                    if cpu_usage >= cpu_warn:
+                        effective_interval_seconds = int(interval_seconds * interval_mul)
+
+                if self._last_strategy_research_at is None and not run_on_startup:
+                    self._last_strategy_research_at = datetime.now()
+                    await asyncio.sleep(loop_sleep)
+                    continue
+
                 due = (
                     self._last_strategy_research_at is None
-                    or (datetime.now() - self._last_strategy_research_at).total_seconds() >= interval_seconds
+                    or (datetime.now() - self._last_strategy_research_at).total_seconds() >= effective_interval_seconds
                 )
                 if not due or self._strategy_research_running:
                     await asyncio.sleep(loop_sleep)
@@ -4691,6 +4725,8 @@ class MainController:
                         except Exception:
                             pass
                 max_scan = int(cfg.get("symbol_scan_limit", 12) or 12)
+                if cpu_usage is not None and cpu_usage >= cpu_warn:
+                    max_scan = max(1, int(max_scan * scan_ratio))
                 symbols = [str(s) for s in symbols if s][:max(1, max_scan)]
                 timeframe = str(cfg.get("timeframe", "1h") or "1h")
                 lookback_days = int(cfg.get("lookback_days", 30) or 30)

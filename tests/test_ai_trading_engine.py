@@ -139,6 +139,29 @@ class TestAITradingEngine(AsyncTestCase):
         # 风险检查应该失败（超过最大持仓数）
         passed = await trading_engine._risk_check(decision)
         assert passed is False
+
+    @pytest.mark.asyncio
+    async def test_risk_check_denied_by_risk_manager(self, trading_engine):
+        """风险管理器返回passed=false时，应阻断下单。"""
+        from src.modules.core.ai_trading_engine import AIDecision, TradeAction
+
+        trading_engine.risk_manager = Mock()
+        trading_engine.risk_manager.check_order = AsyncMock(
+            return_value={"passed": False, "violations": ["max_total_position_exceeded"]}
+        )
+        trading_engine._refresh_positions_for_risk_gate = AsyncMock()
+
+        decision = AIDecision(
+            action=TradeAction.OPEN_LONG,
+            symbol="BTC/USDT",
+            price=50000.0,
+            quantity=0.001,
+            confidence=0.9,
+            reasoning="Test",
+        )
+
+        passed = await trading_engine._risk_check(decision)
+        assert passed is False
     
     @pytest.mark.asyncio
     async def test_execute_decision_success(self, trading_engine):
@@ -207,6 +230,110 @@ class TestAITradingEngine(AsyncTestCase):
         
         # 验证持仓已更新
         assert "BTC/USDT" in trading_engine.positions
+
+    @pytest.mark.asyncio
+    async def test_update_positions_okx_swap_instid_normalization(self, trading_engine):
+        """OKX: instId=BTC-USDT-SWAP 应归一为 BTC/USDT，避免持仓键漂移。"""
+        trading_engine.exchange.get_positions = AsyncMock(
+            return_value=[
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "symbol": "BTC/USDT/SWAP",
+                    "posSide_raw": "net",
+                    "side": "short",
+                    "raw_pos": -2.0,
+                    "size": 2.0,
+                    "avgPx": 60000.0,
+                    "markPx": 59900.0,
+                    "upl": -10.0,
+                    "uplRatio": -0.001,
+                }
+            ]
+        )
+
+        await trading_engine._update_positions()
+
+        assert "BTC/USDT" in trading_engine.positions
+        pos = trading_engine.positions["BTC/USDT"]
+        assert pos.side == "short"
+        assert pos.quantity == 2.0
+        # Keep raw instId for audit/debug
+        assert getattr(pos, "metadata", {}).get("instId") == "BTC-USDT-SWAP"
+
+    @pytest.mark.asyncio
+    async def test_update_positions_okx_net_side_long_from_positive_pos(self, trading_engine):
+        """OKX net 模式：pos>0 应被判定为 long。"""
+        trading_engine.exchange.get_positions = AsyncMock(
+            return_value=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "symbol": "ETH/USDT/SWAP",
+                    "posSide_raw": "net",
+                    "side": "long",
+                    "raw_pos": 3.0,
+                    "size": 3.0,
+                    "avgPx": 3000.0,
+                    "markPx": 3010.0,
+                    "uplRatio": 0.005,
+                }
+            ]
+        )
+
+        await trading_engine._update_positions()
+
+        assert "ETH/USDT" in trading_engine.positions
+        pos = trading_engine.positions["ETH/USDT"]
+        assert pos.side == "long"
+        assert pos.quantity == 3.0
+
+    @pytest.mark.asyncio
+    async def test_update_positions_okx_net_side_short_from_negative_pos(self, trading_engine):
+        """OKX net 模式：pos<0 应被判定为 short。"""
+        trading_engine.exchange.get_positions = AsyncMock(
+            return_value=[
+                {
+                    "instId": "SOL-USDT-SWAP",
+                    "symbol": "SOL/USDT/SWAP",
+                    "posSide_raw": "net",
+                    "side": "short",
+                    "raw_pos": -4.0,
+                    "size": 4.0,
+                    "avgPx": 150.0,
+                    "markPx": 149.5,
+                    "uplRatio": -0.004,
+                }
+            ]
+        )
+
+        await trading_engine._update_positions()
+
+        assert "SOL/USDT" in trading_engine.positions
+        pos = trading_engine.positions["SOL/USDT"]
+        assert pos.side == "short"
+        assert pos.quantity == 4.0
+
+    @pytest.mark.asyncio
+    async def test_update_positions_fallback_to_symbol_when_instid_missing(self, trading_engine):
+        """兼容适配器缺少 instId 场景：仍可从 symbol 归一化得到正确键。"""
+        trading_engine.exchange.get_positions = AsyncMock(
+            return_value=[
+                {
+                    "symbol": "XRP/USDT/SWAP",
+                    "side": "long",
+                    "size": 10.0,
+                    "avgPx": 0.5,
+                    "markPx": 0.52,
+                    "uplRatio": 0.04,
+                }
+            ]
+        )
+
+        await trading_engine._update_positions()
+
+        assert "XRP/USDT" in trading_engine.positions
+        pos = trading_engine.positions["XRP/USDT"]
+        assert pos.side == "long"
+        assert pos.quantity == 10.0
 
 
 class TestMarketAnalysis(AsyncTestCase):

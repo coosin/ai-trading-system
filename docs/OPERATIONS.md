@@ -4,6 +4,34 @@
 
 ---
 
+## 0. 运行模式选择（先确认）
+
+当前系统同时支持 Docker 与裸机运行。若延续旧容器化参数到裸机场景，最常见冲突是代理地址与回环地址。
+
+- **Docker 模式**：继续使用本手册后续 `docker compose` 流程。
+- **裸机模式**（当前常用）：
+  - 建议从项目根运行：`python3 run_api.py`（或由 systemd/supervisor 托管）
+  - 对外基址统一为：`http://127.0.0.1:8000`（本机）或实际监听地址
+  - 若配置了代理，请确认 `NO_PROXY=127.0.0.1,localhost,redis`
+  - 禁止把 `host.docker.internal` 写入裸机代理/上游地址
+
+裸机最小健康检查：
+
+```bash
+curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/api/v1/s1/verify
+curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/audit?enrich=true'
+```
+
+本页后续所有 `curl` 示例可统一替换为：
+
+```bash
+BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
+curl -s "$BASE_URL/health"
+```
+
+---
+
 ## 1. Docker 部署
 
 ### 1.1 首次与更新
@@ -83,7 +111,13 @@ curl -s http://localhost:8000/api/v1/modules/surface/registry
 # 2) A 接口（司令部统一入口）触发交易动作
 curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
   -H 'Content-Type: application/json' \
-  -d '{"message":"强制开仓 BTC/USDT 0.001","source":"api_chat"}'
+  -d '{"message":"强制开仓 BTC/USDT 0.001","source":"api_chat","timeout_sec":8}'
+
+# 2.1) 若返回 status=timeout，改用异步模式并轮询
+curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"强制开仓 BTC/USDT 0.001","source":"api_chat","async_mode":true}'
+curl -s 'http://localhost:8000/api/v1/modules/commander/dispatch/jobs/<job_id>'
 
 # 3) 事件流验证（前端/API 实时消费基线）
 curl -s 'http://localhost:8000/api/v1/trade/events?limit=20'
@@ -99,6 +133,27 @@ curl -s http://localhost:8000/api/v1/modules/stop-loss/stats
 - `production-audit.execution_spine.last_order_*` 与最近动作一致（source/op/symbol/size/success）。
 - `stop-loss/stats` 在触发后计数递增，`active_orders` 与持仓状态一致。
 - `surface/channels` 与 `surface/registry` 返回成功，用于前端与第三方 API 对接配置。
+
+### 2.1.1 超时治理与降级观测（2026-04-20 新增）
+
+```bash
+# 1) AI 对话链路分段耗时（trace）
+curl -s -X POST http://localhost:8000/api/v1/ai/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"请简要返回当前系统状态","timeout_sec":15}'
+
+# 2) 行情聚合快返回与降级语义
+curl -s 'http://localhost:8000/api/v1/market/state?timeout_sec=3.2'
+
+# 3) 学习反馈可观测指标
+curl -s 'http://localhost:8000/api/v1/modules/ai/learning-feedback'
+```
+
+判读建议：
+
+- `ai/chat` 关注 `data.trace.path` 与 `data.trace.*_ms`，用于确认卡点在核心路由、执行器还是直连 LLM。
+- `market/state` 关注 `degraded`、`latency_ms` 与 `message`；出现 `snapshot_skipped_fast_mode` 代表主动快路径限时策略，不等价于断连。
+- `learning-feedback.summary` 关注 `penalized_ratio`、`total_stop_loss_hits`、`penalty_rule.*`，判断“学习反馈”是否真实参与开仓阈值治理。
 
 ### 2.2 API / 推送 / 告警 / 记忆 二次验收（2026-04-13）
 
@@ -164,10 +219,16 @@ curl -s http://localhost:8000/api/v1/modules/surface/registry
 curl -s 'http://localhost:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
 curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
   -H 'Content-Type: application/json' \
-  -d '{"message":"系统巡检","source":"openclaw"}'
+  -d '{"message":"系统巡检","source":"openclaw","timeout_sec":8}'
 ```
 
 完整流程见：`docs/OPENCLAW_INTEGRATION_GUIDE.md`。
+
+补充：若 `dispatch` 在高峰期超时，建议直接使用脚本：
+
+```bash
+python3 scripts/commander_dispatch_client.py "系统巡检" --source openclaw
+```
 
 ---
 
@@ -175,7 +236,7 @@ curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
 
 ### 3.1 目标
 
-- 容器访问外网经 **宿主机 Clash**：`host.docker.internal:7890`（见 `docker-compose.yml` `extra_hosts`；详细步骤与排障见 **`deploy/HOST_CLASH_EGRESS.md`**）  
+- 容器访问外网经 **宿主机 Clash**：`host.docker.internal:7890`（见 `docker-compose.yml` `extra_hosts`；详细步骤与排障见 **`deploy/HOST_CLASH_EGRESS.md`**；仅 Docker 模式使用）  
 - **OKX** 使用 `https://www.okx.com`，TLS 校验开启  
 - DNS：避免将 OKX 解析到异常池；Clash 建议 **Rule** 模式、`fake-ip-filter` 含 `+.okx.com`
 
@@ -194,6 +255,8 @@ python3 scripts/proxy_mode_network_benchmark.py --label my_run --runs 7 --out /t
 ### 3.3 容器内代理环境
 
 Compose 已注入 `HTTP(S)_PROXY` / `OPENCLAW_*_PROXY` 与 `NO_PROXY=localhost,127.0.0.1,redis`。若自定义，请保持 **Redis 与 localhost 不走代理**，否则健康检查与内网会失败。
+
+裸机模式同样建议保持 `NO_PROXY=localhost,127.0.0.1,redis`，并避免将本机 API 地址配置为 `host.docker.internal`。
 
 ### 3.4 OKX 余额/持仓与进程内同步
 

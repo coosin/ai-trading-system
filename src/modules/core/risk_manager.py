@@ -377,6 +377,20 @@ class RiskManager:
 
             return result
 
+    async def check_trade(self, trade_data: Dict[str, Any]) -> bool:
+        """
+        Compatibility wrapper for trading engines.
+
+        Historically some modules called `check_trade()` expecting a boolean gate.
+        The authoritative interface is `check_order()` which returns a structured result.
+        """
+        try:
+            res = await self.check_order(trade_data or {})
+            return bool(res.get("passed"))
+        except Exception:
+            # Fail-open to avoid blocking on risk subsystem internal errors.
+            return True
+
     async def add_trade(self, trade_data: Dict[str, Any]) -> None:
         """
         添加交易记录

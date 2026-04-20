@@ -49,6 +49,7 @@ try:
     from fastapi.openapi.docs import get_swagger_ui_html
     from fastapi.openapi.utils import get_openapi
     from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.routing import APIRoute
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
     from pydantic import BaseModel, Field, confloat, conint, validator
     from jose import JWTError, jwt
@@ -62,6 +63,20 @@ except ImportError as e:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _generate_stable_operation_id(route: APIRoute) -> str:
+    """Generate deterministic, collision-resistant operation IDs for OpenAPI."""
+    methods = "_".join(sorted((route.methods or {"GET"})))
+    path = (
+        route.path_format.strip("/")
+        .replace("/", "_")
+        .replace("{", "")
+        .replace("}", "")
+        .replace(":", "_")
+        or "root"
+    )
+    return f"{route.name}_{path}_{methods}".lower()
 
 
 class APIVersion(Enum):
@@ -379,6 +394,7 @@ class APIServer:
                 docs_url=None if not self.enable_swagger else "/docs",
                 redoc_url=None if not self.enable_swagger else "/redoc",
                 openapi_url=None if not self.enable_swagger else "/openapi.json",
+                generate_unique_id_function=_generate_stable_operation_id,
             )
 
             # 加载配置
@@ -1499,7 +1515,6 @@ class APIServer:
             }
 
         # 受保护的路由示例
-        @self.app.get("/api/v1/protected", tags=["api"])
         @api_v1_router.get("/protected", tags=["api"])
         async def protected_route(
             credentials: HTTPAuthorizationCredentials = Depends(self.security),
@@ -2573,6 +2588,18 @@ class APIServer:
             try:
                 message = chat_data.get("message", "")
                 model_id = chat_data.get("model_id")
+                chat_started_at = datetime.now()
+                trace: Dict[str, Any] = {
+                    "path": None,
+                    "core_router_ms": None,
+                    "executor_ms": None,
+                    "llm_direct_ms": None,
+                }
+                try:
+                    timeout_sec = float(chat_data.get("timeout_sec", 20.0) or 20.0)
+                except Exception:
+                    timeout_sec = 20.0
+                timeout_sec = max(5.0, min(timeout_sec, 90.0))
                 
                 def _safe_json(obj: Any, depth: int = 0) -> Any:
                     """
@@ -2608,23 +2635,35 @@ class APIServer:
                 # 优先走主控制器核心大脑统一路由
                 if hasattr(self.main_controller, "process_user_command"):
                     logger.debug(f"使用核心大脑统一路由处理: {message[:50]}...")
-                    result = await self.main_controller.process_user_command(message, source="api_chat")
+                    started_at = datetime.now()
+                    result = await asyncio.wait_for(
+                        self.main_controller.process_user_command(message, source="api_chat"),
+                        timeout=timeout_sec,
+                    )
+                    latency_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+                    trace["core_router_ms"] = latency_ms
                     
                     if result.get("success"):
+                        trace["path"] = "core_brain_router"
                         return {
                             "status": "success",
                             "message": "AI响应成功",
                             "data": {
                                 "response": result.get("response", ""),
                                 "data": _safe_json(result.get("data")),
-                                "source": result.get("source", "core_brain_router")
+                                "source": result.get("source", "core_brain_router"),
+                                "latency_ms": latency_ms,
+                                "trace": trace,
                             },
+                            "latency_ms_total": int((datetime.now() - chat_started_at).total_seconds() * 1000),
                             "timestamp": datetime.now().isoformat()
                         }
                     else:
                         return {
                             "status": "error",
                             "message": result.get("response", "AI处理失败"),
+                            "trace": trace,
+                            "latency_ms_total": int((datetime.now() - chat_started_at).total_seconds() * 1000),
                             "timestamp": datetime.now().isoformat()
                         }
                 
@@ -2632,16 +2671,26 @@ class APIServer:
                 ai_executor = getattr(self.main_controller, 'ai_command_executor', None)
                 if ai_executor:
                     logger.debug(f"回退到AICommandExecutor处理: {message[:50]}...")
-                    result = await ai_executor.process_input(message, source="api_chat")
+                    started_at = datetime.now()
+                    result = await asyncio.wait_for(
+                        ai_executor.process_input(message, source="api_chat"),
+                        timeout=timeout_sec,
+                    )
+                    latency_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+                    trace["executor_ms"] = latency_ms
                     if result.get("success"):
+                        trace["path"] = "ai_command_executor"
                         return {
                             "status": "success",
                             "message": "AI响应成功",
                             "data": {
                                 "response": result.get("response", ""),
                                 "data": _safe_json(result.get("data")),
-                                "source": "ai_command_executor"
+                                "source": "ai_command_executor",
+                                "latency_ms": latency_ms,
+                                "trace": trace,
                             },
+                            "latency_ms_total": int((datetime.now() - chat_started_at).total_seconds() * 1000),
                             "timestamp": datetime.now().isoformat()
                         }
                 
@@ -2659,13 +2708,18 @@ class APIServer:
                     model_id = llm_integration.llm_manager.default_model
                 
                 logger.debug(f"回退到直接LLM调用: {message[:50]}...")
-                
-                response = await llm_integration.generate(
-                    prompt=message,
-                    model_id=model_id
+                started_at = datetime.now()
+                response = await asyncio.wait_for(
+                    llm_integration.generate(
+                        prompt=message,
+                        model_id=model_id
+                    ),
+                    timeout=timeout_sec,
                 )
+                trace["llm_direct_ms"] = int((datetime.now() - started_at).total_seconds() * 1000)
                 
                 if response.success:
+                    trace["path"] = "llm_direct"
                     return {
                         "status": "success",
                         "message": "对话成功",
@@ -2676,17 +2730,29 @@ class APIServer:
                             "tokens_used": response.tokens_used,
                             "latency_ms": response.latency_ms,
                             "cost": response.cost,
-                            "source": "llm_direct"
+                            "source": "llm_direct",
+                            "trace": trace,
                         },
+                        "latency_ms_total": int((datetime.now() - chat_started_at).total_seconds() * 1000),
                         "timestamp": datetime.now().isoformat()
                     }
                 else:
                     return {
                         "status": "error",
                         "message": f"AI模型调用失败: {response.error_message}",
+                        "trace": trace,
+                        "latency_ms_total": int((datetime.now() - chat_started_at).total_seconds() * 1000),
                         "timestamp": datetime.now().isoformat()
                     }
-                    
+            except asyncio.TimeoutError:
+                return {
+                    "status": "timeout",
+                    "message": f"AI对话超时（>{timeout_sec:.1f}s）",
+                    "hint": "可降低输入长度，或使用 commander/dispatch async_mode=true",
+                    "trace": trace if "trace" in locals() else {},
+                    "latency_ms_total": int((datetime.now() - chat_started_at).total_seconds() * 1000) if "chat_started_at" in locals() else None,
+                    "timestamp": datetime.now().isoformat()
+                }
             except Exception as e:
                 logger.error(f"AI对话失败: {e}")
                 import traceback
@@ -3490,21 +3556,28 @@ class APIServer:
                 "timestamp": datetime.now().isoformat(),
             }
 
-        @api_v1_router.api_route(
-            "/commander",
-            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-            tags=["commander"],
-        )
         async def commander_mirror_root(request: Request):
             return await _forward_commander_request(request, "")
 
-        @api_v1_router.api_route(
-            "/commander/{path:path}",
-            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-            tags=["commander"],
-        )
         async def commander_mirror(request: Request, path: str):
             return await _forward_commander_request(request, path)
+
+        mirror_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+        for method in mirror_methods:
+            api_v1_router.add_api_route(
+                "/commander",
+                commander_mirror_root,
+                methods=[method],
+                tags=["commander"],
+                name=f"commander_mirror_root_{method.lower()}",
+            )
+            api_v1_router.add_api_route(
+                "/commander/{path:path}",
+                commander_mirror,
+                methods=[method],
+                tags=["commander"],
+                name=f"commander_mirror_{method.lower()}",
+            )
 
         # 添加API路由到应用
         api_router.include_router(api_v1_router)

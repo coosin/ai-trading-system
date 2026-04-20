@@ -1,893 +1,170 @@
-# OpenClaw Trading - 开发文档
+# OpenClaw Trading - 开发文档（对齐当前仓库）
 
-> 本文件位于 `docs/DEVELOPMENT.md`。总索引见 [README.md](./README.md)，工程总览见 [ENGINEERING.md](./ENGINEERING.md)。
-
-## 目录
-
-- [开发环境设置](#开发环境设置)
-- [项目结构](#项目结构)
-- [核心模块说明](#核心模块说明)
-- [开发规范](#开发规范)
-- [测试指南](#测试指南)
-- [调试技巧](#调试技巧)
-- [性能优化](#性能优化)
-- [常见问题](#常见问题)
+> 总索引见 `docs/README.md`，运行与配置边界见 `docs/ENGINEERING.md`，运维与网络见 `docs/OPERATIONS.md`。
 
 ---
 
-## 开发环境设置
+## 1. 开发基线
 
-### 系统要求
+- Python: `3.12`（与当前 `.venv` 和生产环境一致）
+- 包管理: `pip` + `requirements.txt`
+- API 框架: FastAPI
+- 推荐本地运行入口: `python -m src.main`（完整系统）  
 
-- Python 3.8+
-- pip 21.0+
-- Git
-- 虚拟环境 (推荐)
+---
 
-### 仅 Docker 运行（生产推荐）
-
-- 运行依赖在**镜像**内完成安装；仓库根下的 `venv/`、`.venv/` **不是容器运行所必需**。若只走 Docker，可删除它们以省磁盘；需要跑全量测试时再执行 `./scripts/run_full_test_suite.sh`（会自动创建 `.venv_test/`）。根目录 **`agents/`** 为本地/IDE 会话类产物，已在 `.gitignore`，勿提交。
-- 维护：`./scripts/check_trading_host_health.sh` 做宿主体检；`./scripts/cleanup_trading_workspace.sh` 做日志与缓存清理（可选环境变量见脚本内注释）。
-- 降低 swap 抖动：见 `config/trading-host-sysctl.conf`（复制到 `/etc/sysctl.d/` 后 `sysctl --system`）。
-- **重建并加载**：`docker compose build trading-system && docker compose up -d`
-
-### 环境搭建
+## 2. 本地开发环境
 
 ```bash
-# 1. 克隆项目
-git clone https://github.com/your-username/openclaw-trading.git
-cd openclaw-trading
-
-# 2. 创建虚拟环境
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# 或
-venv\Scripts\activate  # Windows
-
-# 3. 安装依赖
+cd /home/cool/ai-trading-system
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
-pip install -r requirements-dev.txt  # 开发依赖
-
-# 4. 配置环境变量
 cp .env.example .env
-nano .env  # 填写必需的API密钥
-
-# 5. 初始化数据库
-python scripts/init_db.py
-
-# 6. 运行测试
-pytest tests/
-
-# 7. 启动开发服务器
-python start.py
 ```
 
-### MCP 基础联调（新增）
+配置说明：
 
-建议先阅读 [`docs/MCP_BASELINE.md`](./MCP_BASELINE.md)。开发联调顺序：
+- 主业务配置：`config/config.yaml`
+- 本机覆盖配置：`config/local.yaml`（可选，勿提交）
+- 密钥与环境变量：`.env`
 
-1. 先跑本系统 API（`/health`、`/api/v1/modules/commander/snapshot`）
-2. 再接 MCP 客户端（Cursor / Claude Code）做只读工具验证
-3. 最后开放写路径并开启二次确认（下单/撤单）
+---
 
-最小验收：
+## 3. 启动方式（本地优先）
+
+### 3.1 前台启动（调试推荐）
+
+```bash
+. .venv/bin/activate
+python -m src.main
+```
+
+### 3.2 后台启动（值守常用）
+
+```bash
+bash scripts/start-openclaw-trading.sh
+bash scripts/stop-openclaw-trading.sh
+```
+
+### 3.3 API-only 启动（仅接口调试）
+
+`run_api.py` 只启动 API 服务，不覆盖完整交易主循环，适合接口层验证：
+
+```bash
+. .venv/bin/activate
+python run_api.py
+```
+
+---
+
+## 4. 最小联调检查
 
 ```bash
 curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/api/v1/s1/verify
 curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
-curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/account-diagnostics'
+curl -s 'http://127.0.0.1:8000/api/v1/trade/events?limit=20'
 ```
 
-### OpenClaw 本地联调（新增）
-
-最小联调顺序：
-
-1. 读取能力与契约：`capabilities` + `tool-contract`
-2. 读取快照与事件：`snapshot` + `trade/events`
-3. 指令写入：`commander/dispatch`（`source=openclaw`）
-
-最小命令：
+OpenClaw 接口最小检查：
 
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/modules/commander/capabilities
 curl -s http://127.0.0.1:8000/api/v1/modules/commander/tool-contract
-curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
-curl -s 'http://127.0.0.1:8000/api/v1/trade/events?limit=20'
 curl -s -X POST http://127.0.0.1:8000/api/v1/modules/commander/dispatch \
   -H 'Content-Type: application/json' \
-  -d '{"message":"系统巡检","source":"openclaw"}'
+  -d '{"message":"系统巡检","source":"openclaw","timeout_sec":8}'
+curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/dispatch/jobs/<job_id>'
 ```
 
-详细见：`docs/OPENCLAW_INTEGRATION_GUIDE.md`。
+`commander/dispatch` 最新语义（建议）：
 
-### IDE配置
+- 同步模式默认 `timeout_sec=12`（范围 2~90），超时返回 `status=timeout`。
+- 需要长耗时执行时，直接使用 `async_mode=true` 并通过 `dispatch/jobs/{job_id}` 轮询结果。
+- 推荐值守脚本：`python3 scripts/commander_dispatch_client.py "系统巡检"`（同步优先，超时自动异步）。
 
-推荐使用 VSCode 或 PyCharm
+`ai/chat` 与行情聚合调试（2026-04-20）：
 
-**VSCode扩展:**
-- Python
-- Pylance
-- Python Docstring Generator
-- GitLens
-
-**推荐设置:**
-```json
-{
-  "python.linting.enabled": true,
-  "python.linting.pylintEnabled": true,
-  "python.formatting.provider": "black",
-  "editor.formatOnSave": true
-}
-```
-
----
-
-## 项目结构
-
-```
-openclaw-trading/
-├── config/                    # 配置目录
-│   ├── config.yaml           # 唯一主业务配置（必选）
-│   ├── local.yaml            # 本机覆盖（可选，勿提交；见 config.local.example.yaml）
-│   ├── clash_config.yaml     # Clash 等专项文件（由脚本单独读取）
-│   └── subscription.yaml     # 订阅等专项文件
-│
-├── src/                      # 源代码
-│   ├── modules/              # 功能模块
-│   │   ├── core/            # 核心模块
-│   │   │   ├── ai_trading_engine.py      # AI交易引擎
-│   │   │   ├── ai_learning_engine.py     # AI学习引擎
-│   │   │   ├── ai_memory.py              # AI记忆管理
-│   │   │   ├── enhanced_llm_manager.py   # LLM管理器
-│   │   │   ├── llm_integration.py        # LLM集成
-│   │   │   ├── main_controller.py        # 主控制器
-│   │   │   ├── config_manager.py         # 配置管理
-│   │   │   ├── event_system.py           # 事件系统
-│   │   │   └── risk_manager.py           # 风险管理
-│   │   │
-│   │   ├── data/            # 数据模块
-│   │   │   ├── data_pipeline.py          # 数据管道
-│   │   │   ├── historical_data_storage.py # 历史数据存储
-│   │   │   └── multi_source_data_fusion.py # 多源数据融合
-│   │   │
-│   │   ├── strategies/       # 策略模块
-│   │   │   ├── strategy_base.py          # 策略基类
-│   │   │   ├── strategy_manager.py       # 策略管理器
-│   │   │   └── strategy_optimizer.py     # 策略优化器
-│   │   │
-│   │   ├── exchanges/        # 交易所接口
-│   │   │   ├── exchange_base.py          # 交易所基类
-│   │   │   ├── okx.py                    # OKX交易所
-│   │   │   └── binance.py                # Binance交易所
-│   │   │
-│   │   ├── monitoring/       # 监控模块
-│   │   │   ├── trading_monitor.py        # 交易监控
-│   │   │   └── account_risk_monitor.py   # 账户风险监控
-│   │   │
-│   │   ├── notification/     # 通知模块
-│   │   │   ├── telegram_bot.py           # Telegram机器人
-│   │   │   └── notification_manager.py   # 通知管理器
-│   │   │
-│   │   ├── api/              # API接口
-│   │   │   ├── server.py                 # API服务器
-│   │   │   └── routes/                   # API路由
-│   │   │
-│   │   └── intelligence/     # 智能模块
-│   │       ├── natural_language_interface.py # 自然语言接口
-│   │       └── anomaly_detection.py      # 异常检测
-│   │
-│   ├── utils/                # 工具函数
-│   │   ├── env_config.py                 # 环境变量配置
-│   │   ├── logger.py                     # 日志工具
-│   │   └── helpers.py                    # 辅助函数
-│   │
-│   └── main.py               # 主入口
-│
-├── workspace/                # AI记忆文件
-│   ├── SOUL.md              # 核心信念
-│   ├── IDENTITY.md          # 身份定义
-│   ├── USER.md              # 用户信息
-│   ├── TRADING.md           # 交易知识库
-│   └── INSTRUCTIONS.md      # 工作指令
-│
-├── data/                    # 数据存储
-│   ├── historical/          # 历史数据
-│   ├── memory/              # AI记忆数据
-│   └── events.db            # 事件数据库
-│
-├── logs/                    # 日志文件
-│   ├── trading.log          # 交易日志
-│   ├── error.log            # 错误日志
-│   └── system.log           # 系统日志
-│
-├── tests/                   # 测试文件
-│   ├── unit/                # 单元测试
-│   ├── integration/         # 集成测试
-│   └── e2e/                 # 端到端测试
-│
-├── docs/                    # 文档
-│   ├── ARCHITECTURE.md      # 架构文档
-│   ├── DEPLOYMENT.md        # 部署文档
-│   ├── API.md               # API文档
-│   └── FAQ.md               # 常见问题
-│
-├── scripts/                 # 脚本工具
-│   ├── init_db.py           # 初始化数据库
-│   ├── backup.py            # 备份脚本
-│   └── health_check.py      # 健康检查
-│
-├── .env.example             # 环境变量模板
-├── requirements.txt         # 生产依赖
-├── requirements-dev.txt     # 开发依赖
-├── start.py                # 启动脚本
-├── README.md               # 主文档
-└── DEVELOPMENT.md          # 开发文档
-```
-
----
-
-## 核心模块说明
-
-### 1. AI交易引擎 (ai_trading_engine.py)
-
-**功能:**
-- 完全自动化的交易流程
-- AI驱动的市场分析
-- 智能决策生成
-- 自动订单执行
-
-**关键方法:**
-```python
-async def _trading_loop(self) -> None:
-    """主交易循环"""
-    while self._running:
-        for symbol in self.symbols:
-            # 1. 数据采集
-            market_data = await self._collect_market_data(symbol)
-            
-            # 2. AI分析
-            context = await self._analyze_market(symbol, market_data)
-            
-            # 3. AI决策
-            decision = await self._make_decision(symbol, context, position)
-            
-            # 4. 风险检查
-            if await self._risk_check(decision):
-                # 5. 执行交易
-                await self._execute_decision(decision)
-```
-
-### 2. LLM管理器 (enhanced_llm_manager.py)
-
-**功能:**
-- 多模型支持和管理
-- 动态模型切换
-- 负载均衡和故障转移
-- 使用统计和性能监控
-
-**使用示例:**
-```python
-# 初始化
-llm_manager = EnhancedLLMManager()
-await llm_manager.initialize(config)
-
-# 生成文本
-response = await llm_manager.generate(
-    prompt="分析BTC/USDT市场趋势",
-    model_id="astron-code-latest",
-    task_type=TaskType.MARKET_ANALYSIS
-)
-```
-
-### 3. AI记忆管理 (ai_memory.py)
-
-**功能:**
-- 短期记忆: 对话上下文
-- 长期记忆: 交易历史、用户偏好
-- 文件化记忆: SOUL.md等
-- 记忆检索和注入
-
-**使用示例:**
-```python
-# 添加记忆
-await memory_manager.add_long_term_memory(
-    content="用户偏好保守策略",
-    memory_type=MemoryType.USER_PREF,
-    importance=0.8
-)
-
-# 检索记忆
-memories = await memory_manager.retrieve_memory(
-    query="交易策略",
-    top_k=5
-)
-```
-
-### 4. 风险管理 (risk_manager.py)
-
-**功能:**
-- 账户级风险控制
-- 仓位级风险控制
-- 实时风险监控
-- 自动预警机制
-
-**风险检查流程:**
-```python
-async def _risk_check(self, decision: AIDecision) -> bool:
-    # 1. 检查最大持仓数
-    if len(self.positions) >= self.max_positions:
-        return False
-    
-    # 2. 检查仓位大小
-    if decision.quantity > self.max_position_size:
-        return False
-    
-    # 3. 检查风险敞口
-    total_risk = self._calculate_total_risk()
-    if total_risk > self.max_risk:
-        return False
-    
-    return True
-```
-
----
-
-## 开发规范
-
-### 代码风格
-
-遵循 PEP 8 规范，使用以下工具:
+- `POST /api/v1/ai/chat` 成功响应新增 `data.trace` 与 `latency_ms_total`，用于分段耗时定位：
 
 ```bash
-# 代码格式化
-black src/
-
-# 代码检查
-flake8 src/
-
-# 类型检查
-mypy src/
+curl -s -X POST http://127.0.0.1:8000/api/v1/ai/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"请简要返回当前系统状态","timeout_sec":15}'
 ```
 
-### 命名规范
-
-- **模块名**: 小写下划线 `ai_trading_engine.py`
-- **类名**: 大驼峰 `AITradingEngine`
-- **函数名**: 小写下划线 `make_decision`
-- **常量**: 大写下划线 `MAX_POSITIONS`
-- **变量**: 小写下划线 `market_data`
-
-### 文档字符串
-
-使用Google风格文档字符串:
-
-```python
-def calculate_position_size(self, symbol: str, risk: float) -> float:
-    """计算仓位大小
-    
-    Args:
-        symbol: 交易对符号
-        risk: 风险比例 (0-1)
-    
-    Returns:
-        仓位大小
-    
-    Raises:
-        ValueError: 如果risk不在0-1范围内
-    
-    Example:
-        >>> size = calculate_position_size("BTC/USDT", 0.02)
-        >>> print(size)
-        0.001
-    """
-    pass
-```
-
-### 异步编程规范
-
-- 所有IO操作使用async/await
-- 使用asyncio.gather()并发执行
-- 避免阻塞操作
-- 正确处理异常和取消
-
-```python
-# 好的做法
-async def fetch_data(self):
-    try:
-        async with asyncio.timeout(30):
-            data = await self.api.get_data()
-            return data
-    except asyncio.TimeoutError:
-        logger.error("请求超时")
-        return None
-
-# 不好的做法
-async def fetch_data(self):
-    data = await self.api.get_data()  # 没有超时处理
-    return data
-```
-
----
-
-## 测试指南
-
-### 测试结构
-
-```
-tests/
-├── unit/                    # 单元测试
-│   ├── test_ai_engine.py
-│   ├── test_llm_manager.py
-│   └── test_risk_manager.py
-│
-├── integration/             # 集成测试
-│   ├── test_trading_flow.py
-│   └── test_data_pipeline.py
-│
-└── e2e/                     # 端到端测试
-    └── test_full_system.py
-```
-
-### 编写测试
-
-**Pytest 9**：异步 **fixture** 必须使用 `import pytest_asyncio` 且装饰为 `@pytest_asyncio.fixture`；若仍用 `unittest` 写异步用例，请继承 **`unittest.IsolatedAsyncioTestCase`**，否则协程不会被 await。
-
-```python
-import pytest
-import pytest_asyncio
-from unittest.mock import Mock, AsyncMock, patch
-
-@pytest_asyncio.fixture
-async def engine():
-    e = AITradingEngine()
-    await e.initialize()
-    yield e
-    await e.cleanup()
-
-@pytest.mark.asyncio
-async def test_ai_decision(engine):
-    """测试AI决策生成"""
-    engine.llm_integration = Mock()
-    engine.llm_integration.generate_trading_signal = AsyncMock(
-        return_value={"signal": "buy", "confidence": 0.8}
-    )
-
-    # 执行
-    context = MarketContext(
-        symbol="BTC/USDT",
-        price=50000,
-        trend="bullish"
-    )
-    decision = await engine._make_decision("BTC/USDT", context, None)
-    
-    # 验证
-    assert decision is not None
-    assert decision.action == TradeAction.OPEN_LONG
-    assert decision.confidence >= 0.65
-```
-
-### 运行测试
+- `GET /api/v1/market/state` 支持 `timeout_sec`（1.5~8.0），成功响应含 `latency_ms`，降级响应含 `timeout_sec`：
 
 ```bash
-# 若 pyproject 里配置了 coverage 等 addopts，可临时清空：
-export PYTEST_ADDOPTS=""
+curl -s 'http://127.0.0.1:8000/api/v1/market/state?timeout_sec=3.2'
+```
 
-# 运行所有测试（无 coverage 时可覆盖 addopts）
-pytest tests/ -o addopts="--strict-markers --strict-config --tb=short"
+- `GET /api/v1/modules/ai/learning-feedback` 的 `summary` 新增观测字段：
+  - `penalized_ratio`
+  - `total_stop_loss_hits`
+  - `penalty_rule`
 
-# 运行特定测试
-pytest tests/unit/test_natural_language_interface.py -q
+---
 
-# 运行并生成覆盖率报告（需 pytest-cov）
-pytest --cov=src tests/
+## 5. 测试
 
-# 容器内（与 CI 一致）
-docker compose run --rm --no-deps trading-system sh -c \
-  'export PYTHONPATH=/app HOME=/tmp/tsthome && mkdir -p /tmp/tsthome && cd /app && \
-   python -m pytest tests/unit/ -q -o addopts="--strict-markers --strict-config --tb=line" -o cache_dir=/tmp/pytest_cache'
+```bash
+# 建议显式设置 PYTHONPATH，避免 src 包导入差异
+PYTHONPATH=/home/cool/ai-trading-system .venv/bin/pytest -q tests/e2e/test_api_surface_commander_chain.py
+```
+
+常用：
+
+```bash
+PYTHONPATH=/home/cool/ai-trading-system .venv/bin/pytest -q tests/unit
+PYTHONPATH=/home/cool/ai-trading-system .venv/bin/pytest -q tests
 ```
 
 ---
 
-## 调试技巧
+## 6. Docker 开发（可选）
 
-### API 进程与监控
+Docker 仍受支持，但不再是唯一默认路径：
 
-本地服务启动后，应用内状态以 **HTTP API所在进程** 为准；独立 `python -c` 脚本导入的 `DataSourceHub` 可能与线上不一致。可调用 `GET /api/v1/debug/exchange-binding`；合并后的告警列表见 `GET /api/v1/monitoring/alerts`（条目含 `source`）。运维向巡检清单见 [OPERATIONS.md](./OPERATIONS.md) §2.3。
-
-### 日志调试
-
-```python
-import logging
-
-logger = logging.getLogger(__name__)
-
-# 不同级别的日志
-logger.debug("调试信息")
-logger.info("一般信息")
-logger.warning("警告信息")
-logger.error("错误信息")
+```bash
+docker compose build trading-system
+docker compose up -d
+docker compose logs -f trading-system
 ```
 
-### 断点调试
+使用 Docker 时，优先参考：
 
-在VSCode中设置断点，使用F5启动调试
+- `docs/OPERATIONS.md`
+- `deploy/HOST_CLASH_EGRESS.md`
 
-**launch.json配置:**
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Python: Current File",
-      "type": "python",
-      "request": "launch",
-      "program": "${file}",
-      "console": "integratedTerminal",
-      "justMyCode": false
-    }
-  ]
-}
-```
+---
 
-### 性能分析
+## 7. 文档与接口一致性要求
 
-```python
-import cProfile
-import pstats
+- API 权威来源：运行时 `GET /openapi.json`
+- 文档快照：`docs/API_OPENAPI_FULL.json`
+- 接口语义说明：`docs/API_REFERENCE.md`
 
-# 性能分析
-profiler = cProfile.Profile()
-profiler.enable()
+变更 API 后应至少执行：
 
-# 运行代码
-await main_function()
+1. 运行接口烟测（`tests/e2e/test_api_surface_commander_chain.py`）
+2. 重新导出 OpenAPI 快照
+3. 同步更新 `docs/API_REFERENCE.md` 中对应链路说明
 
-profiler.disable()
-stats = pstats.Stats(profiler)
-stats.sort_stats('cumulative')
-stats.print_stats(10)
+建议附加执行（快速发现“文档漂移/脚本引用缺失”）：
+
+```bash
+python3 scripts/check_docs_runtime_consistency.py
+# 若要对照当前代码运行时生成的 OpenAPI：
+python3 scripts/check_docs_runtime_consistency.py --runtime
 ```
 
 ---
 
-## 性能优化
+## 8. 常见坑（本地化迁移后）
 
-### 异步优化
+- 不要把 `host.docker.internal` 用在裸机模式。
+- 配置代理时请保持 `NO_PROXY=localhost,127.0.0.1,redis`。
+- 若脚本启动失败，先检查 `.venv` 是否存在，以及 `PYTHONPATH` 是否指向仓库根目录。
 
-```python
-# 并发执行
-results = await asyncio.gather(
-    fetch_data_1(),
-    fetch_data_2(),
-    fetch_data_3()
-)
-
-# 使用连接池
-async with aiohttp.TCPConnector(limit=100) as connector:
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # 使用session
-        pass
-```
-
-### 缓存优化
-
-```python
-from functools import lru_cache
-
-@lru_cache(maxsize=128)
-def calculate_indicator(klines_hash: str) -> Dict:
-    """缓存技术指标计算结果"""
-    return calculate(klines_hash)
-```
-
-### 数据库优化
-
-- 使用索引
-- 批量插入
-- 连接池
-- 查询优化
-
----
-
-## 常见问题
-
-### Q: 如何添加新的AI模型？
-
-A: 在 `enhanced_llm_manager.py` 中添加新的Provider类:
-
-```python
-class NewAIProvider(BaseLLMProvider):
-    async def generate(self, prompt: str, **kwargs) -> LLMResponse:
-        # 实现生成逻辑
-        pass
-```
-
-### Q: 如何添加新的交易所？
-
-A: 继承 `ExchangeBase` 类并实现所有方法:
-
-```python
-class NewExchange(ExchangeBase):
-    async def get_market_data(self, symbol: str) -> MarketData:
-        # 实现获取市场数据
-        pass
-```
-
-### Q: 如何调试AI决策？
-
-A: 启用详细日志并检查AI响应:
-
-```python
-logging.getLogger("src.modules.core.ai_trading_engine").setLevel(logging.DEBUG)
-```
-
-### Q: 如何优化性能？
-
-A: 
-1. 使用异步IO
-2. 添加缓存
-3. 优化数据库查询
-4. 使用连接池
-
----
-
-## 贡献代码
-
-请参考 [贡献指南](CONTRIBUTING.md)
-
----
-
-## 更新日志
-
-请参考 [更新日志](docs/CHANGELOG.md)
-
----
-
-## 2026-04-08 全量修复记录
-
-本次修复覆盖 API、主控状态统计、记忆存储路径、数据库路径和 Telegram 连通性，目标是恢复生产可用性并消除关键告警。
-
-### 已完成修复
-
-- `src/modules/intelligence/natural_language_interface.py`
-  - 增加宽松 JSON 解析（支持 ```json 包裹与前后缀文本）
-  - 针对“最近执行/执行历史”增加直连执行查询路径，避免 `unknown` 误判
-- `src/modules/api/server.py`
-  - `/api/v1/ai/query` 增加解析失败回退，保证接口可用
-- `src/modules/main_controller.py`
-  - `get_system_status()` 增加模块统计回退逻辑，避免 `module_count=0/running_modules=0`
-- `src/modules/core/database_manager.py`
-  - 容器内优先使用 `/app/data/trading_system.db`，减少回退 `/tmp` 场景
-- `src/modules/core/optimized_memory_system.py`
-  - 重构存储目录可写探测，容器内优先 `/app/data/memory`、次选 `/app/workspace/memory`
-- `src/modules/core/ai_memory.py`
-  - 增强可写探测，统一容器目录优先级，降低权限抖动导致的降级
-- `src/modules/core/llm_integration.py`
-  - 兼容 `MemoryGateway` 与旧记忆接口，消除方法缺失告警
-- `src/modules/notification/telegram_bot.py`
-  - 连接初始化增加“代理失败后直连”回退
-  - 未配置 token 时直接跳过，避免无意义报错
-
-### 回归结果
-
-- `GET /api/v1/status`：模块统计正常（`module_count=29`，`running_modules=29`）
-- `POST /api/v1/ai/query`：查询可正常返回执行记录
-- `GET /api/v1/s1/verify`：`all_passed=true`
-- Telegram：可连接并返回机器人身份（`getMe` 通过）
-- 最近启动日志中已不再出现：
-  - `无法解析命令执行结果`
-  - `module_count=0/running_modules=0`
-  - `权限不足，使用备用路径: /tmp/openclaw_*`
-
-### 运维建议
-
-- 使用 Docker Compose v2：
-  - 启动：`docker compose up -d`
-  - 重建：`docker compose up -d --build`
-  - 日志：`docker compose logs -f trading-system`
-- 避免覆盖 `.env` 中真实密钥，开发脚本应只在 `.env` 不存在时初始化模板。
-
----
-
-## 2026-04-08 阶段优化进度快照（总控闭环）
-
-本阶段目标：先打通“策略研究 -> 优化 -> 生产审计 -> 交易反馈再优化”的前后端闭环，再进入数据源模块专项优化。
-
-### 后端链路优化进度
-
-- 研究任务异步化：
-  - `POST /api/v1/modules/strategy/research-run` 改为异步任务提交，返回 `job_id`
-  - 新增 `GET /api/v1/modules/strategy/research-jobs` 与 `GET /api/v1/modules/strategy/research-jobs/{job_id}`
-- 优化与反馈接口：
-  - 新增 `POST /api/v1/modules/strategy/optimize-now`（手动触发每日优化）
-  - 新增 `POST /api/v1/modules/strategy/trade-feedback`（交易结果回灌触发自适应参数优化）
-- 生产闭环可观测性：
-  - 新增 `GET /api/v1/modules/execution/production-audit`
-  - 风险侧动态 SL/TP（含波动、趋势、点差、深度不平衡）已纳入调整逻辑
-
-### 前端总控优化进度
-
-- `frontend/src/services/api.js` 已补齐模块接口封装：
-  - `getStrategyResearchJobs`
-  - `getStrategyResearchJob`
-  - `triggerStrategyOptimizeNow`
-  - `submitStrategyTradeFeedback`
-  - `getExecutionProductionAudit`
-  - `getStrategyOptimizationConfig`
-- `frontend/src/modules/control-hub/ControlHubModule.jsx` 已补齐控制面板能力：
-  - 研究任务提交后按 `job_id` 轮询状态
-  - 手动触发每日优化批次
-  - 手动提交交易反馈（含 `force_optimize`）
-  - 展示研究任务队列与生产执行审计 JSON
-  - 展示部署分层统计（paper/shadow/small/full）
-
-### 当前缺口与下一阶段
-
-- 当前缺口：数据源模块尚未完成“专项优化 + 深度融合门控”
-- 下一阶段（立即执行）：
-  1. 完整梳理数据源链路（market/external/data-fusion）
-  2. 建立数据质量评分与可执行门控（研究/优化触发前置检查）
-  3. 打通异常降级与缓存回退策略，降低外部数据抖动影响
-
----
-
-## 2026-04-08 数据源统一化升级（双渠道）
-
-### 目标
-
-- 将分散的数据获取统一收口到一个模块中心，支持降级容错并提供中文可读输出给前端。
-
-### 已实施
-
-- 新增 `src/modules/data/data_source_hub.py`：
-  - 统一交易所渠道（渠道A）：行情、K线、订单簿、持仓、挂单、未平仓量、资金费率、爆仓风险代理
-  - 统一外部情报渠道（渠道B）：链上、新闻、舆情情绪
-  - 提供 `get_unified_snapshot(symbol)`，输出：
-    - `渠道A_交易所实时执行数据`
-    - `渠道B_链上新闻舆情数据`
-    - `统一分析判断`
-    - `数据质量评估`
-    - `数据来源状态`
-- API 接口统一收口到 Hub：
-  - 已改造 `market/ticker|klines|orderbook|symbols`
-  - 已改造 `data-fusion/analyze`
-  - 新增 `data-hub/status`
-  - 新增 `data-hub/unified-snapshot`
-  - 新增/补齐 `external/analyze-trends|signals|indicators`
-  - 增加 query 参数兼容路由，避免前后端调用断裂
-- 前端中文模块化接入：
-  - `frontend/src/services/api.js` 新增 `dataHub` API
-  - `frontend/src/modules/control-hub/ControlHubModule.jsx` 增加“统一双渠道快照（中文）”展示
-
-### 降级策略
-
-- 任一来源失败时不阻断总链路，自动退化到可用来源并标记 `provenance`。
-- 数据质量分会反映通道退化原因（如订单簿缺失、链上退化、舆情退化）。
-- 输出中保留来源状态说明，供策略与前端做风险提示。
-
----
-
-## 2026-04-08 市场分析模块并入交易链路
-
-### 已完成
-
-- 保留并升级 `src/modules/data/own_market_analyzer.py`（不删除重做）：
-  - 通过 `DataSourceHub` 纳入统一分析输出
-  - 结果进入 `统一分析判断` 与 `大资金与大户监控`
-- `DataSourceHub` 增强：
-  - 自动回退读取 `ai_trading_engine` 已初始化的 `third_party_data` / `onchain_data`
-  - 汇总链上大户活跃、交易所资金流样本、盘口大单监控
-- 交易引擎联动：
-  - `AITradingEngine._analyze_market` 引入 `get_unified_snapshot(symbol)` 作为统一分析输入
-  - `AITradingEngine._make_decision` 新增数据质量门控（低质量数据禁止新开仓）
-- 主控制器联动：
-  - `MainController` 初始化 `data_source_hub`
-  - 修正信息收集器初始化顺序后的分析器引用同步（`market_analyzer`/`onchain_integrator`）
-
-### 作用
-
-- 所有关键数据（交易所+链上+新闻舆情+市场分析）进入统一快照，再进入交易决策，减少分散取数导致的判断偏差。
-- 在数据源退化时自动降级到“观望优先”，降低误开仓风险。
-
----
-
-## 2026-04-08 数据质量评分与优化建议插件
-
-### 已完成
-
-- 新增 `src/modules/data/data_quality_advisor.py`：
-  - 基于统一快照给出：
-    - `quality_score`（当前数据质量）
-    - `effectiveness_score`（对交易决策的作用）
-    - `stability_score`（历史窗口稳定性）
-    - `confidence/grade`
-    - `suggestions`（可执行优化建议）
-- `DataSourceHub` 已接入顾问模块：
-  - 在 `get_unified_snapshot(symbol)` 输出新增 `数据质量与作用评分`
-  - 支持短期历史表现评分（窗口化）
-- API 已开放：
-  - `GET /api/v1/data-hub/quality-advice?symbol=...`
-- 前端总控已展示：
-  - 评分等级、置信度、质量分、作用分、稳定性
-  - 中文建议列表
-
-### 说明
-
-- 该能力采用“插件化风格”，可继续接入 plugin manager 做热插拔版本管理。
-- 当前先以稳定接入为主，后续可扩展到“按策略维度评分”和“按执行结果回灌评分”。
-
----
-
-## 2026-04-08 司令部总对接收尾（前端/TG/后端统一）
-
-### 已完成
-
-- 司令部统一接口（`module_control_api`）：
-  - `GET /api/v1/modules/commander/snapshot`：统一状态快照
-  - `POST /api/v1/modules/commander/chores`：司令部日常任务（可带优化）
-  - `POST /api/v1/modules/commander/dispatch`：统一指令分发（前端/TG同入口）
-  - `GET /api/v1/modules/commander/audit`：全链路接入审查
-- 记忆复盘接口：
-  - `GET /api/v1/modules/memory/daily-summary`
-  - `POST /api/v1/modules/memory/daily-summary/run`
-- 前端总控（`ControlHubModule`）对接司令部：
-  - 指挥页新增：司令部任务按钮、司令部消息输入、审查结果、统一快照
-  - 策略页新增：每日复盘记忆卡片 + 手动触发每日复盘
-- TG/消息通道与司令部统一：
-  - Telegram 继续走 `main_controller.process_user_command`
-  - 前端 `dispatch` 同链路接入，形成统一中枢
-
-### AI自主与安全边界
-
-- AI执行器新增自然语言技能别名映射（chat 也可触发技能动作）：
-  - 巡检 / 复盘 / 策略研发 / 回测 / 优化 / 强制开平仓 / SLTP状态
-- 高风险动作确认模板：
-  - 强制开仓/强制平仓需“确认/立即执行/批准”后执行
-- 每日自动总结：
-  - 自主循环中每日写入交易复盘记忆（交易数、胜率、盈亏、回撤）
-  - 支持手动强制触发
-
-### 记忆库统一化与恢复
-
-- 已执行备份优先迁移：
-  - `scripts/memory_unify_migrate.py`
-  - `scripts/memory_restore_optimize.py`
-- 统一结构保留：
-  - `workspace/memory/{core,working,experience,history,trades,sessions,_archive}`
-- 旧库已移除，备份与归档保留，可回滚。
-
-### 审查结论（代码级）
-
-- 后端语法检查通过（`py_compile`）
-- 前端/后端 lints 无新增报错
-- 司令部接口、前端入口、消息通道、记忆复盘链路已完成统一对接
-
----
-
-## 2026-04-09 交付前最终审查收敛（接管/代理/OKX稳定性）
-
-### 交付前审查（运行态）
-
-- 容器健康检查通过：
-  - `openclaw-trading` / `openclaw-redis` health 均为 `healthy`
-  - `GET /health` 返回 200
-- 司令部快照核验通过：
-  - `GET /api/v1/modules/commander/snapshot?mode=fast` 返回 `account.balance / account.positions / account.synced_at`
-  - 同时返回 `risk.sltp` 与 `risk.position_recommendations`
-
-### 不稳定因素与修复
-
-- 代理污染导致外部网络不稳定：
-  - 问题：容器中意外启用 `HTTP_PROXY=http://127.0.0.1:7890`（宿主机变量/默认注入），造成 Binance/CoinGecko/LLM 外部请求失败。
-  - 修复：默认清空容器内 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`（含大小写），改用 `OPENCLAW_HTTP_PROXY/OPENCLAW_HTTPS_PROXY` 显式启用。
-- OKX 错误噪音（`Invalid Sign` / `Instrument ID does not exist.`）：
-  - 修复：GET 签名 requestPath 纳入 query string；instId 归一（避免 `-SWAP-SWAP`），并提升对 `BTC-USDT-SWAP` 这类 instId 输入的兼容性。
-
-### 仓库洁净性
-
-- `workspace/memory/` 为运行态记忆与归档产物，已整体加入忽略，避免交付提交被污染。
-
----
-
-**Happy Coding! 🚀**

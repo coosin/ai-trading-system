@@ -32,6 +32,8 @@ services:
       - MODE=${MODE:-live_trading}
       - OPENCLAW__trading__mode=${TRADING_MODE:-live_trading}
       - OPENCLAW__system__mode=${SYSTEM_MODE:-live_trading}
+      # bridge 网络访问宿主机代理与 AIClient；本机 bare-metal 勿设此项
+      - OPENCLAW__proxy__global_proxy__host=${PROXY_GATEWAY_HOST:-host.docker.internal}
       - OKX_TESTNET=${OKX_TESTNET:-0}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HTTP_PROXY=${OPENCLAW_HTTP_PROXY:-}

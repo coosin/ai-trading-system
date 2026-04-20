@@ -2,6 +2,9 @@
 
 本文档用于把 OpenClaw 客户端/智能体接入当前交易系统，作为统一控制与编排入口。
 
+> 运行地址建议使用变量：`BASE_URL=${BASE_URL:-http://127.0.0.1:8000}`  
+> Docker 环境可覆盖为 `http://localhost:8000` 或实际反向代理地址。
+
 ---
 
 ## 1. 对接目标
@@ -16,9 +19,10 @@
 ## 2. 上线前最小检查
 
 ```bash
-curl -s http://localhost:8000/health
-curl -s http://localhost:8000/api/v1/s1/verify
-curl -s http://localhost:8000/api/v1/modules/commander/audit?enrich=true
+BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
+curl -s "$BASE_URL/health"
+curl -s "$BASE_URL/api/v1/s1/verify"
+curl -s "$BASE_URL/api/v1/modules/commander/audit?enrich=true"
 ```
 
 通过标准：
@@ -32,14 +36,16 @@ curl -s http://localhost:8000/api/v1/modules/commander/audit?enrich=true
 ## 3. OpenClaw 必接读取接口
 
 ```bash
-curl -s http://localhost:8000/api/v1/modules/commander/capabilities
-curl -s http://localhost:8000/api/v1/modules/commander/tool-contract
-curl -s http://localhost:8000/api/v1/modules/surface/channels
-curl -s http://localhost:8000/api/v1/modules/surface/registry
-curl -s 'http://localhost:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
-curl -s 'http://localhost:8000/api/v1/modules/commander/account-diagnostics'
-curl -s 'http://localhost:8000/api/v1/trade/events?limit=20'
-curl -s 'http://localhost:8000/api/v1/modules/commander/openclaw-integration'
+curl -s "$BASE_URL/api/v1/modules/commander/capabilities"
+curl -s "$BASE_URL/api/v1/modules/commander/tool-contract"
+curl -s "$BASE_URL/api/v1/modules/surface/channels"
+curl -s "$BASE_URL/api/v1/modules/surface/registry"
+curl -s "$BASE_URL/api/v1/modules/commander/snapshot?symbol=BTC/USDT"
+curl -s "$BASE_URL/api/v1/modules/commander/account-diagnostics"
+curl -s "$BASE_URL/api/v1/trade/events?limit=20"
+curl -s "$BASE_URL/api/v1/modules/commander/openclaw-integration"
+curl -s "$BASE_URL/api/v1/market/state?timeout_sec=3.2"
+curl -s "$BASE_URL/api/v1/modules/ai/learning-feedback"
 ```
 
 用途：
@@ -51,6 +57,8 @@ curl -s 'http://localhost:8000/api/v1/modules/commander/openclaw-integration'
 - `account-diagnostics`：账户/持仓权威对账
 - `trade/events`：事件补偿与回放
 - `openclaw-integration`：OpenClaw 对接就绪度与推送链路状态
+- `market/state`：全局行情快照（含 `degraded` / `latency_ms`）
+- `ai/learning-feedback`：学习反馈治理指标（`penalized_ratio`、`penalty_rule`）
 
 ---
 
@@ -59,22 +67,33 @@ curl -s 'http://localhost:8000/api/v1/modules/commander/openclaw-integration'
 ### 4.1 指令投递
 
 ```bash
-curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
+curl -s -X POST "$BASE_URL/api/v1/modules/commander/dispatch" \
   -H 'Content-Type: application/json' \
-  -d '{"message":"查看 BTC/USDT 当前状态","source":"openclaw"}'
+  -d '{"message":"查看 BTC/USDT 当前状态","source":"openclaw","timeout_sec":8}'
 ```
 
 说明：
 
 - `source` 建议固定 `openclaw`，便于审计溯源
 - 高风险动作仍受托管模式与风控红线约束
+- 同步模式默认超时 12 秒（范围 2~90）；若返回 `status=timeout`，改用 `async_mode=true`
+- 异步任务查询：`GET /api/v1/modules/commander/dispatch/jobs/{job_id}`
+- 若需要诊断 AI 链路耗时，可额外调用 `POST /api/v1/ai/chat`，查看响应中的 `data.trace` 和 `latency_ms_total`
+
+推荐（值守场景）：
+
+```bash
+python3 scripts/commander_dispatch_client.py "查看 BTC/USDT 当前状态" --source openclaw
+```
+
+该脚本使用“同步优先、超时自动异步并轮询”的调用策略，可减少前端/机器人侧阻塞超时。
 
 ### 4.2 治理控制（可选）
 
 ```bash
-curl -s http://localhost:8000/api/v1/modules/commander/hosting-mode
-curl -s http://localhost:8000/api/v1/modules/commander/automation-profile
-curl -s http://localhost:8000/api/v1/modules/commander/risk-redlines
+curl -s "$BASE_URL/api/v1/modules/commander/hosting-mode"
+curl -s "$BASE_URL/api/v1/modules/commander/automation-profile"
+curl -s "$BASE_URL/api/v1/modules/commander/risk-redlines"
 ```
 
 ---
@@ -114,7 +133,7 @@ openclaw_push:
 ## 6. 安全与审计
 
 ```bash
-curl -s 'http://localhost:8000/api/v1/modules/commander/governance-audit?limit=20'
+curl -s "$BASE_URL/api/v1/modules/commander/governance-audit?limit=20"
 ```
 
 - 所有托管模式/自动化档位/风控红线变更均会进入治理审计流

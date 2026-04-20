@@ -5,11 +5,11 @@ After=network.target
 [Service]
 Type=simple
 User=cool
-WorkingDirectory=/home/cool/.openclaw-trading
-ExecStart=/home/cool/.openclaw-trading/venv/bin/python -m src.main
+WorkingDirectory=/home/cool/ai-trading-system
+ExecStart=/home/cool/ai-trading-system/.venv/bin/python -m src.main
 Restart=always
 RestartSec=5
-Environment=PYTHONPATH=/home/cool/.openclaw-trading
+Environment=PYTHONPATH=/home/cool/ai-trading-system
 Environment=TRADING_ENV=production
 Environment=LOG_LEVEL=INFO
 
