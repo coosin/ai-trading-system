@@ -26,6 +26,12 @@ python3 scripts/one_click_upgrade_pipeline.py BTC/USDT
 - 输出 `OVERALL: PASS`
 - 关键阶段全部 `PASS`（尤其是 `force_sync_account_state`、`run_ai_commander_chores`、`hosting_guard_status`、`governance_profile_check`）
 
+补充（快速只读总验收，适合 API 值守探活）：
+
+```bash
+curl -s http://localhost:8000/api/v1/system/acceptance
+```
+
 若失败，先不要继续全自动，转到“第 4 节：失败时处理”。
 
 ---

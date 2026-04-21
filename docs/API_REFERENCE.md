@@ -55,6 +55,7 @@
 - **系统与链路**
   - `GET /health` -> `healthy`
   - `GET /api/v1/s1/verify` -> `all_passed=true`
+  - `GET /api/v1/system/acceptance` -> `verdict=PASS`（本次运行实例可用性总验收）
   - `GET /api/v1/modules/system/health` -> `overall=healthy`
   - `GET /api/v1/modules/commander/audit?enrich=true` -> `all_passed=true`
 
@@ -193,6 +194,29 @@
   - 以运行实例 `GET /openapi.json` 为准；
   - `docs/API_OPENAPI_FULL.json` 为当前仓库快照；
   - 本文用于链路与语义说明。
+
+---
+
+## 本次 API 对接复核（2026-04-21）
+
+以下为当前裸机实例（`http://127.0.0.1:8000`）抽样复核结果（用于“是否对接正常”的快速证据）：
+
+- **OpenAPI 与文档一致性**
+  - `python3 scripts/check_docs_runtime_consistency.py` -> OK（snapshot）
+  - `python3 scripts/check_docs_runtime_consistency.py --runtime` -> OK（runtime build）
+  - 当前 OpenAPI：OpenAPI 3.1，约 185 条路径（与 `docs/API_OPENAPI_FULL.json` 一致）
+
+- **系统状态**
+  - `GET /api/v1/system/status` -> `running`（29/29 modules）
+  - `GET /api/v1/system/acceptance` -> `PASS`
+
+- **交易所对接**
+  - `GET /api/v1/exchanges` -> OKX `connected`
+  - `GET /api/v1/debug/exchange-binding` -> MainController 与 DataSourceHub 绑定一致、ticker 探针有值
+
+- **交易闭环可观测性**
+  - `GET /api/v1/trade/events?limit=...` -> 持续返回事件（用于前端与外部系统回放/对账）
+  - `GET /api/v1/positions` -> 返回持仓结构（带 cache/stale 语义）
 - **调用地址建议**
   - 推荐在脚本中统一声明：`BASE_URL=${BASE_URL:-http://127.0.0.1:8000}`，再用 `"$BASE_URL/..."` 访问接口，减少 Docker/裸机切换时的手工修改。
 

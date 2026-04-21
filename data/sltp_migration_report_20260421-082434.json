@@ -1,0 +1,37 @@
+{
+  "timestamp": "2026-04-21T08:24:34.760947",
+  "file": "/home/cool/ai-trading-system/data/stop_loss_orders.json",
+  "apply": true,
+  "retry_threshold": 100,
+  "before_status_counts": {
+    "cancelled": 211,
+    "triggered": 43,
+    "pending_close": 2,
+    "active": 5
+  },
+  "remove_count": 2,
+  "removed_items": [
+    {
+      "order_id": "sltp_pos:AVAX-USDT-SWAP|long_20260420010918864764_46de306c",
+      "attempts": 483,
+      "symbol": "AVAX/USDT/SWAP",
+      "side": "long",
+      "status": "pending_close",
+      "index_key": "pos:AVAX-USDT-SWAP|long"
+    },
+    {
+      "order_id": "sltp_pos:ETH-USDT-SWAP|long_20260420011139977360_f243fd73",
+      "attempts": 483,
+      "symbol": "ETH/USDT/SWAP",
+      "side": "long",
+      "status": "pending_close",
+      "index_key": "pos:ETH-USDT-SWAP|long"
+    }
+  ],
+  "backup": "/home/cool/ai-trading-system/data/stop_loss_orders.json.bak.migrate-20260421-082434",
+  "after_status_counts": {
+    "cancelled": 211,
+    "triggered": 43,
+    "active": 5
+  }
+}
