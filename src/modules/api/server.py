@@ -1607,6 +1607,34 @@ class APIServer:
                 "created_at": datetime.now().isoformat(),
             }
 
+        @self.app.get("/auth/status", tags=["auth"])
+        @api_v1_router.get("/auth/status", tags=["auth"])
+        async def auth_status():
+            """返回当前 API 鉴权运行状态（不包含敏感密钥）。"""
+            return {
+                "auth_configured": bool(self.admin_password),
+                "enforce_auth_on_writes": bool(self.enforce_auth_on_writes),
+                "require_ws_auth": bool(self.require_ws_auth),
+                "required_write_roles": sorted(list(self.required_write_roles)),
+                "protected_write_prefixes": list(self.protected_write_prefixes),
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        @self.app.get("/auth/write-policy", tags=["auth"])
+        @api_v1_router.get("/auth/write-policy", tags=["auth"])
+        async def auth_write_policy():
+            """返回写接口鉴权策略，用于前端/自动化运维对接。"""
+            return {
+                "success": True,
+                "policy": {
+                    "enforce_auth_on_writes": bool(self.enforce_auth_on_writes),
+                    "required_write_roles": sorted(list(self.required_write_roles)),
+                    "protected_write_prefixes": list(self.protected_write_prefixes),
+                    "auth_exempt_paths": sorted(list(self.auth_exempt_paths)),
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+
         # 受保护的路由示例
         @api_v1_router.get("/protected", tags=["api"])
         async def protected_route(

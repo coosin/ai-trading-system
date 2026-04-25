@@ -1,5 +1,25 @@
 # 变更记录
 
+## 2026-04-26 — 安全加固、鉴权回归测试与文档同步
+
+- **API 鉴权与权限策略：**
+  - 受保护写接口启用 token + role（默认 admin）校验；
+  - WebSocket `/ws` 默认要求 token；
+  - commander mirror 目标固定为本机回环地址，降低 Host Header 相关转发风险。
+- **新增 API 接口：**
+  - `GET /api/v1/auth/status`（鉴权状态）
+  - `GET /api/v1/auth/write-policy`（写策略可观测）
+- **数据一致性：**
+  - 历史交易库对非空 `order_id` 增加唯一索引；
+  - `save_trade` 在有 `order_id` 时使用 `INSERT OR IGNORE`；
+  - 交易历史服务增加缓存层幂等去重（`order_id` / `trade_id`）。
+- **稳定性：**
+  - 风控异常在实盘模式下改为 fail-safe 拒绝交易；
+  - 数据库备份流程改为 `asyncio.to_thread` 避免阻塞事件循环。
+- **测试与文档：**
+  - 新增 `tests/unit/test_api_auth_write_guard.py` 覆盖 `401/403/200` 与策略接口可见性；
+  - 同步更新 `docs/API_REFERENCE.md`、`docs/ENGINEERING.md`、`docs/OPERATIONS.md`。
+
 ## 2026-04-20 — 超时治理与可观测性增强（文档同步）
 
 - **AI 对话链路可观测性：**

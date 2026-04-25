@@ -14,6 +14,7 @@ def _build_guarded_api() -> APIServer:
     api.trusted_hosts = ["testserver", "127.0.0.1", "localhost"]
     api.app = FastAPI()
     asyncio.run(api._add_middleware())
+    asyncio.run(api._setup_routes())
 
     @api.app.post("/api/v1/modules/demo")
     async def protected_write():
@@ -55,3 +56,21 @@ def test_protected_write_accepts_admin_role():
     )
     assert res.status_code == 200
     assert res.json().get("ok") is True
+
+
+def test_auth_status_and_write_policy_visible():
+    api = _build_guarded_api()
+    client = TestClient(api.app)
+
+    s = client.get("/api/v1/auth/status")
+    assert s.status_code == 200
+    sj = s.json()
+    assert "enforce_auth_on_writes" in sj
+    assert "required_write_roles" in sj
+    assert "protected_write_prefixes" in sj
+
+    p = client.get("/api/v1/auth/write-policy")
+    assert p.status_code == 200
+    pj = p.json()
+    assert pj.get("success") is True
+    assert "policy" in pj

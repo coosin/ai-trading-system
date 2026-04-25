@@ -21,6 +21,7 @@
 curl -s http://127.0.0.1:8000/health
 curl -s http://127.0.0.1:8000/api/v1/s1/verify
 curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/audit?enrich=true'
+curl -s http://127.0.0.1:8000/api/v1/auth/status
 ```
 
 本页后续所有 `curl` 示例可统一替换为：
@@ -107,14 +108,18 @@ curl -s 'http://localhost:8000/api/v1/modules/commander/account-diagnostics'
 curl -s http://localhost:8000/api/v1/modules/commander/capabilities
 curl -s http://localhost:8000/api/v1/modules/surface/channels
 curl -s http://localhost:8000/api/v1/modules/surface/registry
+curl -s http://localhost:8000/api/v1/auth/write-policy
 
 # 2) A 接口（司令部统一入口）触发交易动作
+TOKEN="<admin_jwt>"
 curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
+  -H "Authorization: Bearer ${TOKEN}" \
   -H 'Content-Type: application/json' \
   -d '{"message":"强制开仓 BTC/USDT 0.001","source":"api_chat","timeout_sec":8}'
 
 # 2.1) 若返回 status=timeout，改用异步模式并轮询
 curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
+  -H "Authorization: Bearer ${TOKEN}" \
   -H 'Content-Type: application/json' \
   -d '{"message":"强制开仓 BTC/USDT 0.001","source":"api_chat","async_mode":true}'
 curl -s 'http://localhost:8000/api/v1/modules/commander/dispatch/jobs/<job_id>'
@@ -175,6 +180,7 @@ curl -s http://localhost:8000/api/v1/monitoring/alerts
 curl -s 'http://localhost:8000/api/v1/modules/commander/audit?enrich=true'
 curl -s http://localhost:8000/api/v1/modules/commander/memory/status
 curl -s 'http://localhost:8000/api/v1/modules/commander/memory/workspace?filename=COMMANDER_PROFILE.md'
+curl -s http://localhost:8000/api/v1/auth/status
 
 # 4) 记忆读写探针（写入后立即召回）
 curl -s -X POST http://localhost:8000/api/v1/ai/memory/store \
@@ -364,6 +370,8 @@ docker logs openclaw-trading --tail 200
 
 - **实盘** `MODE=live_trading` 前确认 API 密钥、风控与 `OKX_TESTNET`  
 - 勿将 `.env` 提交仓库（已在 `.gitignore`）  
+- `POST/PUT/PATCH/DELETE` 命中 `modules/monitoring/commander/trade` 前缀时默认要求 Bearer token 且角色满足写策略（默认 admin）。
+- WebSocket `/ws` 默认要求 token（query/header），建议通过 `GET /api/v1/auth/write-policy` 与 `GET /api/v1/auth/status` 做上线前核对。
 
 ---
 

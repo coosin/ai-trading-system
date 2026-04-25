@@ -122,6 +122,17 @@ OpenAPI 以运行实例 **`/openapi.json`** 为准。
 - 建议强制保留 `source=openclaw` 作为调用来源标识，以便治理审计追溯。
 - 对接操作手册：`docs/OPENCLAW_INTEGRATION_GUIDE.md`。
 
+### 4.5 API 鉴权与写保护（2026-04-26）
+
+- `APIServer` 默认开启受保护写接口鉴权（`enforce_auth_on_writes=true`）：
+  - 保护前缀：`/api/v1/modules`、`/api/v1/monitoring`、`/api/v1/commander`、`/api/v1/trade`
+  - 受保护写方法：`POST/PUT/PATCH/DELETE`（`GET/HEAD/OPTIONS` 不受此规则约束）
+- 角色门控：默认 `required_write_roles=["admin"]`，非 admin token 会返回 `403`。
+- WebSocket `/ws` 默认要求 token（query/header 二选一），无效 token 将关闭连接（`1008`）。
+- 新增策略可观测接口：
+  - `GET /api/v1/auth/status`
+  - `GET /api/v1/auth/write-policy`
+
 ---
 
 ## 5. 与 ARCHITECTURE 的关系

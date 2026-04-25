@@ -168,6 +168,7 @@
 ### WebSocket（OpenAPI 中不展开）
 
 - **URL:** `ws://<host>:8000/ws`（生产若走 HTTPS 则为 `wss://`）
+- **鉴权:** 默认要求携带 token（`?token=<jwt>` 或 `Authorization: Bearer <jwt>`），未携带/无效会以 `1008` 关闭连接。
 - **用途:** 实时推送；连接后发送 JSON，支持 `subscribe` / `unsubscribe` / `heartbeat`（与 `WebSocketEventType` 一致，详见 `src/modules/api/server.py` 中 `_handle_websocket_connection`）。
 - **频道匹配:** 支持精确频道与前缀通配，例如 `trade.*`、`market.*`。
 - **建议生产基线:** WebSocket 与 `GET /api/v1/trade/events` 并用（前者实时、后者补偿与回放），避免前端因连接抖动丢关键成交/止损事件。
@@ -177,6 +178,17 @@
 
 - **范围:** 以 `/api` 为前缀的路径，响应体为 JSON 时，由中间件在**不删除原有字段**的前提下补齐 `ok`、`success`、`status`、`message`（按需）、`timestamp`。
 - **响应头:** `X-OpenClaw-Standardized: 1` 表示该响应已按上述规则规范化。
+
+### 鉴权与写接口策略（2026-04-26 更新）
+
+- **登录配置:** `POST /auth/login` 与 `POST /api/v1/auth/login` 依赖管理员账号配置；若未配置会返回 `503`（`API auth is not configured`）。
+- **写接口保护:** `POST/PUT/PATCH/DELETE` 命中受保护前缀时，默认强制 token 校验；无 token 返回 `401`，角色不满足返回 `403`。
+- **默认受保护前缀:** `/api/v1/modules`、`/api/v1/monitoring`、`/api/v1/commander`、`/api/v1/trade`。
+- **角色策略:** 默认仅 `admin` 可执行受保护写操作（可由 `api.required_write_roles` 调整）。
+- **策略可观测接口（新增）:**
+  - `GET /auth/status`、`GET /api/v1/auth/status`
+  - `GET /auth/write-policy`、`GET /api/v1/auth/write-policy`
+- **Commander mirror 安全边界:** `/api/v1/commander/*` 转发目标固定为 `127.0.0.1:<api_port>`，避免 Host Header 影响转发目标。
 
 ### 运行模式兼容说明（Docker / 裸机）
 
@@ -301,6 +313,8 @@
 | POST | `/api/v1/auth/logout` | Logout | api, api-v1, auth |
 | GET | `/api/v1/auth/me` | Get Current User | api, api-v1, auth |
 | POST | `/api/v1/auth/refresh` | Refresh Token | api, api-v1, auth |
+| GET | `/api/v1/auth/status` | Auth Status | api, api-v1, auth |
+| GET | `/api/v1/auth/write-policy` | Auth Write Policy | api, api-v1, auth |
 | DELETE | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
 | GET | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
 | HEAD | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
@@ -450,5 +464,7 @@
 | POST | `/auth/logout` | Logout | auth |
 | GET | `/auth/me` | Get Current User | auth |
 | POST | `/auth/refresh` | Refresh Token | auth |
+| GET | `/auth/status` | Auth Status | auth |
+| GET | `/auth/write-policy` | Auth Write Policy | auth |
 | GET | `/health` | Health Check | health |
 | GET | `/metrics` | Get Metrics | metrics |
