@@ -47,12 +47,16 @@ logs/config-health.json
 
 # SQLite / runtime DBs and trade artifacts (never commit)
 data/**/*.db
+data/**/*.db-journal
 data/stop_loss_orders.json
 data/strategy_optimization.json
+data/execute_order.json
+data/reduce_link_order.sh
 data/audit/
 data/executions/
 data/trade_history/
 data/memory/
+strategy_research.log
 
 # Local backups and ad-hoc DB tree
 backups/
