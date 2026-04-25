@@ -2225,8 +2225,14 @@ class StopLossTakeProfitManager:
                                 getattr(order, "order_id", None),
                                 attempts,
                             )
-                            # keep scheduling with a long backoff to avoid tight loops
-                            self._schedule_pending_close_retry(order, error="max_retries_exceeded")
+                            # 超过最大重试后终止该任务，避免形成长期僵尸 pending_close
+                            order.status = StopLossTakeProfitStatus.CANCELLED
+                            order.updated_at = datetime.now()
+                            meta = dict(order.metadata or {})
+                            meta["pending_close_last_error"] = "max_retries_exceeded"
+                            meta["pending_close_done"] = True
+                            meta.pop("pending_close_next_ts", None)
+                            order.metadata = meta
                             await self._save_orders()
                             continue
                         await self._attempt_pending_close(order, str(order.trigger_reason or "pending_close"))

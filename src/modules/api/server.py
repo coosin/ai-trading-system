@@ -1788,28 +1788,63 @@ class APIServer:
         @api_v1_router.get("/risk/metrics", tags=["risk"])
         async def get_risk_metrics():
             """获取风险指标"""
-            # 这里应该从风险管理服务获取真实数据
-            # 为简化，返回模拟数据
+            mc = self.main_controller
+            if mc and hasattr(mc, "get_risk_metrics"):
+                try:
+                    risk = mc.get_risk_metrics()
+                    if isinstance(risk, dict):
+                        return {
+                            **risk,
+                            "source": "main_controller",
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                except Exception as e:
+                    logger.warning("get_risk_metrics from main_controller failed: %s", e)
+
+            # 无实时样本时返回统一降级结构，避免前端硬依赖固定字段时报错
             return {
-                "max_drawdown": 8.2,
-                "sharpe_ratio": 2.3,
-                "var": 2.5,
-                "risk_exposure": 42,
-                "position_data": [
-                    { "name": "BTC/USDT", "value": 45 },
-                    { "name": "ETH/USDT", "value": 25 },
-                    { "name": "BNB/USDT", "value": 15 },
-                    { "name": "SOL/USDT", "value": 10 },
-                    { "name": "ADA/USDT", "value": 5 }
-                ],
-                "risk_alerts": [
-                    { "level": "low", "message": "市场波动率正常，无异常情况" },
-                    { "level": "low", "message": "资产配置符合风险控制要求" },
-                    { "level": "medium", "message": "BTC价格波动较大，建议关注" }
-                ]
+                "portfolio_value": 0.0,
+                "total_exposure": 0.0,
+                "var_95": 0.0,
+                "max_position_size": 0.0,
+                "leverage_used": 0.0,
+                "margin_level": 0.0,
+                "risk_level": "unknown",
+                "position_count": 0,
+                "warnings": [],
+                "source": "fallback:empty",
+                "timestamp": datetime.now().isoformat(),
             }
 
         # 交易历史路由 - 支持 /api/v1/trades
+        def _load_execution_audit_records(days: int = 30) -> List[Dict[str, Any]]:
+            """Fallback data source: load execution audit JSONL records from logs/executions."""
+            records: List[Dict[str, Any]] = []
+            exec_dir = Path("logs/executions")
+            if not exec_dir.exists():
+                return records
+            cutoff = datetime.now() - timedelta(days=max(days, 1))
+            for file_path in sorted(exec_dir.glob("*.jsonl"), reverse=True):
+                try:
+                    for raw_line in file_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        row = json.loads(line)
+                        ts_raw = row.get("timestamp")
+                        if ts_raw:
+                            try:
+                                ts_obj = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                            except Exception:
+                                ts_obj = None
+                            if ts_obj is not None and ts_obj.replace(tzinfo=None) < cutoff:
+                                continue
+                        records.append(row)
+                except Exception:
+                    continue
+            records.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
+            return records
+
         @api_v1_router.get("/trades", tags=["trades"])
         async def get_trades(
             range: str = "7d",
@@ -1914,10 +1949,33 @@ class APIServer:
                     
                     except Exception as db_error:
                         logger.error(f"数据库查询失败: {db_error}")
+                        fallback_days = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}.get(range, 7)
+                        audit_rows = _load_execution_audit_records(days=fallback_days)
+                        mapped: List[Dict[str, Any]] = []
+                        for row in audit_rows[offset: offset + max(limit, 1)]:
+                            details = row.get("details") or {}
+                            mapped.append(
+                                {
+                                    "order_id": details.get("order_id"),
+                                    "symbol": row.get("symbol") or details.get("symbol"),
+                                    "side": details.get("side") or row.get("action"),
+                                    "quantity": details.get("quantity"),
+                                    "price": details.get("price"),
+                                    "status": row.get("status"),
+                                    "timestamp": row.get("timestamp"),
+                                    "executed_quantity": details.get("quantity"),
+                                    "avg_price": details.get("price"),
+                                    "fee": None,
+                                    "source": "execution_audit",
+                                    "error_message": row.get("error_message"),
+                                }
+                            )
                         return {
-                            "error": "交易历史服务不可用且数据库查询失败",
-                            "details": str(db_error),
-                            "suggestion": "请检查系统配置或稍后重试"
+                            "trades": mapped,
+                            "total": len(mapped),
+                            "source": "fallback:execution_audit",
+                            "note": "trade_history_service/database unavailable",
+                            "query_time": datetime.now().isoformat(),
                         }
                         
             except Exception as e:
@@ -1943,6 +2001,25 @@ class APIServer:
                 trades = result.get("trades", []) if isinstance(result.get("trades"), list) else []
             elif isinstance(result, list):
                 trades = result
+            if not trades:
+                # When primary history is empty, fall back to execution audit rows.
+                fallback_days = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}.get(range, 7)
+                audit_rows = _load_execution_audit_records(days=fallback_days)
+                for row in audit_rows[offset: offset + max(limit, 1)]:
+                    details = row.get("details") or {}
+                    trades.append(
+                        {
+                            "order_id": details.get("order_id"),
+                            "symbol": row.get("symbol") or details.get("symbol"),
+                            "side": details.get("side") or row.get("action"),
+                            "quantity": details.get("quantity"),
+                            "price": details.get("price"),
+                            "status": row.get("status"),
+                            "timestamp": row.get("timestamp"),
+                            "source": "execution_audit",
+                            "error_message": row.get("error_message"),
+                        }
+                    )
             return {
                 "success": True,
                 "data": trades,
@@ -1977,16 +2054,57 @@ class APIServer:
                 
                 if trade_service:
                     stats = await trade_service.get_statistics(days=days)
-                    
+                    if isinstance(stats, dict) and int(stats.get("total_trades", 0) or 0) == 0:
+                        rows = _load_execution_audit_records(days=days)
+                        total = len(rows)
+                        success = sum(1 for r in rows if str(r.get("status", "")).lower() == "success")
+                        failed = total - success
+                        symbols = sorted(
+                            {
+                                str((r.get("symbol") or (r.get("details") or {}).get("symbol") or "")).strip()
+                                for r in rows
+                                if str((r.get("symbol") or (r.get("details") or {}).get("symbol") or "")).strip()
+                            }
+                        )
+                        return {
+                            "total_trades": total,
+                            "success_trades": success,
+                            "failed_trades": failed,
+                            "success_rate": (success / total) if total else 0.0,
+                            "symbols": symbols,
+                            "period_days": days,
+                            "generated_at": datetime.now().isoformat(),
+                            "source": "fallback:execution_audit",
+                            "note": "trade_history_service returned empty stats",
+                        }
                     return {
                         **stats,
                         "period_days": days,
                         "generated_at": datetime.now().isoformat()
                     }
                 else:
+                    # Fallback: aggregate from execution audit log
+                    rows = _load_execution_audit_records(days=days)
+                    total = len(rows)
+                    success = sum(1 for r in rows if str(r.get("status", "")).lower() == "success")
+                    failed = total - success
+                    symbols = sorted(
+                        {
+                            str((r.get("symbol") or (r.get("details") or {}).get("symbol") or "")).strip()
+                            for r in rows
+                            if str((r.get("symbol") or (r.get("details") or {}).get("symbol") or "")).strip()
+                        }
+                    )
                     return {
-                        "error": "交易统计服务不可用",
-                        "suggestion": "请确保交易历史服务已正确初始化"
+                        "total_trades": total,
+                        "success_trades": success,
+                        "failed_trades": failed,
+                        "success_rate": (success / total) if total else 0.0,
+                        "symbols": symbols,
+                        "period_days": days,
+                        "generated_at": datetime.now().isoformat(),
+                        "source": "fallback:execution_audit",
+                        "note": "trade_history_service unavailable",
                     }
                     
             except Exception as e:

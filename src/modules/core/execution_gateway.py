@@ -84,6 +84,16 @@ class ExecutionGateway:
         self._idempotent_recent: Dict[str, float] = {}
         self._idempotent_ttl_sec = 8.0
         self._recent_events_limit = 30
+        self._open_retry_attempts = 2
+        self._open_retry_base_delay_sec = 0.8
+        self._open_retry_cap_delay_sec = 3.5
+        self._open_symbol_cooldown_sec = 90.0
+        self._open_symbol_cooldown_until: Dict[str, float] = {}
+        self._open_symbol_fail_count: Dict[str, int] = {}
+        self._open_retry_count: int = 0
+        self._open_cooldown_denied_count: int = 0
+        self._open_last_retry_error: Optional[str] = None
+        self._open_last_retry_at: Optional[str] = None
         self._policy_metrics: Dict[str, int] = {
             "open_policy_denied": 0,
             "close_policy_denied": 0,
@@ -257,6 +267,44 @@ class ExecutionGateway:
         except Exception:
             pass
         return src == swo
+
+    @staticmethod
+    def _is_retryable_open_error(detail: str) -> bool:
+        d = str(detail or "").lower()
+        if not d:
+            return False
+        retryable_markers = (
+            "all operations failed",
+            "connector is closed",
+            "connection",
+            "timeout",
+            "temporarily",
+            "system error",
+            "rate limit",
+        )
+        return any(m in d for m in retryable_markers)
+
+    def _is_symbol_open_cooling_down(self, symbol: str) -> bool:
+        now = time.time()
+        key = str(symbol or "").upper()
+        until = float(self._open_symbol_cooldown_until.get(key, 0.0) or 0.0)
+        if until <= now:
+            self._open_symbol_cooldown_until.pop(key, None)
+            return False
+        return True
+
+    def _mark_symbol_open_failure(self, symbol: str, detail: str) -> None:
+        key = str(symbol or "").upper()
+        cnt = int(self._open_symbol_fail_count.get(key, 0) or 0) + 1
+        self._open_symbol_fail_count[key] = cnt
+        # cooldown after repeated failures on the same symbol to reduce thrashing
+        if cnt >= 2:
+            self._open_symbol_cooldown_until[key] = time.time() + float(self._open_symbol_cooldown_sec)
+
+    def _mark_symbol_open_success(self, symbol: str) -> None:
+        key = str(symbol or "").upper()
+        self._open_symbol_fail_count.pop(key, None)
+        self._open_symbol_cooldown_until.pop(key, None)
 
     def record_tick(self, source: str, note: str = "") -> None:
         self._snapshot.last_tick_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -651,6 +699,15 @@ class ExecutionGateway:
                 pass
             return {"success": False, "error": msg}
 
+        if self._is_symbol_open_cooling_down(symbol):
+            self._metric_inc("open_policy_denied")
+            self._open_cooldown_denied_count += 1
+            left = int(max(1.0, self._open_symbol_cooldown_until.get(str(symbol).upper(), 0.0) - time.time()))
+            msg = f"open_cooldown_active:{left}s"
+            logger.warning("ExecutionGateway.open_swap: cooldown deny symbol=%s source=%s left=%ss", symbol, source, left)
+            self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context)
+            return {"success": False, "error": msg}
+
         ex = self._exchange()
         self._snapshot.exchange_connected = ex is not None
         if not ex:
@@ -755,18 +812,44 @@ class ExecutionGateway:
                     self._record_order(source, "open", False, err, symbol=sym, side=side, size=size, leverage=lev, reason=reason, context=context)
                     return {"success": False, "error": err}
 
-                res = await opn(
-                    sym,
-                    side,
-                    float(size),
-                    lev,
-                    price,
-                    margin_mode,
-                )
+                res: Any = None
+                detail = ""
+                max_attempts = max(1, int(self._open_retry_attempts or 1))
+                for attempt in range(1, max_attempts + 1):
+                    res = await opn(
+                        sym,
+                        side,
+                        float(size),
+                        lev,
+                        price,
+                        margin_mode,
+                    )
+                    ok_attempt = bool(isinstance(res, dict) and res.get("success"))
+                    detail = str(res.get("error") if isinstance(res, dict) else res)[:500]
+                    if ok_attempt:
+                        break
+                    if attempt >= max_attempts or not self._is_retryable_open_error(detail):
+                        break
+                    self._open_retry_count += 1
+                    self._open_last_retry_error = detail[:500]
+                    self._open_last_retry_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    # best-effort connection refresh before retry
+                    try:
+                        rebuild = getattr(ex, "_rebuild_session", None)
+                        if callable(rebuild):
+                            await rebuild("gateway open retry")
+                    except Exception:
+                        pass
+                    delay = min(
+                        float(self._open_retry_cap_delay_sec),
+                        float(self._open_retry_base_delay_sec) * (2 ** (attempt - 1)),
+                    )
+                    await asyncio.sleep(max(0.0, delay))
                 ok = bool(isinstance(res, dict) and res.get("success"))
                 detail = str(res.get("error") if isinstance(res, dict) else res)[:500]
                 self._record_order(source, "open", ok, detail or "ok", symbol=symbol, side=side, size=size, leverage=lev, reason=reason, context=context)
                 if ok:
+                    self._mark_symbol_open_success(symbol)
                     self._metric_inc("open_ok")
                     logger.info(
                         "ExecutionGateway: open_swap ok symbol=%s side=%s source=%s reason=%s",
@@ -805,6 +888,7 @@ class ExecutionGateway:
                         f"✅ 开仓\n交易对: {symbol}\n方向: {side}\n数量: {size}\n杠杆: {lev}x\n来源: {source}\n原因: {reason}{extra}"
                     )
                 else:
+                    self._mark_symbol_open_failure(symbol, detail)
                     self._metric_inc("open_fail")
                     logger.error(
                         "ExecutionGateway: open_swap failed symbol=%s source=%s err=%s",
@@ -958,4 +1042,22 @@ class ExecutionGateway:
         self._snapshot.exchange_connected = ex is not None
         out = self._snapshot.to_dict()
         out["policy_metrics"] = dict(self._policy_metrics)
+        now = time.time()
+        cooldown_symbols: Dict[str, int] = {}
+        for sym, until in list(self._open_symbol_cooldown_until.items()):
+            left = int(float(until) - now)
+            if left > 0:
+                cooldown_symbols[str(sym)] = left
+            else:
+                self._open_symbol_cooldown_until.pop(sym, None)
+        out["execution_resilience"] = {
+            "open_retry_attempts_config": int(self._open_retry_attempts),
+            "open_retry_count": int(self._open_retry_count),
+            "open_last_retry_error": self._open_last_retry_error,
+            "open_last_retry_at": self._open_last_retry_at,
+            "open_cooldown_seconds_config": int(self._open_symbol_cooldown_sec),
+            "open_cooldown_denied_count": int(self._open_cooldown_denied_count),
+            "open_cooldown_symbols": cooldown_symbols,
+            "open_symbol_fail_count": dict(self._open_symbol_fail_count),
+        }
         return out

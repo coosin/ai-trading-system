@@ -1864,10 +1864,12 @@ class OKXExchange(ExchangeBase):
             "instId": okx_symbol,
             "tdMode": margin_mode,
             "side": "buy" if side == "long" else "sell",
-            "posSide": pos_side,
             "ordType": order_type,
             "sz": str(size)
         }
+        # net_mode 下不应传 posSide，避免触发交易所参数校验失败
+        if str(pos_side).strip().lower() != "net":
+            body["posSide"] = str(pos_side)
         
         if price:
             body["px"] = str(price)
@@ -1968,10 +1970,11 @@ class OKXExchange(ExchangeBase):
             "instId": okx_symbol,
             "tdMode": "cross",
             "side": "sell" if side == "long" else "buy",
-            "posSide": pos_side,
             "ordType": "market",
             "sz": str(size)
         }
+        if str(pos_side).strip().lower() != "net":
+            body["posSide"] = str(pos_side)
         
         endpoint = "/api/v5/trade/order"
         

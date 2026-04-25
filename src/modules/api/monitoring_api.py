@@ -259,9 +259,22 @@ async def get_risk_metrics():
             "max_position_size": risk_metrics.max_position_size,
             "leverage_used": risk_metrics.leverage_used,
             "margin_level": risk_metrics.margin_level,
-            "last_update": risk_metrics.last_update
+            "last_update": risk_metrics.last_update,
+            "source": "trading_monitor",
         }
-    return {"error": "Risk metrics not available"}
+    # Fallback: keep endpoint usable for dashboards even when no live risk sample
+    return {
+        "portfolio_value": 0.0,
+        "total_exposure": 0.0,
+        "var_95": 0.0,
+        "max_position_size": 0.0,
+        "leverage_used": 0.0,
+        "margin_level": 0.0,
+        "risk_level": "unknown",
+        "position_count": 0,
+        "warnings": [],
+        "source": "fallback:empty",
+    }
 
 @router.post("/market-data/update")
 async def update_market_data(symbol: str, last_price: float, volume: float, bid: float, ask: float, 

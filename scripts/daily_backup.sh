@@ -10,6 +10,8 @@ LOG_FILE="$APP_DIR/logs/backup.log"
 MAX_BACKUPS=3
 
 # Telegram 配置
+# Use explicit proxy to avoid network timeouts in restricted networks.
+TELEGRAM_PROXY="http://127.0.0.1:7890"
 TELEGRAM_BOT_TOKEN="8792055007:AAHpk8zwcsCXYh3bKqwDgxb4UVLZ3Qlik60"
 TELEGRAM_CHAT_ID=""
 
@@ -26,7 +28,7 @@ log() {
 send_telegram() {
     local message="$1"
     if [ -n "$TELEGRAM_CHAT_ID" ]; then
-        curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+        curl -s -x "$TELEGRAM_PROXY" -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
             -d chat_id="$TELEGRAM_CHAT_ID" \
             -d text="$message" \
             -d parse_mode="Markdown" > /dev/null 2>&1

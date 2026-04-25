@@ -21,6 +21,23 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default if default is not None else 0.0)
+        return float(value)
+    except Exception:
+        return float(default if default is not None else 0.0)
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return int(default)
+        return int(value)
+    except Exception:
+        return int(default)
+
 
 @dataclass
 class TradeRecord:
@@ -182,24 +199,26 @@ class TradeHistoryService:
     
     async def record_trade_dict(self, trade_dict: Dict[str, Any]) -> bool:
         """从字典创建并记录交易"""
+        side_raw = str(trade_dict.get("side", "buy") or "buy").strip().lower()
+        side_norm = {"long": "buy", "short": "sell"}.get(side_raw, side_raw or "buy")
         trade = TradeRecord(
             trade_id=trade_dict.get("trade_id", f"trade_{datetime.now().timestamp()}"),
             order_id=trade_dict.get("order_id", ""),
             symbol=trade_dict.get("symbol", ""),
-            side=trade_dict.get("side", "buy"),
+            side=side_norm,
             order_type=trade_dict.get("order_type", "market"),
-            quantity=float(trade_dict.get("quantity", 0)),
-            price=float(trade_dict.get("price", 0)),
-            cost=float(trade_dict.get("cost", 0)),
-            fee=float(trade_dict.get("fee", 0)),
-            pnl=float(trade_dict.get("pnl", 0)),
-            pnl_percent=float(trade_dict.get("pnl_percent", 0)),
+            quantity=_to_float(trade_dict.get("quantity"), 0.0),
+            price=_to_float(trade_dict.get("price"), 0.0),
+            cost=_to_float(trade_dict.get("cost"), 0.0),
+            fee=_to_float(trade_dict.get("fee"), 0.0),
+            pnl=_to_float(trade_dict.get("pnl"), 0.0),
+            pnl_percent=_to_float(trade_dict.get("pnl_percent"), 0.0),
             status=trade_dict.get("status", "filled"),
             strategy=trade_dict.get("strategy", ""),
             reasoning=trade_dict.get("reasoning", ""),
-            stop_loss=trade_dict.get("stop_loss"),
-            take_profit=trade_dict.get("take_profit"),
-            leverage=int(trade_dict.get("leverage", 1)),
+            stop_loss=_to_float(trade_dict.get("stop_loss"), 0.0) if trade_dict.get("stop_loss") is not None else None,
+            take_profit=_to_float(trade_dict.get("take_profit"), 0.0) if trade_dict.get("take_profit") is not None else None,
+            leverage=_to_int(trade_dict.get("leverage"), 1),
             timestamp=trade_dict.get("timestamp", datetime.now().isoformat()),
             metadata=trade_dict.get("metadata", {})
         )
