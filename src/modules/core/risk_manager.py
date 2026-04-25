@@ -237,6 +237,7 @@ class RiskManager:
         self.var_horizon = 1  # 1天
         self.max_position_size = 0.1  # 最大仓位比例
         self.max_leverage = 3  # 最大杠杆
+        self.enable_simulated_advanced_risk = False
 
         # 统计
         self.stats = {
@@ -388,7 +389,14 @@ class RiskManager:
             res = await self.check_order(trade_data or {})
             return bool(res.get("passed"))
         except Exception:
-            # Fail-open to avoid blocking on risk subsystem internal errors.
+            # In live trading we must fail-safe (deny) when risk subsystem is unhealthy.
+            try:
+                if await self._is_live_trading_mode():
+                    logger.error("风险检查异常，实盘模式触发 fail-safe 拒绝交易", exc_info=True)
+                    return False
+            except Exception:
+                pass
+            logger.warning("风险检查异常，非实盘模式按兼容策略放行", exc_info=True)
             return True
 
     async def add_trade(self, trade_data: Dict[str, Any]) -> None:
@@ -735,6 +743,9 @@ class RiskManager:
                     self.max_leverage = float(c["leverage_max"])
                 except (TypeError, ValueError):
                     pass
+            self.enable_simulated_advanced_risk = bool(
+                risk_config.get("enable_simulated_advanced_risk", self.enable_simulated_advanced_risk)
+            )
 
             # 仓位限制
             position_config = risk_config.get("position_limits", {})
@@ -1142,8 +1153,13 @@ class RiskManager:
                 sortino_ratio = await self._calculate_sortino_ratio()
                 
                 # 计算流动性风险和系统性风险（模拟）
-                liquidity_risk = np.random.normal(0.1, 0.05)
-                systemic_risk = np.random.normal(0.15, 0.05)
+                if self.enable_simulated_advanced_risk:
+                    liquidity_risk = np.random.normal(0.1, 0.05)
+                    systemic_risk = np.random.normal(0.15, 0.05)
+                else:
+                    # 生产默认关闭随机风险值，避免不可复现告警驱动自动动作。
+                    liquidity_risk = 0.0
+                    systemic_risk = 0.0
 
                 # 更新指标
                 async with self._lock:
@@ -1181,13 +1197,49 @@ class RiskManager:
 
     async def _update_risk_metrics(self) -> None:
         """更新风险指标"""
-        # 这里可以添加实时指标更新逻辑
-        pass
+        self.metrics.var_95 = await self.calculate_var(0.95)
+        self.metrics.var_99 = await self.calculate_var(0.99)
+        self.metrics.max_drawdown = await self.calculate_max_drawdown()
+        self.metrics.sharpe_ratio = await self.calculate_sharpe_ratio()
+        self.metrics.sortino_ratio = await self._calculate_sortino_ratio()
+        self.metrics.timestamp = datetime.now()
 
     async def _check_system_risk(self) -> None:
         """检查系统风险"""
-        # 这里可以添加系统级风险检查
-        pass
+        if self.metrics.max_drawdown > max(0.12, float(self.loss_limits.max_total_loss)):
+            await self._create_alert(
+                rule_id="system_drawdown_guard",
+                severity=AlertSeverity.CRITICAL,
+                message=f"系统级回撤超阈值: {self.metrics.max_drawdown*100:.2f}%",
+                data={
+                    "max_drawdown": self.metrics.max_drawdown,
+                    "max_total_loss": float(self.loss_limits.max_total_loss),
+                },
+            )
+        if self.metrics.var_95 > 0 and self.metrics.var_99 > self.metrics.var_95 * 1.8:
+            await self._create_alert(
+                rule_id="system_var_spike",
+                severity=AlertSeverity.WARNING,
+                message=f"系统级VaR异常放大: var99={self.metrics.var_99:.4f}, var95={self.metrics.var_95:.4f}",
+                data={"var_95": self.metrics.var_95, "var_99": self.metrics.var_99},
+            )
+
+    async def _is_live_trading_mode(self) -> bool:
+        """Detect live trading mode from config for fail-safe risk gating."""
+        try:
+            if not self.config_manager:
+                return False
+            mode_raw = await self.config_manager.get_config("mode", "paper")
+            mode = str(mode_raw or "paper").strip().lower()
+            if mode in {"live", "live_trading", "production"}:
+                return True
+            trading_cfg = await self.config_manager.get_config("trading", {}) or {}
+            if isinstance(trading_cfg, dict):
+                tm = str(trading_cfg.get("mode", "") or "").strip().lower()
+                return tm in {"live", "live_trading", "production"}
+        except Exception:
+            return False
+        return False
 
     async def _cleanup_old_alerts(self) -> None:
         """清理旧警报"""

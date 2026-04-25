@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -1043,7 +1044,13 @@ class DatabaseManager:
                 ]
                 env = os.environ.copy()
                 env["PGPASSWORD"] = self.config.password
-                result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    cmd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
                 if result.returncode != 0:
                     logger.error(f"PostgreSQL备份失败: {result.stderr}")
                     return False
@@ -1059,7 +1066,12 @@ class DatabaseManager:
                     f"{self.config.database}",
                     f"--result-file={backup_path}"
                 ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                )
                 if result.returncode != 0:
                     logger.error(f"MySQL备份失败: {result.stderr}")
                     return False
@@ -1071,7 +1083,7 @@ class DatabaseManager:
                 import shutil
                 db_path = Path(self.config.database)
                 if db_path.exists():
-                    shutil.copy2(db_path, backup_path)
+                    await asyncio.to_thread(shutil.copy2, db_path, backup_path)
                 else:
                     logger.warning(f"SQLite数据库文件不存在: {db_path}")
                     return False

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 import httpx
 
@@ -366,6 +366,28 @@ class APIServer:
         self.enable_rate_limit = True
         self.enable_swagger = True
         self.enable_metrics = True
+        self.cors_allowed_origins: List[str] = ["http://127.0.0.1:8000"]
+        self.trusted_hosts: List[str] = ["127.0.0.1", "localhost"]
+        self.enforce_auth_on_writes: bool = True
+        self.require_ws_auth: bool = True
+        self.protected_write_prefixes: List[str] = [
+            "/api/v1/modules",
+            "/api/v1/monitoring",
+            "/api/v1/commander",
+            "/api/v1/trade",
+        ]
+        self.auth_exempt_paths: Set[str] = {
+            "/auth/login",
+            "/api/v1/auth/login",
+            "/health",
+            "/api/health",
+            "/api/v1/health",
+            "/metrics",
+            "/api/metrics",
+            "/api/v1/metrics",
+        }
+        self.admin_username: Optional[str] = os.getenv("OPENCLAW_API_ADMIN_USERNAME", "admin")
+        self.admin_password: Optional[str] = os.getenv("OPENCLAW_API_ADMIN_PASSWORD")
 
         logger.info(f"API服务器初始化完成，监听 {host}:{port}")
 
@@ -721,6 +743,25 @@ class APIServer:
         except JWTError:
             return None
 
+    @staticmethod
+    def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
+        raw = str(auth_header or "").strip()
+        if not raw:
+            return None
+        if raw.lower().startswith("bearer "):
+            token = raw[7:].strip()
+            return token or None
+        return None
+
+    def _is_protected_write_path(self, path: str, method: str) -> bool:
+        m = str(method or "GET").upper()
+        if m in {"GET", "HEAD", "OPTIONS"}:
+            return False
+        p = str(path or "")
+        if p in self.auth_exempt_paths:
+            return False
+        return any(p.startswith(prefix) for prefix in self.protected_write_prefixes)
+
     # 私有方法
 
     async def _load_config(self) -> None:
@@ -736,6 +777,21 @@ class APIServer:
             self.enable_metrics = api_config.get("enable_metrics", True)
             self.secret_key = api_config.get("secret_key", self.secret_key)
             self.access_token_expire_minutes = api_config.get("access_token_expire_minutes", 30)
+            cors_origins = api_config.get("cors_allowed_origins", self.cors_allowed_origins)
+            if isinstance(cors_origins, list) and cors_origins:
+                self.cors_allowed_origins = [str(x).strip() for x in cors_origins if str(x).strip()]
+            trusted_hosts = api_config.get("trusted_hosts", self.trusted_hosts)
+            if isinstance(trusted_hosts, list) and trusted_hosts:
+                self.trusted_hosts = [str(x).strip() for x in trusted_hosts if str(x).strip()]
+            self.enforce_auth_on_writes = bool(api_config.get("enforce_auth_on_writes", self.enforce_auth_on_writes))
+            self.require_ws_auth = bool(api_config.get("require_ws_auth", self.require_ws_auth))
+            pfx = api_config.get("protected_write_prefixes", self.protected_write_prefixes)
+            if isinstance(pfx, list) and pfx:
+                self.protected_write_prefixes = [str(x).strip() for x in pfx if str(x).strip()]
+            auth_cfg = api_config.get("auth", {}) if isinstance(api_config, dict) else {}
+            if isinstance(auth_cfg, dict):
+                self.admin_username = str(auth_cfg.get("admin_username", self.admin_username) or self.admin_username)
+                self.admin_password = str(auth_cfg.get("admin_password", self.admin_password) or self.admin_password)
 
             # 加载速率限制配置
             rate_limit_config = api_config.get("rate_limits", {})
@@ -793,20 +849,29 @@ class APIServer:
         if self.enable_cors:
             self.app.add_middleware(
                 CORSMiddleware,
-                allow_origins=["*"],  # 生产环境应该限制
+                allow_origins=self.cors_allowed_origins,
                 allow_credentials=True,
                 allow_methods=["*"],
                 allow_headers=["*"],
             )
 
         # 信任主机中间件
-        self.app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])  # 生产环境应该限制
+        self.app.add_middleware(TrustedHostMiddleware, allowed_hosts=self.trusted_hosts)
 
         # 自定义中间件
         @self.app.middleware("http")
         async def add_process_time_header(request: Request, call_next):
             """添加处理时间头"""
             start_time = datetime.now()
+
+            if self.enforce_auth_on_writes and self._is_protected_write_path(request.url.path, request.method):
+                token = self._extract_bearer_token(request.headers.get("authorization"))
+                payload = await self.verify_token(token) if token else None
+                if not payload:
+                    return JSONResponse(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        content={"error": "Unauthorized write operation"},
+                    )
 
             # 速率限制检查
             if self.enable_rate_limit:
@@ -1450,9 +1515,13 @@ class APIServer:
         @api_v1_router.post("/auth/login", tags=["auth"])
         async def login(request: LoginRequest):
             """用户登录"""
-            # 这里应该从数据库验证用户
-            # 为简化，我们使用模拟验证
-            if request.username == "admin" and request.password == "admin123":
+            # 支持从配置或环境变量注入管理员账号，避免硬编码默认口令。
+            if not self.admin_password:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="API auth is not configured",
+                )
+            if request.username == self.admin_username and request.password == self.admin_password:
                 access_token = self.create_access_token(
                     data={"sub": request.username, "role": "admin"}
                 )
@@ -1502,14 +1571,18 @@ class APIServer:
         # 获取当前用户路由 - 同时支持 /auth/me 和 /api/v1/auth/me
         @self.app.get("/auth/me", tags=["auth"])
         @api_v1_router.get("/auth/me", tags=["auth"])
-        async def get_current_user():
+        async def get_current_user(
+            credentials: HTTPAuthorizationCredentials = Depends(self.security),
+        ):
             """获取当前用户信息"""
-            # 这里应该从令牌中获取用户信息
-            # 为简化，我们返回模拟用户数据
+            token = credentials.credentials
+            payload = await self.verify_token(token)
+            if not payload:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的令牌")
             return {
                 "id": 1,
-                "username": "admin",
-                "role": "admin",
+                "username": payload.get("sub", "unknown"),
+                "role": payload.get("role", "viewer"),
                 "email": "admin@example.com",
                 "created_at": datetime.now().isoformat(),
             }
@@ -3342,6 +3415,14 @@ class APIServer:
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
             """WebSocket端点"""
+            if self.require_ws_auth:
+                token = websocket.query_params.get("token")
+                if not token:
+                    token = self._extract_bearer_token(websocket.headers.get("authorization"))
+                payload = await self.verify_token(token) if token else None
+                if not payload:
+                    await websocket.close(code=1008)
+                    return
             await self._handle_websocket_connection(websocket)
 
         # 交易所状态API - 支持 /api/v1/exchanges

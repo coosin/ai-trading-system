@@ -171,6 +171,18 @@ class TradeHistoryService:
         """
         try:
             async with self._lock:
+                # 基础幂等保护：避免同一 order_id/trade_id 重复入账（常见于重试回放场景）。
+                if trade.order_id:
+                    for existing in reversed(self._cache[-200:]):
+                        if existing.order_id and existing.order_id == trade.order_id:
+                            logger.info("⏭️ 跳过重复交易写入（order_id 已存在）: %s", trade.order_id)
+                            return True
+                if trade.trade_id:
+                    for existing in reversed(self._cache[-200:]):
+                        if existing.trade_id == trade.trade_id:
+                            logger.info("⏭️ 跳过重复交易写入（trade_id 已存在）: %s", trade.trade_id)
+                            return True
+
                 # 1. 写入数据库
                 if self.db_storage:
                     await self._save_to_database(trade)
