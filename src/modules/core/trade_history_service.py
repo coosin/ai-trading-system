@@ -117,6 +117,7 @@ class TradeHistoryService:
         
         # 锁
         self._lock = asyncio.Lock()
+        self._cache_bootstrapped = False
         
         # 配置路径
         base_path = Path(self.config.get("base_path", "/app/workspace/trade_history"))
@@ -253,6 +254,8 @@ class TradeHistoryService:
             descending: 是否降序
         """
         try:
+            if not self._cache and self.db_storage and not self._cache_bootstrapped:
+                await self._load_cache_from_db()
             results = self._cache.copy()
             
             # 应用过滤器
@@ -389,7 +392,8 @@ class TradeHistoryService:
         
         gross_profit = sum(t["pnl"] for t in wins) if wins else 0
         gross_loss = abs(sum(t["pnl"] for t in losses)) if losses else 0
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        # JSON 响应不接受 inf，使用可序列化上限值表示“无亏损”
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 9999.0
         
         best_trade = max((t["pnl"] for t in trades), default=0)
         worst_trade = min((t["pnl"] for t in trades), default=0)
@@ -682,8 +686,46 @@ class TradeHistoryService:
         """从数据库加载缓存"""
         try:
             if self.db_storage:
-                # 尝试从数据库加载最近的交易
-                pass  # HistoricalDataStorage可能没有批量查询方法，这里预留接口
+                rows = await self.db_storage.get_trades(limit=self._cache_max_size)
+                self._cache_bootstrapped = True
+                if not rows:
+                    return
+
+                loaded: List[TradeRecord] = []
+                for idx, row in enumerate(rows):
+                    if not isinstance(row, dict):
+                        continue
+                    symbol = str(row.get("symbol") or "").strip()
+                    if not symbol:
+                        continue
+
+                    side_raw = str(row.get("side", "buy") or "buy").strip().lower()
+                    side_norm = {"long": "buy", "short": "sell"}.get(side_raw, side_raw or "buy")
+                    loaded.append(
+                        TradeRecord(
+                            trade_id=f"db_{row.get('id', idx)}",
+                            order_id=str(row.get("order_id") or ""),
+                            symbol=symbol,
+                            side=side_norm,
+                            order_type=str(row.get("order_type") or "market"),
+                            quantity=_to_float(row.get("quantity"), 0.0),
+                            price=_to_float(row.get("price"), 0.0),
+                            fee=_to_float(row.get("fee"), 0.0),
+                            pnl=_to_float(row.get("pnl"), 0.0),
+                            status="filled",
+                            reasoning=str(row.get("reasoning") or ""),
+                            timestamp=str(row.get("timestamp") or datetime.now().isoformat()),
+                            metadata={"source": "db_bootstrap", "db_id": row.get("id")},
+                        )
+                    )
+
+                loaded.sort(key=lambda t: t.timestamp)
+                self._cache = loaded[-self._cache_max_size :]
+                self._symbol_index.clear()
+                self._date_index.clear()
+                for trade in self._cache:
+                    self._update_index(trade)
+                logger.info("✅ 从数据库回灌交易缓存 %s 条", len(self._cache))
         except Exception as e:
             logger.warning(f"加载数据库缓存失败: {e}")
     

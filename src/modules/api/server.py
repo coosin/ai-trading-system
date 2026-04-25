@@ -1801,6 +1801,86 @@ class APIServer:
                 except Exception as e:
                     logger.warning("get_risk_metrics from main_controller failed: %s", e)
 
+            # 兜底：从交易所实时持仓估算风险指标，避免长期 fallback:empty
+            if mc:
+                try:
+                    ex = mc.get_exchange() if hasattr(mc, "get_exchange") else None
+                    ex = ex or getattr(mc, "okx_exchange", None)
+                    if ex and hasattr(ex, "get_positions"):
+                        rows = await ex.get_positions()
+                        total_exposure = 0.0
+                        max_position_size = 0.0
+                        leverage_used = 0.0
+                        margin_used = 0.0
+                        position_count = 0
+                        for p in rows or []:
+                            if not isinstance(p, dict):
+                                continue
+                            try:
+                                size_v = abs(float(p.get("size", p.get("pos", 0)) or 0.0))
+                            except Exception:
+                                size_v = 0.0
+                            if size_v <= 0:
+                                continue
+
+                            try:
+                                notional = abs(float(p.get("notional_value") or 0.0))
+                            except Exception:
+                                notional = 0.0
+                            if notional <= 0:
+                                try:
+                                    mark_px = float(p.get("mark_px", p.get("mark_price", 0)) or 0.0)
+                                except Exception:
+                                    mark_px = 0.0
+                                notional = abs(size_v * mark_px)
+
+                            try:
+                                lev = float(p.get("leverage") or 0.0)
+                            except Exception:
+                                lev = 0.0
+
+                            total_exposure += notional
+                            max_position_size = max(max_position_size, notional)
+                            leverage_used = max(leverage_used, lev)
+                            if lev > 0:
+                                margin_used += notional / lev
+                            position_count += 1
+
+                        latest = getattr(mc, "_latest_account_state", {}) or {}
+                        portfolio_value = 0.0
+                        for k in ("usdt_total", "usdt_free"):
+                            try:
+                                v = float(latest.get(k) or 0.0)
+                                portfolio_value = max(portfolio_value, v)
+                            except Exception:
+                                continue
+                        if portfolio_value <= 0:
+                            portfolio_value = margin_used
+
+                        margin_level = (portfolio_value / total_exposure) if total_exposure > 0 else 0.0
+                        if leverage_used >= 50 or margin_level < 0.05:
+                            risk_level = "high"
+                        elif leverage_used >= 20 or margin_level < 0.1:
+                            risk_level = "medium"
+                        else:
+                            risk_level = "low"
+
+                        return {
+                            "portfolio_value": float(portfolio_value),
+                            "total_exposure": float(total_exposure),
+                            "var_95": 0.0,
+                            "max_position_size": float(max_position_size),
+                            "leverage_used": float(leverage_used),
+                            "margin_level": float(margin_level),
+                            "risk_level": risk_level,
+                            "position_count": int(position_count),
+                            "warnings": [],
+                            "source": "main_controller:positions_estimated",
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                except Exception as e:
+                    logger.warning("get_risk_metrics estimated fallback failed: %s", e)
+
             # 无实时样本时返回统一降级结构，避免前端硬依赖固定字段时报错
             return {
                 "portfolio_value": 0.0,
