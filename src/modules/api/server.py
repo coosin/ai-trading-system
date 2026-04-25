@@ -370,6 +370,7 @@ class APIServer:
         self.trusted_hosts: List[str] = ["127.0.0.1", "localhost"]
         self.enforce_auth_on_writes: bool = True
         self.require_ws_auth: bool = True
+        self.required_write_roles: Set[str] = {"admin"}
         self.protected_write_prefixes: List[str] = [
             "/api/v1/modules",
             "/api/v1/monitoring",
@@ -379,6 +380,10 @@ class APIServer:
         self.auth_exempt_paths: Set[str] = {
             "/auth/login",
             "/api/v1/auth/login",
+            "/auth/refresh",
+            "/api/v1/auth/refresh",
+            "/auth/logout",
+            "/api/v1/auth/logout",
             "/health",
             "/api/health",
             "/api/v1/health",
@@ -762,6 +767,13 @@ class APIServer:
             return False
         return any(p.startswith(prefix) for prefix in self.protected_write_prefixes)
 
+    def _has_required_write_role(self, payload: Dict[str, Any]) -> bool:
+        required = {str(x).strip().lower() for x in self.required_write_roles if str(x).strip()}
+        if not required:
+            return True
+        role = str(payload.get("role", "") or "").strip().lower()
+        return role in required
+
     # 私有方法
 
     async def _load_config(self) -> None:
@@ -785,6 +797,9 @@ class APIServer:
                 self.trusted_hosts = [str(x).strip() for x in trusted_hosts if str(x).strip()]
             self.enforce_auth_on_writes = bool(api_config.get("enforce_auth_on_writes", self.enforce_auth_on_writes))
             self.require_ws_auth = bool(api_config.get("require_ws_auth", self.require_ws_auth))
+            required_roles = api_config.get("required_write_roles", list(self.required_write_roles))
+            if isinstance(required_roles, list) and required_roles:
+                self.required_write_roles = {str(x).strip().lower() for x in required_roles if str(x).strip()}
             pfx = api_config.get("protected_write_prefixes", self.protected_write_prefixes)
             if isinstance(pfx, list) and pfx:
                 self.protected_write_prefixes = [str(x).strip() for x in pfx if str(x).strip()]
@@ -871,6 +886,11 @@ class APIServer:
                     return JSONResponse(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         content={"error": "Unauthorized write operation"},
+                    )
+                if not self._has_required_write_role(payload):
+                    return JSONResponse(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        content={"error": "Forbidden write operation"},
                     )
 
             # 速率限制检查
@@ -3736,8 +3756,8 @@ class APIServer:
             if str(path or "").lstrip("/").startswith("commander/"):
                 raise HTTPException(status_code=400, detail="invalid commander mirror path")
 
-            base = str(request.base_url).rstrip("/")
-            target_url = f"{base}/api/v1/{path.lstrip('/')}"
+            # Force loopback target to avoid Host-header based SSRF pivots.
+            target_url = f"http://127.0.0.1:{int(getattr(self, 'port', 8000) or 8000)}/api/v1/{path.lstrip('/')}"
             body = await request.body()
             headers = _filter_forward_headers(dict(request.headers))
             params = dict(request.query_params)

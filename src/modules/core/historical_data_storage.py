@@ -175,6 +175,9 @@ class HistoricalDataStorage:
             CREATE INDEX IF NOT EXISTS idx_klines_timestamp ON klines(timestamp);
             CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
             CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_order_id_unique
+                ON trades(order_id)
+                WHERE order_id IS NOT NULL AND order_id != '';
             CREATE INDEX IF NOT EXISTS idx_indicators_symbol ON indicators(symbol);
             CREATE INDEX IF NOT EXISTS idx_indicators_timestamp ON indicators(timestamp);
         """)
@@ -287,22 +290,41 @@ class HistoricalDataStorage:
         """保存交易记录"""
         async with self._lock:
             try:
-                await self._db.execute("""
-                    INSERT INTO trades 
-                    (symbol, side, order_type, quantity, price, timestamp, order_id, pnl, fee, reasoning)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    trade.symbol,
-                    trade.side,
-                    trade.order_type,
-                    trade.quantity,
-                    trade.price,
-                    trade.timestamp,
-                    trade.order_id,
-                    trade.pnl,
-                    trade.fee,
-                    trade.reasoning
-                ))
+                has_order_id = bool(str(getattr(trade, "order_id", "") or "").strip())
+                if has_order_id:
+                    await self._db.execute("""
+                        INSERT OR IGNORE INTO trades 
+                        (symbol, side, order_type, quantity, price, timestamp, order_id, pnl, fee, reasoning)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        trade.symbol,
+                        trade.side,
+                        trade.order_type,
+                        trade.quantity,
+                        trade.price,
+                        trade.timestamp,
+                        trade.order_id,
+                        trade.pnl,
+                        trade.fee,
+                        trade.reasoning
+                    ))
+                else:
+                    await self._db.execute("""
+                        INSERT INTO trades 
+                        (symbol, side, order_type, quantity, price, timestamp, order_id, pnl, fee, reasoning)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        trade.symbol,
+                        trade.side,
+                        trade.order_type,
+                        trade.quantity,
+                        trade.price,
+                        trade.timestamp,
+                        trade.order_id,
+                        trade.pnl,
+                        trade.fee,
+                        trade.reasoning
+                    ))
                 
                 await self._db.commit()
                 logger.info(f"✅ 保存交易记录: {trade.symbol} {trade.side} {trade.quantity}@{trade.price}")
