@@ -117,6 +117,31 @@ class ScannerOpportunityGate:
                 es = getattr(view, "execution_support", None)
                 guards = (es.get("guards") or {}) if isinstance(es, dict) else {}
                 q = getattr(view, "quality_score", None)
+                # unknown/partial 数据更保守：对点差/RR 门槛做收紧，避免“信息不全也照样开仓”
+                try:
+                    partial = bool(getattr(view, "partial", False))
+                except Exception:
+                    partial = False
+                prov = str(getattr(view, "provenance", "") or "").strip().lower() or "unknown"
+                metrics["mi_partial"] = partial
+                metrics["mi_provenance"] = prov
+                if partial or prov == "unknown":
+                    # 只在 gate 未显式配置得更严格时才覆写（尊重用户配置）
+                    try:
+                        cur_spread = float(self._c("max_spread_bps", 45.0) or 45.0)
+                    except Exception:
+                        cur_spread = 45.0
+                    try:
+                        cur_rr = float(self._c("min_risk_reward", 1.05) or 1.05)
+                    except Exception:
+                        cur_rr = 1.05
+                    tightened_spread = min(cur_spread, float(self._c("partial_max_spread_bps", 35.0) or 35.0))
+                    tightened_rr = max(cur_rr, float(self._c("partial_min_risk_reward", 1.15) or 1.15))
+                    self.config["max_spread_bps"] = tightened_spread
+                    self.config["min_risk_reward"] = tightened_rr
+                    metrics["gate_tightened_for_partial"] = True
+                    metrics["tightened_max_spread_bps"] = tightened_spread
+                    metrics["tightened_min_risk_reward"] = tightened_rr
                 if q is not None:
                     try:
                         metrics["mi_quality_score"] = float(q)

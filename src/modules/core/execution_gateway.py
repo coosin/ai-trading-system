@@ -354,6 +354,30 @@ class ExecutionGateway:
         tid = context.get("trace_id") or context.get("TraceId") or context.get("traceId")
         return str(tid or "").strip()
 
+    @staticmethod
+    def _extract_market_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Normalize regime/qty factor from gateway context for trade_history attribution."""
+        ctx = context if isinstance(context, dict) else {}
+        gp = ctx.get("guard_profile") if isinstance(ctx.get("guard_profile"), dict) else {}
+        regime = (
+            ctx.get("regime")
+            or gp.get("regime")
+            or gp.get("profile")
+            or "unknown"
+        )
+        try:
+            qty_factor = float(
+                ctx.get("effective_qty_factor")
+                if ctx.get("effective_qty_factor") is not None
+                else gp.get("effective_qty_factor", 1.0)
+            )
+        except Exception:
+            qty_factor = 1.0
+        return {
+            "regime": str(regime or "unknown"),
+            "effective_qty_factor": float(qty_factor),
+        }
+
     def _close_idempotent_key(self, symbol: str, side: str, size: Optional[float], context: Optional[Dict[str, Any]]) -> str:
         """
         close 幂等粒度：
@@ -566,6 +590,68 @@ class ExecutionGateway:
                     try:
                         ths = getattr(self._mc, "trade_history_service", None) if self._mc else None
                         if ths and hasattr(ths, "record_trade_dict"):
+                            ctx = context if isinstance(context, dict) else {}
+                            mkt = self._extract_market_context(ctx)
+                            price_val: float = 0.0
+                            try:
+                                if isinstance(res, dict) and (res.get("average") or res.get("price")):
+                                    price_val = float(res.get("average") or res.get("price") or 0)
+                                elif ctx.get("trigger_price") is not None:
+                                    price_val = float(ctx.get("trigger_price") or 0)
+                                elif ctx.get("mark_price") is not None:
+                                    price_val = float(ctx.get("mark_price") or 0)
+                            except Exception:
+                                price_val = 0.0
+
+                            fee_val: float = 0.0
+                            try:
+                                if isinstance(res, dict):
+                                    fee_val = float(
+                                        res.get("fee")
+                                        or res.get("fillFee")
+                                        or (res.get("data") or {}).get("fee", 0)
+                                        or 0
+                                    )
+                            except Exception:
+                                fee_val = 0.0
+
+                            pnl_val: float = 0.0
+                            pnl_pct_val: float = 0.0
+                            try:
+                                # 优先使用上游已计算的触发收益率（例如 SLTP 触发上下文），
+                                # 可避免由于价格/名义缺失导致的 pnl 长期为 0。
+                                if ctx.get("trigger_pnl_percent") is not None:
+                                    pnl_pct_val = float(ctx.get("trigger_pnl_percent") or 0.0)
+                                elif ctx.get("entry_price") is not None and price_val > 0:
+                                    ep = float(ctx.get("entry_price") or 0)
+                                    if ep > 0:
+                                        sd = str(side or "").strip().lower()
+                                        # close_swap 的 side 入参是 long/short（策略内部约定）；trade_history_service 会归一为 buy/sell
+                                        if sd == "long":
+                                            pnl_pct_val = (price_val - ep) / ep
+                                        elif sd == "short":
+                                            pnl_pct_val = (ep - price_val) / ep
+                                # 名义金额兜底：position_notional -> quantity * entry_price -> quantity * fill_price
+                                position_notional = float(ctx.get("position_notional") or 0.0)
+                                if position_notional <= 0:
+                                    try:
+                                        qty = float(size or 0.0) if size is not None else float(ctx.get("quantity") or 0.0)
+                                    except Exception:
+                                        qty = 0.0
+                                    try:
+                                        ep = float(ctx.get("entry_price") or 0.0)
+                                    except Exception:
+                                        ep = 0.0
+                                    if qty > 0 and ep > 0:
+                                        position_notional = qty * ep
+                                    elif qty > 0 and price_val > 0:
+                                        position_notional = qty * price_val
+                                # 合约张数/币本位不一定等同名义数量，这里保留“估算 pnl”用于运营观测/学习闭环。
+                                pnl_val = float(pnl_pct_val) * max(1e-12, float(position_notional or 0.0))
+                            except Exception:
+                                pnl_val = 0.0
+                                pnl_pct_val = 0.0
+
                             await ths.record_trade_dict(
                                 {
                                     "timestamp": self._snapshot.last_order_at,
@@ -576,8 +662,24 @@ class ExecutionGateway:
                                     "reason": str(reason or ""),
                                     "status": "filled",
                                     "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
-                                    "price": float(res.get("average") or res.get("price") or 0) if isinstance(res, dict) and (res.get("average") or res.get("price")) else None,
+                                    "price": float(price_val),
                                     "quantity": float(size) if size is not None else None,
+                                    "fee": float(fee_val),
+                                    "pnl": float(pnl_val),
+                                    "pnl_percent": float(pnl_pct_val),
+                                    "metadata": {
+                                        "market_context": {
+                                            "regime": mkt.get("regime"),
+                                            "effective_qty_factor": float(mkt.get("effective_qty_factor", 1.0)),
+                                        },
+                                        "gateway": {
+                                            "op": "close",
+                                            "source": str(source or "gateway"),
+                                            "reason": str(reason or ""),
+                                            "context": dict(ctx) if isinstance(ctx, dict) else {},
+                                        },
+                                        "raw": dict(res) if isinstance(res, dict) else {"raw": str(res)},
+                                    },
                                 }
                             )
                     except Exception:
@@ -944,6 +1046,29 @@ class ExecutionGateway:
                     try:
                         ths = getattr(self._mc, "trade_history_service", None) if self._mc else None
                         if ths and hasattr(ths, "record_trade_dict"):
+                            ctx = context if isinstance(context, dict) else {}
+                            mkt = self._extract_market_context(ctx)
+                            price_val: float = 0.0
+                            try:
+                                if isinstance(res, dict) and (res.get("average") or res.get("price")):
+                                    price_val = float(res.get("average") or res.get("price") or 0)
+                                elif ctx.get("mark_price") is not None:
+                                    price_val = float(ctx.get("mark_price") or 0)
+                            except Exception:
+                                price_val = 0.0
+
+                            fee_val: float = 0.0
+                            try:
+                                if isinstance(res, dict):
+                                    fee_val = float(
+                                        res.get("fee")
+                                        or res.get("fillFee")
+                                        or (res.get("data") or {}).get("fee", 0)
+                                        or 0
+                                    )
+                            except Exception:
+                                fee_val = 0.0
+
                             await ths.record_trade_dict(
                                 {
                                     "timestamp": self._snapshot.last_order_at,
@@ -954,9 +1079,23 @@ class ExecutionGateway:
                                     "reason": str(reason or ""),
                                     "status": "filled",
                                     "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
-                                    "price": float(res.get("average") or res.get("price") or 0) if isinstance(res, dict) and (res.get("average") or res.get("price")) else None,
+                                    "price": float(price_val),
                                     "quantity": float(size) if size is not None else None,
                                     "leverage": int(lev) if lev is not None else None,
+                                    "fee": float(fee_val),
+                                    "metadata": {
+                                        "market_context": {
+                                            "regime": mkt.get("regime"),
+                                            "effective_qty_factor": float(mkt.get("effective_qty_factor", 1.0)),
+                                        },
+                                        "gateway": {
+                                            "op": "open",
+                                            "source": str(source or "gateway"),
+                                            "reason": str(reason or ""),
+                                            "context": dict(ctx) if isinstance(ctx, dict) else {},
+                                        },
+                                        "raw": dict(res) if isinstance(res, dict) else {"raw": str(res)},
+                                    },
                                 }
                             )
                     except Exception:

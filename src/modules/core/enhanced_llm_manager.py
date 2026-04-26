@@ -214,6 +214,17 @@ class OpenAIProvider(BaseLLMProvider):
                 return True
         return False
 
+    @staticmethod
+    def _detect_rate_limit_kind(status_code: int, error_text: str) -> Optional[str]:
+        """Best-effort classify 429/limit errors to support circuit breaking."""
+        if status_code != 429:
+            return None
+        lower = (error_text or "").lower()
+        # Provider-specific quota wording (e.g. volc ark AccountQuotaExceeded)
+        if "accountquotaexceeded" in lower or "quota exceeded" in lower or "exceeded the weekly usage quota" in lower:
+            return "QUOTA_EXCEEDED"
+        return "RATE_LIMIT"
+
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
         """生成文本（带重试机制和认证错误检测）"""
         start_time = time.time()
@@ -268,6 +279,7 @@ class OpenAIProvider(BaseLLMProvider):
                 if response.status_code != 200:
                     error_text = response.text
                     is_auth_failure = self._is_auth_error(response.status_code, error_text)
+                    limit_kind = self._detect_rate_limit_kind(response.status_code, error_text)
                     
                     if is_auth_failure:
                         logger.warning(f"LLM API认证失败 ({self.config.model_id}): {error_text[:200]}")
@@ -280,6 +292,18 @@ class OpenAIProvider(BaseLLMProvider):
                             success=False,
                             error_message=last_error,
                             error_code="AUTH_FAILED"
+                        )
+                    if limit_kind:
+                        last_error = f"{limit_kind}: {response.status_code}"
+                        # Don't aggressively retry quota/limit errors; let the manager failover.
+                        return LLMResponse(
+                            content="",
+                            model_id=self.config.model_id,
+                            provider=self.config.provider,
+                            latency_ms=(time.time() - start_time) * 1000,
+                            success=False,
+                            error_message=error_text[:500] or last_error,
+                            error_code=limit_kind,
                         )
                     
                     logger.error(f"OpenAI API返回错误: status={response.status_code}, url={url}, response={error_text[:500]}")
@@ -354,7 +378,8 @@ class OpenAIProvider(BaseLLMProvider):
                     provider=self.config.provider,
                     latency_ms=latency_ms,
                     success=False,
-                    error_message=last_error
+                    error_message=last_error,
+                    error_code="TIMEOUT",
                 )
             except httpx.HTTPStatusError as e:
                 latency_ms = (time.time() - start_time) * 1000
@@ -369,7 +394,8 @@ class OpenAIProvider(BaseLLMProvider):
                     provider=self.config.provider,
                     latency_ms=latency_ms,
                     success=False,
-                    error_message=last_error
+                    error_message=last_error,
+                    error_code="HTTP_ERROR",
                 )
             except httpx.RequestError as e:
                 latency_ms = (time.time() - start_time) * 1000
@@ -420,7 +446,8 @@ class OpenAIProvider(BaseLLMProvider):
                     provider=self.config.provider,
                     latency_ms=latency_ms,
                     success=False,
-                    error_message=last_error
+                    error_message=last_error,
+                    error_code="NETWORK_ERROR",
                 )
             except Exception as e:
                 latency_ms = (time.time() - start_time) * 1000
@@ -435,7 +462,8 @@ class OpenAIProvider(BaseLLMProvider):
                     provider=self.config.provider,
                     latency_ms=latency_ms,
                     success=False,
-                    error_message=last_error
+                    error_message=last_error,
+                    error_code="UNHANDLED_ERROR",
                 )
         
         return LLMResponse(
@@ -570,6 +598,20 @@ class EnhancedLLMManager:
         self.default_model: Optional[str] = None
         self._initialized = False
         self._lock = asyncio.Lock()
+        # Circuit breaker: model_id -> unix_ts (seconds) until which the model is considered unhealthy.
+        self._unhealthy_until: Dict[str, float] = {}
+
+    def _is_model_healthy(self, model_id: str) -> bool:
+        until = float(self._unhealthy_until.get(model_id, 0.0) or 0.0)
+        return time.time() >= until
+
+    def _mark_model_unhealthy(self, model_id: str, *, seconds: float, reason: str) -> None:
+        seconds = float(max(1.0, seconds))
+        until = time.time() + seconds
+        prev = float(self._unhealthy_until.get(model_id, 0.0) or 0.0)
+        if until > prev:
+            self._unhealthy_until[model_id] = until
+        logger.warning(f"LLM circuit-break: mark {model_id} unhealthy {int(seconds)}s reason={reason}")
 
     async def initialize(self, config: Dict[str, Any]):
         """初始化管理器"""
@@ -699,6 +741,8 @@ class EnhancedLLMManager:
                 if model_id in self.providers:
                     model = self.models.get(model_id)
                     if model and model.enabled:
+                        if not self._is_model_healthy(model_id):
+                            continue
                         if prefer_reasoning and not model.supports_reasoning:
                             continue
                         if max_cost is not None:
@@ -712,6 +756,8 @@ class EnhancedLLMManager:
         )
         
         for model in available_models:
+            if not self._is_model_healthy(model.model_id):
+                continue
             if prefer_reasoning and not model.supports_reasoning:
                 continue
             if max_cost is not None:
@@ -740,6 +786,12 @@ class EnhancedLLMManager:
         if not model_id:
             model_id = await self.select_model(task_type, prefer_reasoning)
             logger.debug(f"自动选择模型: {model_id}, 可用providers: {list(self.providers.keys())}")
+        elif not self._is_model_healthy(model_id):
+            # Caller requested a specific model, but it's currently unhealthy. Try selecting an alternative.
+            alt = await self.select_model(task_type, prefer_reasoning)
+            if alt and alt != model_id:
+                logger.info(f"Requested model {model_id} is unhealthy; switching to {alt}")
+                model_id = alt
         
         if not model_id:
             logger.error("没有可用的模型")
@@ -762,6 +814,22 @@ class EnhancedLLMManager:
             )
         
         response = await self._generate_with_model(prompt, model_id, task_type, **kwargs)
+
+        if not response.success:
+            code = (getattr(response, "error_code", None) or "").strip()
+            # Tunable circuit-break windows via env vars.
+            rl_sec = float(os.getenv("OPENCLAW_LLM_CB_RATE_LIMIT_SEC", "180") or "180")
+            quota_sec = float(os.getenv("OPENCLAW_LLM_CB_QUOTA_SEC", "21600") or "21600")  # 6h
+            to_sec = float(os.getenv("OPENCLAW_LLM_CB_TIMEOUT_SEC", "45") or "45")
+            net_sec = float(os.getenv("OPENCLAW_LLM_CB_NETWORK_SEC", "30") or "30")
+            if code == "RATE_LIMIT":
+                self._mark_model_unhealthy(model_id, seconds=rl_sec, reason=code)
+            elif code == "QUOTA_EXCEEDED":
+                self._mark_model_unhealthy(model_id, seconds=quota_sec, reason=code)
+            elif code == "TIMEOUT":
+                self._mark_model_unhealthy(model_id, seconds=to_sec, reason=code)
+            elif code in {"NETWORK_ERROR", "HTTP_ERROR"}:
+                self._mark_model_unhealthy(model_id, seconds=net_sec, reason=code)
         
         if not response.success and use_fallback:
             is_auth_error = getattr(response, 'error_code', None) == 'AUTH_FAILED'
@@ -770,6 +838,8 @@ class EnhancedLLMManager:
             if model_config and model_config.fallback_models:
                 for fallback_model_id in model_config.fallback_models:
                     if fallback_model_id in self.providers:
+                        if not self._is_model_healthy(fallback_model_id):
+                            continue
                         logger.info(f"尝试回退模型: {fallback_model_id}")
                         fallback_response = await self._generate_with_model(
                             prompt, fallback_model_id, task_type, **kwargs
@@ -784,6 +854,8 @@ class EnhancedLLMManager:
                     key=lambda x: -x.priority
                 )
                 for alt_model in available_models:
+                    if not self._is_model_healthy(alt_model.model_id):
+                        continue
                     logger.info(f"认证失败，尝试备用模型: {alt_model.model_id}")
                     alt_response = await self._generate_with_model(
                         prompt, alt_model.model_id, task_type, **kwargs

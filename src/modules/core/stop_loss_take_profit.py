@@ -184,22 +184,41 @@ class StopLossTakeProfitConfig:
     trailing_momentum_loosen_factor: float = 1.05
     enable_breakeven: bool = True  # 启用保本止损
     breakeven_trigger: float = 0.02
+    # 盈利保护加速器：浮盈达到阈值后，将止损上移到盈利区间并收紧 trailing，减少回吐
+    profit_protect_accelerator_enable: bool = True
+    profit_protect_trigger_1: float = 0.02
+    profit_protect_lock_1: float = 0.004
+    profit_protect_trigger_2: float = 0.04
+    profit_protect_lock_2: float = 0.012
+    profit_protect_tighten_factor: float = 0.88
+    # 按市场状态自适应盈利保护：
+    # - high_vol/low_liquidity：更早锁盈、更快收紧
+    # - trend：适度放宽，保留趋势利润空间
+    profit_protect_regime_overrides: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {
+            "high_vol": {"trigger_mult": 0.80, "lock_mult": 1.25, "tighten_mult": 0.92},
+            "low_liquidity": {"trigger_mult": 0.85, "lock_mult": 1.20, "tighten_mult": 0.94},
+            "range": {"trigger_mult": 0.95, "lock_mult": 1.10, "tighten_mult": 0.98},
+            "trend": {"trigger_mult": 1.10, "lock_mult": 0.90, "tighten_mult": 1.05},
+        }
+    )
     # 分层固定止盈（锁仓）
-    # 1) 浮盈>=30% 平30%
-    # 2) 浮盈>=50% 再平20%
-    # 剩余50%继续持有
+    # 默认按更贴近合约/日内的阈值配置（避免长期不触发导致“TP=0”的体感）：
+    # 1) 浮盈>=3%  平30%
+    # 2) 浮盈>=6%  再平40%
+    # 3) 浮盈>=10% 再平30%
     enable_partial_tp: bool = True
     layered_partial_tp_enable: bool = True
     layered_partial_tp_levels: List[Tuple[float, float]] = field(
-        default_factory=lambda: [(0.30, 0.30), (0.50, 0.20)]
+        default_factory=lambda: [(0.03, 0.30), (0.06, 0.40), (0.10, 0.30)]
     )
     # 分层移动止盈（按峰值回撤触发）：
-    # 峰值浮盈>=30% -> 回撤5%
-    # 峰值浮盈>=50% -> 回撤10%
-    # 峰值浮盈>=60% -> 回撤15%
+    # 峰值浮盈>=3%  -> 回撤1%
+    # 峰值浮盈>=6%  -> 回撤2%
+    # 峰值浮盈>=10% -> 回撤3%
     layered_trailing_tp_enable: bool = True
     layered_trailing_tp_drawdown_levels: List[Tuple[float, float]] = field(
-        default_factory=lambda: [(0.30, 0.05), (0.50, 0.10), (0.60, 0.15)]
+        default_factory=lambda: [(0.03, 0.01), (0.06, 0.02), (0.10, 0.03)]
     )
     check_interval: int = 5
     # 仅限制「活跃跟踪」数量；已触发/已取消的历史单不计入（否则会误伤 sync_open_positions）
@@ -225,6 +244,13 @@ class StopLossTakeProfitConfig:
     pending_close_max_retries: int = 6
     pending_close_backoff_base_sec: float = 2.0
     pending_close_backoff_cap_sec: float = 120.0
+    # 自适应时间止盈：浮盈迟迟无法扩张时，允许提前离场，减少利润回吐
+    adaptive_time_stop_enable: bool = True
+    adaptive_time_stop_min_hold_sec: int = 1800
+    adaptive_time_stop_max_hold_sec: int = 21600
+    adaptive_time_stop_base_sec: int = 7200
+    adaptive_time_stop_profit_floor: float = 0.008
+    adaptive_time_stop_profit_stall_abs: float = 0.003
 
 
 def _coerce_stop_loss_take_profit_field(name: str, raw: Any, template: StopLossTakeProfitConfig) -> Any:
@@ -544,6 +570,7 @@ class StopLossTakeProfitManager:
             close_sz = float(order.remaining_quantity or order.quantity or 0) or None
         try:
             if gw:
+                meta_ctx = order.metadata or {}
                 res = await gw.close_swap(
                     symbol=order.symbol,
                     side=order.side,
@@ -551,11 +578,14 @@ class StopLossTakeProfitManager:
                     source="stop_loss_take_profit",
                     reason=reason,
                     context={
-                        "trace_id": (order.metadata or {}).get("trace_id") or (order.metadata or {}).get("traceId"),
-                        "index_key": (order.metadata or {}).get("index_key"),
-                        "position_key": (order.metadata or {}).get("position_key"),
+                        "trace_id": meta_ctx.get("trace_id") or meta_ctx.get("traceId"),
+                        "index_key": meta_ctx.get("index_key"),
+                        "position_key": meta_ctx.get("position_key"),
                         "sltp_reason": reason,
                         "sltp_order_id": getattr(order, "order_id", None),
+                        "entry_price": float(order.entry_price or 0),
+                        "trigger_price": meta_ctx.get("trigger_price"),
+                        "trigger_pnl_percent": meta_ctx.get("trigger_pnl_percent"),
                     },
                 )
             else:
@@ -1273,6 +1303,7 @@ class StopLossTakeProfitManager:
         await self._update_trailing_stop(order, current_price)
         
         await self._check_breakeven(order, current_price)
+        await self._apply_profit_protect_accelerator(order, current_price)
         
         triggered = await self._check_stop_loss_take_profit(order, current_price)
         
@@ -1727,6 +1758,84 @@ class StopLossTakeProfitManager:
             logger.info(f"🛡️ {order.symbol} 激活保本止损 (盈利 {pnl_percent*100:.1f}%)")
             
             await self._notify_callbacks("on_breakeven", order)
+
+    async def _apply_profit_protect_accelerator(self, order: StopLossTakeProfitOrder, current_price: float) -> None:
+        """盈利保护加速器：分段锁盈并收紧 trailing。"""
+        if not bool(getattr(self.config, "profit_protect_accelerator_enable", True)):
+            return
+        try:
+            pnl = self._calculate_pnl_percent(order, current_price)
+            t1 = float(getattr(self.config, "profit_protect_trigger_1", 0.02) or 0.02)
+            t2 = float(getattr(self.config, "profit_protect_trigger_2", 0.04) or 0.04)
+            lock1 = float(getattr(self.config, "profit_protect_lock_1", 0.004) or 0.004)
+            lock2 = float(getattr(self.config, "profit_protect_lock_2", 0.012) or 0.012)
+            tighten = float(getattr(self.config, "profit_protect_tighten_factor", 0.88) or 0.88)
+            meta = dict(order.metadata or {})
+            gp = meta.get("guard_profile") if isinstance(meta.get("guard_profile"), dict) else {}
+            regime = str(gp.get("regime") or gp.get("profile") or "normal").strip().lower()
+            ro_map = getattr(self.config, "profit_protect_regime_overrides", {}) or {}
+            ro = ro_map.get(regime, {}) if isinstance(ro_map, dict) else {}
+            trig_mult = float(ro.get("trigger_mult", 1.0) or 1.0)
+            lock_mult = float(ro.get("lock_mult", 1.0) or 1.0)
+            tighten_mult = float(ro.get("tighten_mult", 1.0) or 1.0)
+            t1 = max(0.001, float(t1 * trig_mult))
+            t2 = max(t1 + 0.001, float(t2 * trig_mult))
+            lock1 = max(0.0001, float(lock1 * lock_mult))
+            lock2 = max(lock1, float(lock2 * lock_mult))
+            tighten = min(1.0, max(0.75, float(tighten * tighten_mult)))
+            stage = int(meta.get("profit_protect_stage", 0) or 0)
+            target_stage = 0
+            lock_pct = 0.0
+            if pnl >= t2:
+                target_stage = 2
+                lock_pct = lock2
+            elif pnl >= t1:
+                target_stage = 1
+                lock_pct = lock1
+            if target_stage <= stage or target_stage <= 0:
+                return
+
+            old_sl = float(order.stop_loss_price or 0.0)
+            entry = float(order.entry_price or 0.0)
+            if entry <= 0:
+                return
+            if order.side == "long":
+                new_sl = entry * (1.0 + lock_pct)
+                if new_sl > old_sl:
+                    order.stop_loss_price = new_sl
+            else:
+                new_sl = entry * (1.0 - lock_pct)
+                if old_sl <= 0 or new_sl < old_sl:
+                    order.stop_loss_price = new_sl
+
+            # 收紧 trailing 偏移，进一步减少盈利回吐
+            off0 = float(order.trailing_stop_offset or self.config.initial_trailing_offset)
+            new_off = max(float(self.config.min_trailing_offset), off0 * tighten)
+            if new_off < off0:
+                order.trailing_stop_offset = new_off
+
+            meta["profit_protect_stage"] = int(target_stage)
+            meta["profit_protect_lock_pct"] = float(lock_pct)
+            meta["profit_protect_applied_at"] = datetime.now().isoformat()
+            meta["profit_protect_regime"] = regime
+            meta["profit_protect_trigger_1_effective"] = float(t1)
+            meta["profit_protect_trigger_2_effective"] = float(t2)
+            meta["profit_protect_tighten_effective"] = float(tighten)
+            order.metadata = meta
+            logger.info(
+                "🛡️ 盈利保护加速: %s regime=%s stage=%s pnl=%.2f%% lock=%.2f%% sl %.4f->%.4f off %.4f->%.4f",
+                order.symbol,
+                regime,
+                target_stage,
+                pnl * 100.0,
+                lock_pct * 100.0,
+                old_sl,
+                float(order.stop_loss_price or 0.0),
+                off0,
+                float(order.trailing_stop_offset or off0),
+            )
+        except Exception as e:
+            logger.debug(f"盈利保护加速器执行失败: {e}")
     
     async def _check_stop_loss_take_profit(
         self,
@@ -1804,36 +1913,59 @@ class StopLossTakeProfitManager:
         """触发止损"""
         order.status = StopLossTakeProfitStatus.PENDING_CLOSE
         order.triggered_at = datetime.now()
-        order.trigger_reason = "stop_loss"
-        self._stats["stop_loss_triggered"] += 1
         
         pnl_percent = self._calculate_pnl_percent(order, current_price)
+        try:
+            meta = dict(order.metadata or {})
+            meta["trigger_price"] = float(current_price or 0)
+            meta["trigger_pnl_percent"] = float(pnl_percent or 0)
+            meta["triggered_at"] = order.triggered_at.isoformat() if order.triggered_at else datetime.now().isoformat()
+            order.metadata = meta
+        except Exception:
+            pass
+
+        # trailing-only 模式下：价格回撤触发的是 stop_loss_price，但很多时候是“盈利回撤出场”。
+        # 为了避免监控/学习把盈利出场误判成止损，将其归类为 take_profit（统计、告警、事件）。
+        is_trailing_take_profit = bool(order.trailing_stop_activated) and (pnl_percent > 0)
+        if is_trailing_take_profit:
+            order.trigger_reason = "trailing_take_profit"
+            self._stats["take_profit_triggered"] += 1
+        else:
+            order.trigger_reason = "stop_loss"
+            self._stats["stop_loss_triggered"] += 1
         
-        logger.warning(f"🚨 {order.symbol} 触发止损!")
-        logger.warning(f"   入场价: {order.entry_price:.4f}")
-        logger.warning(f"   止损价: {order.stop_loss_price:.4f}")
-        logger.warning(f"   当前价: {current_price:.4f}")
-        logger.warning(f"   亏损: {pnl_percent*100:.2f}%")
+        if is_trailing_take_profit:
+            logger.info(f"🎯 {order.symbol} 追踪止盈出场!")
+            logger.info(f"   入场价: {order.entry_price:.4f}")
+            logger.info(f"   追踪止损价: {order.stop_loss_price:.4f}")
+            logger.info(f"   当前价: {current_price:.4f}")
+            logger.info(f"   盈利: {pnl_percent*100:.2f}%")
+        else:
+            logger.warning(f"🚨 {order.symbol} 触发止损!")
+            logger.warning(f"   入场价: {order.entry_price:.4f}")
+            logger.warning(f"   止损价: {order.stop_loss_price:.4f}")
+            logger.warning(f"   当前价: {current_price:.4f}")
+            logger.warning(f"   亏损: {pnl_percent*100:.2f}%")
         
         if self._audit_logger:
             from .audit_logger import AuditEventType, AuditSeverity
             await self._audit_logger.log_trade(
-                action="stop_loss_trigger",
+                action="take_profit_trigger" if is_trailing_take_profit else "stop_loss_trigger",
                 symbol=order.symbol,
                 side="sell" if order.side == "long" else "buy",
                 quantity=order.remaining_quantity,
                 price=current_price,
-                result="stop_loss"
+                result="take_profit" if is_trailing_take_profit else "stop_loss",
             )
         
         if self._enhanced_monitoring:
             await self._enhanced_monitoring.update_metric(
-                "stop_loss_triggered",
+                "take_profit_triggered" if is_trailing_take_profit else "stop_loss_triggered",
                 1,
                 {"symbol": order.symbol, "pnl_percent": pnl_percent}
             )
         
-        await self._notify_callbacks("on_stop_loss", order, current_price)
+        await self._notify_callbacks("on_take_profit" if is_trailing_take_profit else "on_stop_loss", order, current_price)
 
         # Trade domain event (best-effort)
         try:
@@ -1848,7 +1980,7 @@ class StopLossTakeProfitManager:
                     side=str(order.side),
                     kind="sltp.trigger",
                     data={
-                        "trigger_reason": "stop_loss",
+                        "trigger_reason": "take_profit" if is_trailing_take_profit else "stop_loss",
                         "entry_price": float(order.entry_price or 0),
                         "stop_loss_price": float(order.stop_loss_price or 0),
                         "take_profit_price": float(order.take_profit_price or 0),
@@ -1857,7 +1989,11 @@ class StopLossTakeProfitManager:
                         "order_id": getattr(order, "order_id", None),
                         "index_key": (order.metadata or {}).get("index_key"),
                     },
-                    tg_message=f"🧯 止损触发\n{order.symbol} {order.side}\npx={current_price:.4g} pnl={pnl_percent*100:.2f}%\ntrace_id={trace_id}",
+                    tg_message=(
+                        f"🎯 追踪止盈出场\n{order.symbol} {order.side}\npx={current_price:.4g} pnl={pnl_percent*100:.2f}%\ntrace_id={trace_id}"
+                        if is_trailing_take_profit
+                        else f"🧯 止损触发\n{order.symbol} {order.side}\npx={current_price:.4g} pnl={pnl_percent*100:.2f}%\ntrace_id={trace_id}"
+                    ),
                 )
         except Exception:
             pass
@@ -1869,11 +2005,19 @@ class StopLossTakeProfitManager:
             if mg:
                 await mg.add_memory(
                     memory_type="risk_event",
-                    content=f"SL触发: {order.symbol} side={order.side} entry={order.entry_price} sl={order.stop_loss_price} px={current_price} pnl%={pnl_percent*100:.2f}",
-                    summary=f"🧯 止损触发 {order.symbol} {order.side}",
+                    content=(
+                        f"TP(追踪)触发: {order.symbol} side={order.side} entry={order.entry_price} trail_sl={order.stop_loss_price} px={current_price} pnl%={pnl_percent*100:.2f}"
+                        if is_trailing_take_profit
+                        else f"SL触发: {order.symbol} side={order.side} entry={order.entry_price} sl={order.stop_loss_price} px={current_price} pnl%={pnl_percent*100:.2f}"
+                    ),
+                    summary=(
+                        f"🎯 追踪止盈出场 {order.symbol} {order.side}"
+                        if is_trailing_take_profit
+                        else f"🧯 止损触发 {order.symbol} {order.side}"
+                    ),
                     metadata=base_metadata(
                         source_module="stop_loss_take_profit",
-                        kind="sltp_stop_loss_triggered",
+                        kind="sltp_take_profit_triggered" if is_trailing_take_profit else "sltp_stop_loss_triggered",
                         symbol=order.symbol,
                         extra={
                             "side": order.side,
@@ -1884,20 +2028,24 @@ class StopLossTakeProfitManager:
                             "trigger_reason": order.trigger_reason,
                             "triggered_at": order.triggered_at.isoformat() if order.triggered_at else None,
                             "idempotency_key": (
-                                f"sltp:{order.symbol}:stop_loss:"
+                                f"sltp:{order.symbol}:{'take_profit' if is_trailing_take_profit else 'stop_loss'}:"
                                 f"{order.triggered_at.isoformat() if order.triggered_at else ''}"
                             ),
                             "order": order.to_dict() if hasattr(order, "to_dict") else {},
                         },
                     ),
-                    importance=0.95,
+                    importance=0.9 if is_trailing_take_profit else 0.95,
                     source_module="stop_loss_take_profit",
-                    tags=tags(kind_tag("sltp"), kind_tag("stop_loss"), symbol_tag(order.symbol)),
+                    tags=tags(
+                        kind_tag("sltp"),
+                        kind_tag("take_profit" if is_trailing_take_profit else "stop_loss"),
+                        symbol_tag(order.symbol),
+                    ),
                 )
         except Exception as e:
             logger.debug(f"写入止损触发记忆失败: {e}")
 
-        await self._attempt_pending_close(order, "stop_loss")
+        await self._attempt_pending_close(order, "take_profit" if is_trailing_take_profit else "stop_loss")
         
         await self._save_orders()
         
@@ -1910,6 +2058,14 @@ class StopLossTakeProfitManager:
     ) -> StopLossTakeProfitOrder:
         """触发止盈"""
         pnl_percent = self._calculate_pnl_percent(order, current_price)
+        try:
+            meta = dict(order.metadata or {})
+            meta["trigger_price"] = float(current_price or 0)
+            meta["trigger_pnl_percent"] = float(pnl_percent or 0)
+            meta["triggered_at"] = datetime.now().isoformat()
+            order.metadata = meta
+        except Exception:
+            pass
         
         if self.config.enable_partial_tp and order.take_profit_type == TakeProfitType.PARTIAL:
             # Real partial TP requires a real partial close on exchange (via S1). The legacy behavior only
@@ -2041,12 +2197,48 @@ class StopLossTakeProfitManager:
     
     async def _check_time_stop(self, order: StopLossTakeProfitOrder):
         """检查时间止损"""
-        if not order.time_limit:
+        now = datetime.now()
+        effective_time_limit = order.time_limit
+        if bool(getattr(self.config, "adaptive_time_stop_enable", True)):
+            try:
+                age_sec = max(0.0, (now - order.created_at).total_seconds())
+                pnl_now = self._calculate_pnl_percent(order, float(order.current_price or order.entry_price or 0.0))
+                meta = dict(order.metadata or {})
+                peak = float(meta.get("peak_pnl_percent", pnl_now) or pnl_now)
+                if pnl_now > peak:
+                    peak = float(pnl_now)
+                    meta["peak_pnl_percent"] = peak
+                base_sec = int(getattr(self.config, "adaptive_time_stop_base_sec", 7200) or 7200)
+                min_sec = int(getattr(self.config, "adaptive_time_stop_min_hold_sec", 1800) or 1800)
+                max_sec = int(getattr(self.config, "adaptive_time_stop_max_hold_sec", 21600) or 21600)
+                profit_floor = float(getattr(self.config, "adaptive_time_stop_profit_floor", 0.008) or 0.008)
+                stall_abs = float(getattr(self.config, "adaptive_time_stop_profit_stall_abs", 0.003) or 0.003)
+                dynamic_limit_sec = base_sec
+                if peak >= 0.03:
+                    dynamic_limit_sec = max(min_sec, int(base_sec * 0.6))
+                elif peak >= 0.015:
+                    dynamic_limit_sec = max(min_sec, int(base_sec * 0.8))
+                elif peak <= 0.0:
+                    dynamic_limit_sec = min(max_sec, int(base_sec * 1.3))
+                dynamic_limit_sec = min(max_sec, max(min_sec, int(dynamic_limit_sec)))
+                # 盈利却进入“停滞”区间时，允许提前触发时间止盈。
+                stall = peak > 0 and (peak - pnl_now) >= stall_abs and pnl_now >= profit_floor
+                if stall:
+                    dynamic_limit_sec = max(min_sec, int(dynamic_limit_sec * 0.7))
+                effective_time_limit = order.created_at + timedelta(seconds=dynamic_limit_sec)
+                meta["adaptive_time_stop_sec"] = int(dynamic_limit_sec)
+                meta["adaptive_time_stop_peak_pnl_percent"] = float(peak)
+                meta["adaptive_time_stop_last_pnl_percent"] = float(pnl_now)
+                order.metadata = meta
+            except Exception:
+                effective_time_limit = order.time_limit
+
+        if not effective_time_limit:
             return
-        
-        if datetime.now() >= order.time_limit:
+
+        if now >= effective_time_limit:
             order.status = StopLossTakeProfitStatus.PENDING_CLOSE
-            order.triggered_at = datetime.now()
+            order.triggered_at = now
             order.trigger_reason = "time_stop"
             self._stats["time_stop_triggered"] += 1
             

@@ -10,42 +10,69 @@ system:
   log_level: INFO
   environment: production
 llm:
-  # Ark(OpenAI 兼容) 直连配置：建议在 local.yaml/.env 中设置 ARK_API_KEY
-  default_model: doubao-seed-2.0-pro
+  # 与 OpenClaw 网关保持一致：Baidu 主模型 + Ark 备用模型（OpenAI 兼容接口）
+  default_model: qianfan-code-latest
   models:
+  - provider: openai
+    model_id: qianfan-code-latest
+    display_name: Baidu Qianfan Code Latest
+    api_key_env: BAIDU_QIANFAN_API_KEY
+    base_url: https://qianfan.baidubce.com/v2/coding
+    temperature: 0.5
+    max_tokens: 8000
+    timeout: 45.0
+    max_retries: 2
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 200000
+    supports_vision: true
+    supports_reasoning: false
+    enabled: true
+    priority: 30
+    fallback_models:
+    - doubao-seed-2.0-pro
   - provider: openai
     model_id: doubao-seed-2.0-pro
     display_name: Volcengine Ark Doubao Seed 2.0 Pro
     api_key_env: ARK_API_KEY
     base_url: https://ark.cn-beijing.volces.com/api/coding/v3
-    temperature: 0.7
+    temperature: 0.6
     max_tokens: 8000
-    timeout: 120.0
-    max_retries: 3
+    timeout: 30.0
+    max_retries: 1
     cost_per_input_token: 0.0
     cost_per_output_token: 0.0
-    context_window: 32768
-    supports_vision: false
-    supports_reasoning: true
+    context_window: 200000
+    supports_vision: true
+    supports_reasoning: false
     enabled: true
     priority: 20
-    fallback_models: []
+    fallback_models:
+    - qianfan-code-latest
   task_model_mapping:
     general:
+    - qianfan-code-latest
     - doubao-seed-2.0-pro
     market_analysis:
+    - qianfan-code-latest
     - doubao-seed-2.0-pro
     strategy_generation:
+    - qianfan-code-latest
     - doubao-seed-2.0-pro
     signal_generation:
+    - qianfan-code-latest
     - doubao-seed-2.0-pro
     risk_assessment:
+    - qianfan-code-latest
     - doubao-seed-2.0-pro
     news_analysis:
+    - qianfan-code-latest
     - doubao-seed-2.0-pro
     code_generation:
+    - qianfan-code-latest
     - doubao-seed-2.0-pro
     natural_language:
+    - qianfan-code-latest
     - doubao-seed-2.0-pro
 trading:
   # 默认关注列表（动态选币开启时仍作 always_include 候选）
@@ -66,11 +93,11 @@ trading:
     position_mode: oneway
     leverage_min: 10
     leverage_max: 100
-    default_leverage: 20
+    default_leverage: 10
     # 默认开仓数量（USDT 永续合约张数/数量，按交易所合约规则解释）
     # 以前代码写死 0.01，这里改为配置项，便于按风险/账户规模调整
     default_quantity: 0.01
-    max_positions_oneway: 5
+    max_positions_oneway: 4
     max_positions_hedge: 8
     grid_trading: true
     grid_levels: 5
@@ -178,6 +205,13 @@ data:
   - BTC/USDT
   - ETH/USDT
   update_interval: 60
+
+# 统一快照数据源编排（DataSourceHub）
+# 可选扩展数据提供者：coinglass（需设置环境变量 COINGLASS_API_KEY）
+data_source_hub:
+  extra_providers:
+  - coinglass
+  - aicoin
 strategies:
   max_strategies: 10
   optimization_interval: 3600
@@ -263,7 +297,9 @@ api:
     allow_headers:
     - '*'
   auth:
-    enabled: false
+    enabled: true
+    admin_username: cool
+    admin_password: '095136'
     api_key_header: X-API-Key
     api_key_env: API_KEY
   enable_cors: true
@@ -406,7 +442,7 @@ proactive_scanner:
   proactive_ai_core_forward_cooldown_sec: 60
   # 均值回归机会的 confidence 由 |24h涨跌幅|×10 推导；0.55≈5.5% 才会触发执行评估。
   # 统一提升开仓门槛：置信度 >=75% 才允许自动开仓评估
-  proactive_execute_min_confidence: 0.75
+  proactive_execute_min_confidence: 0.78
   # 原值 0.08(8%) 过于激进，会导致多数时间“无机会”，从而看起来系统不产生开仓线索。
   mean_reversion_min_abs_change: 0.02
   breakout_min_volume_vs_prior_avg: 0
@@ -419,7 +455,7 @@ proactive_scanner:
     # 允许入场价与最新价存在一定偏差（突破/均值回归会用K线收盘或关键价位作为entry），
     # 过严会导致机会全部被门控拦截，从而看起来“系统不自动开仓”。
     max_entry_vs_last_slippage_pct: 0.05
-    min_risk_reward: 1.0
+    min_risk_reward: 1.2
     min_abs_change_24h: 0.0
     require_insight_trend_alignment: true
     min_volume_vs_avg_ratio: 0.0
@@ -494,7 +530,9 @@ data_source_hub:
   - onchain.whales
   - third_party.sentiment
   - third_party.news
-  extra_providers: []
+  extra_providers:
+  - coinglass
+  - aicoin
 system_maintenance:
   health_thresholds:
     cpu_warning: 70
@@ -516,10 +554,10 @@ ai_trading:
   - BNB/USDT
   ai_config:
     enabled: true
-    model_id: doubao-seed-2.0-pro
+    model_id: qianfan-code-latest
     analysis_interval: 120
-    min_confidence: 0.75
-    max_positions: 5
+    min_confidence: 0.78
+    max_positions: 4
     risk_per_trade: 0.01
     trade_mode: real
     auto_risk_management: true
@@ -548,33 +586,58 @@ stop_loss_take_profit:
   trailing_only_mode: true
   trailing_only_coerce_inputs: true
   trailing_active_on_open: true
-  initial_trailing_offset: 0.03
-  profit_tier2_pnl_threshold: 0.3
-  tier2_trailing_offset: 0.05
+  initial_trailing_offset: 0.02
+  profit_tier2_pnl_threshold: 0.06
+  tier2_trailing_offset: 0.02
   trailing_momentum_adjust_enable: true
-  default_stop_loss_percent: 0.12
-  default_take_profit_percent: 0.20
+  default_stop_loss_percent: 0.04
+  default_take_profit_percent: 0.08
   open_rr_synthetic_reward_multiple: 1.5
   enable_trailing_stop: true
-  trailing_stop_offset: 0.03
-  trailing_stop_trigger: 0.0
+  trailing_stop_offset: 0.02
+  trailing_stop_trigger: 0.01
   enable_breakeven: true
   breakeven_trigger: 0.02
+  profit_protect_accelerator_enable: true
+  profit_protect_trigger_1: 0.02
+  profit_protect_lock_1: 0.004
+  profit_protect_trigger_2: 0.04
+  profit_protect_lock_2: 0.012
+  profit_protect_tighten_factor: 0.88
+  profit_protect_regime_overrides:
+    high_vol:
+      trigger_mult: 0.8
+      lock_mult: 1.25
+      tighten_mult: 0.92
+    low_liquidity:
+      trigger_mult: 0.85
+      lock_mult: 1.2
+      tighten_mult: 0.94
+    range:
+      trigger_mult: 0.95
+      lock_mult: 1.1
+      tighten_mult: 0.98
+    trend:
+      trigger_mult: 1.1
+      lock_mult: 0.9
+      tighten_mult: 1.05
   enable_partial_tp: true
   layered_partial_tp_enable: true
   layered_partial_tp_levels:
-  - - 0.3
+  - - 0.03
     - 0.3
-  - - 0.5
-    - 0.2
+  - - 0.06
+    - 0.4
+  - - 0.1
+    - 0.3
   layered_trailing_tp_enable: true
   layered_trailing_tp_drawdown_levels:
-  - - 0.3
-    - 0.05
-  - - 0.5
-    - 0.1
-  - - 0.6
-    - 0.15
+  - - 0.03
+    - 0.01
+  - - 0.06
+    - 0.02
+  - - 0.1
+    - 0.03
   min_trailing_offset: 0.005
   max_trailing_offset: 0.2
   check_interval: 5

@@ -140,6 +140,8 @@ class MarketIntelligenceEngine:
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ts: Dict[str, float] = {}
         self._rolling: Dict[str, Dict[str, float]] = {}
+        # anomaly debounce state: key -> {"count": int, "last_ts": float}
+        self._anomaly_streak: Dict[str, Dict[str, float]] = {}
         self._contract_cache: Dict[str, Dict[str, Any]] = {}
         self._contract_cache_ts: Dict[str, float] = {}
         self._last_emitted: Dict[str, Dict[str, Any]] = {}
@@ -176,6 +178,87 @@ class MarketIntelligenceEngine:
         self._fee_rate_taker = float(self._cfg.get("fee_rate_taker", 0.0005) or 0.0005)
         self._fee_rate_maker = float(self._cfg.get("fee_rate_maker", 0.0002) or 0.0002)
         self._schema_version = int(self._cfg.get("schema_version", 1) or 1)
+        self._anomaly_confirm_hits = int(self._cfg.get("anomaly_confirm_hits", 2) or 2)
+        self._anomaly_streak_ttl_sec = float(self._cfg.get("anomaly_streak_ttl_sec", 900) or 900)
+
+    def _stable_anomalies(self, symbol_key: str, anomalies: List[str]) -> List[str]:
+        """
+        Debounce anomaly spikes:
+        - Promote only anomalies that appear >= anomaly_confirm_hits times consecutively-ish
+        - Keep a bounded TTL so stale anomalies decay naturally
+        """
+        now = self._now()
+        ttl = max(60.0, float(self._anomaly_streak_ttl_sec))
+        confirm_hits = max(1, int(self._anomaly_confirm_hits))
+        # cleanup stale entries (bounded best-effort)
+        try:
+            stale = [k for k, v in self._anomaly_streak.items() if (now - float(v.get("last_ts", 0.0))) > ttl]
+            for k in stale[:200]:
+                self._anomaly_streak.pop(k, None)
+        except Exception:
+            pass
+
+        out: List[str] = []
+        active = set([str(x) for x in (anomalies or []) if str(x)])
+        for a in active:
+            k = f"{symbol_key}:{a}"
+            row = self._anomaly_streak.get(k) or {"count": 0.0, "last_ts": 0.0}
+            # if long gap, restart streak
+            if (now - float(row.get("last_ts", 0.0))) > ttl:
+                row["count"] = 0.0
+            row["count"] = float(row.get("count", 0.0)) + 1.0
+            row["last_ts"] = now
+            self._anomaly_streak[k] = row
+            if int(row["count"]) >= confirm_hits:
+                out.append(a)
+
+        # decay entries not active this round for this symbol
+        try:
+            prefix = f"{symbol_key}:"
+            for k, row in list(self._anomaly_streak.items())[:500]:
+                if not k.startswith(prefix):
+                    continue
+                a = k[len(prefix) :]
+                if a not in active:
+                    c = float(row.get("count", 0.0))
+                    row["count"] = max(0.0, c - 1.0)
+                    row["last_ts"] = now
+                    if row["count"] <= 0:
+                        self._anomaly_streak.pop(k, None)
+                    else:
+                        self._anomaly_streak[k] = row
+        except Exception:
+            pass
+        return sorted(set(out))
+
+    def _anomaly_stability_snapshot(self, symbol_key: str, anomalies: List[str]) -> Dict[str, Any]:
+        """
+        Return per-anomaly confirmation progress for observability/UI:
+        {
+          "confirm_hits": 2,
+          "ttl_sec": 900,
+          "items": [{"anomaly":"spread_spike:..","hits":1,"confirmed":False}, ...]
+        }
+        """
+        confirm_hits = max(1, int(self._anomaly_confirm_hits))
+        ttl = max(60.0, float(self._anomaly_streak_ttl_sec))
+        rows: List[Dict[str, Any]] = []
+        for a in sorted(set([str(x) for x in (anomalies or []) if str(x)])):
+            k = f"{symbol_key}:{a}"
+            state = self._anomaly_streak.get(k) or {}
+            hits = int(float(state.get("count", 0.0) or 0.0))
+            rows.append(
+                {
+                    "anomaly": a,
+                    "hits": hits,
+                    "confirmed": bool(hits >= confirm_hits),
+                }
+            )
+        return {
+            "confirm_hits": confirm_hits,
+            "ttl_sec": int(ttl),
+            "items": rows,
+        }
 
     def _fmt(self, v: Any, *, nd: int = 4) -> Optional[str]:
         try:
@@ -776,6 +859,7 @@ class MarketIntelligenceEngine:
         # Pull core fields (统一快照字段)
         exch = (snapshot.get("渠道A_交易所实时执行数据") or {}) if isinstance(snapshot, dict) else {}
         intel = (snapshot.get("渠道B_链上新闻舆情数据") or {}) if isinstance(snapshot, dict) else {}
+        extras = (snapshot.get("扩展数据") or {}) if isinstance(snapshot, dict) else {}
         ticker = (exch.get("ticker") or {}) if isinstance(exch, dict) else {}
         order_book = (exch.get("order_book") or {}) if isinstance(exch, dict) else {}
         positions = (exch.get("positions") or []) if isinstance(exch, dict) else []
@@ -783,6 +867,8 @@ class MarketIntelligenceEngine:
         funding_rate = exch.get("funding_rate") if isinstance(exch, dict) else None
         open_interest = (exch.get("open_interest") or {}) if isinstance(exch, dict) else {}
         liq_proxy = (exch.get("liquidation_proxy") or {}) if isinstance(exch, dict) else {}
+        aicoin_extra = (extras.get("aicoin") or {}) if isinstance(extras, dict) else {}
+        coinglass_extra = (extras.get("coinglass") or {}) if isinstance(extras, dict) else {}
         intel_ai = {}
         analysis = {}
         q = (snapshot.get("数据质量评估") or {}) if isinstance(snapshot, dict) else {}
@@ -899,6 +985,15 @@ class MarketIntelligenceEngine:
             "positions_count": len(positions) if isinstance(positions, list) else None,
             "open_orders_count": len(open_orders) if isinstance(open_orders, list) else None,
         }
+
+        # Promote derived liquidation risk proxy (when no position-based liqPx is available)
+        # into execution guards so gates can tighten in a data-driven way.
+        try:
+            drp = (liq_proxy.get("derived_risk_proxy") or {}) if isinstance(liq_proxy, dict) else {}
+            if isinstance(drp, dict) and drp.get("risk_score_0_1") is not None:
+                exchange_support["derived_liquidation_risk_proxy"] = dict(drp)
+        except Exception:
+            pass
 
         # Contract specs (minSz/lotSz/ctVal...) for execution sizing alignment
         contract: Dict[str, Any] = {}
@@ -1109,6 +1204,52 @@ class MarketIntelligenceEngine:
                 except Exception:
                     pass
 
+        # Extra providers anomaly enrichment (AiCoin/CoinGlass best-effort).
+        # These are advisory only; never block the pipeline when unavailable.
+        try:
+            if isinstance(aicoin_extra, dict) and bool(aicoin_extra.get("enabled")):
+                fr_blk = (aicoin_extra.get("funding_rate_series") or {})
+                liq_blk = (aicoin_extra.get("liquidation_series") or {})
+                tv_blk = (aicoin_extra.get("open_interest_volume_series") or {})
+                fr_rows = fr_blk.get("rows") if isinstance(fr_blk.get("rows"), list) else []
+                liq_rows = liq_blk.get("rows") if isinstance(liq_blk.get("rows"), list) else []
+                tv_rows = tv_blk.get("rows") if isinstance(tv_blk.get("rows"), list) else []
+                if fr_rows:
+                    last = fr_rows[-1] if isinstance(fr_rows[-1], dict) else {}
+                    frx = last.get("fundingRate")
+                    if frx is not None:
+                        try:
+                            fr_abs2 = abs(float(frx))
+                            if fr_abs2 >= float(self._cfg.get("aicoin_funding_extreme_abs", 0.0012) or 0.0012):
+                                anomalies.append(f"aicoin_funding_extreme_abs:{fr_abs2:.6f}")
+                            elif fr_abs2 >= float(self._cfg.get("aicoin_funding_high_abs", 0.0006) or 0.0006):
+                                anomalies.append(f"aicoin_funding_high_abs:{fr_abs2:.6f}")
+                        except Exception:
+                            pass
+                if liq_rows:
+                    # aili 常见字段: buySize/sellSize（平空/平多）
+                    last_l = liq_rows[-1] if isinstance(liq_rows[-1], dict) else {}
+                    try:
+                        lq = abs(float(last_l.get("buySize") or 0.0)) + abs(float(last_l.get("sellSize") or 0.0))
+                        if lq > 0:
+                            anomalies.append("aicoin_liquidation_activity_detected")
+                    except Exception:
+                        pass
+                if tv_rows:
+                    last_tv = tv_rows[-1] if isinstance(tv_rows[-1], dict) else {}
+                    oi2 = last_tv.get("openInterest")
+                    if oi2 is not None:
+                        try:
+                            exchange_support["extra_open_interest"] = {"aicoin_open_interest": float(oi2)}
+                        except Exception:
+                            pass
+            if isinstance(coinglass_extra, dict) and bool(coinglass_extra.get("enabled")):
+                liq_meta = ((coinglass_extra.get("liquidation") or {}).get("meta") or {}) if isinstance(coinglass_extra.get("liquidation"), dict) else {}
+                if str(liq_meta.get("status") or "") == "200":
+                    anomalies.append("coinglass_liquidation_feed_ok")
+        except Exception:
+            pass
+
         # Funding conflict hint vs reference bias (not a directive)
         warnings: List[str] = []
         if fr is not None and action_bias in ("buy", "sell"):
@@ -1182,6 +1323,47 @@ class MarketIntelligenceEngine:
                 "执行/开平仓由 ai_core 决策 + ExecutionGateway 执行；SLTP 仅消费建议参数。",
             ],
         }
+        # Debounced/stable anomalies for downstream controllers (e.g. auto frequency profile switch).
+        try:
+            stable_anomalies = self._stable_anomalies(cache_key, anomalies)
+        except Exception:
+            stable_anomalies = list(anomalies or [])
+        execution_support["stable_anomalies"] = stable_anomalies
+        try:
+            execution_support["anomaly_stability"] = self._anomaly_stability_snapshot(cache_key, anomalies)
+        except Exception:
+            execution_support["anomaly_stability"] = {
+                "confirm_hits": max(1, int(self._anomaly_confirm_hits)),
+                "ttl_sec": int(max(60.0, float(self._anomaly_streak_ttl_sec))),
+                "items": [],
+            }
+
+        # Attach a compact summary of extra providers for operator visibility.
+        try:
+            execution_support["extra_provider_summary"] = {
+                "aicoin_enabled": bool(isinstance(aicoin_extra, dict) and aicoin_extra.get("enabled")),
+                "coinglass_enabled": bool(isinstance(coinglass_extra, dict) and coinglass_extra.get("enabled")),
+            }
+        except Exception:
+            pass
+
+        # Apply a conservative tightening when derived liquidation risk proxy indicates stress.
+        try:
+            drp = exchange_support.get("derived_liquidation_risk_proxy")
+            if isinstance(drp, dict) and drp.get("risk_score_0_1") is not None:
+                rs = float(drp.get("risk_score_0_1") or 0.0)
+                if rs >= float(self._cfg.get("liq_risk_proxy_high", 0.75) or 0.75):
+                    g = execution_support.get("guards") if isinstance(execution_support.get("guards"), dict) else {}
+                    # tighten spread + RR + min_quality slightly
+                    g["max_spread_bps_to_trade"] = float(min(float(g.get("max_spread_bps_to_trade") or max_spread_bps), 28.0))
+                    g["min_rr_to_trade"] = float(max(float(g.get("min_rr_to_trade") or min_rr), 1.20))
+                    g["min_quality_score_to_trade"] = float(max(float(g.get("min_quality_score_to_trade") or min_quality), 0.70))
+                    execution_support["guards"] = g
+                    anomalies.append(f"liq_risk_proxy_high:{rs:.3f}")
+                elif rs >= float(self._cfg.get("liq_risk_proxy_mid", 0.55) or 0.55):
+                    anomalies.append(f"liq_risk_proxy_mid:{rs:.3f}")
+        except Exception:
+            pass
 
         # Optional LLM deep analysis (analysis module responsibility, bounded by quality+timeout).
         # Mutate llm_block in place so execution_support["llm_analysis"] stays consistent.

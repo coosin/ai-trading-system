@@ -2046,6 +2046,60 @@ class APIServer:
             records.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
             return records
 
+        def _to_float(v: Any, default: float = 0.0) -> float:
+            try:
+                if v is None or v == "":
+                    return float(default)
+                return float(v)
+            except Exception:
+                return float(default)
+
+        def _audit_row_to_trade(row: Dict[str, Any]) -> Dict[str, Any]:
+            details = row.get("details") if isinstance(row.get("details"), dict) else {}
+            pnl = _to_float(
+                details.get("pnl")
+                if details.get("pnl") is not None
+                else details.get("realized_pnl")
+            )
+            pnl_percent = _to_float(
+                details.get("pnl_percent")
+                if details.get("pnl_percent") is not None
+                else details.get("realized_pnl_percent")
+            )
+            fee = _to_float(details.get("fee"))
+            return {
+                "trade_id": row.get("execution_id"),
+                "order_id": details.get("order_id") or row.get("execution_id"),
+                "symbol": row.get("symbol") or details.get("symbol"),
+                "side": details.get("side") or row.get("action"),
+                "quantity": _to_float(details.get("quantity")),
+                "price": _to_float(details.get("price")),
+                "fee": fee,
+                "pnl": pnl,
+                "pnl_percent": pnl_percent,
+                "status": "filled" if str(row.get("status", "")).lower() == "success" else str(row.get("status") or "unknown"),
+                "timestamp": row.get("timestamp"),
+                "source": "execution_audit",
+                "metadata": {
+                    "source": "execution_audit",
+                    "execution_id": row.get("execution_id"),
+                    "verified": bool(row.get("verified")),
+                    "verification_details": row.get("verification_details"),
+                    "command_type": row.get("command_type"),
+                },
+                "error_message": row.get("error_message"),
+            }
+
+        def _is_bootstrap_trade(row: Dict[str, Any]) -> bool:
+            md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            src = str((md.get("source") or row.get("source") or "")).strip().lower()
+            return src == "db_bootstrap"
+
+        def _is_realized_trade(row: Dict[str, Any]) -> bool:
+            pnl = _to_float(row.get("pnl"))
+            pnl_pct = _to_float(row.get("pnl_percent"))
+            return abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12
+
         @api_v1_router.get("/trades", tags=["trades"])
         async def get_trades(
             range: str = "7d",
@@ -2193,7 +2247,9 @@ class APIServer:
             symbol: Optional[str] = None,
             side: Optional[str] = None,
             limit: int = 100,
-            offset: int = 0
+            offset: int = 0,
+            realized_only: bool = True,
+            exclude_bootstrap: bool = True,
         ):
             """兼容旧前端：/api/v1/trading/history -> /api/v1/trades"""
             result = await get_trades(range=range, symbol=symbol, side=side, limit=limit, offset=offset)
@@ -2202,30 +2258,26 @@ class APIServer:
                 trades = result.get("trades", []) if isinstance(result.get("trades"), list) else []
             elif isinstance(result, list):
                 trades = result
-            if not trades:
+            if trades:
+                if exclude_bootstrap:
+                    trades = [t for t in trades if isinstance(t, dict) and not _is_bootstrap_trade(t)]
+                if realized_only:
+                    trades = [t for t in trades if isinstance(t, dict) and _is_realized_trade(t)]
+            if not trades and not (realized_only or exclude_bootstrap):
                 # When primary history is empty, fall back to execution audit rows.
                 fallback_days = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}.get(range, 7)
                 audit_rows = _load_execution_audit_records(days=fallback_days)
                 for row in audit_rows[offset: offset + max(limit, 1)]:
-                    details = row.get("details") or {}
-                    trades.append(
-                        {
-                            "order_id": details.get("order_id"),
-                            "symbol": row.get("symbol") or details.get("symbol"),
-                            "side": details.get("side") or row.get("action"),
-                            "quantity": details.get("quantity"),
-                            "price": details.get("price"),
-                            "status": row.get("status"),
-                            "timestamp": row.get("timestamp"),
-                            "source": "execution_audit",
-                            "error_message": row.get("error_message"),
-                        }
-                    )
+                    trades.append(_audit_row_to_trade(row))
             return {
                 "success": True,
                 "data": trades,
                 "total": len(trades),
                 "source": "compat:/trading/history",
+                "filters": {
+                    "realized_only": bool(realized_only),
+                    "exclude_bootstrap": bool(exclude_bootstrap),
+                },
                 "query_time": datetime.now().isoformat(),
             }
 
@@ -2236,12 +2288,26 @@ class APIServer:
             side: Optional[str] = None,
             limit: int = 100,
             offset: int = 0,
+            realized_only: bool = True,
+            exclude_bootstrap: bool = True,
         ):
             """兼容旧验收/前端：/api/v1/trade/history -> /api/v1/trading/history"""
-            return await get_trading_history_compat(range=range, symbol=symbol, side=side, limit=limit, offset=offset)
+            return await get_trading_history_compat(
+                range=range,
+                symbol=symbol,
+                side=side,
+                limit=limit,
+                offset=offset,
+                realized_only=realized_only,
+                exclude_bootstrap=exclude_bootstrap,
+            )
 
         @api_v1_router.get("/trades/statistics", tags=["trades"])
-        async def get_trade_statistics(days: int = 30):
+        async def get_trade_statistics(
+            days: int = 30,
+            realized_only: bool = True,
+            exclude_bootstrap: bool = True,
+        ):
             """
             获取交易统计数据
             
@@ -2254,6 +2320,137 @@ class APIServer:
                     trade_service = mc.trade_history_service
                 
                 if trade_service:
+                    # Realized metrics path (default): prefer clean PnL records over mixed bootstrap rows.
+                    # This gives stable production indicators for profitability decisions.
+                    start_date = datetime.now() - timedelta(days=days)
+                    rows = await trade_service.get_trade_history(start_date=start_date, limit=10000)
+                    clean_rows: List[Dict[str, Any]] = []
+                    for r in (rows or []):
+                        if not isinstance(r, dict):
+                            continue
+                        md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                        src = str((md.get("source") or r.get("source") or "")).strip().lower()
+                        if exclude_bootstrap and src == "db_bootstrap":
+                            continue
+                        pnl = _to_float(r.get("pnl"))
+                        pnl_pct = _to_float(r.get("pnl_percent"))
+                        if realized_only and not (abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12):
+                            continue
+                        clean_rows.append(r)
+
+                    if clean_rows:
+                        wins = [x for x in clean_rows if float(x.get("pnl", 0) or 0) > 0]
+                        losses = [x for x in clean_rows if float(x.get("pnl", 0) or 0) < 0]
+                        total = len(clean_rows)
+                        gross_profit = sum(float(x.get("pnl", 0) or 0) for x in wins)
+                        gross_loss = abs(sum(float(x.get("pnl", 0) or 0) for x in losses))
+                        total_pnl = sum(float(x.get("pnl", 0) or 0) for x in clean_rows)
+                        total_fees = sum(float(x.get("fee", 0) or 0) for x in clean_rows)
+                        avg_win = (gross_profit / len(wins)) if wins else 0.0
+                        avg_loss = (sum(float(x.get("pnl", 0) or 0) for x in losses) / len(losses)) if losses else 0.0
+                        win_rate = (len(wins) / total) if total else 0.0
+                        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 9999.0
+                        expectancy = (total_pnl / total) if total else 0.0
+                        symbols = sorted(
+                            {
+                                str(x.get("symbol") or "").strip()
+                                for x in clean_rows
+                                if str(x.get("symbol") or "").strip()
+                            }
+                        )
+                        return {
+                            "total_trades": total,
+                            "winning_trades": len(wins),
+                            "losing_trades": len(losses),
+                            "win_rate": round(win_rate * 100, 2),
+                            "total_pnl": round(total_pnl, 6),
+                            "total_fees": round(total_fees, 6),
+                            "avg_win": round(avg_win, 6),
+                            "avg_loss": round(avg_loss, 6),
+                            "profit_factor": round(profit_factor, 4),
+                            "expectancy": round(expectancy, 6),
+                            "symbols": symbols,
+                            "period_days": days,
+                            "generated_at": datetime.now().isoformat(),
+                            "source": "trade_history:realized",
+                            "filters": {
+                                "realized_only": bool(realized_only),
+                                "exclude_bootstrap": bool(exclude_bootstrap),
+                            },
+                        }
+
+                    # Secondary fallback for profitability analytics:
+                    # leverage execution audit only when strict filters are disabled.
+                    if not (realized_only or exclude_bootstrap):
+                        audit_rows = _load_execution_audit_records(days=days)
+                        mapped = [_audit_row_to_trade(x) for x in audit_rows if isinstance(x, dict)]
+                        if mapped:
+                            wins = [x for x in mapped if _to_float(x.get("pnl")) > 0]
+                            losses = [x for x in mapped if _to_float(x.get("pnl")) < 0]
+                            total = len(mapped)
+                            gross_profit = sum(_to_float(x.get("pnl")) for x in wins)
+                            gross_loss = abs(sum(_to_float(x.get("pnl")) for x in losses))
+                            total_pnl = sum(_to_float(x.get("pnl")) for x in mapped)
+                            total_fees = sum(_to_float(x.get("fee")) for x in mapped)
+                            avg_win = (gross_profit / len(wins)) if wins else 0.0
+                            avg_loss = (sum(_to_float(x.get("pnl")) for x in losses) / len(losses)) if losses else 0.0
+                            win_rate = (len(wins) / total) if total else 0.0
+                            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 9999.0
+                            expectancy = (total_pnl / total) if total else 0.0
+                            symbols = sorted(
+                                {
+                                    str(x.get("symbol") or "").strip()
+                                    for x in mapped
+                                    if str(x.get("symbol") or "").strip()
+                                }
+                            )
+                            return {
+                                "total_trades": total,
+                                "winning_trades": len(wins),
+                                "losing_trades": len(losses),
+                                "win_rate": round(win_rate * 100, 2),
+                                "total_pnl": round(total_pnl, 6),
+                                "total_fees": round(total_fees, 6),
+                                "avg_win": round(avg_win, 6),
+                                "avg_loss": round(avg_loss, 6),
+                                "profit_factor": round(profit_factor, 4),
+                                "expectancy": round(expectancy, 6),
+                                "symbols": symbols,
+                                "period_days": days,
+                                "generated_at": datetime.now().isoformat(),
+                                "source": "execution_audit:mapped",
+                                "filters": {
+                                    "realized_only": bool(realized_only),
+                                    "exclude_bootstrap": bool(exclude_bootstrap),
+                                },
+                                "note": "Mapped from execution audit; pnl fields depend on audit payload completeness.",
+                            }
+
+                    # When strict filters are enabled, do not silently fall back to bootstrap-mixed stats.
+                    # Return an explicit empty realized set so operators don't misread profitability.
+                    if realized_only or exclude_bootstrap:
+                        return {
+                            "total_trades": 0,
+                            "winning_trades": 0,
+                            "losing_trades": 0,
+                            "win_rate": 0.0,
+                            "total_pnl": 0.0,
+                            "total_fees": 0.0,
+                            "avg_win": 0.0,
+                            "avg_loss": 0.0,
+                            "profit_factor": 0.0,
+                            "expectancy": 0.0,
+                            "symbols": [],
+                            "period_days": days,
+                            "generated_at": datetime.now().isoformat(),
+                            "source": "trade_history:realized_empty",
+                            "filters": {
+                                "realized_only": bool(realized_only),
+                                "exclude_bootstrap": bool(exclude_bootstrap),
+                            },
+                            "note": "No realized trades after filters; bootstrap/non-realized rows excluded.",
+                        }
+
                     stats = await trade_service.get_statistics(days=days)
                     if isinstance(stats, dict) and int(stats.get("total_trades", 0) or 0) == 0:
                         rows = _load_execution_audit_records(days=days)
@@ -2347,6 +2544,248 @@ class APIServer:
                 return {
                     "error": "生成交易复盘失败",
                     "details": str(e)
+                }
+
+        @api_v1_router.get("/trades/attribution/regime", tags=["trades"])
+        async def get_trade_regime_attribution(
+            days: int = 30,
+            realized_only: bool = True,
+            exclude_bootstrap: bool = True,
+            limit: int = 5000,
+        ):
+            """按 market_context.regime 聚合收益归因指标。"""
+            try:
+                mc = self.main_controller
+                trade_service = getattr(mc, "trade_history_service", None) if mc else None
+                if not trade_service:
+                    return {
+                        "success": False,
+                        "message": "trade_history_service unavailable",
+                    }
+
+                start_date = datetime.now() - timedelta(days=max(1, int(days or 30)))
+                rows = await trade_service.get_trade_history(start_date=start_date, limit=max(1, int(limit or 5000)))
+                clean_rows: List[Dict[str, Any]] = []
+                for r in (rows or []):
+                    if not isinstance(r, dict):
+                        continue
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    src = str((md.get("source") or r.get("source") or "")).strip().lower()
+                    if exclude_bootstrap and src == "db_bootstrap":
+                        continue
+                    pnl = _to_float(r.get("pnl"))
+                    pnl_pct = _to_float(r.get("pnl_percent"))
+                    if realized_only and not (abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12):
+                        continue
+                    clean_rows.append(r)
+
+                groups: Dict[str, Dict[str, Any]] = {}
+                for r in clean_rows:
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+                    regime = str(mkt.get("regime") or "unknown").strip().lower() or "unknown"
+                    grp = groups.get(regime)
+                    if not grp:
+                        grp = {
+                            "regime": regime,
+                            "total_trades": 0,
+                            "winning_trades": 0,
+                            "losing_trades": 0,
+                            "total_pnl": 0.0,
+                            "total_fees": 0.0,
+                            "sum_qty_factor": 0.0,
+                            "qty_factor_count": 0,
+                            "sum_pnl_percent": 0.0,
+                            "pnl_percent_count": 0,
+                        }
+                        groups[regime] = grp
+                    pnl = _to_float(r.get("pnl"))
+                    fee = _to_float(r.get("fee"))
+                    pnl_pct = _to_float(r.get("pnl_percent"))
+                    qf = _to_float(mkt.get("effective_qty_factor"), 1.0)
+                    grp["total_trades"] += 1
+                    grp["total_pnl"] += pnl
+                    grp["total_fees"] += fee
+                    grp["sum_qty_factor"] += qf
+                    grp["qty_factor_count"] += 1
+                    if abs(pnl_pct) > 1e-12:
+                        grp["sum_pnl_percent"] += pnl_pct
+                        grp["pnl_percent_count"] += 1
+                    if pnl > 0:
+                        grp["winning_trades"] += 1
+                    elif pnl < 0:
+                        grp["losing_trades"] += 1
+
+                out: List[Dict[str, Any]] = []
+                for regime, g in groups.items():
+                    wins = int(g["winning_trades"])
+                    losses = int(g["losing_trades"])
+                    total = int(g["total_trades"])
+                    gross_profit = sum(
+                        _to_float(x.get("pnl"))
+                        for x in clean_rows
+                        if str(((x.get("metadata") or {}).get("market_context") or {}).get("regime") or "unknown").strip().lower() == regime
+                        and _to_float(x.get("pnl")) > 0
+                    )
+                    gross_loss = abs(
+                        sum(
+                            _to_float(x.get("pnl"))
+                            for x in clean_rows
+                            if str(((x.get("metadata") or {}).get("market_context") or {}).get("regime") or "unknown").strip().lower() == regime
+                            and _to_float(x.get("pnl")) < 0
+                        )
+                    )
+                    win_rate = (wins / total) if total else 0.0
+                    expectancy = (_to_float(g["total_pnl"]) / total) if total else 0.0
+                    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (9999.0 if gross_profit > 0 else 0.0)
+                    avg_qty_factor = (_to_float(g["sum_qty_factor"]) / max(1, int(g["qty_factor_count"])))
+                    avg_pnl_percent = (_to_float(g["sum_pnl_percent"]) / max(1, int(g["pnl_percent_count"])))
+                    out.append(
+                        {
+                            "regime": regime,
+                            "total_trades": total,
+                            "winning_trades": wins,
+                            "losing_trades": losses,
+                            "win_rate": round(win_rate * 100, 2),
+                            "profit_factor": round(float(profit_factor), 4),
+                            "expectancy": round(float(expectancy), 6),
+                            "total_pnl": round(_to_float(g["total_pnl"]), 6),
+                            "total_fees": round(_to_float(g["total_fees"]), 6),
+                            "avg_pnl_percent": round(float(avg_pnl_percent), 6),
+                            "avg_effective_qty_factor": round(float(avg_qty_factor), 6),
+                        }
+                    )
+                out.sort(key=lambda x: x.get("total_trades", 0), reverse=True)
+
+                return {
+                    "success": True,
+                    "ok": True,
+                    "status": "success",
+                    "period_days": int(days or 30),
+                    "source": "trade_history:regime_attribution",
+                    "filters": {
+                        "realized_only": bool(realized_only),
+                        "exclude_bootstrap": bool(exclude_bootstrap),
+                        "limit": int(limit or 5000),
+                    },
+                    "summary": {
+                        "input_trades": int(len(rows or [])),
+                        "attributed_trades": int(len(clean_rows)),
+                        "regime_count": int(len(out)),
+                    },
+                    "data": out,
+                    "generated_at": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                logger.error(f"获取 regime 归因失败: {e}")
+                return {
+                    "success": False,
+                    "message": "获取 regime 归因失败",
+                    "details": str(e),
+                }
+
+        @api_v1_router.get("/trades/attribution/regime/health", tags=["trades"])
+        async def get_trade_regime_attribution_health(
+            days: int = 30,
+            sample_limit: int = 200,
+            realized_only: bool = True,
+            exclude_bootstrap: bool = True,
+        ):
+            """归因数据健康度：评估 regime/pnl 样本是否足够用于参数调优。"""
+            try:
+                mc = self.main_controller
+                trade_service = getattr(mc, "trade_history_service", None) if mc else None
+                if not trade_service:
+                    return {"success": False, "message": "trade_history_service unavailable"}
+
+                start_date = datetime.now() - timedelta(days=max(1, int(days or 30)))
+                rows = await trade_service.get_trade_history(
+                    start_date=start_date,
+                    limit=max(20, int(sample_limit or 200)),
+                )
+                filtered: List[Dict[str, Any]] = []
+                for r in (rows or []):
+                    if not isinstance(r, dict):
+                        continue
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    src = str((md.get("source") or r.get("source") or "")).strip().lower()
+                    if exclude_bootstrap and src == "db_bootstrap":
+                        continue
+                    pnl = _to_float(r.get("pnl"))
+                    pnl_pct = _to_float(r.get("pnl_percent"))
+                    if realized_only and not (abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12):
+                        continue
+                    filtered.append(r)
+
+                total = int(len(filtered))
+                with_regime = 0
+                nonzero_pnl = 0
+                nonzero_pnl_pct = 0
+                with_qty_factor = 0
+                regime_counter: Dict[str, int] = {}
+                for r in filtered:
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+                    regime = str(mkt.get("regime") or "").strip().lower()
+                    if regime:
+                        with_regime += 1
+                        regime_counter[regime] = int(regime_counter.get(regime, 0)) + 1
+                    if mkt.get("effective_qty_factor") is not None:
+                        with_qty_factor += 1
+                    pnl = _to_float(r.get("pnl"))
+                    pnl_pct = _to_float(r.get("pnl_percent"))
+                    if abs(pnl) > 1e-12:
+                        nonzero_pnl += 1
+                    if abs(pnl_pct) > 1e-12:
+                        nonzero_pnl_pct += 1
+
+                regime_cov = (with_regime / total) if total else 0.0
+                pnl_cov = (nonzero_pnl / total) if total else 0.0
+                pnl_pct_cov = (nonzero_pnl_pct / total) if total else 0.0
+                qty_cov = (with_qty_factor / total) if total else 0.0
+                ready = bool(total >= 20 and regime_cov >= 0.6 and pnl_cov >= 0.5)
+
+                return {
+                    "success": True,
+                    "ok": True,
+                    "status": "success",
+                    "source": "trade_history:regime_attribution_health",
+                    "period_days": int(days or 30),
+                    "filters": {
+                        "realized_only": bool(realized_only),
+                        "exclude_bootstrap": bool(exclude_bootstrap),
+                        "sample_limit": int(sample_limit or 200),
+                    },
+                    "sample": {
+                        "total": total,
+                        "with_regime": int(with_regime),
+                        "with_effective_qty_factor": int(with_qty_factor),
+                        "nonzero_pnl": int(nonzero_pnl),
+                        "nonzero_pnl_percent": int(nonzero_pnl_pct),
+                    },
+                    "coverage": {
+                        "regime_coverage": round(regime_cov, 4),
+                        "qty_factor_coverage": round(qty_cov, 4),
+                        "nonzero_pnl_coverage": round(pnl_cov, 4),
+                        "nonzero_pnl_percent_coverage": round(pnl_pct_cov, 4),
+                    },
+                    "regime_distribution": dict(sorted(regime_counter.items(), key=lambda kv: kv[1], reverse=True)),
+                    "readiness": {
+                        "ready_for_regime_tuning": ready,
+                        "rules": {
+                            "min_samples": 20,
+                            "min_regime_coverage": 0.6,
+                            "min_nonzero_pnl_coverage": 0.5,
+                        },
+                    },
+                    "generated_at": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                logger.error(f"获取 regime 归因健康度失败: {e}")
+                return {
+                    "success": False,
+                    "message": "获取 regime 归因健康度失败",
+                    "details": str(e),
                 }
 
         @api_v1_router.get("/monitoring/logs", tags=["monitoring"])

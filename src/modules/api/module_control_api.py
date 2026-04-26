@@ -5,7 +5,7 @@
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -172,6 +172,28 @@ def init_module_control_api(app, main_controller):
         mi = getattr(mc, "market_intelligence", None) if mc else None
         if not mi or not hasattr(mi, "get_symbol_view"):
             return {"ok": False, "message": "MarketIntelligenceEngine unavailable"}
+        def _ensure_execution_support_schema(view_obj: Dict[str, Any]) -> Dict[str, Any]:
+            """Keep response schema stable under degraded/cached paths."""
+            if not isinstance(view_obj, dict):
+                return {}
+            es = view_obj.get("execution_support")
+            if not isinstance(es, dict):
+                es = {}
+            if not isinstance(es.get("stable_anomalies"), list):
+                es["stable_anomalies"] = []
+            if not isinstance(es.get("anomaly_stability"), dict):
+                es["anomaly_stability"] = {
+                    "confirm_hits": 2,
+                    "ttl_sec": 900,
+                    "items": [],
+                }
+            if not isinstance(es.get("extra_provider_summary"), dict):
+                es["extra_provider_summary"] = {
+                    "aicoin_enabled": False,
+                    "coinglass_enabled": False,
+                }
+            view_obj["execution_support"] = es
+            return view_obj
         try:
             # Avoid blocking the control-plane. Prefer cached view when upstream is unstable.
             try:
@@ -179,36 +201,83 @@ def init_module_control_api(app, main_controller):
             except Exception:
                 cached = {}
             if cached and not bool(include_snapshot):
-                out_view = dict(cached)
+                out_view = _ensure_execution_support_schema(dict(cached))
                 if fields:
                     allow = {k.strip() for k in str(fields).split(",") if k.strip()}
                     allow.add("symbol")
                     allow.add("timestamp")
                     out_view = {k: v for k, v in out_view.items() if k in allow}
-                return {"ok": True, "view": out_view, "snapshot": None, "degraded": True, "message": "symbol_view_cached"}
+                return {
+                    "ok": True,
+                    "view": out_view,
+                    "snapshot": None,
+                    "degraded": True,
+                    "message": "symbol_view_cached",
+                    "degraded_reason": {
+                        "code": "cached_fastpath",
+                        "source": "market_intelligence_cache",
+                        "include_snapshot": bool(include_snapshot),
+                        "note": "返回缓存快照以保证控制面快速响应",
+                    },
+                }
 
             # unified_snapshot has its own bounded budget (DataSourceHub.snapshot_timeout_sec, default ~2.5s).
             # In proxy-only environments, scheduling + JSON + partial collectors can push the end-to-end
             # call slightly above 3s. Use a slightly larger cap to avoid false "timeout_degraded".
             view = await asyncio.wait_for(
-                mi.get_symbol_view(symbol, include_snapshot=bool(include_snapshot)),
+                mi.get_symbol_view(
+                    symbol,
+                    include_snapshot=bool(include_snapshot),
+                    # API 默认查询不带 snapshot 时，优先快路径，避免被重采集拖慢并产生误导性 timeout。
+                    prefer_fast_only=not bool(include_snapshot),
+                ),
                 timeout=4.5,
             )
             out_view = view.to_dict()
+            out_view = _ensure_execution_support_schema(out_view)
             if fields:
                 allow = {k.strip() for k in str(fields).split(",") if k.strip()}
                 allow.add("symbol")
                 allow.add("timestamp")
                 out_view = {k: v for k, v in out_view.items() if k in allow}
-            return {"ok": True, "view": out_view, "snapshot": view.snapshot if include_snapshot else None, "degraded": False}
+            return {
+                "ok": True,
+                "view": out_view,
+                "snapshot": view.snapshot if include_snapshot else None,
+                "degraded": False,
+                "degraded_reason": None,
+            }
         except asyncio.TimeoutError:
             try:
                 cached = mi.get_cached_symbol_view(symbol) if hasattr(mi, "get_cached_symbol_view") else {}
             except Exception:
                 cached = {}
-            return {"ok": True, "view": cached or {}, "snapshot": None, "degraded": True, "message": "symbol_view_timeout_degraded"}
+            cached = _ensure_execution_support_schema(dict(cached) if isinstance(cached, dict) else {})
+            return {
+                "ok": True,
+                "view": cached or {},
+                "snapshot": None,
+                "degraded": True,
+                "message": "symbol_view_timeout_degraded",
+                "degraded_reason": {
+                    "code": "upstream_timeout",
+                    "source": "market_intelligence_get_symbol_view",
+                    "include_snapshot": bool(include_snapshot),
+                    "note": "上游采集超时，已降级为缓存/空结果",
+                },
+            }
         except Exception as e:
-            return {"ok": False, "message": str(e)}
+            return {
+                "ok": False,
+                "message": str(e),
+                "degraded": True,
+                "degraded_reason": {
+                    "code": "internal_error",
+                    "source": "market_symbol_view_handler",
+                    "include_snapshot": bool(include_snapshot),
+                    "note": "接口内部异常，请查看服务日志",
+                },
+            }
 
     @market_router.get("/state")
     async def get_market_state(timeout_sec: float = 3.2) -> Dict[str, Any]:
@@ -722,6 +791,30 @@ def init_module_control_api(app, main_controller):
             "low_risk_spread_multiplier",
             "high_risk_rr_multiplier",
             "high_risk_spread_multiplier",
+            "regime_enable",
+            "regime_low_vol_atr_pct",
+            "regime_high_vol_atr_pct",
+            "regime_trend_threshold",
+            "regime_low_liquidity_spread_bps",
+            "regime_profile_overrides",
+            "pnl_health_sizing_enable",
+            "pnl_health_lookback_trades",
+            "pnl_health_bad_expectancy",
+            "pnl_health_bad_drawdown",
+            "pnl_health_bad_factor",
+            "pnl_health_good_expectancy",
+            "pnl_health_good_drawdown",
+            "pnl_health_good_factor",
+            "edge_after_cost_guard_enable",
+            "edge_min_net_reward_pct",
+            "edge_fee_rate_per_side",
+            "edge_slippage_rate_per_side",
+            "edge_spread_penalty_weight",
+            "loss_streak_cooldown_enable",
+            "loss_streak_trigger",
+            "loss_streak_lookback",
+            "loss_streak_cooldown_sec",
+            "loss_streak_min_abs_loss",
             "auto_frequency_profile_switch",
             "frequency_profile_switch_telegram_notify",
             "frequency_profile_cooldown_seconds",
@@ -874,20 +967,42 @@ def init_module_control_api(app, main_controller):
         """读取当前开单频率档位（根据关键门控参数推断）"""
         if not main_controller or not hasattr(main_controller, "ai_core") or not main_controller.ai_core:
             return {"success": False, "message": "AI核心决策引擎未初始化"}
-        cfg = main_controller.ai_core.config if hasattr(main_controller.ai_core, "config") else {}
+        ai_core = main_controller.ai_core
+        cfg = ai_core.config if hasattr(ai_core, "config") else {}
         min_interval = float(cfg.get("min_trade_interval", 120) or 120)
         min_conf = float(cfg.get("min_confidence_to_trade", 0.75) or 0.75)
         min_rr = float(cfg.get("min_rr_to_trade", 1.2) or 1.2)
         spread = float(cfg.get("max_spread_bps_to_trade", 35.0) or 35.0)
-        if min_interval <= 70 and min_conf <= 0.70 and min_rr <= 1.10 and spread >= 45.0:
-            inferred = "aggressive"
-        elif min_interval <= 90 and min_conf <= 0.72 and min_rr <= 1.15 and spread >= 40.0:
-            inferred = "balanced"
+        prof_status = (
+            ai_core.get_frequency_profile_status()
+            if hasattr(ai_core, "get_frequency_profile_status")
+            else {
+                "profile": getattr(ai_core, "_frequency_profile", "balanced"),
+                "last_switch_at": (
+                    ai_core._last_frequency_profile_switch_at.isoformat()
+                    if hasattr(ai_core, "_last_frequency_profile_switch_at") and ai_core._last_frequency_profile_switch_at
+                    else None
+                ),
+                "last_switch_detail": getattr(ai_core, "_last_frequency_profile_switch_detail", {}),
+            }
+        )
+        # 优先使用运行时真实档位；启发式推断仅做兜底（避免与当前 profile 参数漂移产生误报）。
+        runtime_profile = str(prof_status.get("profile") or "").strip().lower()
+        if runtime_profile in ("conservative", "balanced", "aggressive"):
+            inferred = runtime_profile
         else:
-            inferred = "conservative"
+            if min_interval <= 70 and min_rr <= 1.10 and spread >= 45.0:
+                inferred = "aggressive"
+            elif min_interval <= 90 and min_rr <= 1.15 and spread >= 40.0:
+                inferred = "balanced"
+            else:
+                inferred = "conservative"
         return {
             "success": True,
             "inferred_profile": inferred,
+            "runtime_profile": prof_status.get("profile"),
+            "last_switch_at": prof_status.get("last_switch_at"),
+            "last_switch_detail": prof_status.get("last_switch_detail"),
             "config": {
                 "min_trade_interval": min_interval,
                 "min_confidence_to_trade": min_conf,
@@ -895,6 +1010,85 @@ def init_module_control_api(app, main_controller):
                 "max_spread_bps_to_trade": spread,
                 "boost_on_low_risk": bool(cfg.get("boost_on_low_risk", True)),
             },
+        }
+
+    def _build_frequency_profile_explain_payload(
+        runtime_profile: str,
+        inferred_profile: str,
+        last_switch_at: Optional[str],
+        last_switch_detail: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        detail = dict(last_switch_detail or {})
+        source = str(detail.get("source") or "unknown")
+        reason_metrics = detail.get("reason_metrics") if isinstance(detail.get("reason_metrics"), dict) else {}
+        market_ctx = detail.get("market_signal_context") if isinstance(detail.get("market_signal_context"), dict) else {}
+        top_anomalies = market_ctx.get("top_anomalies") if isinstance(market_ctx.get("top_anomalies"), list) else []
+        applied = detail.get("applied") if isinstance(detail.get("applied"), dict) else {}
+        mode = "auto" if source == "auto" else ("manual" if source == "manual_api" else "unknown")
+
+        explain = []
+        if mode == "auto":
+            win_rate = reason_metrics.get("win_rate")
+            dd = reason_metrics.get("max_drawdown")
+            risk_ratio = reason_metrics.get("mi_risk_ratio")
+            if win_rate is not None:
+                explain.append(f"win_rate={win_rate}")
+            if dd is not None:
+                explain.append(f"max_drawdown={dd}")
+            if risk_ratio is not None:
+                explain.append(f"mi_risk_ratio={risk_ratio}")
+            if top_anomalies:
+                tops = [str((x or {}).get("anomaly") or "") for x in top_anomalies[:3] if isinstance(x, dict)]
+                tops = [x for x in tops if x]
+                if tops:
+                    explain.append(f"top_anomalies={','.join(tops)}")
+        elif mode == "manual":
+            if applied:
+                explain.append("manual_api_applied")
+            explain.append(f"from={detail.get('from')} to={detail.get('to')}")
+        else:
+            explain.append("switch_detail_unavailable")
+
+        return {
+            "mode": mode,
+            "source": source,
+            "runtime_profile": runtime_profile,
+            "inferred_profile": inferred_profile,
+            "last_switch_at": last_switch_at,
+            "switch": {
+                "from": detail.get("from"),
+                "to": detail.get("to"),
+                "timestamp": detail.get("timestamp") or last_switch_at,
+            },
+            "reason_metrics": reason_metrics,
+            "market_signal_context": {
+                "top_anomalies": top_anomalies,
+            },
+            "applied": applied,
+            "explain_text": "; ".join(explain),
+        }
+
+    @router.get("/ai/frequency-profile/explain")
+    async def get_ai_frequency_profile_explain():
+        """统一返回手动/自动切档解释，便于 OpenClaw 前端稳定渲染。"""
+        raw = await get_ai_frequency_profile()
+        if not isinstance(raw, dict) or not bool(raw.get("success")):
+            return {
+                "success": False,
+                "message": (raw or {}).get("message", "读取频率档位状态失败") if isinstance(raw, dict) else "读取频率档位状态失败",
+            }
+        payload = _build_frequency_profile_explain_payload(
+            runtime_profile=str(raw.get("runtime_profile") or ""),
+            inferred_profile=str(raw.get("inferred_profile") or ""),
+            last_switch_at=raw.get("last_switch_at"),
+            last_switch_detail=raw.get("last_switch_detail") if isinstance(raw.get("last_switch_detail"), dict) else {},
+        )
+        return {
+            "success": True,
+            "ok": True,
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "data": payload,
         }
 
     @router.post("/ai/frequency-profile")
@@ -914,6 +1108,7 @@ def init_module_control_api(app, main_controller):
                 "success": False,
                 "message": "无效档位，支持: conservative / balanced / aggressive",
             }
+        old_profile = str(getattr(ai_core, "_frequency_profile", "unknown") or "unknown")
         if hasattr(ai_core, "_apply_frequency_profile"):
             applied = ai_core._apply_frequency_profile(requested)
         else:
@@ -921,6 +1116,17 @@ def init_module_control_api(app, main_controller):
             for k, v in profiles[requested].items():
                 ai_core.config[k] = v
                 applied[k] = v
+        # 记录手动切档明细，便于 OpenClaw 直接观测来源与参数变化。
+        try:
+            ai_core._last_frequency_profile_switch_detail = {
+                "source": "manual_api",
+                "from": old_profile,
+                "to": requested,
+                "timestamp": datetime.now().isoformat(),
+                "applied": dict(applied or {}),
+            }
+        except Exception:
+            pass
         return {
             "success": True,
             "message": f"已切换到 {requested} 档位",
@@ -1000,6 +1206,293 @@ def init_module_control_api(app, main_controller):
             return {"success": True, "data": rows, "count": len(rows), "timestamp": datetime.now().isoformat()}
         except Exception as e:
             return {"success": False, "message": f"读取活动 SLTP 订单失败: {e}"}
+
+    @router.get("/stop-loss/profit-protect-debug")
+    async def get_stop_loss_profit_protect_debug(limit: int = 30):
+        """调试盈利保护加速器：配置 + 活跃订单的生效参数。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        try:
+            slm = getattr(main_controller, "stop_loss_manager", None)
+            if not slm:
+                return {"success": False, "message": "止盈止损管理器未初始化"}
+            cfg = getattr(slm, "config", None)
+            cfg_out: Dict[str, Any] = {}
+            if cfg is not None:
+                try:
+                    cfg_out = {
+                        "profit_protect_accelerator_enable": bool(getattr(cfg, "profit_protect_accelerator_enable", False)),
+                        "profit_protect_trigger_1": float(getattr(cfg, "profit_protect_trigger_1", 0.0) or 0.0),
+                        "profit_protect_lock_1": float(getattr(cfg, "profit_protect_lock_1", 0.0) or 0.0),
+                        "profit_protect_trigger_2": float(getattr(cfg, "profit_protect_trigger_2", 0.0) or 0.0),
+                        "profit_protect_lock_2": float(getattr(cfg, "profit_protect_lock_2", 0.0) or 0.0),
+                        "profit_protect_tighten_factor": float(getattr(cfg, "profit_protect_tighten_factor", 0.0) or 0.0),
+                        "profit_protect_regime_overrides": dict(getattr(cfg, "profit_protect_regime_overrides", {}) or {}),
+                    }
+                except Exception:
+                    cfg_out = {}
+            if not hasattr(slm, "get_all_active_orders"):
+                return {
+                    "success": True,
+                    "config": cfg_out,
+                    "data": [],
+                    "count": 0,
+                    "message": "止盈止损明细接口不可用",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            orders = await slm.get_all_active_orders()
+            rows: List[Dict[str, Any]] = []
+            for o in (orders or [])[: max(0, int(limit or 30))]:
+                try:
+                    obj = o.to_dict() if hasattr(o, "to_dict") else dict(o)
+                except Exception:
+                    continue
+                md = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+                gp = md.get("guard_profile") if isinstance(md.get("guard_profile"), dict) else {}
+                rows.append(
+                    {
+                        "order_id": obj.get("order_id"),
+                        "symbol": obj.get("symbol"),
+                        "side": obj.get("side"),
+                        "entry_price": obj.get("entry_price"),
+                        "current_price": obj.get("current_price"),
+                        "stop_loss_price": obj.get("stop_loss_price"),
+                        "trailing_stop_offset": obj.get("trailing_stop_offset"),
+                        "regime": (
+                            md.get("profit_protect_regime")
+                            or gp.get("regime")
+                            or gp.get("profile")
+                            or "unknown"
+                        ),
+                        "profit_protect_stage": md.get("profit_protect_stage"),
+                        "profit_protect_lock_pct": md.get("profit_protect_lock_pct"),
+                        "profit_protect_trigger_1_effective": md.get("profit_protect_trigger_1_effective"),
+                        "profit_protect_trigger_2_effective": md.get("profit_protect_trigger_2_effective"),
+                        "profit_protect_tighten_effective": md.get("profit_protect_tighten_effective"),
+                        "profit_protect_applied_at": md.get("profit_protect_applied_at"),
+                    }
+                )
+            return {
+                "success": True,
+                "config": cfg_out,
+                "data": rows,
+                "count": len(rows),
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": f"读取盈利保护调试信息失败: {e}"}
+
+    @router.get("/profit/ops-overview")
+    async def get_profit_ops_overview(
+        days: int = 30,
+        sample_limit: int = 200,
+        active_order_limit: int = 20,
+    ):
+        """盈利运营一屏视图：归因 + 健康度 + 盈利保护调试。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化"}
+        try:
+            # 1) AI execution guards snapshot
+            ai_guard = {}
+            try:
+                ai_core = getattr(main_controller, "ai_core", None)
+                st = ai_core.get_status() if ai_core and hasattr(ai_core, "get_status") else {}
+                ai_guard = (st or {}).get("execution_guards", {}) if isinstance(st, dict) else {}
+            except Exception:
+                ai_guard = {}
+
+            # 2) Trade history / attribution & readiness
+            trade_service = getattr(main_controller, "trade_history_service", None)
+            regime_rows: List[Dict[str, Any]] = []
+            health = {
+                "sample": {"total": 0, "with_regime": 0, "with_effective_qty_factor": 0, "nonzero_pnl": 0, "nonzero_pnl_percent": 0},
+                "coverage": {"regime_coverage": 0.0, "qty_factor_coverage": 0.0, "nonzero_pnl_coverage": 0.0, "nonzero_pnl_percent_coverage": 0.0},
+                "readiness": {"ready_for_regime_tuning": False, "rules": {"min_samples": 20, "min_regime_coverage": 0.6, "min_nonzero_pnl_coverage": 0.5}},
+            }
+            if trade_service and hasattr(trade_service, "get_trade_history"):
+                start_date = datetime.now() - timedelta(days=max(1, int(days or 30)))
+                rows = await trade_service.get_trade_history(start_date=start_date, limit=max(50, int(sample_limit or 2000)))
+                clean_rows: List[Dict[str, Any]] = []
+                for r in (rows or []):
+                    if not isinstance(r, dict):
+                        continue
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    src = str((md.get("source") or r.get("source") or "")).strip().lower()
+                    if src == "db_bootstrap":
+                        continue
+                    pnl = float(r.get("pnl", 0) or 0)
+                    pnl_pct = float(r.get("pnl_percent", 0) or 0)
+                    if not (abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12):
+                        continue
+                    clean_rows.append(r)
+
+                # Attribution grouped by regime
+                grp: Dict[str, Dict[str, Any]] = {}
+                with_regime = 0
+                with_qf = 0
+                nonzero_pnl = 0
+                nonzero_pnl_pct = 0
+                for r in clean_rows:
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+                    regime = str(mkt.get("regime") or "unknown").strip().lower() or "unknown"
+                    if regime and regime != "unknown":
+                        with_regime += 1
+                    if mkt.get("effective_qty_factor") is not None:
+                        with_qf += 1
+                    pnl = float(r.get("pnl", 0) or 0)
+                    pnl_pct = float(r.get("pnl_percent", 0) or 0)
+                    if abs(pnl) > 1e-12:
+                        nonzero_pnl += 1
+                    if abs(pnl_pct) > 1e-12:
+                        nonzero_pnl_pct += 1
+
+                    g = grp.get(regime)
+                    if not g:
+                        g = {
+                            "regime": regime,
+                            "total_trades": 0,
+                            "winning_trades": 0,
+                            "losing_trades": 0,
+                            "total_pnl": 0.0,
+                            "total_fees": 0.0,
+                            "sum_qty_factor": 0.0,
+                            "qty_factor_count": 0,
+                            "sum_pnl_percent": 0.0,
+                            "pnl_percent_count": 0,
+                            "gross_profit": 0.0,
+                            "gross_loss": 0.0,
+                        }
+                        grp[regime] = g
+                    g["total_trades"] += 1
+                    g["total_pnl"] += pnl
+                    g["total_fees"] += float(r.get("fee", 0) or 0)
+                    qf = float(mkt.get("effective_qty_factor", 1.0) or 1.0)
+                    g["sum_qty_factor"] += qf
+                    g["qty_factor_count"] += 1
+                    if abs(pnl_pct) > 1e-12:
+                        g["sum_pnl_percent"] += pnl_pct
+                        g["pnl_percent_count"] += 1
+                    if pnl > 0:
+                        g["winning_trades"] += 1
+                        g["gross_profit"] += pnl
+                    elif pnl < 0:
+                        g["losing_trades"] += 1
+                        g["gross_loss"] += abs(pnl)
+
+                for regime, g in grp.items():
+                    total = int(g["total_trades"])
+                    win_rate = (int(g["winning_trades"]) / total) if total else 0.0
+                    pf = (float(g["gross_profit"]) / float(g["gross_loss"])) if float(g["gross_loss"]) > 0 else (9999.0 if float(g["gross_profit"]) > 0 else 0.0)
+                    expectancy = float(g["total_pnl"]) / total if total else 0.0
+                    regime_rows.append(
+                        {
+                            "regime": regime,
+                            "total_trades": total,
+                            "winning_trades": int(g["winning_trades"]),
+                            "losing_trades": int(g["losing_trades"]),
+                            "win_rate": round(win_rate * 100, 2),
+                            "profit_factor": round(float(pf), 4),
+                            "expectancy": round(float(expectancy), 6),
+                            "total_pnl": round(float(g["total_pnl"]), 6),
+                            "total_fees": round(float(g["total_fees"]), 6),
+                            "avg_pnl_percent": round(float(g["sum_pnl_percent"]) / max(1, int(g["pnl_percent_count"])), 6),
+                            "avg_effective_qty_factor": round(float(g["sum_qty_factor"]) / max(1, int(g["qty_factor_count"])), 6),
+                        }
+                    )
+                regime_rows.sort(key=lambda x: x.get("total_trades", 0), reverse=True)
+
+                total = len(clean_rows)
+                regime_cov = (with_regime / total) if total else 0.0
+                qty_cov = (with_qf / total) if total else 0.0
+                pnl_cov = (nonzero_pnl / total) if total else 0.0
+                pnl_pct_cov = (nonzero_pnl_pct / total) if total else 0.0
+                ready = bool(total >= 20 and regime_cov >= 0.6 and pnl_cov >= 0.5)
+                health = {
+                    "sample": {
+                        "total": int(total),
+                        "with_regime": int(with_regime),
+                        "with_effective_qty_factor": int(with_qf),
+                        "nonzero_pnl": int(nonzero_pnl),
+                        "nonzero_pnl_percent": int(nonzero_pnl_pct),
+                    },
+                    "coverage": {
+                        "regime_coverage": round(regime_cov, 4),
+                        "qty_factor_coverage": round(qty_cov, 4),
+                        "nonzero_pnl_coverage": round(pnl_cov, 4),
+                        "nonzero_pnl_percent_coverage": round(pnl_pct_cov, 4),
+                    },
+                    "readiness": {
+                        "ready_for_regime_tuning": ready,
+                        "rules": {"min_samples": 20, "min_regime_coverage": 0.6, "min_nonzero_pnl_coverage": 0.5},
+                    },
+                }
+
+            # 3) Profit protect debug summary
+            protect_cfg: Dict[str, Any] = {}
+            protect_orders: List[Dict[str, Any]] = []
+            slm = getattr(main_controller, "stop_loss_manager", None)
+            if slm:
+                cfg = getattr(slm, "config", None)
+                if cfg is not None:
+                    try:
+                        protect_cfg = {
+                            "profit_protect_accelerator_enable": bool(getattr(cfg, "profit_protect_accelerator_enable", False)),
+                            "profit_protect_trigger_1": float(getattr(cfg, "profit_protect_trigger_1", 0.0) or 0.0),
+                            "profit_protect_lock_1": float(getattr(cfg, "profit_protect_lock_1", 0.0) or 0.0),
+                            "profit_protect_trigger_2": float(getattr(cfg, "profit_protect_trigger_2", 0.0) or 0.0),
+                            "profit_protect_lock_2": float(getattr(cfg, "profit_protect_lock_2", 0.0) or 0.0),
+                            "profit_protect_tighten_factor": float(getattr(cfg, "profit_protect_tighten_factor", 0.0) or 0.0),
+                            "profit_protect_regime_overrides": dict(getattr(cfg, "profit_protect_regime_overrides", {}) or {}),
+                        }
+                    except Exception:
+                        protect_cfg = {}
+                if hasattr(slm, "get_all_active_orders"):
+                    orders = await slm.get_all_active_orders()
+                    for o in (orders or [])[: max(0, int(active_order_limit or 20))]:
+                        try:
+                            obj = o.to_dict() if hasattr(o, "to_dict") else dict(o)
+                        except Exception:
+                            continue
+                        md = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+                        gp = md.get("guard_profile") if isinstance(md.get("guard_profile"), dict) else {}
+                        protect_orders.append(
+                            {
+                                "order_id": obj.get("order_id"),
+                                "symbol": obj.get("symbol"),
+                                "side": obj.get("side"),
+                                "regime": md.get("profit_protect_regime") or gp.get("regime") or gp.get("profile") or "unknown",
+                                "profit_protect_stage": md.get("profit_protect_stage"),
+                                "profit_protect_lock_pct": md.get("profit_protect_lock_pct"),
+                                "profit_protect_trigger_1_effective": md.get("profit_protect_trigger_1_effective"),
+                                "profit_protect_trigger_2_effective": md.get("profit_protect_trigger_2_effective"),
+                                "profit_protect_tighten_effective": md.get("profit_protect_tighten_effective"),
+                            }
+                        )
+
+            return {
+                "success": True,
+                "ok": True,
+                "status": "success",
+                "timestamp": datetime.now().isoformat(),
+                "days": int(days or 30),
+                "profit_attribution": {
+                    "regime": regime_rows,
+                    "health": health,
+                },
+                "profit_protect_debug": {
+                    "config": protect_cfg,
+                    "active_orders": protect_orders,
+                    "active_count": len(protect_orders),
+                },
+                "execution_guards": {
+                    "config": (ai_guard.get("config") or {}) if isinstance(ai_guard, dict) else {},
+                    "adaptive_profile": (ai_guard.get("adaptive_profile") or {}) if isinstance(ai_guard, dict) else {},
+                    "stats": (ai_guard.get("stats") or {}) if isinstance(ai_guard, dict) else {},
+                },
+            }
+        except Exception as e:
+            return {"success": False, "message": f"读取盈利运营总览失败: {e}"}
 
     @router.get("/stop-loss/config")
     async def get_stop_loss_config():

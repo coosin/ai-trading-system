@@ -1674,6 +1674,19 @@ class MainController:
             # 注册止盈止损回调
             async def on_stop_loss_trigger(order, current_price):
                 logger.warning(f"🚨 止损触发: {order.symbol} @ {current_price}")
+                # 反馈给 AITradingEngine 的信号惩罚门控（learning-feedback 数据源）
+                try:
+                    eng = getattr(self, "ai_trading_engine", None)
+                    rec = getattr(eng, "_record_stop_loss_feedback", None) if eng else None
+                    if callable(rec):
+                        await rec(
+                            symbol=str(order.symbol),
+                            side=str(order.side),
+                            current_price=float(current_price),
+                            stop_loss=float(order.stop_loss_price or 0.0),
+                        )
+                except Exception:
+                    pass
                 if self.telegram_bot:
                     pnl_percent = (current_price - order.entry_price) / order.entry_price if order.side == "long" \
                                   else (order.entry_price - current_price) / order.entry_price

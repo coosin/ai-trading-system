@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from src.modules.data.data_quality_advisor import DataQualityAdvisor
+from src.modules.data.binance_public_provider import get_binance_public_provider
 
 logger = logging.getLogger(__name__)
 
@@ -283,9 +284,27 @@ class DataSourceHub:
         main_controller can expose:
           - data_provider_plugins: Dict[str, Callable[[str], Awaitable[Dict]]]
         """
+        out: Dict[str, Any] = {}
+        # Built-in plugins (enabled via config `data_source_hub.extra_providers`)
+        try:
+            from src.modules.data.coinglass_provider import fetch_coinglass_snapshot
+
+            out["coinglass"] = fetch_coinglass_snapshot
+        except Exception:
+            pass
+        try:
+            from src.modules.data.aicoin_provider import fetch_aicoin_snapshot
+
+            out["aicoin"] = fetch_aicoin_snapshot
+        except Exception:
+            pass
+
+        # External plugins injected by MainController (highest priority)
         mc = self.main_controller
         plugins = getattr(mc, "data_provider_plugins", None) if mc else None
-        return plugins if isinstance(plugins, dict) else {}
+        if isinstance(plugins, dict) and plugins:
+            out.update(plugins)
+        return out
 
     def get_collector_contract(self) -> Dict[str, Any]:
         """
@@ -477,6 +496,18 @@ class DataSourceHub:
                     return self._sanitize(oi)
             except Exception:
                 pass
+        # Public fallback (no key): Binance Futures OI
+        if str(os.getenv("OPENCLAW_DATA_HUB_BINANCE_PUBLIC_FALLBACK", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
+            try:
+                prov = await get_binance_public_provider()
+                oi2, meta = await prov.get_open_interest_current(symbol)
+                if isinstance(oi2, dict) and oi2.get("openInterest") is not None:
+                    out = dict(oi2)
+                    out["fallback_meta"] = meta
+                    self._cache_set(cache_key, out)
+                    return self._sanitize(out)
+            except Exception:
+                pass
         cached = self._cache_get(cache_key, ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_OI_CACHE_TTL", "20") or "20"))
         if isinstance(cached, dict):
             return self._sanitize(cached)
@@ -492,6 +523,16 @@ class DataSourceHub:
                 if out is not None:
                     self._cache_set(cache_key, out)
                 return out
+            except Exception:
+                pass
+        # Public fallback (no key): Binance Futures funding rate
+        if str(os.getenv("OPENCLAW_DATA_HUB_BINANCE_PUBLIC_FALLBACK", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
+            try:
+                prov = await get_binance_public_provider()
+                fr2, _meta = await prov.get_funding_rate_current(symbol)
+                if fr2 is not None:
+                    self._cache_set(cache_key, float(fr2))
+                    return float(fr2)
             except Exception:
                 pass
         cached = self._cache_get(cache_key, ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_FUNDING_CACHE_TTL", "20") or "20"))
@@ -518,7 +559,7 @@ class DataSourceHub:
                 if dist < 0.05:
                     high_risk += 1
                 samples.append({"mark_price": mark_px, "liquidation_price": liq_px, "distance_pct": dist * 100.0})
-        return {
+        out = {
             "symbol": symbol,
             "positions_considered": len(matched),
             "high_risk_positions": high_risk,
@@ -526,6 +567,52 @@ class DataSourceHub:
             "source": "position_proxy",
             "timestamp": datetime.now().isoformat(),
         }
+        # If no positions matched (common in read-only/boot windows), provide a derived risk proxy
+        # from funding/extreme volatility/spread so upstream MI/gates can still behave conservatively.
+        if len(matched) <= 0:
+            try:
+                ticker = await self.get_ticker(symbol)
+                last = float((ticker or {}).get("last") or (ticker or {}).get("price") or 0.0)
+            except Exception:
+                last = 0.0
+            try:
+                fr = await self.get_funding_rate(symbol)
+            except Exception:
+                fr = None
+            try:
+                ob = await self.get_order_book(symbol, depth=10)
+            except Exception:
+                ob = {}
+            spread_bps = None
+            try:
+                bids = (ob or {}).get("bids") or []
+                asks = (ob or {}).get("asks") or []
+                if bids and asks:
+                    bb = float(bids[0][0])
+                    ba = float(asks[0][0])
+                    mid = 0.5 * (bb + ba)
+                    if mid > 0 and ba >= bb:
+                        spread_bps = ((ba - bb) / mid) * 10000.0
+            except Exception:
+                spread_bps = None
+            # crude risk score: higher funding abs and wider spread imply more liquidation-prone regime
+            risk = 0.0
+            try:
+                if fr is not None:
+                    risk += min(1.0, abs(float(fr)) / 0.0010) * 0.6
+                if spread_bps is not None:
+                    risk += min(1.0, float(spread_bps) / 80.0) * 0.4
+            except Exception:
+                risk = 0.0
+            out["derived_risk_proxy"] = {
+                "risk_score_0_1": float(round(max(0.0, min(1.0, risk)), 4)),
+                "funding_rate": float(fr) if fr is not None else None,
+                "spread_bps": float(spread_bps) if spread_bps is not None else None,
+                "last": float(last) if last > 0 else None,
+                "source": "derived_funding_spread",
+            }
+            out["source"] = "derived_or_position_proxy"
+        return out
 
     async def analyze_trends(self, symbol: str) -> Dict[str, Any]:
         if not await self._legacy_enabled():
@@ -630,6 +717,22 @@ class DataSourceHub:
 
         onchain = self._get_onchain_integrator()
         if onchain and any(k.startswith("onchain.") for k in enabled):
+            # Detect mock-only onchain provider to avoid "fake health ok" that misleads quality scoring.
+            try:
+                provs = getattr(onchain, "providers", None)
+                if isinstance(provs, list) and provs:
+                    real_cnt = 0
+                    mock_cnt = 0
+                    for p in provs:
+                        name = type(p).__name__ if p is not None else ""
+                        if name == "MockOnChainProvider":
+                            mock_cnt += 1
+                        else:
+                            real_cnt += 1
+                    if real_cnt <= 0 and mock_cnt > 0:
+                        out["health"]["onchain"] = "mock"
+            except Exception:
+                pass
             sentiment = await self._fetch_safe(
                 "onchain.sentiment",
                 onchain.analyze_onchain_sentiment(symbol),
@@ -658,7 +761,9 @@ class DataSourceHub:
             if "onchain.whales" not in enabled:
                 whales = []
             out["onchain"] = self._sanitize({"sentiment": sentiment or {}, "flows": flows or [], "whales": whales or []})
-            out["health"]["onchain"] = "ok" if sentiment is not None else "degraded"
+            # If already marked as mock, keep it; otherwise set ok/degraded.
+            if out["health"].get("onchain") != "mock":
+                out["health"]["onchain"] = "ok" if sentiment is not None else "degraded"
 
         third = self._get_third_party_integrator()
         if third and any(k.startswith("third_party.") for k in enabled):
@@ -953,7 +1058,10 @@ class DataSourceHub:
             score += 0.15
         else:
             reasons.append("舆情/新闻通道退化")
-        if intel_channel.get("health", {}).get("onchain", "").startswith("ok"):
+        on_h = str((intel_channel.get("health", {}) or {}).get("onchain", "") or "")
+        if on_h == "mock":
+            reasons.append("链上通道为 mock（未配置真实链上 API）")
+        elif on_h.startswith("ok"):
             score += 0.15
         else:
             reasons.append("链上通道退化")
@@ -1016,23 +1124,59 @@ class DataSourceHub:
                 "说明": "live=主要实时数据, mixed=部分降级, degraded=需谨慎使用",
             },
         }
-        # Extra provider plugins (reserved for future add/remove)
+        # Extra provider plugins: run in parallel and use cache fallback.
+        # Goal: external providers should enrich snapshot, never drag the control-plane latency.
         extras: Dict[str, Any] = {}
         plugins = self._get_data_provider_plugins()
         req = set([str(x) for x in (cfg.get("extra_providers") or [])])
+        extra_health = ((exchange_channel.get("collector") or {}).get("health") if isinstance(exchange_channel, dict) else None)
+        extra_errors = ((exchange_channel.get("collector") or {}).get("errors") if isinstance(exchange_channel, dict) else None)
+        tasks: Dict[str, asyncio.Task] = {}
         for name, fn in (plugins or {}).items():
             if req and str(name) not in req:
                 continue
             if not callable(fn):
                 continue
             # plugin signature: async fn(symbol) -> dict
-            extras[str(name)] = await self._fetch_safe(
-                f"extra.{name}",
-                fn(symbol),
-                default={},
-                health=((exchange_channel.get("collector") or {}).get("health") if isinstance(exchange_channel, dict) else None),
-                errors=((exchange_channel.get("collector") or {}).get("errors") if isinstance(exchange_channel, dict) else None),
+            tasks[str(name)] = asyncio.create_task(
+                self._fetch_safe(
+                    f"extra.{name}",
+                    fn(symbol),
+                    default={},
+                    health=extra_health,
+                    errors=extra_errors,
+                )
             )
+        if tasks:
+            extra_budget = float(os.getenv("OPENCLAW_DATA_HUB_EXTRA_BUDGET_SEC", "4.0") or "4.0")
+            extra_budget = max(1.0, min(extra_budget, 8.0))
+            done, pending = await asyncio.wait(set(tasks.values()), timeout=extra_budget)
+            for name, task in tasks.items():
+                cache_key = f"extra:{name}:{symbol}"
+                value: Dict[str, Any] = {}
+                if task in done:
+                    try:
+                        raw = task.result()
+                        if isinstance(raw, dict):
+                            value = raw
+                    except Exception:
+                        value = {}
+                else:
+                    task.cancel()
+                    if isinstance(extra_errors, list):
+                        extra_errors.append(f"extra.{name}:budget_timeout")
+                # cache only non-empty payloads
+                if isinstance(value, dict) and value:
+                    self._cache_set(cache_key, value)
+                else:
+                    cached = self._cache_get(
+                        cache_key,
+                        ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_EXTRA_CACHE_TTL_SEC", "900") or "900"),
+                    )
+                    if isinstance(cached, dict) and cached:
+                        value = dict(cached)
+                        value.setdefault("cache_fallback", True)
+                extras[name] = value if isinstance(value, dict) else {}
         if extras:
             snapshot["扩展数据"] = self._sanitize(extras)
 

@@ -136,6 +136,37 @@ class AICoreDecisionEngine:
             "low_risk_spread_multiplier": 1.08,
             "high_risk_rr_multiplier": 1.08,
             "high_risk_spread_multiplier": 0.90,
+            "regime_enable": True,
+            "regime_low_vol_atr_pct": 0.005,
+            "regime_high_vol_atr_pct": 0.02,
+            "regime_trend_threshold": 0.004,
+            "regime_low_liquidity_spread_bps": 55.0,
+            "regime_profile_overrides": {
+                "trend": {"min_rr_mult": 0.96, "spread_mult": 1.05, "qty_mult": 1.10, "min_conf_add": 0.0},
+                "range": {"min_rr_mult": 1.04, "spread_mult": 0.95, "qty_mult": 0.90, "min_conf_add": 0.01},
+                "high_vol": {"min_rr_mult": 1.10, "spread_mult": 0.90, "qty_mult": 0.75, "min_conf_add": 0.02},
+                "low_liquidity": {"min_rr_mult": 1.12, "spread_mult": 0.80, "qty_mult": 0.70, "min_conf_add": 0.03},
+            },
+            "pnl_health_sizing_enable": True,
+            "pnl_health_lookback_trades": 20,
+            "pnl_health_bad_expectancy": -0.0015,
+            "pnl_health_bad_drawdown": 0.10,
+            "pnl_health_bad_factor": 0.70,
+            "pnl_health_good_expectancy": 0.0015,
+            "pnl_health_good_drawdown": 0.04,
+            "pnl_health_good_factor": 1.10,
+            # 净边际收益门控：reward 扣除手续费/滑点/点差后仍需为正且达阈值
+            "edge_after_cost_guard_enable": True,
+            "edge_min_net_reward_pct": 0.003,
+            "edge_fee_rate_per_side": 0.0005,
+            "edge_slippage_rate_per_side": 0.0003,
+            "edge_spread_penalty_weight": 1.0,
+            # 连续亏损冷静期：降低震荡期连续误判导致的回撤扩张
+            "loss_streak_cooldown_enable": True,
+            "loss_streak_trigger": 3,
+            "loss_streak_lookback": 8,
+            "loss_streak_cooldown_sec": 1800,
+            "loss_streak_min_abs_loss": 0.001,
             "auto_frequency_profile_switch": True,
             "frequency_profile_switch_telegram_notify": True,
             "frequency_profile_cooldown_seconds": 1800,
@@ -215,6 +246,8 @@ class AICoreDecisionEngine:
             "data_quality_guard_hold": 0,
             "degraded_quantity_reduced": 0,
             "rr_rejected": 0,
+            "edge_rejected": 0,
+            "loss_streak_cooldown_rejected": 0,
             "spread_rejected": 0,
             "depth_imbalance_rejected": 0,
             "discretionary_close_suppressed": 0,
@@ -233,8 +266,10 @@ class AICoreDecisionEngine:
         self._sltp_group_adaptive: Dict[str, Dict[str, float]] = {}
         self._last_sltp_tune_at: Dict[str, datetime] = {}
         self._last_research_at: Optional[datetime] = None
+        self._loss_streak_cooldown_until: Optional[datetime] = None
         self._frequency_profile: str = "balanced"
         self._last_frequency_profile_switch_at: Optional[datetime] = None
+        self._last_frequency_profile_switch_detail: Dict[str, Any] = {}
         # (symbol_base, side) -> 最近一次由主循环执行的「主观平仓」成功时间
         self._last_ai_discretionary_close_at: Dict[str, datetime] = {}
         # key -> (consecutive_close_signals, first_signal_at)
@@ -1072,6 +1107,18 @@ class AICoreDecisionEngine:
         self._last_frequency_profile_switch_at = datetime.utcnow()
         return applied
 
+    def get_frequency_profile_status(self) -> Dict[str, Any]:
+        """返回当前频率档位及最近一次切档明细，供 API/OpenClaw 直接读取。"""
+        return {
+            "profile": self._frequency_profile,
+            "last_switch_at": (
+                self._last_frequency_profile_switch_at.isoformat()
+                if self._last_frequency_profile_switch_at
+                else None
+            ),
+            "last_switch_detail": dict(self._last_frequency_profile_switch_detail or {}),
+        }
+
     async def _auto_switch_frequency_profile(self) -> None:
         if not bool(self.config.get("auto_frequency_profile_switch", True)):
             return
@@ -1120,18 +1167,124 @@ class AICoreDecisionEngine:
 
             dd_guard = float(self.config.get("frequency_profile_max_drawdown_guard", 0.12) or 0.12)
             target = self._frequency_profile or "balanced"
-            if dd >= dd_guard or max_losses_streak >= 3 or win_rate < 0.42:
+            # 市场异常前置信号（来自 MarketIntelligenceEngine）：
+            # 当出现资金费率极端、流动性骤降、强平风险代理升高等信号时，优先收紧频率档位，
+            # 避免“绩效尚未恶化但市场已进入高风险状态”。
+            mi_risk_hits = 0
+            mi_checked = 0
+            mi_anomaly_counter: Dict[str, int] = {}
+            try:
+                mc = self.main_controller
+                mi = getattr(mc, "market_intelligence", None) if mc else None
+                if mi:
+                    symbols = await self._auto_select_trading_symbols()
+                    for s in (symbols or [])[:5]:
+                        view = {}
+                        try:
+                            if hasattr(mi, "get_cached_symbol_view"):
+                                view = mi.get_cached_symbol_view(s) or {}
+                            elif hasattr(mi, "get_symbol_view"):
+                                vobj = await mi.get_symbol_view(s, include_snapshot=False, prefer_fast_only=True)
+                                view = vobj.to_dict() if hasattr(vobj, "to_dict") else {}
+                        except Exception:
+                            view = {}
+                        if not isinstance(view, dict) or not view:
+                            continue
+                        mi_checked += 1
+                        es = (view.get("execution_support") or {}) if isinstance(view.get("execution_support"), dict) else {}
+                        stability = es.get("anomaly_stability") if isinstance(es.get("anomaly_stability"), dict) else {}
+                        st_items = stability.get("items") if isinstance(stability.get("items"), list) else []
+                        stable_anomalies = es.get("stable_anomalies") if isinstance(es.get("stable_anomalies"), list) else []
+                        anomalies = stable_anomalies or (es.get("anomalies") if isinstance(es.get("anomalies"), list) else [])
+                        drp = (view.get("exchange_support") or {}).get("derived_liquidation_risk_proxy")
+                        drp_score = None
+                        try:
+                            if isinstance(drp, dict) and drp.get("risk_score_0_1") is not None:
+                                drp_score = float(drp.get("risk_score_0_1") or 0.0)
+                        except Exception:
+                            drp_score = None
+                        high_flags = 0
+                        for a in anomalies:
+                            ax = str(a or "")
+                            if ax:
+                                mi_anomaly_counter[ax] = int(mi_anomaly_counter.get(ax, 0)) + 1
+                            if (
+                                ("funding_rate_extreme_abs" in ax)
+                                or ("aicoin_funding_extreme_abs" in ax)
+                                or ("spread_spike" in ax)
+                                or ("depth_drop_top5" in ax)
+                                or ("liq_risk_proxy_high" in ax)
+                            ):
+                                high_flags += 1
+                        # Also absorb streak-confirmed anomaly counts from stability panel when available.
+                        for row in st_items:
+                            if not isinstance(row, dict):
+                                continue
+                            ax = str(row.get("anomaly") or "")
+                            if not ax:
+                                continue
+                            try:
+                                hits = int(row.get("hits", 0) or 0)
+                            except Exception:
+                                hits = 0
+                            if hits > 0:
+                                mi_anomaly_counter[ax] = int(mi_anomaly_counter.get(ax, 0)) + hits
+                        if (drp_score is not None and drp_score >= 0.75) or (high_flags >= 1):
+                            mi_risk_hits += 1
+            except Exception:
+                mi_risk_hits = 0
+                mi_checked = 0
+                mi_anomaly_counter = {}
+
+            mi_risk_ratio = (mi_risk_hits / mi_checked) if mi_checked > 0 else 0.0
+
+            if dd >= dd_guard or max_losses_streak >= 3 or win_rate < 0.42 or mi_risk_ratio >= 0.40:
                 target = "conservative"
-            elif win_rate >= 0.62 and avg_pnl > 0 and dd < dd_guard * 0.7 and max_losses_streak <= 1:
+            elif (
+                win_rate >= 0.62
+                and avg_pnl > 0
+                and dd < dd_guard * 0.7
+                and max_losses_streak <= 1
+                and mi_risk_ratio <= 0.10
+            ):
                 target = "aggressive"
             else:
                 target = "balanced"
 
             old_profile = self._frequency_profile or "balanced"
             if target != old_profile:
+                top_anomalies = sorted(
+                    [{"anomaly": k, "score": int(v)} for k, v in (mi_anomaly_counter or {}).items()],
+                    key=lambda x: x.get("score", 0),
+                    reverse=True,
+                )[:6]
                 self._apply_frequency_profile(target)
+                self._last_frequency_profile_switch_detail = {
+                    "source": "auto",
+                    "from": old_profile,
+                    "to": target,
+                    "timestamp": (
+                        self._last_frequency_profile_switch_at.isoformat()
+                        if self._last_frequency_profile_switch_at
+                        else datetime.utcnow().isoformat()
+                    ),
+                    "reason_metrics": {
+                        "win_rate": float(round(win_rate, 6)),
+                        "avg_pnl": float(round(avg_pnl, 6)),
+                        "max_drawdown": float(round(dd, 6)),
+                        "max_losses_streak": int(max_losses_streak),
+                        "sample_size": int(len(pnls)),
+                        "mi_risk_ratio": float(round(mi_risk_ratio, 6)),
+                        "mi_risk_hits": int(mi_risk_hits),
+                        "mi_checked": int(mi_checked),
+                        "dd_guard": float(round(dd_guard, 6)),
+                    },
+                    "market_signal_context": {
+                        "top_anomalies": top_anomalies,
+                    },
+                }
                 logger.info(
-                    "🎛️ 自动切档: %s -> %s (win_rate=%.2f avg_pnl=%.4f max_dd=%.3f max_loss_streak=%s sample=%s)",
+                    "🎛️ 自动切档: %s -> %s (win_rate=%.2f avg_pnl=%.4f max_dd=%.3f max_loss_streak=%s sample=%s mi_risk_ratio=%.2f checked=%s)",
                     old_profile,
                     target,
                     win_rate,
@@ -1139,6 +1292,8 @@ class AICoreDecisionEngine:
                     dd,
                     max_losses_streak,
                     len(pnls),
+                    mi_risk_ratio,
+                    mi_checked,
                 )
                 if bool(self.config.get("frequency_profile_switch_telegram_notify", True)):
                     try:
@@ -1152,7 +1307,9 @@ class AICoreDecisionEngine:
                                     f"平均PnL: {avg_pnl:.4f}\n"
                                     f"最大回撤: {dd:.3f}\n"
                                     f"最大连亏: {max_losses_streak}\n"
-                                    f"样本数: {len(pnls)}"
+                                    f"样本数: {len(pnls)}\n"
+                                    f"市场风险命中率: {mi_risk_ratio:.0%} ({mi_risk_hits}/{mi_checked})\n"
+                                    f"确认异常Top: {', '.join([x.get('anomaly','') for x in top_anomalies[:3]]) if top_anomalies else '无'}"
                                 ),
                             )
                     except Exception as e:
@@ -1193,6 +1350,64 @@ class AICoreDecisionEngine:
         if 8 <= hour < 16:
             return "EU"
         return "US"
+
+    def _get_recent_pnl_health(self, lookback: Optional[int] = None) -> Dict[str, Any]:
+        """Recent expectancy/drawdown health for dynamic sizing."""
+        lb = max(8, int(lookback or self.config.get("pnl_health_lookback_trades", 20) or 20))
+        pnls: List[float] = []
+        for rec in list(getattr(self, "_trade_history", []) or [])[-lb:]:
+            d = rec.get("decision", {}) if isinstance(rec, dict) else {}
+            try:
+                p = float(d.get("pnl"))
+            except Exception:
+                continue
+            pnls.append(p)
+        if not pnls:
+            return {"sample_size": 0, "expectancy": 0.0, "max_drawdown": 0.0, "health": "neutral"}
+
+        eq = 1.0
+        peak = 1.0
+        dd = 0.0
+        for p in pnls:
+            eq *= (1.0 + p)
+            peak = max(peak, eq)
+            if peak > 0:
+                dd = max(dd, (peak - eq) / peak)
+        exp = float(sum(pnls) / max(1, len(pnls)))
+        bad_exp = float(self.config.get("pnl_health_bad_expectancy", -0.0015) or -0.0015)
+        bad_dd = float(self.config.get("pnl_health_bad_drawdown", 0.10) or 0.10)
+        good_exp = float(self.config.get("pnl_health_good_expectancy", 0.0015) or 0.0015)
+        good_dd = float(self.config.get("pnl_health_good_drawdown", 0.04) or 0.04)
+        health = "neutral"
+        if exp <= bad_exp or dd >= bad_dd:
+            health = "bad"
+        elif exp >= good_exp and dd <= good_dd:
+            health = "good"
+        return {
+            "sample_size": int(len(pnls)),
+            "expectancy": float(round(exp, 6)),
+            "max_drawdown": float(round(dd, 6)),
+            "health": health,
+        }
+
+    def _get_recent_loss_streak(self, lookback: Optional[int] = None, min_abs_loss: Optional[float] = None) -> int:
+        """Count consecutive losses from latest closed trade records."""
+        lb = max(3, int(lookback or self.config.get("loss_streak_lookback", 8) or 8))
+        min_loss = float(min_abs_loss or self.config.get("loss_streak_min_abs_loss", 0.001) or 0.001)
+        streak = 0
+        rows = list(getattr(self, "_trade_history", []) or [])
+        for rec in reversed(rows[-lb:]):
+            d = rec.get("decision", {}) if isinstance(rec, dict) else {}
+            try:
+                p = float(d.get("pnl"))
+            except Exception:
+                continue
+            if p <= -abs(min_loss):
+                streak += 1
+                continue
+            # first non-loss breaks the recent consecutive streak
+            break
+        return int(streak)
 
     async def _run_research_pipeline(self) -> None:
         pipeline = None
@@ -3404,6 +3619,41 @@ class AICoreDecisionEngine:
                     )
                     logger.info("🧷 AI主观平仓暂缓: %s %s — %s", decision.symbol, decision.side, why_dc)
                     return False
+            if is_open and bool(self.config.get("loss_streak_cooldown_enable", True)):
+                try:
+                    now = datetime.utcnow()
+                    if self._loss_streak_cooldown_until and now < self._loss_streak_cooldown_until:
+                        left = int((self._loss_streak_cooldown_until - now).total_seconds())
+                        self._execution_guards_stats["loss_streak_cooldown_rejected"] = int(
+                            self._execution_guards_stats.get("loss_streak_cooldown_rejected", 0)
+                        ) + 1
+                        logger.warning(
+                            "🧊 连亏冷静期生效，拒绝开仓: symbol=%s left=%ss",
+                            decision.symbol,
+                            max(1, left),
+                        )
+                        self._adaptive_guard_profile["loss_streak_cooldown_left_sec"] = max(1, left)
+                        return False
+                    trigger = max(2, int(self.config.get("loss_streak_trigger", 3) or 3))
+                    streak = self._get_recent_loss_streak()
+                    self._adaptive_guard_profile["recent_loss_streak"] = int(streak)
+                    if streak >= trigger:
+                        cool_sec = max(300, int(self.config.get("loss_streak_cooldown_sec", 1800) or 1800))
+                        self._loss_streak_cooldown_until = now + timedelta(seconds=cool_sec)
+                        self._execution_guards_stats["loss_streak_cooldown_rejected"] = int(
+                            self._execution_guards_stats.get("loss_streak_cooldown_rejected", 0)
+                        ) + 1
+                        logger.warning(
+                            "🧊 连亏冷静期触发: streak=%s trigger=%s cooldown=%ss symbol=%s",
+                            streak,
+                            trigger,
+                            cool_sec,
+                            decision.symbol,
+                        )
+                        self._adaptive_guard_profile["loss_streak_cooldown_left_sec"] = int(cool_sec)
+                        return False
+                except Exception:
+                    pass
 
             # 开仓：不再做应用层「最小可用 USDT」硬门槛；实际能否成交由交易所 minSz/余额 决定。平仓不因低 USDT 阻塞。
 
@@ -3554,6 +3804,9 @@ class AICoreDecisionEngine:
                 min_rr = float(gcfg.get("min_rr_to_trade", self.config.get("min_rr_to_trade", 1.2)) or 1.2)
                 max_spread_bps = float(gcfg.get("max_spread_bps_to_trade", self.config.get("max_spread_bps_to_trade", 35.0)) or 35.0)
                 max_abs_imb = float(self.config.get("max_abs_depth_imbalance_to_trade", 0.92) or 0.92)
+                regime = "normal"
+                regime_qty_mult = 1.0
+                regime_conf_add = 0.0
 
             # 3.3.1 自适应门控阈值：波动低 -> 收紧；波动高 -> 适度放宽。
             if (not is_close) and bool(self.config.get("auto_adaptive_guards", True)):
@@ -3576,6 +3829,30 @@ class AICoreDecisionEngine:
                         max_spread_bps = max(5.0, max_spread_bps * 0.80)
                         max_abs_imb = max(0.80, max_abs_imb * 0.95)
 
+                    if bool(self.config.get("regime_enable", True)):
+                        low_vol_thr = float(self.config.get("regime_low_vol_atr_pct", 0.005) or 0.005)
+                        high_vol_thr = float(self.config.get("regime_high_vol_atr_pct", 0.02) or 0.02)
+                        trend_thr = float(self.config.get("regime_trend_threshold", 0.004) or 0.004)
+                        low_liq_spread = float(self.config.get("regime_low_liquidity_spread_bps", 55.0) or 55.0)
+                        spread_now = float(spread_bps) if spread_bps is not None else 0.0
+                        trend_now = float((ma5 - ma20) / max(1e-9, price_ref)) if price_ref > 0 else 0.0
+                        if spread_now >= low_liq_spread:
+                            regime = "low_liquidity"
+                        elif atr_pct >= high_vol_thr:
+                            regime = "high_vol"
+                        elif abs(trend_now) >= trend_thr:
+                            regime = "trend"
+                        elif atr_pct <= low_vol_thr:
+                            regime = "range"
+                        else:
+                            regime = "normal"
+                        reg_over = self.config.get("regime_profile_overrides", {}) or {}
+                        ro = reg_over.get(regime, {}) if isinstance(reg_over, dict) else {}
+                        min_rr *= float(ro.get("min_rr_mult", 1.0) or 1.0)
+                        max_spread_bps *= float(ro.get("spread_mult", 1.0) or 1.0)
+                        regime_qty_mult = float(ro.get("qty_mult", 1.0) or 1.0)
+                        regime_conf_add = float(ro.get("min_conf_add", 0.0) or 0.0)
+
                     # 在低风险状态下做轻度放宽以提高开单率；高风险时反向收紧。
                     if bool(self.config.get("boost_on_low_risk", True)):
                         risk_level = str(getattr(decision, "risk_level", "") or "").lower()
@@ -3597,6 +3874,7 @@ class AICoreDecisionEngine:
                     max_abs_imb = min(0.995, max(0.75, float(max_abs_imb)))
                     self._adaptive_guard_profile = {
                         "profile": profile,
+                        "regime": regime,
                         "symbol_group": symbol_group,
                         "session_group": session_group,
                         "composite_group": composite_group,
@@ -3604,6 +3882,8 @@ class AICoreDecisionEngine:
                         "effective_min_rr": float(min_rr),
                         "effective_max_spread_bps": float(max_spread_bps),
                         "effective_max_abs_depth_imbalance": float(max_abs_imb),
+                        "regime_qty_mult": float(regime_qty_mult),
+                        "regime_min_conf_add": float(regime_conf_add),
                     }
                 except Exception as e:
                     logger.debug(f"自适应门控计算失败: {e}")
@@ -3621,6 +3901,10 @@ class AICoreDecisionEngine:
                     )
                     or 0.72
                 )
+                try:
+                    min_open_c += float((self._adaptive_guard_profile or {}).get("regime_min_conf_add", 0.0) or 0.0)
+                except Exception:
+                    pass
                 if conf < min_open_c:
                     self._execution_guards_stats["confidence_open_rejected"] = int(
                         self._execution_guards_stats.get("confidence_open_rejected", 0)
@@ -3665,6 +3949,61 @@ class AICoreDecisionEngine:
                         abs(depth_imbalance), max_abs_imb, decision.symbol
                     )
                     return False
+                # 3.3.3 净边际收益门控：避免“看起来有 RR，但扣成本后几乎无收益”的交易。
+                try:
+                    if bool(self.config.get("edge_after_cost_guard_enable", True)):
+                        entry_px = max(1e-9, float(decision.entry_price or 0.0))
+                        reward_pct = abs(float(decision.take_profit or 0.0) - entry_px) / entry_px
+                        fee_per_side = float(self.config.get("edge_fee_rate_per_side", 0.0005) or 0.0005)
+                        slippage_per_side = float(self.config.get("edge_slippage_rate_per_side", 0.0003) or 0.0003)
+                        spread_penalty_weight = float(self.config.get("edge_spread_penalty_weight", 1.0) or 1.0)
+                        spread_cost = (
+                            (float(spread_bps) / 10000.0) * spread_penalty_weight
+                            if spread_bps is not None
+                            else 0.0
+                        )
+                        total_cost_pct = (2.0 * fee_per_side) + (2.0 * slippage_per_side) + max(0.0, spread_cost)
+                        net_edge_pct = reward_pct - total_cost_pct
+                        min_net_edge_pct = float(self.config.get("edge_min_net_reward_pct", 0.003) or 0.003)
+                        self._adaptive_guard_profile["reward_pct"] = float(round(reward_pct, 6))
+                        self._adaptive_guard_profile["cost_pct"] = float(round(total_cost_pct, 6))
+                        self._adaptive_guard_profile["net_edge_pct"] = float(round(net_edge_pct, 6))
+                        if net_edge_pct < min_net_edge_pct:
+                            self._execution_guards_stats["edge_rejected"] += 1
+                            logger.warning(
+                                "⚠️ 执行门控拒绝: 净边际收益不足 net=%.4f < %.4f (reward=%.4f cost=%.4f) symbol=%s",
+                                net_edge_pct,
+                                min_net_edge_pct,
+                                reward_pct,
+                                total_cost_pct,
+                                decision.symbol,
+                            )
+                            return False
+                except Exception:
+                    pass
+                try:
+                    qty_factor = float((self._adaptive_guard_profile or {}).get("regime_qty_mult", 1.0) or 1.0)
+                    if bool(self.config.get("pnl_health_sizing_enable", True)):
+                        health = self._get_recent_pnl_health()
+                        if str(health.get("health")) == "bad":
+                            qty_factor *= float(self.config.get("pnl_health_bad_factor", 0.70) or 0.70)
+                        elif str(health.get("health")) == "good":
+                            qty_factor *= float(self.config.get("pnl_health_good_factor", 1.10) or 1.10)
+                        self._adaptive_guard_profile["pnl_health"] = health
+                    qty_factor = min(1.5, max(0.4, float(qty_factor)))
+                    new_qty = max(1, int(float(decision.quantity) * qty_factor))
+                    if new_qty != int(decision.quantity):
+                        logger.info(
+                            "📦 开仓数量缩放: %s -> %s (factor=%.3f regime=%s)",
+                            decision.quantity,
+                            new_qty,
+                            qty_factor,
+                            (self._adaptive_guard_profile or {}).get("regime"),
+                        )
+                        decision.quantity = new_qty
+                    self._adaptive_guard_profile["effective_qty_factor"] = float(qty_factor)
+                except Exception:
+                    pass
 
             logger.info(f"🎯 执行AI决策: {decision.symbol} {decision.action} {decision.side}")
             logger.info(f"   入场价: {decision.entry_price}")
@@ -3777,6 +4116,8 @@ class AICoreDecisionEngine:
                                     "decision_reasoning": getattr(decision, "reasoning", None),
                                     "confidence": getattr(decision, "confidence", None),
                                     "risk_level": getattr(decision, "risk_level", None),
+                                    "guard_profile": getattr(self, "_adaptive_guard_profile", None),
+                                    "effective_qty_factor": (getattr(self, "_adaptive_guard_profile", {}) or {}).get("effective_qty_factor"),
                                     "trace_id": trace_id,
                                 },
                             )
@@ -4145,6 +4486,30 @@ class AICoreDecisionEngine:
                     "low_risk_spread_multiplier": self.config.get("low_risk_spread_multiplier"),
                     "high_risk_rr_multiplier": self.config.get("high_risk_rr_multiplier"),
                     "high_risk_spread_multiplier": self.config.get("high_risk_spread_multiplier"),
+                    "regime_enable": self.config.get("regime_enable"),
+                    "regime_low_vol_atr_pct": self.config.get("regime_low_vol_atr_pct"),
+                    "regime_high_vol_atr_pct": self.config.get("regime_high_vol_atr_pct"),
+                    "regime_trend_threshold": self.config.get("regime_trend_threshold"),
+                    "regime_low_liquidity_spread_bps": self.config.get("regime_low_liquidity_spread_bps"),
+                    "regime_profile_overrides": self.config.get("regime_profile_overrides"),
+                    "pnl_health_sizing_enable": self.config.get("pnl_health_sizing_enable"),
+                    "pnl_health_lookback_trades": self.config.get("pnl_health_lookback_trades"),
+                    "pnl_health_bad_expectancy": self.config.get("pnl_health_bad_expectancy"),
+                    "pnl_health_bad_drawdown": self.config.get("pnl_health_bad_drawdown"),
+                    "pnl_health_bad_factor": self.config.get("pnl_health_bad_factor"),
+                    "pnl_health_good_expectancy": self.config.get("pnl_health_good_expectancy"),
+                    "pnl_health_good_drawdown": self.config.get("pnl_health_good_drawdown"),
+                    "pnl_health_good_factor": self.config.get("pnl_health_good_factor"),
+                    "edge_after_cost_guard_enable": self.config.get("edge_after_cost_guard_enable"),
+                    "edge_min_net_reward_pct": self.config.get("edge_min_net_reward_pct"),
+                    "edge_fee_rate_per_side": self.config.get("edge_fee_rate_per_side"),
+                    "edge_slippage_rate_per_side": self.config.get("edge_slippage_rate_per_side"),
+                    "edge_spread_penalty_weight": self.config.get("edge_spread_penalty_weight"),
+                    "loss_streak_cooldown_enable": self.config.get("loss_streak_cooldown_enable"),
+                    "loss_streak_trigger": self.config.get("loss_streak_trigger"),
+                    "loss_streak_lookback": self.config.get("loss_streak_lookback"),
+                    "loss_streak_cooldown_sec": self.config.get("loss_streak_cooldown_sec"),
+                    "loss_streak_min_abs_loss": self.config.get("loss_streak_min_abs_loss"),
                     "auto_frequency_profile_switch": self.config.get("auto_frequency_profile_switch"),
                     "frequency_profile_switch_telegram_notify": self.config.get("frequency_profile_switch_telegram_notify"),
                     "frequency_profile_cooldown_seconds": self.config.get("frequency_profile_cooldown_seconds"),
@@ -4194,6 +4559,12 @@ class AICoreDecisionEngine:
                     if self._last_frequency_profile_switch_at
                     else None
                 ),
+                "last_frequency_profile_switch_detail": dict(self._last_frequency_profile_switch_detail or {}),
+                "loss_streak_cooldown_until": (
+                    self._loss_streak_cooldown_until.isoformat()
+                    if self._loss_streak_cooldown_until
+                    else None
+                ),
             },
         }
 
@@ -4218,6 +4589,30 @@ class AICoreDecisionEngine:
                 "low_risk_spread_multiplier",
                 "high_risk_rr_multiplier",
                 "high_risk_spread_multiplier",
+                "regime_enable",
+                "regime_low_vol_atr_pct",
+                "regime_high_vol_atr_pct",
+                "regime_trend_threshold",
+                "regime_low_liquidity_spread_bps",
+                "regime_profile_overrides",
+                "pnl_health_sizing_enable",
+                "pnl_health_lookback_trades",
+                "pnl_health_bad_expectancy",
+                "pnl_health_bad_drawdown",
+                "pnl_health_bad_factor",
+                "pnl_health_good_expectancy",
+                "pnl_health_good_drawdown",
+                "pnl_health_good_factor",
+                "edge_after_cost_guard_enable",
+                "edge_min_net_reward_pct",
+                "edge_fee_rate_per_side",
+                "edge_slippage_rate_per_side",
+                "edge_spread_penalty_weight",
+                "loss_streak_cooldown_enable",
+                "loss_streak_trigger",
+                "loss_streak_lookback",
+                "loss_streak_cooldown_sec",
+                "loss_streak_min_abs_loss",
                 "low_balance_usdt_threshold",
                 "default_max_margin_fraction",
                 "low_balance_margin_fraction",
@@ -4255,6 +4650,10 @@ class AICoreDecisionEngine:
                         "auto_tune_by_session",
                         "auto_tune_global_enabled",
                         "auto_tune_sltp_params",
+                        "regime_enable",
+                        "pnl_health_sizing_enable",
+                        "edge_after_cost_guard_enable",
+                        "loss_streak_cooldown_enable",
                         "boost_on_low_risk",
                         "auto_frequency_profile_switch",
                         "frequency_profile_switch_telegram_notify",
