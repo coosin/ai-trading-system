@@ -13,6 +13,7 @@ import os
 import ssl
 import time
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -736,7 +737,7 @@ class OKXExchange(ExchangeBase):
                                 return data.get("data", [])
                             else:
                                 error_code = data.get('code', '')
-                                error_msg = data.get('msg', '') or error_code or 'unknown'
+                                error_msg = self._extract_okx_error_message(data)
                                 if error_code == "51001":
                                     logger.debug(f"OKX API交易对不存在: {method} {endpoint} - {error_msg}")
                                 else:
@@ -769,8 +770,8 @@ class OKXExchange(ExchangeBase):
                                 await self._mark_request_success()
                                 return data.get("data", [])
                             else:
-                                error_msg = data.get('msg', '') or data.get('code', 'unknown')
-                                logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={data.get('msg')}")
+                                error_msg = self._extract_okx_error_message(data)
+                                logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={error_msg}")
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
                     elif method == "DELETE":
@@ -799,7 +800,7 @@ class OKXExchange(ExchangeBase):
                                 return data.get("data", [])
                             else:
                                 error_code = data.get('code', '')
-                                error_msg = data.get('msg', '') or error_code or 'unknown'
+                                error_msg = self._extract_okx_error_message(data)
                                 if error_code == "51001":
                                     logger.debug(f"OKX API交易对不存在: {method} {endpoint}")
                                 else:
@@ -1257,7 +1258,7 @@ class OKXExchange(ExchangeBase):
             "tdMode": "cross",  # 全仓模式
             "side": side_map.get(order.side, "buy"),
             "ordType": ord_type_map.get(order.order_type, "market"),
-            "sz": str(order.quantity)
+            "sz": self._safe_sz(order.quantity),
         }
         
         # 永续合约需要指定posSide
@@ -1749,10 +1750,33 @@ class OKXExchange(ExchangeBase):
                     "timestamp": int(row.get("ts", 0) or 0),
                 }
 
-            # 若 WS 已启用但缓存暂未命中：默认不再回退 REST（REST 在不稳定网络下会拖死扫描/聚合线程）。
+            # 若 WS 已启用但缓存暂未命中：优先尝试持仓 mark 价兜底，
+            # 避免在“有仓位但无瞬时ticker缓存”时出现“无法获取最新价格”。
             if str(os.getenv("OPENCLAW_OKX_WS_ONLY_TICKER", "1")).strip().lower() in ("1", "true", "yes"):
                 if cached_ticker:
                     return dict(cached_ticker)
+                try:
+                    positions = await self.get_positions()
+                    target_inst = self._to_okx_inst_id(symbol, default_type="SWAP")
+                    for p in positions:
+                        inst_id = str(p.get("instId") or "")
+                        mark_px = float(p.get("mark_px") or p.get("mark_price") or 0.0)
+                        if inst_id == target_inst and mark_px > 0:
+                            return {
+                                "symbol": symbol,
+                                "last": mark_px,
+                                "bid": 0.0,
+                                "ask": 0.0,
+                                "high": 0.0,
+                                "low": 0.0,
+                                "volume": 0.0,
+                                "change": 0.0,
+                                "change_24h": 0.0,
+                                "timestamp": int(time.time() * 1000),
+                                "fallback": "positions_mark_price",
+                            }
+                except Exception:
+                    pass
                 return {}
         
         try:
@@ -1865,7 +1889,7 @@ class OKXExchange(ExchangeBase):
             "tdMode": margin_mode,
             "side": "buy" if side == "long" else "sell",
             "ordType": order_type,
-            "sz": str(size)
+            "sz": self._safe_sz(size),
         }
         # net_mode 下不应传 posSide，避免触发交易所参数校验失败
         if str(pos_side).strip().lower() != "net":
@@ -1908,6 +1932,47 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.warning(f"获取持仓模式失败，使用默认: {e}")
             return side
+
+    @staticmethod
+    def _safe_sz(value: Any) -> str:
+        """
+        Normalize order size to clean decimal string to avoid float tail artifacts.
+        """
+        try:
+            d = Decimal(str(value))
+            if d <= 0:
+                return "0"
+            s = format(d.normalize(), "f")
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s or "0"
+        except (InvalidOperation, ValueError, TypeError):
+            try:
+                return str(float(value))
+            except Exception:
+                return "0"
+
+    @staticmethod
+    def _extract_okx_error_message(resp: Dict[str, Any]) -> str:
+        """
+        Build rich error message from top-level + per-order data rows.
+        """
+        if not isinstance(resp, dict):
+            return "unknown"
+        top_code = str(resp.get("code", "") or "")
+        top_msg = str(resp.get("msg", "") or "")
+        details = []
+        rows = resp.get("data")
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            row = rows[0]
+            for k in ("sCode", "sMsg", "ordId", "clOrdId"):
+                v = str(row.get(k, "") or "")
+                if v:
+                    details.append(f"{k}={v}")
+        base = top_msg or top_code or "unknown"
+        if details:
+            return f"{base} ({', '.join(details)})"
+        return base
     
     async def _get_account_config(self) -> Dict[str, Any]:
         """获取账户配置"""
@@ -1971,7 +2036,9 @@ class OKXExchange(ExchangeBase):
             "tdMode": "cross",
             "side": "sell" if side == "long" else "buy",
             "ordType": "market",
-            "sz": str(size)
+            "sz": self._safe_sz(size),
+            # 在 net_mode 下明确仅减仓，避免被交易所判定为反向开仓。
+            "reduceOnly": True,
         }
         if str(pos_side).strip().lower() != "net":
             body["posSide"] = str(pos_side)
@@ -1990,6 +2057,47 @@ class OKXExchange(ExchangeBase):
                 "data": data
             }
         except Exception as e:
+            # 兜底：若方向判断异常，尝试反向 close side 再试一次。
+            if "All operations failed" in str(e):
+                try:
+                    alt_body = dict(body)
+                    alt_body["side"] = "buy" if str(body.get("side")) == "sell" else "sell"
+                    data2 = await self._make_request("POST", endpoint, body=alt_body)
+                    logger.info(f"✅ 平仓成功(反向side兜底): {symbol} {side} {size}")
+                    return {
+                        "success": True,
+                        "orderId": data2.get("ordId") if isinstance(data2, dict) else data2[0].get("ordId") if isinstance(data2, list) else None,
+                        "symbol": symbol,
+                        "side": side,
+                        "size": size,
+                        "data": data2,
+                        "fallback": "alternate_side",
+                    }
+                except Exception:
+                    pass
+            # 兜底：部分账号在 net 模式下 trade/order 会返回 "All operations failed"，
+            # 尝试 close-position 接口按方向强制减仓。
+            if "All operations failed" in str(e):
+                try:
+                    fallback_body = {
+                        "instId": okx_symbol,
+                        "mgnMode": "cross",
+                        "posSide": "short" if side == "short" else "long",
+                    }
+                    fb = await self._make_request("POST", "/api/v5/trade/close-position", body=fallback_body)
+                    logger.info(f"✅ 平仓成功(close-position兜底): {symbol}")
+                    return {
+                        "success": True,
+                        "orderId": None,
+                        "symbol": symbol,
+                        "side": side,
+                        "size": size,
+                        "data": fb,
+                        "fallback": "close_position_endpoint",
+                    }
+                except Exception as e2:
+                    logger.error(f"平仓失败: primary={e}; fallback={e2}")
+                    return {"success": False, "error": str(e)}
             logger.error(f"平仓失败: {e}")
             return {"success": False, "error": str(e)}
     

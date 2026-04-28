@@ -137,6 +137,7 @@ class MarketIntelligenceEngine:
         self._cfg = dict(config or {})
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._prewarm_task: Optional[asyncio.Task] = None
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ts: Dict[str, float] = {}
         self._rolling: Dict[str, Dict[str, float]] = {}
@@ -148,6 +149,35 @@ class MarketIntelligenceEngine:
         self._cache_ttl_sec = float(self._cfg.get("cache_ttl_sec", 20) or 20)
         self._push_interval_sec = float(self._cfg.get("push_interval_sec", 15) or 15)
         self._watch_symbols: List[str] = list(self._cfg.get("watch_symbols") or [])
+        self._prewarm_enabled: bool = bool(self._cfg.get("prewarm_enabled", True))
+        self._prewarm_interval_sec: float = float(self._cfg.get("prewarm_interval_sec", 45) or 45)
+        self._prewarm_fast_interval_sec: float = float(
+            self._cfg.get("prewarm_fast_interval_sec", 15) or 15
+        )
+        self._prewarm_full_every_n_fast: int = int(
+            self._cfg.get("prewarm_full_every_n_fast", 3) or 3
+        )
+        self._prewarm_max_symbols: int = int(self._cfg.get("prewarm_max_symbols", 12) or 12)
+        self._prewarm_batch_size: int = int(self._cfg.get("prewarm_batch_size", 4) or 4)
+        self._prewarm_slow_symbol_cooldown_sec: float = float(
+            self._cfg.get("prewarm_slow_symbol_cooldown_sec", 120) or 120
+        )
+        self._prewarm_slow_latency_ms: float = float(
+            self._cfg.get("prewarm_slow_latency_ms", 7000) or 7000
+        )
+        self._prewarm_timeout_cooldown_sec: float = float(
+            self._cfg.get("prewarm_timeout_cooldown_sec", 240) or 240
+        )
+        self._prewarm_symbol_health: Dict[str, Dict[str, Any]] = {}
+        self._prewarm_stats: Dict[str, Any] = {
+            "cycles": 0,
+            "ok": 0,
+            "fail": 0,
+            "last_cycle_at": None,
+            "last_error": None,
+            "fast_cycles": 0,
+            "full_cycles": 0,
+        }
         self._contract_cache_ttl_sec = float(self._cfg.get("contract_cache_ttl_sec", 3600) or 3600)
         # market state aggregation stability/perf guards
         self._market_state_cache: Dict[str, Any] = {}
@@ -427,6 +457,8 @@ class MarketIntelligenceEngine:
             return
         self._running = True
         self._task = asyncio.create_task(self._push_loop())
+        if bool(self._prewarm_enabled):
+            self._prewarm_task = asyncio.create_task(self._prewarm_loop())
 
     async def stop(self) -> None:
         self._running = False
@@ -437,6 +469,13 @@ class MarketIntelligenceEngine:
             except Exception:
                 pass
         self._task = None
+        if self._prewarm_task and not self._prewarm_task.done():
+            self._prewarm_task.cancel()
+            try:
+                await self._prewarm_task
+            except Exception:
+                pass
+        self._prewarm_task = None
 
     async def _push_loop(self) -> None:
         while self._running:
@@ -464,6 +503,110 @@ class MarketIntelligenceEngine:
             except Exception as e:
                 logger.debug("MarketIntelligence push loop error: %s", e)
                 await asyncio.sleep(3)
+
+    async def _prewarm_loop(self) -> None:
+        fast_cycle = 0
+        while self._running:
+            try:
+                do_full = True
+                syms = list(self._watch_symbols or [])
+                if not syms:
+                    hub = self._hub()
+                    if hub and hasattr(hub, "get_symbols"):
+                        try:
+                            syms = (await hub.get_symbols())[: self._prewarm_max_symbols]
+                        except Exception:
+                            syms = ["BTC/USDT", "ETH/USDT"]
+                    else:
+                        syms = ["BTC/USDT", "ETH/USDT"]
+                syms = [str(s) for s in syms if s][: self._prewarm_max_symbols]
+                if syms:
+                    do_full = bool(
+                        fast_cycle % max(1, int(self._prewarm_full_every_n_fast)) == 0
+                    )
+                    await self._prewarm_symbols(syms, include_snapshot=do_full)
+                    if do_full:
+                        self._prewarm_stats["full_cycles"] = int(
+                            self._prewarm_stats.get("full_cycles", 0) or 0
+                        ) + 1
+                    else:
+                        self._prewarm_stats["fast_cycles"] = int(
+                            self._prewarm_stats.get("fast_cycles", 0) or 0
+                        ) + 1
+                    fast_cycle += 1
+                sleep_sec = (
+                    max(10.0, float(self._prewarm_interval_sec))
+                    if do_full
+                    else max(5.0, float(self._prewarm_fast_interval_sec))
+                )
+                await asyncio.sleep(sleep_sec)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._prewarm_stats["last_error"] = str(e)[:220]
+                logger.debug("MarketIntelligence prewarm loop error: %s", e)
+                await asyncio.sleep(5)
+
+    async def _prewarm_symbols(self, symbols: List[str], *, include_snapshot: bool) -> None:
+        self._prewarm_stats["cycles"] = int(self._prewarm_stats.get("cycles", 0) or 0) + 1
+        self._prewarm_stats["last_cycle_at"] = _utc_iso()
+        sem = asyncio.Semaphore(max(1, int(self._prewarm_batch_size)))
+        now = self._now()
+
+        selected: List[str] = []
+        for s in symbols:
+            h = self._prewarm_symbol_health.get(s) or {}
+            next_ok_at = float(h.get("next_try_after_ts", 0.0) or 0.0)
+            if next_ok_at > now:
+                continue
+            selected.append(s)
+        if not selected:
+            return
+
+        async def _one(sym: str) -> bool:
+            async with sem:
+                t0 = self._now()
+                try:
+                    await self.get_symbol_view(
+                        sym,
+                        include_snapshot=bool(include_snapshot),
+                        prefer_fast_only=not bool(include_snapshot),
+                    )
+                    elapsed_ms = float((self._now() - t0) * 1000.0)
+                    h = self._prewarm_symbol_health.get(sym) or {}
+                    h["last_ok_at"] = _utc_iso()
+                    h["last_latency_ms"] = round(elapsed_ms, 1)
+                    h["fail_streak"] = 0
+                    if elapsed_ms >= float(self._prewarm_slow_latency_ms):
+                        h["next_try_after_ts"] = self._now() + float(self._prewarm_slow_symbol_cooldown_sec)
+                    else:
+                        h["next_try_after_ts"] = 0.0
+                    self._prewarm_symbol_health[sym] = h
+                    return True
+                except Exception as e:
+                    h = self._prewarm_symbol_health.get(sym) or {}
+                    h["last_error"] = type(e).__name__
+                    h["fail_streak"] = int(h.get("fail_streak", 0) or 0) + 1
+                    h["next_try_after_ts"] = self._now() + float(self._prewarm_timeout_cooldown_sec)
+                    self._prewarm_symbol_health[sym] = h
+                    return False
+
+        tasks = [asyncio.create_task(_one(s)) for s in selected]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        ok = sum(1 for r in results if r is True)
+        fail = len(results) - ok
+        self._prewarm_stats["ok"] = int(self._prewarm_stats.get("ok", 0) or 0) + int(ok)
+        self._prewarm_stats["fail"] = int(self._prewarm_stats.get("fail", 0) or 0) + int(fail)
+
+    async def refresh_symbol_async(self, symbol: str, *, include_snapshot: bool = True) -> None:
+        """Public hook: trigger one-off background refresh for a symbol."""
+        sym = str(symbol or "").strip()
+        if not sym:
+            return
+        try:
+            await self._prewarm_symbols([sym], include_snapshot=bool(include_snapshot))
+        except Exception:
+            return
 
     async def _publish_symbol_view(self, view: SymbolView) -> None:
         th = self._trade_hub()
@@ -590,6 +733,60 @@ class MarketIntelligenceEngine:
                     cached_by_symbol[key] = cached
         except Exception:
             pass
+
+        # Cold-start guard:
+        # If there are no cached symbol views yet, a fan-out aggregation will likely hit upstream timeouts
+        # and take ~timeout_sec (e.g. ~3s). For control-plane consumers, returning a fast "warming up"
+        # snapshot is better than blocking.
+        if not views and syms:
+            minimal_views: List[Dict[str, Any]] = []
+            for s in [str(x) for x in syms if x][:20]:
+                minimal_views.append(
+                    {
+                        "symbol": s,
+                        "timestamp": _utc_iso(),
+                        "quality_score": 0.0,
+                        "provenance": "degraded",
+                        "schema_version": self._schema_version,
+                        "partial": True,
+                        "errors": ["warming_up"],
+                        "price": None,
+                        "spread_bps": None,
+                        "atr_pct_1h": None,
+                        "change_24h": 0.0,
+                        "trend": "unknown",
+                        "action_bias": "hold",
+                        "confidence": None,
+                        "summary": "",
+                        "conflicts": [],
+                        "exchange_support": {},
+                        "intel_support": {},
+                        "risk_support": {},
+                        "execution_support": {},
+                        "display_cn": {},
+                        "changeset": {},
+                    }
+                )
+            out = {
+                "timestamp": _utc_iso(),
+                "symbols_considered": len(minimal_views),
+                "symbols_attempted": len(minimal_views),
+                "symbols_failed": 0,
+                "trend": "unknown",
+                "counts": {"bullish": 0, "bearish": 0, "sideways": 0, "unknown": len(minimal_views)},
+                "avg_quality_score": 0.0,
+                "max_spread_bps": 0.0,
+                "high_risk_positions": 0,
+                "symbol_views": minimal_views,
+                "warming_up": True,
+                "elapsed_ms": int((time.time() - started_at) * 1000),
+            }
+            try:
+                self._market_state_cache = dict(out)
+                self._market_state_cache_ts = float(self._now())
+            except Exception:
+                pass
+            return out
         bull = bear = side = unknown = 0
         avg_q = []
         max_spread = 0.0
@@ -780,11 +977,25 @@ class MarketIntelligenceEngine:
         if cache_key in self._cache and (now - self._cache_ts.get(cache_key, 0)) < self._cache_ttl_sec:
             cached = self._cache[cache_key]
             view = SymbolView(**cached["view"])
-            if include_snapshot:
-                view.snapshot = cached.get("snapshot", {})
-            else:
-                view.snapshot = {}
-            return view
+            use_cached = True
+            # If caller requests full snapshot-quality view, do not reuse fast/degraded cache.
+            if bool(include_snapshot):
+                prov = str(getattr(view, "provenance", "") or "").lower()
+                partial_cached = bool(getattr(view, "partial", False))
+                weak_cached = (
+                    partial_cached
+                    or prov in {"fastpath", "degraded", "unknown"}
+                    or getattr(view, "quality_score", None) is None
+                    or getattr(view, "confidence", None) is None
+                    or getattr(view, "atr_pct_1h", None) is None
+                )
+                use_cached = not weak_cached
+            if use_cached:
+                if include_snapshot:
+                    view.snapshot = cached.get("snapshot", {})
+                else:
+                    view.snapshot = {}
+                return view
 
         hub = self._hub()
         snapshot: Dict[str, Any] = {}
@@ -838,7 +1049,7 @@ class MarketIntelligenceEngine:
                 # DataSourceHub.get_unified_snapshot uses its own overall budget (default 2.5s).
                 # If we set a smaller outer timeout here, we will prematurely cancel the snapshot and
                 # consistently degrade to snapshot_timeout. Add a small slack for scheduling/JSON work.
-                snap_timeout = max(0.8, min(6.0, float(self._snapshot_timeout_dynamic_s) + 0.8))
+                snap_timeout = max(1.2, min(12.0, float(self._snapshot_timeout_dynamic_s) + 1.2))
                 if not snapshot:
                     snapshot = await asyncio.wait_for(hub.get_unified_snapshot(sym), timeout=snap_timeout)
                     self._record_timeout_result("snapshot", timeout_hit=False)
@@ -881,6 +1092,16 @@ class MarketIntelligenceEngine:
             quality_score = _safe_float(q.get("score"), default=0.0)
 
         price = _safe_float(ticker.get("price") or ticker.get("last") or ticker.get("close") or 0, 0.0)
+        # 价格兜底：统一快照超时时，尝试交易所 ticker（其内部含缓存/持仓 mark 价降级）。
+        ex_client = self._exchange()
+        if price <= 0 and ex_client and hasattr(ex_client, "get_ticker"):
+            try:
+                tk = await ex_client.get_ticker(sym)
+                price = _safe_float((tk or {}).get("last") or (tk or {}).get("close") or 0, 0.0)
+                if price > 0:
+                    errors.append("price_fallback_from_exchange_ticker")
+            except Exception:
+                pass
         sp = _spread_bps(ticker) if isinstance(ticker, dict) else None
         change_24h = _safe_float(ticker.get("change24h") or ticker.get("change") or 0, 0.0)
         # 1h ATR proxy from hub klines if present
@@ -921,6 +1142,32 @@ class MarketIntelligenceEngine:
         except Exception:
             conf = None
         conf_f = _safe_float(conf, default=0.0) if conf is not None else None
+
+        # Fallback trend/confidence derivation to avoid long-lived "unknown + None" outputs
+        # when third-party sentiment is unavailable but exchange snapshot is present.
+        try:
+            if trend_n == "unknown":
+                ch = float(change_24h or 0.0)
+                if ch >= 0.003:
+                    trend_n = "bullish"
+                elif ch <= -0.003:
+                    trend_n = "bearish"
+                else:
+                    trend_n = "sideways"
+        except Exception:
+            pass
+        try:
+            if conf_f is None:
+                q0 = float(quality_score) if quality_score is not None else 0.0
+                # Base confidence from data quality, then penalize large spread.
+                c0 = max(0.45, min(0.85, q0))
+                if sp is not None and float(sp) > 8.0:
+                    c0 = max(0.45, c0 - 0.10)
+                elif sp is not None and float(sp) > 4.0:
+                    c0 = max(0.45, c0 - 0.05)
+                conf_f = float(round(c0, 3))
+        except Exception:
+            pass
 
         # Derive bias from trend + confidence (never treated as an order signal).
         action_bias = "hold"

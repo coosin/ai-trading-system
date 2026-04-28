@@ -5,7 +5,7 @@ mode: rule
 
 # 示例配置（已脱敏）
 # - 请把你的真实订阅生成结果保存为 config/clash_config.yaml（该文件已被 .gitignore 忽略）
-# - 或使用 scripts/subscription_updater.py + scripts/update_clash_subscriptions.sh 自动生成
+# - 若需自动化更新，请使用独立运维工具链（本仓已移除历史 subscription_* 脚本）
 
 proxies: []
 

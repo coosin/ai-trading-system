@@ -41,6 +41,7 @@ def apply_trading_contract_unified(
         "trade_type",
         "margin_mode",
         "position_mode",
+        "leverage_curve",
         "grid_trading",
         "grid_levels",
         "grid_spacing",
@@ -50,12 +51,12 @@ def apply_trading_contract_unified(
             contract_config[key] = tc[key]
 
     if "leverage_min" in tc:
-        contract_config["leverage_min"] = _as_int(tc["leverage_min"], int(contract_config.get("leverage_min") or 10))
+        contract_config["leverage_min"] = _as_int(tc["leverage_min"], int(contract_config.get("leverage_min") or 20))
     if "leverage_max" in tc:
         contract_config["leverage_max"] = _as_int(tc["leverage_max"], int(contract_config.get("leverage_max") or 100))
     if "default_leverage" in tc:
         contract_config["default_leverage"] = _as_int(
-            tc["default_leverage"], int(contract_config.get("default_leverage") or 20)
+            tc["default_leverage"], int(contract_config.get("default_leverage") or 30)
         )
 
     oneway = _as_int(tc.get("max_positions_oneway"), 5)
@@ -69,11 +70,11 @@ def apply_trading_contract_unified(
 
     if ai_core_config is not None:
         if "leverage_min" in tc:
-            ai_core_config["leverage_min"] = int(contract_config.get("leverage_min", 10))
+            ai_core_config["leverage_min"] = int(contract_config.get("leverage_min", 20))
         if "leverage_max" in tc:
             ai_core_config["leverage_max"] = int(contract_config.get("leverage_max", 100))
         if "default_leverage" in tc:
-            ai_core_config["default_leverage"] = int(contract_config.get("default_leverage", 20))
+            ai_core_config["default_leverage"] = int(contract_config.get("default_leverage", 30))
         if "max_positions_oneway" in tc:
             ai_core_config["max_positions"] = oneway
 

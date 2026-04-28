@@ -24,6 +24,7 @@ from .technical_indicators import TechnicalIndicatorCalculator, TechnicalIndicat
 from .historical_data_storage import HistoricalDataStorage, TradeRecord, IndicatorRecord, get_historical_storage
 from .account_risk_monitor import AccountRiskMonitor, AccountRisk, PositionRisk, RiskLevel
 from .strategy_optimizer import StrategyOptimizer, StrategyType, StrategyPerformance
+from .trading_limits import resolve_position_limits
 from ..exchanges.exchange_base import Order
 
 logger = logging.getLogger(__name__)
@@ -151,9 +152,9 @@ class AITradingEngine:
         self.contract_config = {
             "enabled": True,
             "trade_type": "swap",
-            "leverage_min": 10,
+            "leverage_min": 20,
             "leverage_max": 100,
-            "default_leverage": 20,
+            "default_leverage": 30,
             "max_positions": DEFAULT_MAX_POSITIONS,
             "min_positions": 1,
             "margin_mode": "cross",
@@ -226,6 +227,11 @@ class AITradingEngine:
         }
         # 止损复盘统计：连续止损达到阈值后，对该信号提高开仓门槛
         self._signal_stop_loss_stats: Dict[str, Dict[str, Any]] = {}
+        # 止损复盘事件去重：避免 close 重试/重复触发导致 hits 爆炸、信号被永久“惩罚封杀”
+        self._stop_loss_feedback_seen: Dict[str, float] = {}
+        self._stop_loss_feedback_seen_ttl_sec: float = 6 * 3600
+        # Track successful same-symbol same-side opens for staged scale-in confidence gates.
+        self._symbol_side_open_legs: Dict[str, int] = {}
         
         logger.info("全智能AI交易引擎初始化完成")
     
@@ -539,6 +545,8 @@ class AITradingEngine:
     async def start(self) -> None:
         """启动AI交易引擎"""
         logger.info("🚀 启动全智能AI交易引擎...")
+        # stop() 会将 _running 置为 False；start() 必须显式恢复，避免重启后循环不再运行。
+        self._running = True
         await self._bootstrap_live_state_takeover()
         
         # 启动主交易循环（受 single_write_owner 约束）
@@ -1553,15 +1561,21 @@ class AITradingEngine:
             vol_factor = 1.0 - 0.8 * vol  # 0..0.5 => 1..0.6
             margin_value = equity * base_pct * vol_factor
 
-            # 杠杆：10~100，自适应（低波动/高置信度可略提高）
-            lev_min = int(self.contract_config.get("leverage_min", 1) or 10)
+            # 杠杆：20~100，自适应（配置驱动分段曲线）
+            lev_min = int(self.contract_config.get("leverage_min", 1) or 20)
             lev_max = int(self.contract_config.get("leverage_max", 2) or 100)
-            lev0 = int(self.contract_config.get("default_leverage", 1) or 20)
-            lev = lev0
+            lev0 = int(self.contract_config.get("default_leverage", 1) or 30)
+            # context.volatility 通常是 0..0.5，映射为 ATR 口径近似值 0..0.05
+            atr_proxy = max(0.001, min(0.15, float(vol) * 0.1))
+            lev = self._adaptive_leverage_from_atr(
+                atr_pct_1h=atr_proxy,
+                leverage_min=lev_min,
+                leverage_max=lev_max,
+                default_leverage=lev0,
+                leverage_curve=self.contract_config.get("leverage_curve"),
+            )
             if c is not None and c >= 0.80 and vol <= 0.10:
-                lev = min(lev_max, max(lev, int(round(lev0 * 1.25))))
-            if vol >= 0.25:
-                lev = max(lev_min, int(round(lev * 0.75)))
+                lev = min(lev_max, max(lev, int(round(lev0 * 1.15))))
             lev = max(lev_min, min(lev, lev_max))
 
             position_value = margin_value * float(lev)
@@ -1633,20 +1647,18 @@ class AITradingEngine:
                     )
                     return False
 
-                max_same = int(self.ai_config.get("max_same_direction_positions", 5) or 5)
-                max_hedged = int(self.ai_config.get("max_hedged_positions", 8) or 8)
-                # Prefer external config (tests & simple deployments) then fallback to ai_config defaults.
-                try:
-                    max_positions_cfg = (self.config or {}).get("trading", {}).get("max_positions")
-                except Exception:
-                    max_positions_cfg = None
-                max_positions = int(
-                    (max_positions_cfg if max_positions_cfg is not None else self.ai_config.get("max_positions", DEFAULT_MAX_POSITIONS))
-                    or DEFAULT_MAX_POSITIONS
+                limits = await resolve_position_limits(
+                    config_manager=(self.main_controller.config_manager if self.main_controller else None),
+                    trading_config=((self.config or {}).get("trading") if isinstance(self.config, dict) else None),
+                    ai_config=(self.ai_config if isinstance(self.ai_config, dict) else None),
                 )
+                max_same = int(limits.max_same_direction_positions)
+                max_hedged = int(limits.max_positions_hedge)
+                max_positions = int(limits.max_positions_oneway)
                 long_cnt, short_cnt = self._count_open_directions()
                 opening_long = decision.action == TradeAction.OPEN_LONG
                 opening_short = decision.action == TradeAction.OPEN_SHORT
+                existing = self.positions.get(decision.symbol)
 
                 if opening_long and long_cnt >= max_same and decision.symbol not in self.positions:
                     logger.info(f"📊 同向多仓已达上限({max_same})，拒绝新开多: {decision.symbol}")
@@ -1658,13 +1670,37 @@ class AITradingEngine:
                 # 仅单方向时使用基础上限；双方向对冲并存时可放宽到 max_hedged
                 has_both_directions = long_cnt > 0 and short_cnt > 0
                 total_cap = max_hedged if has_both_directions else max_positions
-                hard_max_positions = int(self.ai_config.get("hard_max_positions", 5) or 5)
+                hard_max_positions = int(limits.hard_max_positions)
                 if len(self.positions) >= hard_max_positions and decision.symbol not in self.positions:
                     logger.info(f"📊 硬限制持仓数已达上限({hard_max_positions})，拒绝新开仓: {decision.symbol}")
                     return False
                 if len(self.positions) >= total_cap and decision.symbol not in self.positions:
                     logger.info(f"📊 持仓数已达上限({total_cap})，拒绝新开仓: {decision.symbol}")
                     return False
+
+                # Staged scale-in confidence gates for 2nd/3rd/4th+ same-side opens.
+                decision_side = "long" if opening_long else "short"
+                leg_key = f"{str(decision.symbol).upper()}|{decision_side}"
+                current_legs = int(self._symbol_side_open_legs.get(leg_key, 0) or 0)
+                existing_same_side = bool(existing and getattr(existing, "side", "") == decision_side)
+                next_leg = (current_legs + 1) if current_legs > 0 else (2 if existing_same_side else 1)
+                if next_leg >= 2:
+                    if next_leg == 2:
+                        need_conf = float(limits.scale_in_min_confidence_2)
+                    elif next_leg == 3:
+                        need_conf = float(limits.scale_in_min_confidence_3)
+                    else:
+                        need_conf = float(limits.scale_in_min_confidence_4)
+                    got_conf = float(decision.confidence or 0.0)
+                    if got_conf < need_conf:
+                        logger.info(
+                            "📊 加仓置信度不足，拒绝开仓: symbol=%s leg=%s conf=%.3f required=%.3f",
+                            decision.symbol,
+                            next_leg,
+                            got_conf,
+                            need_conf,
+                        )
+                        return False
 
                 # 资金链保护：检查本次开仓后是否超总敞口
                 projected_value = float(decision.quantity or 0.0) * float(decision.price or 0.0)
@@ -1681,6 +1717,32 @@ class AITradingEngine:
                         except Exception:
                             pass
                     equity = max(available, self._estimate_total_equity_fallback(available))
+
+                    # Canonical per-symbol margin cap (available * symbol_max_margin_ratio).
+                    # We approximate required margin as notional/leverage; if leverage is missing,
+                    # fall back to contract_config.default_leverage (or 1).
+                    try:
+                        lev = None
+                        md = decision.metadata if isinstance(decision.metadata, dict) else {}
+                        lev = md.get("leverage") if isinstance(md, dict) else None
+                        if lev is None:
+                            lev = self.contract_config.get("default_leverage") if isinstance(self.contract_config, dict) else None
+                        lev_f = float(lev or 1.0)
+                        lev_f = max(1.0, min(200.0, lev_f))
+                        required_margin = projected_value / lev_f
+                        symbol_margin_cap = float(limits.symbol_max_margin_ratio) * float(available)
+                        if required_margin > symbol_margin_cap:
+                            logger.info(
+                                "📊 单币种保证金占用超限，拒绝开仓: symbol=%s req_margin=%.2f cap=%.2f available=%.2f lev=%.1f",
+                                decision.symbol,
+                                required_margin,
+                                symbol_margin_cap,
+                                available,
+                                lev_f,
+                            )
+                            return False
+                    except Exception:
+                        pass
                     max_position_value_ratio = float(self.ai_config.get("max_position_value_ratio", 0.05) or 0.05)
                     if projected_value > equity * max_position_value_ratio:
                         logger.info(
@@ -1787,7 +1849,31 @@ class AITradingEngine:
         trend = str(getattr(context, "trend", "unknown") or "unknown")
         return f"{symbol}:{side}:{trend}"
 
-    async def _record_stop_loss_feedback(self, symbol: str, side: str, current_price: float, stop_loss: float) -> None:
+    async def _record_stop_loss_feedback(
+        self,
+        symbol: str,
+        side: str,
+        current_price: float,
+        stop_loss: float,
+        event_id: Optional[str] = None,
+    ) -> None:
+        # best-effort dedupe: if the same SL event is emitted repeatedly (e.g. close retry),
+        # do not accumulate penalties that effectively disable trading.
+        try:
+            if event_id:
+                now_ts = time.time()
+                # purge old seen ids (bounded memory)
+                if self._stop_loss_feedback_seen and (len(self._stop_loss_feedback_seen) > 2000):
+                    cutoff = now_ts - float(self._stop_loss_feedback_seen_ttl_sec or 21600)
+                    self._stop_loss_feedback_seen = {
+                        k: v for k, v in self._stop_loss_feedback_seen.items() if float(v or 0.0) >= cutoff
+                    }
+                prev = float(self._stop_loss_feedback_seen.get(str(event_id), 0.0) or 0.0)
+                if prev and (now_ts - prev) < float(self._stop_loss_feedback_seen_ttl_sec or 21600):
+                    return
+                self._stop_loss_feedback_seen[str(event_id)] = now_ts
+        except Exception:
+            pass
         signal_key = f"{symbol}:{side}:{'bullish' if side == 'long' else 'bearish'}"
         stat = self._signal_stop_loss_stats.setdefault(signal_key, {"stop_loss_hits": 0, "last_at": None})
         stat["stop_loss_hits"] = int(stat.get("stop_loss_hits", 0) or 0) + 1
@@ -2043,6 +2129,13 @@ class AITradingEngine:
                 await self._post_order_reconcile(decision, result)
                 
                 is_open = decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]
+                if is_open:
+                    try:
+                        open_side = "long" if decision.action == TradeAction.OPEN_LONG else "short"
+                        leg_key = f"{str(decision.symbol).upper()}|{open_side}"
+                        self._symbol_side_open_legs[leg_key] = int(self._symbol_side_open_legs.get(leg_key, 0) or 0) + 1
+                    except Exception:
+                        pass
                 if is_open and decision.stop_loss and decision.take_profit:
                     await self._create_stop_loss_order(decision)
                 
@@ -2343,10 +2436,10 @@ class AITradingEngine:
             s = "long"
         if s in ("sell", "s"):
             s = "short"
-        # 自适应杠杆（10-100）
-        lev_min = int(self.contract_config.get("leverage_min", 1) or 10)
+        # 自适应杠杆（20-100）
+        lev_min = int(self.contract_config.get("leverage_min", 1) or 20)
         lev_max = int(self.contract_config.get("leverage_max", 2) or 100)
-        lev0 = int(self.contract_config.get("default_leverage", 1) or 20)
+        lev0 = int(self.contract_config.get("default_leverage", 1) or 30)
         lev = max(lev_min, min(lev0, lev_max))
         try:
             mc = self.main_controller
@@ -2357,9 +2450,13 @@ class AITradingEngine:
                 atrp = vd.get("atr_pct_1h")
                 if atrp is not None:
                     atr = float(atrp)
-                    # 以 1.5% ATR 为基准：更低波动→可适度提高杠杆；更高波动→降低杠杆
-                    target = lev0 * (0.015 / max(0.001, min(0.15, atr)))
-                    lev = int(round(max(lev_min, min(lev_max, target))))
+                    lev = self._adaptive_leverage_from_atr(
+                        atr_pct_1h=atr,
+                        leverage_min=lev_min,
+                        leverage_max=lev_max,
+                        default_leverage=lev0,
+                        leverage_curve=self.contract_config.get("leverage_curve"),
+                    )
         except Exception:
             pass
         try:
@@ -2456,6 +2553,72 @@ class AITradingEngine:
             except Exception as e:
                 logger.warning("execute_trade: 止盈止损注册失败（不影响成交）: %s", e)
         return res
+
+    @staticmethod
+    def _adaptive_leverage_from_atr(
+        *,
+        atr_pct_1h: float,
+        leverage_min: int,
+        leverage_max: int,
+        default_leverage: int,
+        leverage_curve: Optional[Any] = None,
+    ) -> int:
+        """
+        Piecewise leverage curve:
+        - high volatility => lower leverage
+        - low volatility => higher leverage
+        - default_leverage acts as middle anchor when ATR is unavailable/noisy
+        """
+        try:
+            atr = float(atr_pct_1h)
+        except Exception:
+            return int(max(leverage_min, min(leverage_max, default_leverage)))
+
+        atr = max(0.001, min(0.15, atr))
+        target = None
+
+        # Config-driven piecewise curve from trading.contract.leverage_curve:
+        # - atr_gte: threshold (descending)
+        # - leverage: target leverage
+        if isinstance(leverage_curve, list):
+            parsed = []
+            for row in leverage_curve:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    thr = float(row.get("atr_gte"))
+                    lev = int(row.get("leverage"))
+                    parsed.append((thr, lev))
+                except Exception:
+                    continue
+            parsed.sort(key=lambda x: x[0], reverse=True)
+            for thr, lev in parsed:
+                if atr >= thr:
+                    target = lev
+                    break
+
+        if target is None:
+            if atr >= 0.06:
+                target = 20
+            elif atr >= 0.04:
+                target = 24
+            elif atr >= 0.03:
+                target = 28
+            elif atr >= 0.02:
+                target = 32
+            elif atr >= 0.015:
+                target = 36
+            elif atr >= 0.010:
+                target = 45
+            elif atr >= 0.006:
+                target = 60
+            else:
+                target = 75
+
+        # Keep curve centered around configured default.
+        if default_leverage > 0:
+            target = int(round((target * 0.7) + (float(default_leverage) * 0.3)))
+        return int(max(leverage_min, min(leverage_max, target)))
     
     async def _update_positions(self) -> None:
         """更新持仓信息 - 从交易所实时获取"""
@@ -2576,6 +2739,12 @@ class AITradingEngine:
             for symbol in closed_symbols:
                 logger.info(f"📊 {symbol} 已平仓，从监控列表移除")
                 del self.positions[symbol]
+                try:
+                    sym_u = str(symbol).upper()
+                    self._symbol_side_open_legs.pop(f"{sym_u}|long", None)
+                    self._symbol_side_open_legs.pop(f"{sym_u}|short", None)
+                except Exception:
+                    pass
             
             if self.positions:
                 logger.info(f"📊 当前监控 {len(self.positions)} 个持仓")

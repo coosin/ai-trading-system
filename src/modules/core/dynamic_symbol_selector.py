@@ -199,6 +199,11 @@ class DynamicSymbolSelector:
             logger.error(f"发现币种失败: {e}")
             return self.config.always_include
 
+        # IMPORTANT: discovery may legitimately return 0 (API timeout/limited markets).
+        # Never let this empty result wipe the monitoring universe.
+        if not discovered:
+            return list(self.config.always_include)
+
         if self.config.restricted_universe and self.config.allowed_symbols:
             allow = {str(s).strip() for s in self.config.allowed_symbols if s}
             discovered = [s for s in discovered if s in allow]
@@ -466,6 +471,10 @@ class DynamicSymbolSelector:
         self.candidate_symbols = candidates
         
         best_symbols = await self.select_best_symbols(candidates)
+
+        # Never overwrite current_symbols with empty selection.
+        if not best_symbols:
+            best_symbols = list(self.current_symbols or self.config.always_include)
         
         old_symbols = set(self.current_symbols)
         new_symbols = set(best_symbols)

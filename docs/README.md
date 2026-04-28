@@ -14,6 +14,7 @@
 | [**ENGINEERING.md**](./ENGINEERING.md) | **工程主文档**：架构、配置模型、Docker、模块索引 |
 | [**OPERATIONS.md**](./OPERATIONS.md) | 运维：Compose、网络/代理、健康检查、排障 |
 | [**DEVELOPMENT.md**](./DEVELOPMENT.md) | 开发环境、测试（含 Pytest 9）、目录结构 |
+| [**TRADING_TUNING_GUIDE.md**](./TRADING_TUNING_GUIDE.md) | 交易调参：开平仓门控、仓位/加仓、SLTP 与学习引擎验收 |
 | [**CHANGELOG.md**](./CHANGELOG.md) | 变更记录 |
 | [**memory/MEMORY_LIBRARY_GUIDE.md**](./memory/MEMORY_LIBRARY_GUIDE.md) | Memory：配置段与运维要点 |
 | [**API_REFERENCE.md**](./API_REFERENCE.md) | API 与 WebSocket 约定、监控告警合并说明（权威以运行时 `/openapi.json` 为准） |

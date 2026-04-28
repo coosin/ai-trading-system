@@ -53,7 +53,7 @@ fi
 echo ""
 echo "🏥 3. 系统健康检查:"
 echo "   主系统健康状态:"
-MAIN_HEALTH=$(curl -s http://localhost:18789/health 2>/dev/null | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+MAIN_HEALTH=$(curl -s http://localhost:18789/api/v1/system/health 2>/dev/null | grep -Eo '"(status|overall)":"[^"]*"' | head -n1 | cut -d'"' -f4)
 if [ -n "$MAIN_HEALTH" ]; then
     echo "   ✅ $MAIN_HEALTH"
 else
@@ -61,7 +61,7 @@ else
 fi
 
 echo "   交易系统健康状态:"
-TRADING_HEALTH=$(curl -s http://localhost:18790/health 2>/dev/null | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+TRADING_HEALTH=$(curl -s http://localhost:18790/api/v1/system/health 2>/dev/null | grep -Eo '"(status|overall)":"[^"]*"' | head -n1 | cut -d'"' -f4)
 if [ -n "$TRADING_HEALTH" ]; then
     echo "   ✅ $TRADING_HEALTH"
 else

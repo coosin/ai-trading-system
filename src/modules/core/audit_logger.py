@@ -189,22 +189,30 @@ class AuditLogger:
         quantity: float,
         price: float,
         order_id: Optional[str] = None,
+        extra_details: Optional[Dict[str, Any]] = None,
         result: str = "success"
     ) -> str:
         """记录交易事件"""
         event_type = AuditEventType.TRADE_OPEN if "open" in action.lower() else AuditEventType.TRADE_CLOSE
-        
+
+        details = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price,
+            "order_id": order_id,
+        }
+        if isinstance(extra_details, dict) and extra_details:
+            # Don't allow clobbering base fields accidentally
+            for k, v in extra_details.items():
+                if k not in details:
+                    details[k] = v
+
         return await self.log_event(
             event_type=event_type,
             severity=AuditSeverity.INFO,
             action=action,
-            details={
-                "symbol": symbol,
-                "side": side,
-                "quantity": quantity,
-                "price": price,
-                "order_id": order_id
-            },
+            details=details,
             source="trading_engine",
             result=result
         )

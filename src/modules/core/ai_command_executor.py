@@ -820,6 +820,9 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         low = t.lower()
         if any(k in t for k in ("强制平仓", "立即平仓", "马上平仓", "全平", "清仓")):
             params["force_close"] = True
+        # 显式平仓语义优先，避免“平掉XX仓位”被误走开仓链路。
+        if any(k in t for k in ("平仓", "平掉", "平掉仓位", "了结仓位", "关闭仓位", "close")):
+            params["force_close"] = True
         if any(k in t for k in ("强制开仓", "立即开仓", "马上开仓")):
             params["force"] = True
         if any(k in t for k in ("做多", "开多", "买入", "long")) or "buy" in low:
@@ -2043,15 +2046,26 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                 symbol = str(merged.get("symbol") or symbol or "").strip()
                 if not symbol:
                     return {"success": False, "response": "未识别到交易对，请补充如 BTC/USDT。"}
+                # 归一化裸币种输入（如 AVAX -> AVAX/USDT），避免下游拼出不存在的 instId。
+                if "/" not in symbol and re.fullmatch(r"[A-Za-z]{2,12}", symbol):
+                    symbol = f"{symbol.upper()}/USDT"
+                else:
+                    symbol = symbol.upper()
 
-                qty = float(
+                qty_raw = (
                     merged.get("quantity")
                     or merged.get("size")
                     or merged.get("amount")
                     or merged.get("value")
-                    or 0.01
                 )
-                side = str(merged.get("side") or "long").strip().lower()
+                qty: Optional[float] = None
+                if qty_raw is not None:
+                    try:
+                        qty = float(qty_raw)
+                    except Exception:
+                        qty = None
+                side_raw = merged.get("side")
+                side = str(side_raw or "long").strip().lower()
                 if side in ("buy", "b"):
                     side = "long"
                 elif side in ("sell", "s"):
@@ -2063,10 +2077,25 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     gw = getattr(mc, "execution_gateway", None)
                     if not gw:
                         return {"success": False, "response": "ExecutionGateway 未初始化，无法执行平仓。"}
+                    # 若用户未显式给 side，则按交易所实时持仓自动判定方向，避免误默认 long 导致平仓失败。
+                    if not side_raw:
+                        try:
+                            positions = await gw.get_positions()
+                            symbol_swap = symbol.replace("/USDT", "/USDT/SWAP")
+                            for p in positions or []:
+                                psym = str(p.get("symbol") or p.get("instId") or "")
+                                psz = float(p.get("size") or p.get("position_size") or 0.0)
+                                pside = str(p.get("side") or "").lower().strip()
+                                if psz > 0 and (symbol in psym or symbol_swap in psym):
+                                    if pside in ("long", "short"):
+                                        side = pside
+                                        break
+                        except Exception:
+                            pass
                     res = await gw.close_swap(
                         symbol=symbol,
                         side=side,
-                        size=qty if qty > 0 else None,
+                        size=qty if (qty is not None and qty > 0) else None,
                         source="system",
                         reason=reason,
                         force=True,
@@ -2106,7 +2135,7 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     res = await gw.open_swap(
                         symbol=symbol,
                         side=side,
-                        size=qty,
+                        size=qty if (qty is not None and qty > 0) else 0.01,
                         leverage=lev,
                         source="manual",
                         reason=reason,

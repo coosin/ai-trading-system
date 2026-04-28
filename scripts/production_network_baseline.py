@@ -146,7 +146,7 @@ def verify_compose_proxy_env() -> Dict[str, Any]:
 
 def runtime_probe() -> Dict[str, Any]:
     script = r"""
-import os, requests, json, time
+import os, json, time, urllib.request
 proxy = os.getenv("OPENCLAW_HTTP_PROXY")
 out = {"env": {}, "probes": {}}
 for k in ["OPENCLAW_HTTP_PROXY","OPENCLAW_HTTPS_PROXY","OPENCLAW_ALL_PROXY","NO_PROXY"]:
@@ -164,9 +164,10 @@ for name, url in targets.items():
     last = None
     for _ in range(6):
         try:
-            r = requests.get(url, proxies={"http": proxy, "https": proxy}, timeout=8, verify=True)
-            last = r.status_code
-            if r.status_code < 400:
+            req = urllib.request.Request(url, headers={"User-Agent": "network-baseline-probe/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                last = int(getattr(resp, "status", 200) or 200)
+            if last < 400:
                 ok += 1
             else:
                 fail += 1

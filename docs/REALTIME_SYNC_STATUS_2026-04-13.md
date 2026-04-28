@@ -2,7 +2,7 @@
 
 ## 1) 当前系统能力结论
 
-- 核心服务在线：`/health`、`/api/v1/modules/system/health` 返回 healthy。
+- 核心服务在线：`/api/v1/system/health`、`/api/v1/modules/system/health` 返回 healthy。
 - 司令部主入口在线：`POST /api/v1/modules/commander/dispatch` 可直接驱动开平仓指令。
 - 行情实时输出在线：`/api/v1/market/symbol/{symbol}`、`/api/v1/market/state`、`/api/v1/modules/data/hub/unified-snapshot` 正常返回最新判断与质量分。
 - 开平仓通知在线：`/api/v1/trade/events` 可读到 `trade.fill` 事件；`/api/v1/modules/execution/production-audit` 可读到执行脊柱最新动作。

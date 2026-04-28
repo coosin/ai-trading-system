@@ -30,11 +30,11 @@ llm:
     enabled: true
     priority: 30
     fallback_models:
-    - doubao-seed-2.0-pro
+    - ark-code-latest
   - provider: openai
-    model_id: doubao-seed-2.0-pro
-    display_name: Volcengine Ark Doubao Seed 2.0 Pro
-    api_key_env: ARK_API_KEY
+    model_id: ark-code-latest
+    display_name: Volcengine Ark Code Latest
+    api_key: ark-dd309044-fbb7-4028-90b4-12aca1c542c8-ae933
     base_url: https://ark.cn-beijing.volces.com/api/coding/v3
     temperature: 0.6
     max_tokens: 8000
@@ -52,28 +52,28 @@ llm:
   task_model_mapping:
     general:
     - qianfan-code-latest
-    - doubao-seed-2.0-pro
+    - ark-code-latest
     market_analysis:
     - qianfan-code-latest
-    - doubao-seed-2.0-pro
+    - ark-code-latest
     strategy_generation:
     - qianfan-code-latest
-    - doubao-seed-2.0-pro
+    - ark-code-latest
     signal_generation:
     - qianfan-code-latest
-    - doubao-seed-2.0-pro
+    - ark-code-latest
     risk_assessment:
     - qianfan-code-latest
-    - doubao-seed-2.0-pro
+    - ark-code-latest
     news_analysis:
     - qianfan-code-latest
-    - doubao-seed-2.0-pro
+    - ark-code-latest
     code_generation:
     - qianfan-code-latest
-    - doubao-seed-2.0-pro
+    - ark-code-latest
     natural_language:
     - qianfan-code-latest
-    - doubao-seed-2.0-pro
+    - ark-code-latest
 trading:
   # 默认关注列表（动态选币开启时仍作 always_include 候选）
   symbols:
@@ -91,9 +91,29 @@ trading:
     symbol_universe: full_exchange
     allowed_symbols: []
     position_mode: oneway
-    leverage_min: 10
+    leverage_min: 20
     leverage_max: 100
-    default_leverage: 10
+    # 自适应杠杆基准（运行时在 20~100 区间内动态调整）
+    default_leverage: 30
+    # 杠杆分段曲线（atr_pct_1h 口径，按 atr_gte 从高到低匹配）
+    # - 高波动 => 更低杠杆；低波动 => 更高杠杆
+    leverage_curve:
+    - atr_gte: 0.06
+      leverage: 20
+    - atr_gte: 0.04
+      leverage: 24
+    - atr_gte: 0.03
+      leverage: 28
+    - atr_gte: 0.02
+      leverage: 32
+    - atr_gte: 0.015
+      leverage: 36
+    - atr_gte: 0.01
+      leverage: 45
+    - atr_gte: 0.006
+      leverage: 60
+    - atr_gte: 0.0
+      leverage: 75
     # 默认开仓数量（USDT 永续合约张数/数量，按交易所合约规则解释）
     # 以前代码写死 0.01，这里改为配置项，便于按风险/账户规模调整
     default_quantity: 0.01
@@ -111,9 +131,27 @@ trading:
     enable_auto_discovery: true
     always_exclude: []
   analysis_interval: 60
-  min_confidence: 0.65
+  min_confidence: 0.63
   max_positions: 5
   risk_per_trade: 0.02
+  # 统一仓位/持仓入口（唯一推荐入口）
+  # - 资金口径：available（可用余额）
+  # - 限制口径：margin（保证金占用比例）
+  position_limits:
+    # 单币种最大开仓保证金占用（占 available 比例）
+    symbol_max_margin_ratio: 0.2
+    # 同向持仓数上限（long/short 分别计数）
+    max_same_direction_positions: 5
+    # 单向模式（oneway）下的总持仓上限
+    max_positions_oneway: 5
+    # 双向对冲并存（同时存在 long 与 short）时的总持仓上限
+    max_positions_hedge: 8
+    # 最终硬上限（无论任何模式/路径都不得超过）
+    hard_max_positions: 8
+    # 同一方向加仓分层门槛（第2/3/4笔），每笔仍受 symbol_max_margin_ratio=20% 约束
+    scale_in_min_confidence_2: 0.77
+    scale_in_min_confidence_3: 0.82
+    scale_in_min_confidence_4: 0.87
   order:
     type: market
     time_in_force: GTC
@@ -257,6 +295,14 @@ monitoring:
         from_addr: noreply@openclaw-trading.com
         to_addrs: []
   enabled: true
+
+api:
+  # 内网白名单：来自这些 CIDR 的写请求可绕过鉴权（用于本机/内网对接）。
+  # 默认只放行回环地址；如需 LAN 对接，可追加 192.168.0.0/16 等。
+  auth_bypass_enabled: true
+  auth_bypass_cidrs:
+  - 127.0.0.1/32
+  - ::1/128
   health_check_interval: 30
   metrics_interval: 60
 telegram:
@@ -410,6 +456,14 @@ ai_core:
     max_optimize_strategies_per_cycle: 1
     skip_backtest_if_cpu_above: 85
     skip_optimize_if_cpu_above: 85
+ai_core_runtime:
+  # 试验：统一下调开仓相关置信度门槛 0.02
+  min_confidence_to_trade: 0.73
+  ai_core_min_confidence_to_open: 0.73
+  # 统一分析链路硬门槛：分析质量/置信不足或降级数据时，禁止开仓
+  analysis_hard_gate_for_open: true
+  analysis_min_confidence_for_open: 0.55
+  analysis_require_not_degraded_for_open: true
 ai_brain:
   primary_controller: ai_core
   single_write_owner: ai_core
@@ -437,12 +491,19 @@ proactive_scanner:
   scan_interval: 90
   deep_scan_interval: 600
   # 开启后：扫描器对“高置信 + 通过实时数据预检”的机会会触发开仓（走 ExecutionGateway）
-  proactive_auto_execute_opportunities: true
+  proactive_auto_execute_opportunities: false
   # 转发给 ai_core 的冷却收敛到 60 秒
   proactive_ai_core_forward_cooldown_sec: 60
   # 均值回归机会的 confidence 由 |24h涨跌幅|×10 推导；0.55≈5.5% 才会触发执行评估。
   # 统一提升开仓门槛：置信度 >=75% 才允许自动开仓评估
-  proactive_execute_min_confidence: 0.78
+  proactive_execute_min_confidence: 0.76
+  # 防止“连续开多个标的把可用资金耗尽”
+  proactive_global_open_max_per_10m: 1
+  proactive_global_open_max_per_hour: 3
+  # 默认禁止同向加仓（除非你明确要做网格/DCA）
+  proactive_allow_scale_in: false
+  # 止损后冷却：避免“止损后立刻再开/复仇单”
+  proactive_stop_loss_cooldown_sec: 1800
   # 原值 0.08(8%) 过于激进，会导致多数时间“无机会”，从而看起来系统不产生开仓线索。
   mean_reversion_min_abs_change: 0.02
   breakout_min_volume_vs_prior_avg: 0
@@ -477,13 +538,22 @@ proactive_scanner:
 market_intelligence:
   cache_ttl_sec: 20
   push_interval_sec: 15
+  prewarm_enabled: true
+  prewarm_interval_sec: 45
+  prewarm_fast_interval_sec: 15
+  prewarm_full_every_n_fast: 3
+  prewarm_max_symbols: 12
+  prewarm_batch_size: 4
+  prewarm_slow_symbol_cooldown_sec: 120
+  prewarm_slow_latency_ms: 7000
+  prewarm_timeout_cooldown_sec: 240
   market_state_fetch_limit: 4
-  snapshot_timeout_s: 2.2
-  snapshot_timeout_min_s: 1.6
-  snapshot_timeout_max_s: 4.2
-  klines_timeout_s: 1.2
-  klines_timeout_min_s: 0.8
-  klines_timeout_max_s: 2.6
+  snapshot_timeout_s: 8.0
+  snapshot_timeout_min_s: 4.0
+  snapshot_timeout_max_s: 12.0
+  klines_timeout_s: 3.0
+  klines_timeout_min_s: 1.8
+  klines_timeout_max_s: 5.5
   watch_symbols:
   - BTC/USDT
   - ETH/USDT
@@ -510,20 +580,18 @@ market_intelligence:
   min_quality_score_for_llm: 0.55
 data_source_hub:
   enable_legacy_external_analysis: false
-  fetch_timeout_sec: 2.8
-  snapshot_timeout_sec: 6.0
-  # 当前 OKX REST 深度/K线链路不稳定时，禁用重接口，优先保证“可交易最小集”(ticker/资金费率/持仓等)
-  include_klines_1h: false
+  # 数据质量优先：放宽采集超时预算，降低快路径降级概率。
+  fetch_timeout_sec: 8.0
+  snapshot_timeout_sec: 25.0
+  include_klines_1h: true
   klines_1h_limit: 64
   exchange_collectors:
   - ticker
-  # - order_book
-  # - klines_1h
+  - order_book
+  - klines_1h
   - open_interest
   - funding_rate
-  - positions
-  - open_orders
-  - liquidation_proxy
+  # positions/open_orders/liquidation_proxy 采集在网络抖动下耗时高，改为按需拉取，避免 symbol_view 超时降级
   intel_collectors:
   - onchain.sentiment
   - onchain.flows
@@ -556,7 +624,7 @@ ai_trading:
     enabled: true
     model_id: qianfan-code-latest
     analysis_interval: 120
-    min_confidence: 0.78
+    min_confidence: 0.76
     max_positions: 4
     risk_per_trade: 0.01
     trade_mode: real

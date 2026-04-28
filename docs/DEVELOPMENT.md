@@ -61,7 +61,7 @@ python run_api.py
 ## 4. 最小联调检查
 
 ```bash
-curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/api/v1/system/health
 curl -s http://127.0.0.1:8000/api/v1/s1/verify
 curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
 curl -s 'http://127.0.0.1:8000/api/v1/trade/events?limit=20'

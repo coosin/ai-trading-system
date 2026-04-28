@@ -210,7 +210,7 @@ monitor:
 health:
 	@echo "$(BLUE)检查服务健康状态...$(NC)"
 	@echo "$(YELLOW)应用:$(NC)"
-	curl -f http://localhost:8000/health || echo "$(RED)应用不可用$(NC)"
+	curl -f http://localhost:8000/api/v1/system/health || echo "$(RED)应用不可用$(NC)"
 	@echo ""
 	@echo "$(YELLOW)数据库:$(NC)"
 	docker-compose exec postgres pg_isready -U trader || echo "$(RED)数据库不可用$(NC)"

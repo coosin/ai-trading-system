@@ -18,7 +18,7 @@
 优先执行：
 
 ```bash
-python3 scripts/one_click_upgrade_pipeline.py BTC/USDT
+python3 scripts/verify.py trading --base-url http://127.0.0.1:8000
 ```
 
 通过标准：
@@ -104,7 +104,7 @@ curl -s -X POST http://localhost:8000/api/v1/modules/commander/hosting-mode \
 2. 再跑回归脚本定位问题面：
 
 ```bash
-python3 scripts/upgrade_regression_check.py
+python3 scripts/verify.py trading --base-url http://127.0.0.1:8000
 ```
 
 3. 查看治理审计与工具契约（确认变更可追溯）：
@@ -126,7 +126,7 @@ python3 scripts/network_connectivity_smoke.py
 
 ```bash
 BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
-python3 scripts/one_click_upgrade_pipeline.py BTC/USDT
+python3 scripts/verify.py trading --base-url "$BASE_URL"
 curl -s "$BASE_URL/api/v1/modules/commander/hosting-mode"
 curl -s "$BASE_URL/api/v1/modules/commander/risk-redlines"
 curl -s "$BASE_URL/api/v1/modules/commander/account-diagnostics"

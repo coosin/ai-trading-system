@@ -54,7 +54,7 @@ COPY --chown=trader:trader frontend/ ./frontend/
 COPY --from=frontend-build --chown=trader:trader /frontend/dist ./frontend/dist
 COPY --chown=trader:trader workspace/ ./workspace/
 COPY --chown=trader:trader .env.example ./.env.example
-COPY --chown=trader:trader start_production.sh health_check.sh ./
+COPY --chown=trader:trader start_production.sh ./
 
 # 创建必要目录并设置权限（包括记忆系统所需的所有子目录）
 RUN mkdir -p logs \
@@ -73,14 +73,14 @@ RUN mkdir -p logs \
     backups/data && \
     chown -R trader:trader logs data workspace backups && \
     chmod -R 755 logs data workspace backups && \
-    chmod +x start_production.sh health_check.sh
+    chmod +x start_production.sh
 
 # 切换到非root用户
 USER trader
 
 # 健康检查
 HEALTHCHECK --interval=60s --timeout=30s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/api/v1/system/health || exit 1
 
 # 暴露端口
 EXPOSE 8000

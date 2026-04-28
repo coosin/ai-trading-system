@@ -9,9 +9,9 @@ echo "==> 使用 docker-compose.yml + docker-compose.hostnet.yml 重建 trading-
 docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --force-recreate trading-system
 
 PORT="${API_PORT:-8000}"
-echo "==> 等待 http://127.0.0.1:${PORT}/health …"
+echo "==> 等待 http://127.0.0.1:${PORT}/api/v1/system/health …"
 for i in $(seq 1 30); do
-  if curl -sf --max-time 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+  if curl -sf --max-time 5 "http://127.0.0.1:${PORT}/api/v1/system/health" >/dev/null 2>&1; then
     echo "OK"
     exit 0
   fi

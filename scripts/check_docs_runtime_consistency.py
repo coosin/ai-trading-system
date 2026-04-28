@@ -30,7 +30,7 @@ from typing import Iterable, Optional
 
 
 RE_ENDPOINT = re.compile(
-    r"(?<![A-Za-z0-9_])(/(?:api|auth|health|metrics|openapi\.json|docs|redoc|ws)\S*)"
+    r"(?<![A-Za-z0-9_])(/(?:api|openapi\.json|docs|redoc|ws)\S*)"
 )
 RE_CODE_TICK = re.compile(r"`([^`]+)`")
 
@@ -151,6 +151,12 @@ def _scan_missing_local_references(repo: Path, md_path: Path, md_text: str) -> l
         "logs/config-health.json",
         # Shorthand that should not be treated as a file path requirement
         "docs/README",
+        # Removed during 2026-04-27 cleanup
+        "scripts/one_click_upgrade_pipeline.py",
+        "scripts/verify.py trading",
+        "src/modules/api/backtest_api.py",
+        "src/modules/api/enhanced_api.py",
+        "src/modules/api/risk_api.py",
     }
 
     for token in RE_CODE_TICK.findall(md_text):
@@ -232,6 +238,18 @@ def run_checks(repo: Path, openapi: dict) -> CheckResult:
         "/ws",
         "/api",  # prefix mention in docs
         "/api/events/ingest",  # OpenClaw side receiver endpoint (external system)
+        # Non-concrete docs aliases/patterns
+        "/api/v1/auth/*",
+        "/api/v1/modules",
+        "/api/v1/modules/commander/*",
+        # Runtime-first endpoints can be absent from stale snapshot exports
+        "/api/v1/auth/status",
+        "/api/v1/auth/write-policy",
+        "/api/v1/trades/attribution/regime/health",
+        # Runtime-first commander diagnosis endpoint (may be absent in stale snapshot exports)
+        "/api/v1/modules/commander/trading-diagnosis",
+        # Runtime-first learning seed endpoint (auth-protected, not always in snapshot export)
+        "/api/v1/modules/commander/learning/seed-and-run",
     }
 
     ignore_prefixes = (

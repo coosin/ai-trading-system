@@ -25,6 +25,7 @@ class HeartbeatMonitor:
         skill_manager,
         memory_manager,
         notification_handler: Optional[Callable] = None,
+        main_controller: Any = None,
         interval: int = 1800,  # 30分钟
         config_manager=None,
     ):
@@ -32,6 +33,7 @@ class HeartbeatMonitor:
         self.skill_manager = skill_manager
         self.memory_manager = memory_manager
         self.notification_handler = notification_handler
+        self.main_controller = main_controller
         self.config_manager = config_manager
         self.interval = interval
         self.market_opportunity_cooldown_sec = 6 * 3600
@@ -45,10 +47,20 @@ class HeartbeatMonitor:
 
         # Notification dedup at source (in addition to SmartNotificationSystem).
         self._last_notice_at: Dict[str, datetime] = {}
+        self._last_trading_diag_sent_day: Optional[str] = None
+        self._trading_diag_last_metrics: Dict[str, Any] = {}
+
+        # Trading diagnosis reporting/alerts (defaults can be overridden via config heartbeat.*)
+        self.trading_diagnosis_daily_report_enabled: bool = True
+        self.trading_diagnosis_daily_report_hour_local: int = 9
+        self.trading_diagnosis_daily_report_min_interval_sec: int = 8 * 3600
+        self.trading_diagnosis_alerts_enabled: bool = True
+        self.trading_diagnosis_alert_cooldown_sec: int = 900
         
         self.tasks = [
             self._check_system_health,
             self._check_positions_risk,
+            self._trading_diagnosis_report_and_alerts,
             self._analyze_market_opportunities,
             self._update_memories,
             self._generate_reports,
@@ -72,8 +84,233 @@ class HeartbeatMonitor:
             self.market_opportunity_notice_enabled = bool(
                 hb_cfg.get("market_opportunity_notice_enabled", self.market_opportunity_notice_enabled)
             )
+            td = hb_cfg.get("trading_diagnosis", {}) if isinstance(hb_cfg.get("trading_diagnosis"), dict) else {}
+            if isinstance(td, dict) and td:
+                self.trading_diagnosis_daily_report_enabled = bool(
+                    td.get("daily_report_enabled", self.trading_diagnosis_daily_report_enabled)
+                )
+                self.trading_diagnosis_daily_report_hour_local = int(
+                    td.get("daily_report_hour_local", self.trading_diagnosis_daily_report_hour_local)
+                )
+                self.trading_diagnosis_daily_report_min_interval_sec = int(
+                    td.get("daily_report_min_interval_sec", self.trading_diagnosis_daily_report_min_interval_sec)
+                )
+                self.trading_diagnosis_alerts_enabled = bool(
+                    td.get("alerts_enabled", self.trading_diagnosis_alerts_enabled)
+                )
+                self.trading_diagnosis_alert_cooldown_sec = int(
+                    td.get("alerts_cooldown_sec", self.trading_diagnosis_alert_cooldown_sec)
+                )
         except Exception as e:
             logger.debug(f"刷新心跳配置失败，继续使用当前参数: {e}")
+
+    async def _build_trading_diagnosis(self, limit_events: int = 8) -> Dict[str, Any]:
+        """轻量构建 trading diagnosis（与 API commander/trading-diagnosis 同口径，避免翻日志）。"""
+        mc = self.main_controller
+        out: Dict[str, Any] = {"timestamp": datetime.now().isoformat()}
+        if not mc:
+            out["error"] = "main_controller_missing"
+            return out
+
+        try:
+            core = getattr(mc, "ai_core", None)
+            out["ai_core"] = core.get_status() if (core and hasattr(core, "get_status")) else None
+        except Exception as e:
+            out["ai_core_error"] = str(e)
+        try:
+            eng = getattr(mc, "ai_trading_engine", None)
+            out["ai_trading_engine"] = eng.get_status() if (eng and hasattr(eng, "get_status")) else None
+        except Exception as e:
+            out["ai_trading_engine_error"] = str(e)
+        try:
+            gw = getattr(mc, "execution_gateway", None)
+            if gw and hasattr(gw, "get_snapshot"):
+                snap = await gw.get_snapshot()
+                if hasattr(gw, "get_recent_events"):
+                    snap["recent_events"] = await gw.get_recent_events(limit=int(limit_events or 8))
+                out["execution_gateway"] = snap
+            else:
+                out["execution_gateway"] = None
+        except Exception as e:
+            out["execution_gateway_error"] = str(e)
+        try:
+            sltp = getattr(mc, "stop_loss_manager", None)
+            out["sltp"] = sltp.get_stats() if (sltp and hasattr(sltp, "get_stats")) else None
+        except Exception as e:
+            out["sltp_error"] = str(e)
+        try:
+            le = getattr(mc, "ai_learning_engine", None)
+            out["ai_learning_engine"] = le.get_status() if (le and hasattr(le, "get_status")) else None
+        except Exception as e:
+            out["ai_learning_engine_error"] = str(e)
+        return out
+
+    async def _trading_diagnosis_report_and_alerts(self, context: Dict[str, Any]) -> None:
+        """Telegram 每日诊断摘要 + 异常即时告警（去重/节流）。"""
+        if not self.main_controller:
+            return
+        now = datetime.now()
+
+        diag = await self._build_trading_diagnosis(limit_events=6)
+        gw = (diag.get("execution_gateway") or {}) if isinstance(diag.get("execution_gateway"), dict) else {}
+        sltp = (diag.get("sltp") or {}) if isinstance(diag.get("sltp"), dict) else {}
+
+        # --- 1) 即时告警：执行失败增量 / SR 分批止盈失败增量 ---
+        if self.trading_diagnosis_alerts_enabled:
+            try:
+                pm = (gw.get("policy_metrics") or {}) if isinstance(gw.get("policy_metrics"), dict) else {}
+                cur_open_fail = int(pm.get("open_fail", 0) or 0)
+                cur_close_fail = int(pm.get("close_fail", 0) or 0)
+                cur_sr_fail = int(sltp.get("sr_partial_tp_failed", 0) or 0)
+                recent = (gw.get("recent_events") or []) if isinstance(gw.get("recent_events"), list) else []
+                if not isinstance(recent, list):
+                    recent = []
+
+                prev = dict(self._trading_diag_last_metrics or {})
+                prev_open_fail = int(prev.get("open_fail", cur_open_fail) or 0)
+                prev_close_fail = int(prev.get("close_fail", cur_close_fail) or 0)
+                prev_sr_fail = int(prev.get("sr_partial_tp_failed", cur_sr_fail) or 0)
+
+                d_open_fail = max(0, cur_open_fail - prev_open_fail)
+                d_close_fail = max(0, cur_close_fail - prev_close_fail)
+                d_sr_fail = max(0, cur_sr_fail - prev_sr_fail)
+
+                def _cooldown_ok(key: str) -> bool:
+                    last = self._last_notice_at.get(key)
+                    if not last:
+                        return True
+                    return (now - last).total_seconds() >= float(self.trading_diagnosis_alert_cooldown_sec or 900)
+
+                if (d_open_fail + d_close_fail) > 0 and _cooldown_ok("trading_diag_exec_fail"):
+                    self._last_notice_at["trading_diag_exec_fail"] = now
+                    # include top failure reason in the window (low-cardinality)
+                    codes: Dict[str, int] = {}
+                    for e in recent[-12:]:
+                        if not isinstance(e, dict) or e.get("success") is not False:
+                            continue
+                        code = str(e.get("error_code") or "UNKNOWN")
+                        op = str(e.get("op") or "unknown")
+                        k = f"{op}:{code}"
+                        codes[k] = int(codes.get(k, 0)) + 1
+                    top_code = None
+                    if codes:
+                        top_code = sorted(codes.items(), key=lambda x: x[1], reverse=True)[0][0]
+                    await self._send_notification(
+                        "🚨 交易执行异常",
+                        f"近一轮心跳检测到执行失败增量。\n"
+                        f"- open_fail +{d_open_fail} (total={cur_open_fail})\n"
+                        f"- close_fail +{d_close_fail} (total={cur_close_fail})\n"
+                        + (f"- top_reason {top_code}\n" if top_code else "")
+                        + f"建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_attribution.top_reasons。",
+                        priority="high",
+                    )
+
+                # 细粒度告警：某一类失败原因突增（避免只看 open_fail/close_fail 总数）
+                try:
+                    codes: Dict[str, int] = {}
+                    last_samples: Dict[str, str] = {}
+                    for e in recent[-12:]:
+                        if not isinstance(e, dict) or e.get("success") is not False:
+                            continue
+                        code = str(e.get("error_code") or "UNKNOWN")
+                        op = str(e.get("op") or "unknown")
+                        k = f"{op}:{code}"
+                        codes[k] = int(codes.get(k, 0)) + 1
+                        if k not in last_samples:
+                            last_samples[k] = str(e.get("detail") or "")[:180]
+                    prev_codes = (prev.get("recent_fail_codes") or {}) if isinstance(prev.get("recent_fail_codes"), dict) else {}
+                    spikes = []
+                    for k, v in codes.items():
+                        pv = int(prev_codes.get(k, 0) or 0)
+                        dv = int(v) - pv
+                        if dv >= 2:
+                            spikes.append((k, dv, v))
+                    if spikes:
+                        spikes.sort(key=lambda x: x[1], reverse=True)
+                        topk, dv, v = spikes[0]
+                        alert_key = f"trading_diag_reason_spike:{topk}"
+                        if _cooldown_ok(alert_key):
+                            self._last_notice_at[alert_key] = now
+                            await self._send_notification(
+                                "⚠️ 执行失败原因突增",
+                                f"检测到失败原因突增：{topk} (+{dv}, window_total={v})\n"
+                                f"sample: {last_samples.get(topk,'')}\n"
+                                f"建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_attribution.top_reasons。",
+                                priority="medium",
+                            )
+                except Exception:
+                    pass
+
+                if d_sr_fail > 0 and _cooldown_ok("trading_diag_sr_fail"):
+                    self._last_notice_at["trading_diag_sr_fail"] = now
+                    await self._send_notification(
+                        "⚠️ SR 分批止盈执行失败",
+                        f"检测到 SR 分批止盈失败增量 +{d_sr_fail} (total={cur_sr_fail})。\n"
+                        f"建议：检查交易所下单权限/最小下单量/网络稳定性；并查看 sltp.sr_recent_events。",
+                        priority="medium",
+                    )
+
+                self._trading_diag_last_metrics = {
+                    "open_fail": cur_open_fail,
+                    "close_fail": cur_close_fail,
+                    "sr_partial_tp_failed": cur_sr_fail,
+                    "recent_fail_codes": codes if isinstance(locals().get("codes"), dict) else {},
+                }
+            except Exception:
+                pass
+
+        # --- 2) 每日固定时间摘要（默认 09:00 本地时间） ---
+        if self.trading_diagnosis_daily_report_enabled:
+            try:
+                day = now.strftime("%Y-%m-%d")
+                hour = int(now.hour)
+                if hour == int(self.trading_diagnosis_daily_report_hour_local):
+                    # ensure min interval even if heartbeat interval is short
+                    last = self._last_notice_at.get("trading_diag_daily")
+                    if last and (now - last).total_seconds() < float(self.trading_diagnosis_daily_report_min_interval_sec or 28800):
+                        return
+                    if self._last_trading_diag_sent_day == day:
+                        return
+
+                    self._last_notice_at["trading_diag_daily"] = now
+                    self._last_trading_diag_sent_day = day
+
+                    hints = []
+                    try:
+                        core = diag.get("ai_core") or {}
+                        guards = (((core.get("execution_guards") or {}).get("stats")) or {}) if isinstance(core, dict) else {}
+                        top = sorted([(k, int(v)) for k, v in (guards or {}).items()], key=lambda x: x[1], reverse=True)[:6]
+                        if top:
+                            hints.append("门控Top: " + ", ".join([f"{k}={v}" for k, v in top]))
+                    except Exception:
+                        pass
+                    try:
+                        pm = (gw.get("policy_metrics") or {}) if isinstance(gw.get("policy_metrics"), dict) else {}
+                        hints.append(
+                            "执行: " + ", ".join([f"{k}={int(pm.get(k,0) or 0)}" for k in ("open_ok","open_fail","close_ok","close_fail")])
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(sltp, dict):
+                            hints.append(
+                                "SR: "
+                                + ", ".join(
+                                    [
+                                        f"triggered={int(sltp.get('sr_partial_tp_triggered',0) or 0)}",
+                                        f"success={int(sltp.get('sr_partial_tp_success',0) or 0)}",
+                                        f"failed={int(sltp.get('sr_partial_tp_failed',0) or 0)}",
+                                        f"breakeven_lock={int(sltp.get('sr_breakeven_lock_applied',0) or 0)}",
+                                    ]
+                                )
+                            )
+                    except Exception:
+                        pass
+
+                    body = "（trading-diagnosis 日报摘要）\n" + ("\n".join([f"- {x}" for x in hints]) if hints else "- 暂无关键指标")
+                    await self._send_notification("📌 交易系统诊断日报", body, priority="medium")
+            except Exception:
+                pass
     
     async def start(self):
         """启动心跳监控"""

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
+from src.modules.core.trading_limits import resolve_position_limits
 
 from src.modules.core.timing_constants import (
     SLEEP_1S,
@@ -105,9 +106,9 @@ class AICoreDecisionEngine:
         }
         
         self.config = {
-            "leverage_min": 10,
+            "leverage_min": 20,
             "leverage_max": 100,
-            "default_leverage": 20,
+            "default_leverage": 30,
             "max_positions": 5,
             # 开仓最小间隔：收敛到 60 秒，降低噪声交易频率
             "min_trade_interval": 60,
@@ -118,10 +119,13 @@ class AICoreDecisionEngine:
             "aggressive_mode": False,
             "auto_create_strategy": True,
             # 开仓/交易置信度阈值（用户要求：>=65% 才允许开仓）
-            "min_confidence_to_trade": 0.75,
+            "min_confidence_to_trade": 0.73,
             # Explicit open gate: avoid low-confidence churn
-            "ai_core_min_confidence_to_open": 0.75,
+            "ai_core_min_confidence_to_open": 0.73,
             "min_data_quality_to_trade": 0.55,
+            "analysis_hard_gate_for_open": True,
+            "analysis_min_confidence_for_open": 0.55,
+            "analysis_require_not_degraded_for_open": True,
             "min_rr_to_trade": 1.15,
             "max_spread_bps_to_trade": 40.0,
             "max_abs_depth_imbalance_to_trade": 0.92,
@@ -251,6 +255,8 @@ class AICoreDecisionEngine:
             "spread_rejected": 0,
             "depth_imbalance_rejected": 0,
             "discretionary_close_suppressed": 0,
+            "open_evidence_rejected": 0,
+            "open_evidence_error": 0,
         }
         self._adaptive_guard_profile: Dict[str, Any] = {
             "profile": "normal",
@@ -1058,7 +1064,8 @@ class AICoreDecisionEngine:
         return {
             "conservative": {
                 "min_trade_interval": 110,
-                "min_confidence_to_trade": 0.75,
+                "min_confidence_to_trade": 0.73,
+                "ai_core_min_confidence_to_open": 0.73,
                 "min_rr_to_trade": 1.20,
                 "max_spread_bps_to_trade": 35.0,
                 "degraded_data_quantity_factor": 0.60,
@@ -1070,7 +1077,8 @@ class AICoreDecisionEngine:
             },
             "balanced": {
                 "min_trade_interval": 60,
-                "min_confidence_to_trade": 0.75,
+                "min_confidence_to_trade": 0.73,
+                "ai_core_min_confidence_to_open": 0.73,
                 "min_rr_to_trade": 1.15,
                 "max_spread_bps_to_trade": 40.0,
                 "degraded_data_quantity_factor": 0.68,
@@ -1082,7 +1090,8 @@ class AICoreDecisionEngine:
             },
             "aggressive": {
                 "min_trade_interval": 60,
-                "min_confidence_to_trade": 0.75,
+                "min_confidence_to_trade": 0.73,
+                "ai_core_min_confidence_to_open": 0.73,
                 "min_rr_to_trade": 1.10,
                 "max_spread_bps_to_trade": 48.0,
                 "degraded_data_quantity_factor": 0.75,
@@ -2961,6 +2970,50 @@ class AICoreDecisionEngine:
             trend_1h = "bullish" if ma5_1h > ma20_1h else "bearish"
             trend_4h = "bullish" if ma5_4h > ma20_4h else "bearish"
             trend_1d = "bullish" if closes_1d[-1] > ma20_1d else "bearish" if closes_1d[-1] < ma20_1d else "sideways"
+
+            # 基于近端 1H K 线构建支撑/阻力，用于开仓择时门控。
+            highs_1h = [float(k.get("high", 0) or 0) for k in klines_1h]
+            lows_1h = [float(k.get("low", 0) or 0) for k in klines_1h]
+            lookback = int(self.config.get("sr_lookback_bars_1h", 48) or 48)
+            lookback = max(12, min(96, lookback))
+            near_pct = float(self.config.get("sr_near_level_pct", 0.0035) or 0.0035)
+            breakout_buf = float(self.config.get("sr_breakout_buffer_pct", 0.0020) or 0.0020)
+
+            resistance_1h = 0.0
+            support_1h = 0.0
+            # 排除最新一根K线，减少“尚未确认突破/跌破”造成的噪音。
+            if len(highs_1h) >= (lookback + 2):
+                highs_win = highs_1h[-(lookback + 1):-1]
+                lows_win = lows_1h[-(lookback + 1):-1]
+                resistance_1h = max(highs_win) if highs_win else 0.0
+                support_1h = min(lows_win) if lows_win else 0.0
+            else:
+                resistance_1h = max(highs_1h[:-1]) if len(highs_1h) > 1 else (highs_1h[-1] if highs_1h else 0.0)
+                support_1h = min(lows_1h[:-1]) if len(lows_1h) > 1 else (lows_1h[-1] if lows_1h else 0.0)
+
+            price_now = float(closes_1h[-1] if closes_1h else 0.0)
+            dist_to_res_pct = (
+                abs(resistance_1h - price_now) / max(1e-9, price_now)
+                if (price_now > 0 and resistance_1h > 0)
+                else None
+            )
+            dist_to_sup_pct = (
+                abs(price_now - support_1h) / max(1e-9, price_now)
+                if (price_now > 0 and support_1h > 0)
+                else None
+            )
+            near_resistance = bool(
+                dist_to_res_pct is not None
+                and dist_to_res_pct <= near_pct
+                and price_now <= resistance_1h * (1.0 + breakout_buf)
+            )
+            near_support = bool(
+                dist_to_sup_pct is not None
+                and dist_to_sup_pct <= near_pct
+                and price_now >= support_1h * (1.0 - breakout_buf)
+            )
+            breakout_up_confirmed = bool(price_now > resistance_1h * (1.0 + breakout_buf)) if resistance_1h > 0 else False
+            breakdown_down_confirmed = bool(price_now < support_1h * (1.0 - breakout_buf)) if support_1h > 0 else False
             
             return {
                 "ma5_1h": ma5_1h,
@@ -2975,6 +3028,14 @@ class AICoreDecisionEngine:
                 "trend_1d": trend_1d,
                 "price": closes_1h[-1] if closes_1h else 0,
                 "volume_1h": klines_1h[-1].get('volume', 0) if klines_1h else 0,
+                "support_1h": support_1h,
+                "resistance_1h": resistance_1h,
+                "dist_to_support_pct": dist_to_sup_pct,
+                "dist_to_resistance_pct": dist_to_res_pct,
+                "near_support": near_support,
+                "near_resistance": near_resistance,
+                "breakout_up_confirmed": breakout_up_confirmed,
+                "breakdown_down_confirmed": breakdown_down_confirmed,
             }
         except Exception as e:
             logger.error(f"获取技术指标失败: {symbol} - {e}")
@@ -3664,6 +3725,37 @@ class AICoreDecisionEngine:
             if current_price <= 0:
                 logger.error(f"无法获取 {decision.symbol} 的价格")
                 return False
+
+            # 开仓前的“证据完整性门控”：必须拿到 K线/盘口等关键证据，否则不允许开仓（避免只看 ticker 追涨杀跌）。
+            if is_open and bool(self.config.get("open_requires_full_snapshot", True)):
+                try:
+                    mc = self.main_controller
+                    mi = getattr(mc, "market_intelligence", None) if mc else None
+                    if mi and hasattr(mi, "get_symbol_view"):
+                        # include_snapshot=True 会尝试统一快照（含K线等）；失败则 view.partial=True 并带 errors。
+                        view = await mi.get_symbol_view(decision.symbol.replace("/", "-") + "-SWAP", include_snapshot=True)
+                        partial = bool(getattr(view, "partial", False))
+                        errs = list(getattr(view, "errors", []) or [])
+                        # 若缺少K线证据则拒绝开仓；这类情形是“判断能力不足”，应保守等待。
+                        if partial and any("klines_missing" in str(e) for e in errs):
+                            self._execution_guards_stats["data_quality_guard_hold"] += 1
+                            self._execution_guards_stats["open_evidence_rejected"] = int(
+                                self._execution_guards_stats.get("open_evidence_rejected", 0)
+                            ) + 1
+                            logger.warning(
+                                "⛔ 开仓证据不足(缺K线)，拒绝开仓: symbol=%s errors=%s",
+                                decision.symbol,
+                                errs[:6],
+                            )
+                            return False
+                except Exception:
+                    # 若取证异常，宁可不下单。
+                    self._execution_guards_stats["data_quality_guard_hold"] += 1
+                    self._execution_guards_stats["open_evidence_error"] = int(
+                        self._execution_guards_stats.get("open_evidence_error", 0)
+                    ) + 1
+                    logger.warning("⛔ 开仓证据获取失败，拒绝开仓: %s", decision.symbol)
+                    return False
             
             decision.entry_price = current_price
             
@@ -3679,7 +3771,17 @@ class AICoreDecisionEngine:
                 else:
                     margin_frac = float(self.config.get("default_max_margin_fraction") or 0.30)
                 margin_frac = max(0.05, min(0.92, margin_frac))
-                max_margin = available * margin_frac
+                # Canonical cap: per-symbol max margin usage as fraction of available.
+                try:
+                    limits = await resolve_position_limits(
+                        config_manager=(self.main_controller.config_manager if self.main_controller else None),
+                        ai_config=None,
+                        trading_config=None,
+                    )
+                    sym_cap = float(limits.symbol_max_margin_ratio)
+                except Exception:
+                    sym_cap = 0.2
+                max_margin = min(available * margin_frac, available * max(0.01, min(0.92, sym_cap)))
                 max_position_value = max_margin * leverage
                 max_quantity = int(max_position_value / max(current_price, 1e-9))
                 logger.info(
@@ -3889,6 +3991,46 @@ class AICoreDecisionEngine:
                     logger.debug(f"自适应门控计算失败: {e}")
 
             if not is_close:
+                # Hard gate: every open decision must carry usable analysis payload
+                # from the unified market analysis pipeline.
+                try:
+                    if bool(self.config.get("analysis_hard_gate_for_open", True)):
+                        ma = decision.market_analysis if isinstance(getattr(decision, "market_analysis", None), dict) else {}
+                        prov = str(ma.get("provenance") or "").lower()
+                        q_raw = ma.get("quality_score")
+                        c_raw = ma.get("confidence")
+                        q = float(q_raw) if q_raw is not None else None
+                        c2 = float(c_raw) if c_raw is not None else None
+                        degraded = bool(ma.get("partial", False)) or ("degraded" in prov) or ("timeout" in prov)
+                        min_q_hard = float(self.config.get("min_data_quality_to_trade", 0.55) or 0.55)
+                        min_c_hard = float(self.config.get("analysis_min_confidence_for_open", 0.55) or 0.55)
+                        require_non_degraded = bool(self.config.get("analysis_require_not_degraded_for_open", True))
+                        hard_fail = (
+                            q is None
+                            or c2 is None
+                            or q < min_q_hard
+                            or c2 < min_c_hard
+                            or (require_non_degraded and degraded)
+                        )
+                        if hard_fail:
+                            self._execution_guards_stats["analysis_hard_rejected"] = int(
+                                self._execution_guards_stats.get("analysis_hard_rejected", 0)
+                            ) + 1
+                            logger.warning(
+                                "⚠️ 执行门控拒绝: analysis_hard_gate symbol=%s q=%s c=%s degraded=%s prov=%s",
+                                decision.symbol,
+                                f"{q:.3f}" if q is not None else "none",
+                                f"{c2:.3f}" if c2 is not None else "none",
+                                degraded,
+                                prov or "n/a",
+                            )
+                            return False
+                except Exception:
+                    self._execution_guards_stats["analysis_hard_error"] = int(
+                        self._execution_guards_stats.get("analysis_hard_error", 0)
+                    ) + 1
+                    return False
+
                 # Explicit open-confidence gate: prevent low-confidence churn before any exchange interaction.
                 try:
                     conf = float(getattr(decision, "confidence", 0) or 0)
@@ -3916,6 +4058,49 @@ class AICoreDecisionEngine:
                         decision.symbol,
                     )
                     return False
+
+                # 基于支撑/阻力的开仓择时门控：避免在关键位“撞墙”开仓。
+                try:
+                    if bool(self.config.get("sr_timing_guard_enable", True)):
+                        sr = await self._get_technical_indicators(decision.symbol)
+                        near_res = bool(sr.get("near_resistance", False))
+                        near_sup = bool(sr.get("near_support", False))
+                        brk_up = bool(sr.get("breakout_up_confirmed", False))
+                        brk_down = bool(sr.get("breakdown_down_confirmed", False))
+                        dist_res = sr.get("dist_to_resistance_pct")
+                        dist_sup = sr.get("dist_to_support_pct")
+                        self._adaptive_guard_profile["sr_snapshot"] = {
+                            "near_resistance": near_res,
+                            "near_support": near_sup,
+                            "breakout_up_confirmed": brk_up,
+                            "breakdown_down_confirmed": brk_down,
+                            "dist_to_resistance_pct": dist_res,
+                            "dist_to_support_pct": dist_sup,
+                            "resistance_1h": sr.get("resistance_1h"),
+                            "support_1h": sr.get("support_1h"),
+                        }
+                        if decision.side == "long" and near_res and (not brk_up):
+                            self._execution_guards_stats["sr_timing_rejected"] = int(
+                                self._execution_guards_stats.get("sr_timing_rejected", 0)
+                            ) + 1
+                            logger.warning(
+                                "⚠️ 执行门控拒绝: long 贴近阻力且未突破 symbol=%s dist_res=%s",
+                                decision.symbol,
+                                f"{float(dist_res)*100:.2f}%" if dist_res is not None else "n/a",
+                            )
+                            return False
+                        if decision.side == "short" and near_sup and (not brk_down):
+                            self._execution_guards_stats["sr_timing_rejected"] = int(
+                                self._execution_guards_stats.get("sr_timing_rejected", 0)
+                            ) + 1
+                            logger.warning(
+                                "⚠️ 执行门控拒绝: short 贴近支撑且未跌破 symbol=%s dist_sup=%s",
+                                decision.symbol,
+                                f"{float(dist_sup)*100:.2f}%" if dist_sup is not None else "n/a",
+                            )
+                            return False
+                except Exception as e:
+                    logger.debug(f"支撑阻力门控检查失败: {e}")
 
                 if rr < min_rr:
                     self._execution_guards_stats["rr_rejected"] += 1
@@ -4477,6 +4662,9 @@ class AICoreDecisionEngine:
                     "min_confidence_to_trade": self.config.get("min_confidence_to_trade"),
                     "ai_core_min_confidence_to_open": self.config.get("ai_core_min_confidence_to_open"),
                     "min_data_quality_to_trade": self.config.get("min_data_quality_to_trade"),
+                    "analysis_hard_gate_for_open": self.config.get("analysis_hard_gate_for_open"),
+                    "analysis_min_confidence_for_open": self.config.get("analysis_min_confidence_for_open"),
+                    "analysis_require_not_degraded_for_open": self.config.get("analysis_require_not_degraded_for_open"),
                     "min_rr_to_trade": self.config.get("min_rr_to_trade"),
                     "max_spread_bps_to_trade": self.config.get("max_spread_bps_to_trade"),
                     "max_abs_depth_imbalance_to_trade": self.config.get("max_abs_depth_imbalance_to_trade"),
@@ -4579,7 +4767,11 @@ class AICoreDecisionEngine:
             keys = (
                 "min_trade_interval",
                 "min_confidence_to_trade",
+                "ai_core_min_confidence_to_open",
                 "min_data_quality_to_trade",
+                "analysis_hard_gate_for_open",
+                "analysis_min_confidence_for_open",
+                "analysis_require_not_degraded_for_open",
                 "min_rr_to_trade",
                 "max_spread_bps_to_trade",
                 "max_abs_depth_imbalance_to_trade",

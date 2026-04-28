@@ -27,7 +27,7 @@ export OPENCLAW_SOURCE="openclaw"
 
 ### L1 只读巡检（默认放开）
 
-- `GET /health`
+- `GET /api/v1/system/health`
 - `GET /api/v1/s1/verify`
 - `GET /api/v1/auth/status`
 - `GET /api/v1/auth/write-policy`

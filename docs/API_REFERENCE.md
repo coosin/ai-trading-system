@@ -53,7 +53,7 @@
 以下接口已在当前运行环境复核通过（HTTP 200 且返回结构有效）：
 
 - **系统与链路**
-  - `GET /health` -> `healthy`
+  - `GET /api/v1/system/health` -> `healthy`
   - `GET /api/v1/s1/verify` -> `all_passed=true`
   - `GET /api/v1/system/acceptance` -> `verdict=PASS`（本次运行实例可用性总验收）
   - `GET /api/v1/modules/system/health` -> `overall=healthy`
@@ -72,9 +72,9 @@
   - `GET /api/v1/modules/commander/memory/status` 返回网关统计、分层计数、质量指标。
   - `GET /api/v1/modules/commander/memory/workspace?filename=COMMANDER_PROFILE.md` 返回工作区记忆文件内容。
 
-- **迁移兼容接口说明（重要）**
-  - `GET /api/v1/data-fusion/analyze{,/symbol}` 当前为兼容路由，返回 `status=deprecated` 与迁移提示。
-  - 生产调用请切换至：`GET /api/v1/market/symbol/{symbol}` 与 `POST /api/v1/modules/intelligence/batch-analyze`。
+- **迁移完成说明（重要）**
+  - `GET /api/v1/data-fusion/analyze{,/symbol}` 兼容路由已移除。
+  - 生产调用统一使用：`GET /api/v1/market/symbol/{symbol}` 与 `POST /api/v1/modules/intelligence/batch-analyze`。
 
 ### 账户与持仓同步接口（2026-04-15 更新）
 
@@ -92,6 +92,16 @@
     - `degraded=true`
     - `data.hint=account_diagnostics_timeout`
   - 即使超时降级，也会返回关键字段（如 `exchange`、`cached_position_count`），避免误判为“无交易所连接”。
+
+- **`GET /api/v1/modules/commander/trading-diagnosis`**
+  - 交易全链路诊断接口（ai_core / ai_trading_engine / execution_gateway / sltp / learning）。
+  - 返回 `data.position_limits_snapshot` 用于确认统一仓位入口是否生效，关键字段：
+    - `symbol_max_margin_ratio`
+    - `max_same_direction_positions`
+    - `max_positions_oneway`
+    - `max_positions_hedge`
+    - `hard_max_positions`
+  - 支持 `limit_events` 参数控制 `execution_gateway.recent_events` 窗口大小。
 
 - **`GET /api/v1/modules/ai/learning-feedback`**
   - 返回止损复盘与信号惩罚状态：
@@ -181,14 +191,15 @@
 
 ### 鉴权与写接口策略（2026-04-26 更新）
 
-- **登录配置:** `POST /auth/login` 与 `POST /api/v1/auth/login` 依赖管理员账号配置；若未配置会返回 `503`（`API auth is not configured`）。
+- **登录配置:** `POST /api/v1/auth/login` 依赖管理员账号配置；若未配置会返回 `503`（`API auth is not configured`）。
 - **写接口保护:** `POST/PUT/PATCH/DELETE` 命中受保护前缀时，默认强制 token 校验；无 token 返回 `401`，角色不满足返回 `403`。
+- **内网白名单绕过（本机/内网对接用）:** 若请求来源 IP 命中 `config/config.yaml` 的 `api.auth_bypass_cidrs`（如默认 `127.0.0.1/32`、`::1/128`），则写接口可**绕过 token 鉴权**（仍建议仅用于内网环境）。
 - **默认受保护前缀:** `/api/v1/modules`、`/api/v1/monitoring`、`/api/v1/commander`、`/api/v1/trade`。
 - **角色策略:** 默认仅 `admin` 可执行受保护写操作（可由 `api.required_write_roles` 调整）。
-- **策略可观测接口（新增）:**
-  - `GET /auth/status`、`GET /api/v1/auth/status`
-  - `GET /auth/write-policy`、`GET /api/v1/auth/write-policy`
-- **Commander mirror 安全边界:** `/api/v1/commander/*` 转发目标固定为 `127.0.0.1:<api_port>`，避免 Host Header 影响转发目标。
+- **策略可观测接口:**
+  - `GET /api/v1/auth/status`
+  - `GET /api/v1/auth/write-policy`
+- **Commander 入口策略:** 镜像转发已移除，仅保留显式声明的 `/api/v1/modules/commander/*` 能力接口。
 
 ### 运行模式兼容说明（Docker / 裸机）
 
@@ -247,7 +258,15 @@
     - 2026-04-20 起聚合优先快路径，降级行可能包含 `errors=["snapshot_skipped_fast_mode"]`（属于主动限时策略，不等同于交易所断连）
 
 - **`GET /api/v1/market/symbol/{symbol}`**
-  - 若上游慢/超时：会优先返回缓存视图（`degraded=true, message="symbol_view_cached"`），避免阻塞前端与运维面板。
+  - **快返回语义（重要）**：为避免上游慢/抖动导致控制面阻塞，该接口采用“可用即回 + 后台刷新”的策略。
+  - **`include_snapshot=false`（默认）**：
+    - 优先返回缓存（`message="symbol_view_cached"`），保证响应快速。
+  - **`include_snapshot=true`**：
+    - **若缓存存在**：立即返回缓存（`message="symbol_view_cached_refreshing"`），同时后台触发一次完整刷新；响应 `view` 会携带 `cache_age_sec`（缓存年龄，秒）。
+    - **若缓存不存在**：立即返回 warming stub（`message="symbol_view_fastpath_refreshing"`），同时后台触发完整刷新；后续请求会命中缓存并逐步补齐 `quality_score/atr_pct_1h/...`。
+  - 判读建议：
+    - `degraded=true` 不代表交易所断连，可能是“缓存/快路径返回”；
+    - 请结合 `GET /api/v1/data-hub/unified-snapshot` 的 `collector.health/errors` 判断具体慢源与字段缺失原因。
 
 ### 调试：交易所与数据中心绑定一致性
 
@@ -268,9 +287,9 @@
 
 其他监控子路径（策略表现、市场数据状态、异常检测、proactive-ai 等）仍以 **`/api/v1/monitoring/...`** 为准，详见 OpenAPI。
 
-### 代码中存在但未挂到当前主应用的模块
+### 已清理模块说明
 
-仓库内另有 `risk_api.py`、`backtest_api.py` 等路由定义；**当前 `APIServer` 未 `include_router` 时不会出现在上述 OpenAPI 中**。以 `GET /openapi.json` 为准。
+`risk_api.py`、`backtest_api.py`、`enhanced_api.py` 已从主仓清理，避免僵尸接口与误用路径。接口权威以 `GET /openapi.json` 为准。
 
 ---
 
@@ -278,9 +297,7 @@
 
 | 方法 | 路径 | 摘要 | Tags |
 |------|------|------|------|
-| GET | `/api/health` | Health Check | api, health |
 | GET | `/api/metrics` | Get Metrics | api, metrics |
-| GET | `/api/status` | Get Status | api, system |
 | POST | `/api/strategies/activate/{strategy_name}` | Activate Strategy | strategies |
 | POST | `/api/strategies/add` | Add Strategy | strategies |
 | POST | `/api/strategies/deactivate/{strategy_name}` | Deactivate Strategy | strategies |
@@ -315,24 +332,7 @@
 | POST | `/api/v1/auth/refresh` | Refresh Token | api, api-v1, auth |
 | GET | `/api/v1/auth/status` | Auth Status | api, api-v1, auth |
 | GET | `/api/v1/auth/write-policy` | Auth Write Policy | api, api-v1, auth |
-| DELETE | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
-| GET | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
-| HEAD | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
-| OPTIONS | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
-| PATCH | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
-| POST | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
-| PUT | `/api/v1/commander` | Commander Mirror Root | api, api-v1, commander |
-| GET | `/api/v1/commander/_audit` | Commander Mirror Audit | api, api-v1, commander |
-| DELETE | `/api/v1/commander/{path}` | Commander Mirror | api, api-v1, commander |
-| GET | `/api/v1/commander/{path}` | Commander Mirror | api, api-v1, commander |
-| HEAD | `/api/v1/commander/{path}` | Commander Mirror | api, api-v1, commander |
-| OPTIONS | `/api/v1/commander/{path}` | Commander Mirror | api, api-v1, commander |
-| PATCH | `/api/v1/commander/{path}` | Commander Mirror | api, api-v1, commander |
-| POST | `/api/v1/commander/{path}` | Commander Mirror | api, api-v1, commander |
-| PUT | `/api/v1/commander/{path}` | Commander Mirror | api, api-v1, commander |
 | GET | `/api/v1/control-center/state` | Get Control Center State | api, api-v1, control-center |
-| GET | `/api/v1/data-fusion/analyze` | Analyze Market Q | api, api-v1, data-fusion |
-| GET | `/api/v1/data-fusion/analyze/{symbol}` | Analyze Market | api, api-v1, data-fusion |
 | GET | `/api/v1/data-fusion/history` | Get Analysis History | api, api-v1, data-fusion |
 | GET | `/api/v1/data-fusion/sources` | Get Data Sources | api, api-v1, data-fusion |
 | GET | `/api/v1/data-hub/ai-analysis` | Data Hub Ai Analysis | api, api-v1, data-hub |
@@ -345,7 +345,6 @@
 | GET | `/api/v1/external/analyze-trends` | External Analyze Trends | api, api-v1, external |
 | POST | `/api/v1/external/indicators` | External Indicators | api, api-v1, external |
 | GET | `/api/v1/external/signals` | External Signals | api, api-v1, external |
-| GET | `/api/v1/health` | Health Check V1 | api, api-v1, health |
 | GET | `/api/v1/market/data` | Get Market Data | api, api-v1, market |
 | GET | `/api/v1/market/klines` | Get Market Klines Q | api, api-v1, market |
 | GET | `/api/v1/market/klines/{symbol}` | Get Market Klines | api, api-v1, market |
@@ -443,7 +442,6 @@
 | GET | `/api/v1/s1/verify` | S1 Full Verify | s1 |
 | GET | `/api/v1/settings` | Get Settings | api, api-v1, settings |
 | PUT | `/api/v1/settings` | Update Settings | api, api-v1, settings |
-| GET | `/api/v1/status` | Get Status | api, api-v1, system |
 | GET | `/api/v1/strategies` | Get Strategies | api, api-v1, strategies |
 | POST | `/api/v1/strategies` | Create Strategy | api, api-v1, strategies |
 | DELETE | `/api/v1/strategies/{id}` | Delete Strategy | api, api-v1, strategies |
@@ -459,12 +457,4 @@
 | GET | `/api/v1/trades` | Get Trades | api, api-v1, trades |
 | GET | `/api/v1/trades/review` | Get Trade Review | api, api-v1, trades |
 | GET | `/api/v1/trades/statistics` | Get Trade Statistics | api, api-v1, trades |
-| GET | `/api/v1/trading/history` | Get Trading History Compat | api, api-v1, trades |
-| POST | `/auth/login` | Login | auth |
-| POST | `/auth/logout` | Logout | auth |
-| GET | `/auth/me` | Get Current User | auth |
-| POST | `/auth/refresh` | Refresh Token | auth |
-| GET | `/auth/status` | Auth Status | auth |
-| GET | `/auth/write-policy` | Auth Write Policy | auth |
-| GET | `/health` | Health Check | health |
 | GET | `/metrics` | Get Metrics | metrics |

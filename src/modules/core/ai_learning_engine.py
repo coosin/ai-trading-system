@@ -21,11 +21,6 @@ logger = logging.getLogger(__name__)
 
 
 class LessonType(Enum):
-
-    async def initialize(self) -> bool:
-        """初始化模块"""
-        return True
-
     """经验类型"""
     SUCCESS_PATTERN = "success_pattern"      # 成功模式
     FAILURE_PATTERN = "failure_pattern"      # 失败模式
@@ -91,9 +86,10 @@ class AILearningEngine:
     4. 将经验应用到未来的交易决策中
     """
     
-    def __init__(self, memory_manager=None, llm_integration=None):
+    def __init__(self, memory_manager=None, llm_integration=None, *, config_manager=None):
         self.memory_manager = memory_manager
         self.llm_integration = llm_integration
+        self.config_manager = config_manager
         
         self.lessons: List[TradingLesson] = []
         self.learning_reports: List[LearningReport] = []
@@ -105,7 +101,9 @@ class AILearningEngine:
             "learning_interval_hours": 6,
             "max_lessons_kept": 200,
             "min_confidence_for_application": 0.7,
-            "pattern_similarity_threshold": 0.8
+            "pattern_similarity_threshold": 0.8,
+            # Extract lesson when absolute pnl percent reaches this threshold (in percentage points).
+            "min_abs_pnl_percent_for_lesson": 0.6,
         }
         
         self._running = False
@@ -124,6 +122,14 @@ class AILearningEngine:
         self._running = False
         if self._learning_task:
             self._learning_task.cancel()
+            try:
+                await self._learning_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning("停止学习任务时出现异常: %s", e)
+            finally:
+                self._learning_task = None
         logger.info("AI学习引擎已停止")
     
     async def _learning_loop(self) -> None:
@@ -161,6 +167,15 @@ class AILearningEngine:
             symbol = trade.get("symbol", "unknown")
             pnl = trade.get("pnl", 0)
             is_profitable = pnl > 0
+            pnl_percent = trade.get("pnl_percent", 0)
+            try:
+                pnl_percent = float(pnl_percent or 0)
+            except Exception:
+                pnl_percent = 0.0
+            # Normalize common formats:
+            # - 0.012 => 1.2%
+            # - 6.0   => 6.0%
+            pnl_percent_norm = pnl_percent * 100.0 if abs(pnl_percent) <= 1.0 else pnl_percent
             
             trade_context = {
                 "symbol": symbol,
@@ -168,7 +183,7 @@ class AILearningEngine:
                 "entry_price": trade.get("entry_price", 0),
                 "exit_price": trade.get("exit_price", 0),
                 "pnl": pnl,
-                "pnl_percent": trade.get("pnl_percent", 0),
+                "pnl_percent": pnl_percent_norm,
                 "hold_duration": trade.get("hold_duration", ""),
                 "strategy": trade.get("strategy", "unknown"),
                 "reason": trade.get("reason", ""),
@@ -182,6 +197,11 @@ class AILearningEngine:
             if len(self.pattern_cache[symbol]) > 100:
                 self.pattern_cache[symbol] = self.pattern_cache[symbol][-100:]
             
+            # Fast path: capture large enough per-trade lessons immediately.
+            direct_lessons = await self._extract_lessons_from_trade(trade_context)
+            for lesson in direct_lessons:
+                self._add_lesson(lesson)
+
             if len([t for t in self.pattern_cache[symbol]]) >= self.config["min_trades_for_learning"]:
                 lessons = await self._extract_lessons_from_trade(trade_context)
                 for lesson in lessons:
@@ -308,10 +328,11 @@ class AILearningEngine:
         lessons = []
         
         try:
-            pnl_percent = trade_context.get("pnl_percent", 0)
+            pnl_percent = float(trade_context.get("pnl_percent", 0) or 0)
             abs_pnl = abs(pnl_percent)
-            
-            if abs_pnl > 5:
+            min_abs_pct = float(self.config.get("min_abs_pnl_percent_for_lesson", 0.6) or 0.6)
+
+            if abs_pnl >= min_abs_pct:
                 lesson_type = LessonType.SUCCESS_PATTERN if pnl_percent > 0 else LessonType.FAILURE_PATTERN
                 
                 direction = "盈利" if pnl_percent > 0 else "亏损"
@@ -601,19 +622,89 @@ class AILearningEngine:
                     "reason": f"近期{len(timing_lessons)}条时序教训",
                     "expected_impact": "提高胜率"
                 })
-            
-            if optimizations and self.memory_manager:
-                for opt in optimizations:
-                    self.memory_manager.enhanced_memory.save_strategy_optimization(
-                        strategy_name="决策规则优化",
-                        optimization_type=opt["rule"],
-                        old_params={},
-                        new_params={opt["action"]: True},
-                        reason=opt["reason"],
-                        expected_improvement=opt["expected_impact"]
-                    )
-                
-                logger.info(f"🔧 决策规则优化: {len(optimizations)}项")
+
+            # 写回策略：优先写到 ConfigManager（可热更新+持久化），其次再落到记忆里做审计。
+            applied: List[Dict[str, Any]] = []
+            cm = self.config_manager
+            if optimizations and cm is not None and hasattr(cm, "set_config"):
+                try:
+                    # --- 风险教训：降低进场频率/减少噪音单、略微降低仓位预算 ---
+                    if len(risk_lessons) >= 3:
+                        cur = await cm.get_config("ai_core_runtime", {}) if hasattr(cm, "get_config") else {}
+                        try:
+                            cur_open_c = float((cur or {}).get("ai_core_min_confidence_to_open", 0.72) or 0.72)
+                        except Exception:
+                            cur_open_c = 0.72
+                        new_open_c = min(0.86, max(0.65, cur_open_c + 0.02))
+                        await cm.set_config("ai_core_runtime", "ai_core_min_confidence_to_open", float(new_open_c))
+                        applied.append(
+                            {
+                                "section": "ai_core_runtime",
+                                "key": "ai_core_min_confidence_to_open",
+                                "old": cur_open_c,
+                                "new": new_open_c,
+                                "reason": f"risk_lessons={len(risk_lessons)}",
+                            }
+                        )
+
+                        # 降低可用保证金比例（保守且有边界）
+                        try:
+                            cur_mf = float((cur or {}).get("default_max_margin_fraction", 0.30) or 0.30)
+                        except Exception:
+                            cur_mf = 0.30
+                        new_mf = min(0.55, max(0.08, cur_mf * 0.90))
+                        await cm.set_config("ai_core_runtime", "default_max_margin_fraction", float(new_mf))
+                        applied.append(
+                            {
+                                "section": "ai_core_runtime",
+                                "key": "default_max_margin_fraction",
+                                "old": cur_mf,
+                                "new": new_mf,
+                                "reason": f"risk_lessons={len(risk_lessons)}",
+                            }
+                        )
+
+                    # --- 时机教训：提高净边际/盈亏比门槛，减少“挣得少、亏得多”的单子 ---
+                    if len(timing_lessons) >= 3:
+                        cur = await cm.get_config("ai_core_runtime", {}) if hasattr(cm, "get_config") else {}
+                        try:
+                            cur_rr = float((cur or {}).get("min_rr_to_trade", 1.2) or 1.2)
+                        except Exception:
+                            cur_rr = 1.2
+                        new_rr = min(2.10, max(0.9, cur_rr + 0.05))
+                        await cm.set_config("ai_core_runtime", "min_rr_to_trade", float(new_rr))
+                        applied.append(
+                            {"section": "ai_core_runtime", "key": "min_rr_to_trade", "old": cur_rr, "new": new_rr, "reason": f"timing_lessons={len(timing_lessons)}"}
+                        )
+
+                        try:
+                            cur_edge = float((cur or {}).get("edge_min_net_reward_pct", 0.003) or 0.003)
+                        except Exception:
+                            cur_edge = 0.003
+                        new_edge = min(0.012, max(0.0015, cur_edge + 0.001))
+                        await cm.set_config("ai_core_runtime", "edge_min_net_reward_pct", float(new_edge))
+                        applied.append(
+                            {"section": "ai_core_runtime", "key": "edge_min_net_reward_pct", "old": cur_edge, "new": new_edge, "reason": f"timing_lessons={len(timing_lessons)}"}
+                        )
+                except Exception as e:
+                    logger.error(f"写回配置失败（将仅记录优化建议）: {e}")
+
+            if optimizations and self.memory_manager and getattr(self.memory_manager, "enhanced_memory", None):
+                try:
+                    for opt in optimizations:
+                        self.memory_manager.enhanced_memory.save_strategy_optimization(
+                            strategy_name="决策规则优化",
+                            optimization_type=opt["rule"],
+                            old_params={},
+                            new_params={opt["action"]: True},
+                            reason=opt["reason"],
+                            expected_improvement=opt["expected_impact"]
+                        )
+                except Exception:
+                    pass
+
+            if optimizations:
+                logger.info("🔧 决策规则优化: %s项 applied=%s", len(optimizations), len(applied))
                 
         except Exception as e:
             logger.error(f"优化决策规则失败: {e}")

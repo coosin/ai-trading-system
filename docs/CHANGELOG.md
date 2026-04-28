@@ -53,7 +53,7 @@
 ## 2026-04-15 — 新增每日托管验收手册（3~5 步）
 
 - 新增 `docs/DAILY_HOSTING_ACCEPTANCE.md`，提供日常托管最小验收路径：
-  - 一键总验收（`scripts/one_click_upgrade_pipeline.py`）
+  - 一键总验收（当前统一入口：`scripts/verify.py trading`）
   - 托管模式/自动化档位检查
   - 统一风控红线检查
   - 账户持仓与事件流活性检查

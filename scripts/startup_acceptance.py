@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-启动后验收：轮询 /health，拉取 /api/v1/system/status 与 /api/v1/system/acceptance。
+启动后验收：轮询 /api/v1/system/health，拉取 /api/v1/system/status 与 /api/v1/system/acceptance。
 用法：
   ACCEPTANCE_BASE=http://127.0.0.1:8000 python3 scripts/startup_acceptance.py
 """
@@ -25,9 +25,9 @@ def wait_health(base: str, total_wait: float = 120.0, step: float = 3.0) -> None
     last_err = ""
     while time.time() < deadline:
         try:
-            code, body = _get(f"{base.rstrip('/')}/health", timeout=20.0)
+            code, body = _get(f"{base.rstrip('/')}/api/v1/system/health", timeout=20.0)
             if code < 400 and "healthy" in body.lower():
-                print(f"[OK] /health 就绪 ({code})")
+                print(f"[OK] /api/v1/system/health 就绪 ({code})")
                 return
         except Exception as e:
             last_err = str(e)
@@ -41,7 +41,7 @@ def main() -> int:
     wait_health(base)
 
     paths = (
-        ("/health", "根健康检查"),
+        ("/api/v1/system/health", "系统健康检查"),
         ("/api/v1/system/status", "系统状态"),
         ("/api/v1/system/acceptance", "架构师验收快照"),
     )

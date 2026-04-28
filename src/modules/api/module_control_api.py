@@ -220,10 +220,85 @@ def init_module_control_api(app, main_controller):
                         "note": "返回缓存快照以保证控制面快速响应",
                     },
                 }
+            # include_snapshot 请求：优先返回缓存，并触发后台异步刷新，避免前台阻塞慢源链路。
+            if cached and bool(include_snapshot):
+                out_view = _ensure_execution_support_schema(dict(cached))
+                try:
+                    if hasattr(mi, "refresh_symbol_async"):
+                        asyncio.create_task(mi.refresh_symbol_async(symbol, include_snapshot=True))
+                except Exception:
+                    pass
+                if fields:
+                    allow = {k.strip() for k in str(fields).split(",") if k.strip()}
+                    allow.add("symbol")
+                    allow.add("timestamp")
+                    out_view = {k: v for k, v in out_view.items() if k in allow}
+                return {
+                    "ok": True,
+                    "view": out_view,
+                    "snapshot": None,
+                    "degraded": bool(out_view.get("partial", False)),
+                    "message": "symbol_view_cached_refreshing",
+                    "degraded_reason": {
+                        "code": "cached_refreshing",
+                        "source": "market_intelligence_cache",
+                        "include_snapshot": True,
+                        "note": "已返回缓存并触发后台刷新",
+                    },
+                }
+
+            # include_snapshot 请求但无缓存：先返回快路径视图（不阻塞），并后台刷新完整快照。
+            if bool(include_snapshot) and not cached:
+                try:
+                    # 立刻返回 warming stub：保证控制面/诊断接口首次响应毫秒级。
+                    # 后台异步刷新会把缓存补齐，后续请求会走 symbol_view_cached_refreshing。
+                    out_view = _ensure_execution_support_schema(
+                        {
+                            "symbol": symbol,
+                            "timestamp": None,
+                            "trend": "unknown",
+                            "action_bias": "hold",
+                            "confidence": None,
+                            "quality_score": None,
+                            "spread_bps": None,
+                            "atr_pct_1h": None,
+                            "price": None,
+                            "funding_rate": None,
+                            "depth_imbalance": None,
+                            "partial": True,
+                            "cache_age_sec": None,
+                        }
+                    )
+                except Exception:
+                    out_view = _ensure_execution_support_schema({})
+                try:
+                    if hasattr(mi, "refresh_symbol_async"):
+                        asyncio.create_task(mi.refresh_symbol_async(symbol, include_snapshot=True))
+                except Exception:
+                    pass
+                if fields:
+                    allow = {k.strip() for k in str(fields).split(",") if k.strip()}
+                    allow.add("symbol")
+                    allow.add("timestamp")
+                    out_view = {k: v for k, v in out_view.items() if k in allow}
+                return {
+                    "ok": True,
+                    "view": out_view,
+                    "snapshot": None,
+                    "degraded": True,
+                    "message": "symbol_view_fastpath_refreshing",
+                    "degraded_reason": {
+                        "code": "fastpath_refreshing",
+                        "source": "market_intelligence_get_symbol_view",
+                        "include_snapshot": True,
+                        "note": "无缓存：已返回快路径并触发后台刷新",
+                    },
+                }
 
             # unified_snapshot has its own bounded budget (DataSourceHub.snapshot_timeout_sec, default ~2.5s).
             # In proxy-only environments, scheduling + JSON + partial collectors can push the end-to-end
             # call slightly above 3s. Use a slightly larger cap to avoid false "timeout_degraded".
+            req_timeout = 10.5 if bool(include_snapshot) else 4.5
             view = await asyncio.wait_for(
                 mi.get_symbol_view(
                     symbol,
@@ -231,7 +306,7 @@ def init_module_control_api(app, main_controller):
                     # API 默认查询不带 snapshot 时，优先快路径，避免被重采集拖慢并产生误导性 timeout。
                     prefer_fast_only=not bool(include_snapshot),
                 ),
-                timeout=4.5,
+                timeout=req_timeout,
             )
             out_view = view.to_dict()
             out_view = _ensure_execution_support_schema(out_view)
@@ -923,7 +998,13 @@ def init_module_control_api(app, main_controller):
             penalty_step_threshold = float(ai_cfg.get("penalty_step_threshold", 0.05) or 0.05)
             penalty_max_threshold = float(ai_cfg.get("penalty_max_threshold", 0.15) or 0.15)
             max_pos_ratio = float(ai_cfg.get("max_position_value_ratio", 0.05) or 0.05)
-            hard_max_positions = int(ai_cfg.get("hard_max_positions", 5) or 5)
+            try:
+                from src.modules.core.trading_limits import resolve_position_limits
+
+                limits = await resolve_position_limits(config_manager=getattr(main_controller, "config_manager", None))
+                hard_max_positions = int(limits.hard_max_positions)
+            except Exception:
+                hard_max_positions = int(ai_cfg.get("hard_max_positions", 5) or 5)
             require_trend_for_open = bool(ai_cfg.get("require_trend_for_open", True))
             tracked_signals = len(rows)
             penalized_signals = sum(1 for r in rows if float(r.get("extra_confidence_threshold", 0)) > 0)
@@ -2700,6 +2781,390 @@ def init_module_control_api(app, main_controller):
             }
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/trading-diagnosis")
+    async def commander_trading_diagnosis(limit_events: int = 20):
+        """
+        全面体检：开/平仓技术判断、执行脊柱、SLTP 出场、学习引擎是否在运转与写回。
+        用于验收“智能体是否正常运用性能、并能自总结经验教训自动优化策略”。
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        mc = main_controller
+        out: Dict[str, Any] = {"timestamp": datetime.now().isoformat()}
+
+        # 1) ai_core / ai_trading_engine 状态（技术判断路径）
+        try:
+            core = getattr(mc, "ai_core", None)
+            out["ai_core"] = core.get_status() if (core and hasattr(core, "get_status")) else None
+        except Exception as e:
+            out["ai_core_error"] = str(e)
+        try:
+            eng = getattr(mc, "ai_trading_engine", None)
+            out["ai_trading_engine"] = eng.get_status() if (eng and hasattr(eng, "get_status")) else None
+        except Exception as e:
+            out["ai_trading_engine_error"] = str(e)
+
+        # 2) ExecutionGateway（执行成功率、回查一致性、recent events）
+        try:
+            gw = getattr(mc, "execution_gateway", None)
+            if gw and hasattr(gw, "get_snapshot"):
+                snap = await gw.get_snapshot()
+                if gw and hasattr(gw, "get_recent_events"):
+                    snap["recent_events"] = await gw.get_recent_events(limit=int(limit_events or 20))
+                out["execution_gateway"] = snap
+            else:
+                out["execution_gateway"] = None
+        except Exception as e:
+            out["execution_gateway_error"] = str(e)
+
+        # 3) SLTP（含 SR 关键位出场观测）
+        try:
+            sltp = getattr(mc, "stop_loss_manager", None)
+            out["sltp"] = sltp.get_stats() if (sltp and hasattr(sltp, "get_stats")) else None
+        except Exception as e:
+            out["sltp_error"] = str(e)
+
+        # 4) AI 学习引擎（经验教训/优化循环）
+        try:
+            le = getattr(mc, "ai_learning_engine", None)
+            out["ai_learning_engine"] = le.get_status() if (le and hasattr(le, "get_status")) else None
+        except Exception as e:
+            out["ai_learning_engine_error"] = str(e)
+
+        # 5) TradeHistory 统计（用于盈利/亏损结构评估）
+        try:
+            ths = getattr(mc, "trade_history_service", None)
+            if ths and hasattr(ths, "get_statistics"):
+                out["trade_history_30d"] = await ths.get_statistics(days=30, force_refresh=True)
+        except Exception as e:
+            out["trade_history_error"] = str(e)
+
+        # 5.1) Unified analysis pipeline assessment (data sensitivity + decision outcome health)
+        try:
+            assess: Dict[str, Any] = {}
+            cfgm = getattr(mc, "config_manager", None)
+            pa_cfg = {}
+            if cfgm and hasattr(cfgm, "get_config_path_sync"):
+                try:
+                    pa_cfg = cfgm.get_config_path_sync("proactive_scanner", {}) or {}
+                except Exception:
+                    pa_cfg = {}
+            if not isinstance(pa_cfg, dict):
+                pa_cfg = {}
+
+            gw = getattr(mc, "execution_gateway", None)
+            swo = "ai_core"
+            try:
+                if gw and hasattr(gw, "single_write_owner"):
+                    swo = await gw.single_write_owner()
+            except Exception:
+                swo = "ai_core"
+
+            assess["pipeline"] = {
+                "single_write_owner": str(swo or "ai_core"),
+                "proactive_auto_execute_opportunities": bool(pa_cfg.get("proactive_auto_execute_opportunities", False)),
+                "expectation": "scanner_forward_only_then_ai_core_decides",
+            }
+
+            # Market analysis sensitivity sample across default symbols.
+            mi = getattr(mc, "market_intelligence", None)
+            sampled_symbols = list(pa_cfg.get("default_symbols", []) or [])
+            if not sampled_symbols:
+                sampled_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT"]
+            sampled_symbols = [str(s) for s in sampled_symbols[:8]]
+            market_rows: List[Dict[str, Any]] = []
+            degraded_cnt = 0
+            quality_non_null = 0
+            conf_non_null = 0
+            trend_known = 0
+            if mi and hasattr(mi, "get_symbol_view"):
+                for sym in sampled_symbols:
+                    try:
+                        view = await asyncio.wait_for(
+                            mi.get_symbol_view(sym, include_snapshot=True, prefer_fast_only=False),
+                            timeout=5.0,
+                        )
+                        vd = view.to_dict() if hasattr(view, "to_dict") else {}
+                        quality = vd.get("quality_score")
+                        conf = vd.get("confidence")
+                        trend = str(vd.get("trend") or "unknown").lower()
+                        prov = str(vd.get("provenance") or "")
+                        partial = bool(vd.get("partial", False))
+                        degraded = partial or ("degraded" in prov) or ("fastpath" in prov)
+                        if degraded:
+                            degraded_cnt += 1
+                        if quality is not None:
+                            quality_non_null += 1
+                        if conf is not None:
+                            conf_non_null += 1
+                        if trend not in {"", "unknown", "none", "null"}:
+                            trend_known += 1
+                        market_rows.append(
+                            {
+                                "symbol": sym,
+                                "quality_score": quality,
+                                "confidence": conf,
+                                "trend": vd.get("trend"),
+                                "spread_bps": vd.get("spread_bps"),
+                                "atr_pct_1h": vd.get("atr_pct_1h"),
+                                "provenance": vd.get("provenance"),
+                                "partial": partial,
+                                "degraded": degraded,
+                            }
+                        )
+                    except Exception:
+                        degraded_cnt += 1
+                        market_rows.append({"symbol": sym, "degraded": True, "error": "symbol_view_timeout_or_error"})
+
+            total_m = max(1, len(market_rows))
+            assess["market_analysis"] = {
+                "sampled_symbols": sampled_symbols,
+                "degraded_ratio": round(float(degraded_cnt) / float(total_m), 4),
+                "quality_coverage": round(float(quality_non_null) / float(total_m), 4),
+                "confidence_coverage": round(float(conf_non_null) / float(total_m), 4),
+                "trend_known_coverage": round(float(trend_known) / float(total_m), 4),
+                "samples": market_rows,
+            }
+
+            # Decision outcome health from recent realized non-zero trades.
+            decision_health = {"sample_size": 0, "wins": 0, "losses": 0, "win_rate": None, "sum_pnl": 0.0, "expectancy": None}
+            ths = getattr(mc, "trade_history_service", None)
+            if ths and hasattr(ths, "get_recent_trades"):
+                rows = await ths.get_recent_trades(limit=200)
+                clean = []
+                for r in rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    pnl = float(r.get("pnl", 0) or 0)
+                    pnl_pct = float(r.get("pnl_percent", 0) or 0)
+                    if abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12:
+                        clean.append({"pnl": pnl, "reasoning": r.get("reasoning"), "symbol": r.get("symbol")})
+                recent = clean[:40]
+                w = sum(1 for r in recent if float(r.get("pnl", 0) or 0) > 0)
+                l = sum(1 for r in recent if float(r.get("pnl", 0) or 0) < 0)
+                total = len(recent)
+                sum_pnl = float(sum(float(r.get("pnl", 0) or 0) for r in recent))
+                decision_health = {
+                    "sample_size": total,
+                    "wins": w,
+                    "losses": l,
+                    "win_rate": round((float(w) / float(total)) if total else 0.0, 4),
+                    "sum_pnl": round(sum_pnl, 6),
+                    "expectancy": round((sum_pnl / float(total)) if total else 0.0, 6),
+                }
+            assess["decision_outcome_recent"] = decision_health
+
+            # Learning effectiveness readiness.
+            le = getattr(mc, "ai_learning_engine", None)
+            le_st = le.get_status() if (le and hasattr(le, "get_status")) else {}
+            lessons = int((le_st or {}).get("total_lessons", 0) or 0)
+            reports = int((le_st or {}).get("reports_generated", 0) or 0)
+            assess["learning_effectiveness"] = {
+                "running": bool((le_st or {}).get("running", False)),
+                "total_lessons": lessons,
+                "reports_generated": reports,
+                "effective": bool(lessons > 0 and reports > 0),
+                "hint": "seed-and-run then verify total_lessons/reports_generated increments"
+                if not (lessons > 0 and reports > 0)
+                else "learning feedback loop active",
+            }
+            out["analysis_pipeline_assessment"] = assess
+        except Exception as e:
+            out["analysis_pipeline_assessment_error"] = str(e)
+
+        # 6) 自动总结的“经验教训”与建议（轻量，避免误导）
+        try:
+            core = getattr(mc, "ai_core", None)
+            gw = getattr(mc, "execution_gateway", None)
+            hints: List[str] = []
+            if core and hasattr(core, "get_status"):
+                st = core.get_status() or {}
+                guards = ((st.get("execution_guards") or {}).get("stats") or {}) if isinstance(st, dict) else {}
+                top = sorted([(k, int(v)) for k, v in (guards or {}).items()], key=lambda x: x[1], reverse=True)[:6]
+                if top:
+                    hints.append("ai_core 门控Top: " + ", ".join([f"{k}={v}" for k, v in top]))
+            if gw and hasattr(gw, "get_policy_metrics"):
+                pm = gw.get_policy_metrics() or {}
+                hints.append("execution 脊柱: " + ", ".join([f"{k}={pm.get(k)}" for k in ("open_ok","open_fail","close_ok","close_fail")]))
+            out["diagnosis_hints"] = hints
+        except Exception:
+            pass
+
+        # 6.1) Canonical position limits snapshot (single entry validation)
+        try:
+            from src.modules.core.trading_limits import resolve_position_limits
+
+            limits = await resolve_position_limits(config_manager=getattr(mc, "config_manager", None))
+            out["position_limits_snapshot"] = limits.to_dict()
+        except Exception as e:
+            out["position_limits_snapshot_error"] = str(e)
+
+        # 7) Execution failures attribution: Top reasons + samples + action hints
+        try:
+            gw = getattr(mc, "execution_gateway", None)
+            eg = out.get("execution_gateway") if isinstance(out.get("execution_gateway"), dict) else {}
+            events = (eg.get("recent_events") or []) if isinstance(eg.get("recent_events"), list) else []
+            # focus on failures only
+            fails = [e for e in events if isinstance(e, dict) and e.get("success") is False]
+
+            def _key(e: Dict[str, Any]) -> str:
+                op = str(e.get("op") or "unknown")
+                code = str(e.get("error_code") or "UNKNOWN")
+                phase = str(e.get("phase") or "unknown")
+                return f"{op}:{code}:{phase}"
+
+            counts: Dict[str, int] = {}
+            samples: Dict[str, List[Dict[str, Any]]] = {}
+            for e in fails:
+                k = _key(e)
+                counts[k] = int(counts.get(k, 0)) + 1
+                samples.setdefault(k, [])
+                if len(samples[k]) < 3:
+                    samples[k].append(
+                        {
+                            "ts": e.get("ts"),
+                            "symbol": e.get("symbol"),
+                            "side": e.get("side"),
+                            "source": e.get("source"),
+                            "reason": e.get("reason"),
+                            "detail": str(e.get("detail") or "")[:220],
+                            "trace_id": e.get("trace_id"),
+                            "endpoint": e.get("endpoint"),
+                            "retriable": bool(e.get("retriable")),
+                        }
+                    )
+
+            top_keys = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:8]
+
+            def _action_hint(code: str) -> str:
+                code = str(code or "").upper()
+                return {
+                    "POLICY_DENIED": "检查 single_write_owner/来源(source) 是否符合规则；必要时用 manual 或 force_close。",
+                    "HOSTING_MODE_DENIED": "当前半自动托管：需在指令/接口里标记 manual_approved 或用 manual source。",
+                    "OPEN_COOLDOWN_ACTIVE": "开仓冷却中：等待冷却结束或降低同品种反复触发；检查为何连续失败。",
+                    "RISK_REDLINE_DENIED": "触发风控红线：检查 max_positions/保证金占用/风险参数。",
+                    "NO_EXCHANGE": "交易所连接为空：检查主控 exchange 初始化/凭证/网络。",
+                    "TIMEOUT": "网络或交易所接口超时：检查代理稳定性、OKX 私有接口延迟与重试策略。",
+                    "CONNECTION_ERROR": "连接异常：检查网络/代理/会话重建；必要时触发 exchange session rebuild。",
+                    "NETWORK_ERROR": "网络故障：检查 DNS/出网/代理。",
+                    "INSUFFICIENT_MARGIN": "保证金不足：降低仓位/杠杆或补充资金；检查 margin_mode。",
+                    "INSUFFICIENT_FUNDS": "余额不足：检查资金与费用预留。",
+                    "SIZE_TOO_SMALL": "下单张数过小：检查 minSz/lotSz，修正 size 计算与步进对齐。",
+                    "INSTRUMENT_INVALID": "合约标的无效：检查 symbol 规范化与 instId。",
+                    "EXCHANGE_ALL_OPERATIONS_FAILED": "交易所拒单(All operations failed)：检查 reduceOnly/posSide/参数组合，必要时走 close-position fallback。",
+                    "POST_CHECK_ANOMALY": "平仓后复核异常：检查 positions 刷新延迟/是否实际成交；必要时二次 close-position。",
+                }.get(code, "查看 detail/endpoint/trace_id 对照交易所返回，补齐映射或加更具体的重试/降级。")
+
+            top = []
+            for k, v in top_keys:
+                # k = op:code:phase
+                parts = k.split(":")
+                code = parts[1] if len(parts) > 1 else "UNKNOWN"
+                top.append(
+                    {
+                        "key": k,
+                        "count": int(v),
+                        "action_hint": _action_hint(code),
+                        "samples": samples.get(k, [])[:3],
+                    }
+                )
+
+            out["execution_attribution"] = {
+                "failures_in_window": len(fails),
+                "top_reasons": top,
+            }
+        except Exception as e:
+            out["execution_attribution_error"] = str(e)
+
+        return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/learning/seed-and-run")
+    async def commander_learning_seed_and_run(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """
+        体检/验收用：注入少量合成 trade_close 记忆，并立即触发一次学习周期。
+        - 不会触发真实交易
+        - 仅用于验证“自我总结与自动优化策略”的闭环是否通
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        mc = main_controller
+        mg = getattr(mc, "memory_gateway", None)
+        le = getattr(mc, "ai_learning_engine", None)
+        if not mg or not hasattr(mg, "add_memory"):
+            return {"success": False, "message": "memory_gateway 未就绪", "timestamp": datetime.now().isoformat()}
+        if not le:
+            return {"success": False, "message": "ai_learning_engine 未就绪", "timestamp": datetime.now().isoformat()}
+
+        # Runtime wiring fix: seed 使用 memory_gateway 写入，学习引擎读取 memory_manager。
+        # 若两者未绑定，会导致 _analyze_and_learn() 直接返回且统计不更新。
+        if getattr(le, "memory_manager", None) is None:
+            le.memory_manager = mg
+
+        n = int((payload or {}).get("n", 8) or 8)
+        n = max(3, min(30, n))
+        symbol = str((payload or {}).get("symbol") or "BTC/USDT/SWAP")
+        base_pnl_pct = float((payload or {}).get("base_pnl_percent", 0.012) or 0.012)
+        lesson_pnl_percent = float((payload or {}).get("lesson_pnl_percent", 6.0) or 6.0)
+        lesson_pnl_percent = max(5.1, min(40.0, lesson_pnl_percent))
+        now = datetime.now()
+        seeded = 0
+        try:
+            for i in range(n):
+                # Alternating win/loss patterns to trigger timing/risk lessons.
+                pnl_pct = base_pnl_pct if (i % 3 != 0) else (-base_pnl_pct * 1.4)
+                pnl = pnl_pct * 100.0
+                side = "sell" if pnl_pct >= 0 else "buy"
+                await mg.add_memory(
+                    memory_type="trade_record",
+                    content=f"[synthetic] trade_close {symbol} pnl_pct={pnl_pct:+.4%}",
+                    metadata={
+                        "kind": "trade_close",
+                        "synthetic": True,
+                        "symbol": symbol,
+                        "side": side,
+                        "pnl": float(pnl),
+                        "pnl_percent": float(pnl_pct),
+                        "timestamp": (now.isoformat()),
+                        "reason": "synthetic_seed_for_learning_acceptance",
+                    },
+                    source_module="module_control_api",
+                    importance=0.6,
+                    tags=["trade_close", "synthetic", "learning_seed"],
+                )
+                # Also feed the learning engine's direct intake path so diagnosis metrics
+                # update immediately even when memory backend adapters differ.
+                if hasattr(le, "record_trade_result"):
+                    lesson_pct = lesson_pnl_percent if pnl_pct >= 0 else (-lesson_pnl_percent * 1.2)
+                    await le.record_trade_result(
+                        {
+                            "symbol": symbol,
+                            "side": side,
+                            "pnl": float(pnl),
+                            "pnl_percent": float(lesson_pct),
+                            "reason": "synthetic_seed_for_learning_acceptance",
+                            "strategy": "seed_acceptance",
+                            "timestamp": now.isoformat(),
+                        }
+                    )
+                seeded += 1
+        except Exception as e:
+            return {"success": False, "message": f"seed_failed: {e}", "seeded": seeded, "timestamp": datetime.now().isoformat()}
+
+        # Run one learning cycle immediately (best-effort)
+        try:
+            await le._analyze_and_learn()
+            await le._generate_learning_report()
+            await le._optimize_decision_rules()
+        except Exception as e:
+            return {"success": False, "message": f"learning_run_failed: {e}", "seeded": seeded, "timestamp": datetime.now().isoformat()}
+
+        return {
+            "success": True,
+            "seeded": seeded,
+            "learning_status": le.get_status() if hasattr(le, "get_status") else {},
+            "timestamp": datetime.now().isoformat(),
+        }
 
     @router.post("/commander/account-sync/run")
     async def commander_account_sync_run(payload: Dict[str, Any] = Body(default_factory=dict)):

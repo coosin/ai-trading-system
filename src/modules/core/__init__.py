@@ -5,22 +5,37 @@
 
 from .base_module import BaseModule, SingletonModule
 
-from .user_intent_recognizer import (
-    UserIntentRecognizer,
-    UserIntentType,
-    ExtractedIntent,
-    AutoMemoryRecorder,
-    user_intent_recognizer,
-    auto_memory_recorder
-)
+try:
+    from .user_intent_recognizer import (
+        UserIntentRecognizer,
+        UserIntentType,
+        ExtractedIntent,
+        AutoMemoryRecorder,
+        user_intent_recognizer,
+        auto_memory_recorder,
+    )
+except Exception:  # optional in lightweight/script contexts
+    UserIntentRecognizer = None
+    UserIntentType = None
+    ExtractedIntent = None
+    AutoMemoryRecorder = None
+    user_intent_recognizer = None
+    auto_memory_recorder = None
 
-from .system_stability_analyzer import (
-    SystemStabilityAnalyzer,
-    StabilityLevel,
-    DecisionType,
-    StabilityMetrics,
-    StabilityDecision
-)
+try:
+    from .system_stability_analyzer import (
+        SystemStabilityAnalyzer,
+        StabilityLevel,
+        DecisionType,
+        StabilityMetrics,
+        StabilityDecision,
+    )
+except Exception:  # optional in lightweight/script contexts
+    SystemStabilityAnalyzer = None
+    StabilityLevel = None
+    DecisionType = None
+    StabilityMetrics = None
+    StabilityDecision = None
 
 __all__ = [
     "BaseModule",

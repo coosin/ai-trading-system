@@ -18,7 +18,7 @@
 裸机最小健康检查：
 
 ```bash
-curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/api/v1/system/health
 curl -s http://127.0.0.1:8000/api/v1/s1/verify
 curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/audit?enrich=true'
 curl -s http://127.0.0.1:8000/api/v1/auth/status
@@ -28,7 +28,7 @@ curl -s http://127.0.0.1:8000/api/v1/auth/status
 
 ```bash
 BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
-curl -s "$BASE_URL/health"
+curl -s "$BASE_URL/api/v1/system/health"
 ```
 
 ---
@@ -74,7 +74,7 @@ docker compose restart trading-system
 
 - **trading-system**: `8000` → API / 静态前端  
 - **redis**: `6379`（内部网络 `redis:6379`）  
-- **健康检查**: 容器内 `curl http://localhost:8000/health`  
+- **健康检查**: 容器内 `curl http://localhost:8000/api/v1/system/health`  
 - **配置卷**: `./config` → `/app/config`（修改 `config.yaml` 后 `docker compose restart trading-system` 即可，无需重建镜像）
 
 ---
@@ -82,7 +82,7 @@ docker compose restart trading-system
 ## 2. 启动到运行态检查清单
 
 1. `docker ps` — `openclaw-trading` 为 `healthy`  
-2. `curl -s http://localhost:8000/health`  
+2. `curl -s http://localhost:8000/api/v1/system/health`  
 3. `curl -s http://localhost:8000/api/v1/exchanges` — OKX `is_connected`  
 4. `curl -s "http://localhost:8000/api/v1/modules/commander/audit?enrich=true"` — 司令部与第三方诊断  
 5. 日志: `docker logs openclaw-trading --tail 80` — 无持续 Traceback  
@@ -166,7 +166,7 @@ curl -s 'http://localhost:8000/api/v1/modules/ai/learning-feedback'
 
 ```bash
 # 0) 基础健康
-curl -s http://localhost:8000/health
+curl -s http://localhost:8000/api/v1/system/health
 curl -s http://localhost:8000/api/v1/s1/verify
 curl -s http://localhost:8000/api/v1/modules/system/health
 
@@ -306,7 +306,7 @@ python3 scripts/proxy_mode_network_benchmark.py --compare /tmp/net_before.json /
 脚本会对比 **DNS/TCP/HTTPS（尊重代理 vs 强制不走 HTTP 代理）** 的中位数延迟；若 **`no_http_proxy` 明显快于 `respect_env_proxy`**，优先采用 **TUN + 减少容器内 HTTP 代理依赖**（上文的 B 或 C）。全链路再跑：
 
 ```bash
-python3 scripts/full_system_integration_check.py
+python3 scripts/verify.py trading --base-url http://127.0.0.1:8000
 ```
 
 **最优选择（当前仓库实践结论）**：**宿主机 TUN + 规则正确** 为基座；容器侧若仍大量 **CONNECT 超时**，则 **host 网络或 OKX 忽略环境代理** 二选一或组合，直到 **`/api/v1/market/ticker` 的 `source` 为 `exchange` 且有价格**。
@@ -335,7 +335,7 @@ sudo systemctl enable --now okx-proxy-guard.timer
 ### 4.1 命令速查
 
 ```bash
-curl -s http://localhost:8000/health
+curl -s http://localhost:8000/api/v1/system/health
 docker logs openclaw-trading --tail 200
 ./scripts/check_trading_host_health.sh
 ./scripts/cleanup_trading_workspace.sh   # 按需；见脚本内环境变量

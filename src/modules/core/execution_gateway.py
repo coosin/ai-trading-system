@@ -112,10 +112,93 @@ class ExecutionGateway:
 
     def _push_recent_event(self, event: Dict[str, Any]) -> None:
         try:
-            self._snapshot.recent_events.append(event)
+            # Normalize event into a stable schema for downstream aggregation.
+            e = dict(event or {})
+            ctx = e.get("context") if isinstance(e.get("context"), dict) else {}
+            op = str(e.get("op") or "").strip().lower()
+            success = bool(e.get("success"))
+            detail = str(e.get("detail") or "")
+
+            if "event_id" not in e:
+                e["event_id"] = str(uuid.uuid4())
+            if "ts" not in e:
+                e["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            if "trace_id" not in e:
+                e["trace_id"] = self._trace_id_from_context(ctx) or ""
+            if "phase" not in e:
+                e["phase"] = str(ctx.get("phase") or ("exchange" if op in {"open", "close"} else "unknown"))
+            if "endpoint" not in e:
+                e["endpoint"] = str(ctx.get("endpoint") or ctx.get("api") or ctx.get("url") or "")
+            if "idempotency_key" not in e:
+                e["idempotency_key"] = str(ctx.get("idempotency_key") or ctx.get("idempotent_key") or "")
+
+            if "retriable" not in e:
+                e["retriable"] = bool(ctx.get("retriable")) if "retriable" in ctx else self._is_retryable_open_error(detail)
+            if "error_code" not in e:
+                e["error_code"] = self._classify_error_code(op=op, success=success, detail=detail, ctx=ctx)
+
+            # Trim context to avoid bloating snapshots.
+            try:
+                e["context"] = dict(ctx) if isinstance(ctx, dict) else {}
+            except Exception:
+                e["context"] = {"raw": str(ctx)[:800]}
+
+            self._snapshot.recent_events.append(e)
             self._snapshot.recent_events = self._snapshot.recent_events[-self._recent_events_limit :]
         except Exception:
             pass
+
+    @staticmethod
+    def _classify_error_code(op: str, success: bool, detail: str, ctx: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Convert a raw detail string into a stable, low-cardinality error_code for aggregation.
+        """
+        if success:
+            return "OK"
+        d = (detail or "").lower()
+        c = ctx or {}
+
+        # Policy / guards
+        if "policy_denied" in d or "open_policy_denied" in d:
+            return "POLICY_DENIED"
+        if "semi_auto" in d or "半自动" in detail or "托管模式拦截" in detail:
+            return "HOSTING_MODE_DENIED"
+        if "open_cooldown_active" in d:
+            return "OPEN_COOLDOWN_ACTIVE"
+        if "风控" in detail or "redline" in d or "红线" in detail:
+            return "RISK_REDLINE_DENIED"
+
+        # Connectivity / exchange availability
+        if "no_exchange" in d:
+            return "NO_EXCHANGE"
+        if "timeout" in d or "timed out" in d:
+            return "TIMEOUT"
+        if "connection" in d and ("reset" in d or "refused" in d or "closed" in d):
+            return "CONNECTION_ERROR"
+        if "network" in d or "dns" in d:
+            return "NETWORK_ERROR"
+
+        # Common exchange-side failures
+        if "all operations failed" in d:
+            return "EXCHANGE_ALL_OPERATIONS_FAILED"
+        if "insufficient" in d and ("margin" in d or "balance" in d):
+            return "INSUFFICIENT_MARGIN"
+        if "insufficient" in d and ("funds" in d or "balance" in d):
+            return "INSUFFICIENT_FUNDS"
+        if "size" in d and ("too small" in d or "min" in d or "minsz" in d):
+            return "SIZE_TOO_SMALL"
+        if "instrument" in d or "instid" in d:
+            return "INSTRUMENT_INVALID"
+        if "reduceonly" in d:
+            return "REDUCE_ONLY_REJECTED"
+
+        # Post-check anomalies
+        if isinstance(c, dict):
+            pc = c.get("post_close_check")
+            if isinstance(pc, dict) and pc.get("status") in {"position_unchanged", "check_failed"}:
+                return "POST_CHECK_ANOMALY"
+
+        return "EXCHANGE_ERROR"
 
     async def _notify_telegram(self, text: str) -> None:
         try:
@@ -492,6 +575,20 @@ class ExecutionGateway:
 
         async with self._symbol_lock(symbol):
             try:
+                before_size: Optional[float] = None
+                normalized_symbol = str(symbol or "").replace("-SWAP", "/USDT/SWAP")
+                try:
+                    get_positions = getattr(ex, "get_positions", None)
+                    if callable(get_positions):
+                        rows = await get_positions()
+                        for p in rows or []:
+                            ps = str(p.get("symbol") or p.get("instId") or "")
+                            if normalized_symbol.split("/USDT")[0] in ps:
+                                before_size = float(p.get("size") or 0.0)
+                                break
+                except Exception:
+                    before_size = None
+
                 close_swap = getattr(ex, "close_swap_position", None)
                 if callable(close_swap):
                     res = await close_swap(symbol, side, size)
@@ -508,6 +605,56 @@ class ExecutionGateway:
                 detail = str(res.get("error") if isinstance(res, dict) else res)[:500]
                 self._record_order(source, "close", ok, detail or "ok", symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
                 if ok:
+                    post_check: Dict[str, Any] = {"status": "not_checked"}
+                    try:
+                        get_positions = getattr(ex, "get_positions", None)
+                        if callable(get_positions):
+                            # 给交易所状态一个极短传播窗口，降低“刚成交但仓位快照未刷新”的误报。
+                            await asyncio.sleep(0.35)
+                            rows = await get_positions()
+                            after_size = 0.0
+                            found = False
+                            for p in rows or []:
+                                ps = str(p.get("symbol") or p.get("instId") or "")
+                                if normalized_symbol.split("/USDT")[0] in ps:
+                                    after_size = float(p.get("size") or 0.0)
+                                    found = True
+                                    break
+                            if not found:
+                                post_check = {
+                                    "status": "position_closed",
+                                    "before_size": before_size,
+                                    "after_size": 0.0,
+                                }
+                            elif before_size is None:
+                                post_check = {
+                                    "status": "position_observed",
+                                    "before_size": None,
+                                    "after_size": after_size,
+                                }
+                            elif after_size < max(0.0, before_size - 1e-9):
+                                post_check = {
+                                    "status": "position_reduced",
+                                    "before_size": before_size,
+                                    "after_size": after_size,
+                                }
+                            elif after_size <= 1e-9:
+                                post_check = {
+                                    "status": "position_closed",
+                                    "before_size": before_size,
+                                    "after_size": after_size,
+                                }
+                            else:
+                                post_check = {
+                                    "status": "position_unchanged",
+                                    "before_size": before_size,
+                                    "after_size": after_size,
+                                }
+                    except Exception as chk_e:
+                        post_check = {"status": "check_failed", "error": str(chk_e)[:240]}
+
+                    if isinstance(res, dict):
+                        res["post_close_check"] = post_check
                     self._metric_inc("close_ok")
                     logger.info(
                         "ExecutionGateway: close_swap ok symbol=%s side=%s source=%s reason=%s",
@@ -515,21 +662,6 @@ class ExecutionGateway:
                         side,
                         source,
                         reason,
-                    )
-                    self._push_recent_event(
-                        {
-                            "ts": self._snapshot.last_order_at,
-                            "op": "close",
-                            "symbol": symbol,
-                            "side": side,
-                            "size": size,
-                            "leverage": None,
-                            "source": source,
-                            "reason": reason,
-                            "success": True,
-                            "detail": detail or "ok",
-                            "context": context or {},
-                        }
                     )
                     await self._notify_telegram(
                         f"✅ 平仓\n交易对: {symbol}\n方向: {side}\n来源: {source}\n原因: {reason}"
@@ -541,21 +673,6 @@ class ExecutionGateway:
                         symbol,
                         source,
                         detail,
-                    )
-                    self._push_recent_event(
-                        {
-                            "ts": self._snapshot.last_order_at,
-                            "op": "close",
-                            "symbol": symbol,
-                            "side": side,
-                            "size": size,
-                            "leverage": None,
-                            "source": source,
-                            "reason": reason,
-                            "success": False,
-                            "detail": detail,
-                            "context": context or {},
-                        }
                     )
                 # trade event fanout (best-effort)
                 try:
@@ -681,6 +798,34 @@ class ExecutionGateway:
                                         "raw": dict(res) if isinstance(res, dict) else {"raw": str(res)},
                                     },
                                 }
+                            )
+                    except Exception:
+                        pass
+                    # memory persistence (best-effort): feed AILearningEngine (trade_close memories)
+                    try:
+                        mc = self._mc
+                        mg = getattr(mc, "memory_gateway", None) if mc else None
+                        if mg and hasattr(mg, "add_memory"):
+                            ctx = context if isinstance(context, dict) else {}
+                            await mg.add_memory(
+                                memory_type="trade_record",
+                                content=f"trade_close {symbol} {side} pnl={pnl_val:+.4f} pnl_pct={pnl_pct_val:+.4%} price={price_val} qty={size}",
+                                metadata={
+                                    "kind": "trade_close",
+                                    "symbol": str(symbol),
+                                    "side": str(side),
+                                    "pnl": float(pnl_val),
+                                    "pnl_percent": float(pnl_pct_val),
+                                    "price": float(price_val),
+                                    "quantity": float(size) if size is not None else None,
+                                    "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
+                                    "trace_id": (ctx.get("trace_id") if isinstance(ctx, dict) else None),
+                                    "source": str(source or "gateway"),
+                                    "reason": str(reason or ""),
+                                },
+                                source_module="execution_gateway",
+                                importance=0.75,
+                                tags=["trade_close", "learning_feed"],
                             )
                     except Exception:
                         pass
@@ -960,21 +1105,6 @@ class ExecutionGateway:
                         source,
                         reason,
                     )
-                    self._push_recent_event(
-                        {
-                            "ts": self._snapshot.last_order_at,
-                            "op": "open",
-                            "symbol": symbol,
-                            "side": side,
-                            "size": size,
-                            "leverage": lev,
-                            "source": source,
-                            "reason": reason,
-                            "success": True,
-                            "detail": detail or "ok",
-                            "context": context or {},
-                        }
-                    )
                     extra = ""
                     if context and isinstance(context, dict):
                         r = str(context.get("decision_reasoning") or context.get("reasoning") or "")[:160]
@@ -997,21 +1127,6 @@ class ExecutionGateway:
                         symbol,
                         source,
                         detail,
-                    )
-                    self._push_recent_event(
-                        {
-                            "ts": self._snapshot.last_order_at,
-                            "op": "open",
-                            "symbol": symbol,
-                            "side": side,
-                            "size": size,
-                            "leverage": lev,
-                            "source": source,
-                            "reason": reason,
-                            "success": False,
-                            "detail": detail,
-                            "context": context or {},
-                        }
                     )
                 # trade event fanout (best-effort)
                 try:
@@ -1169,6 +1284,29 @@ class ExecutionGateway:
                 self._snapshot.last_order_context = dict(context)
             except Exception:
                 self._snapshot.last_order_context = {"raw": str(context)[:800]}
+
+        # Always emit a normalized recent_event for aggregation/diagnosis.
+        try:
+            ev_ctx: Dict[str, Any] = {}
+            if isinstance(context, dict):
+                ev_ctx.update(context)
+            self._push_recent_event(
+                {
+                    "ts": self._snapshot.last_order_at,
+                    "op": str(op or "").strip().lower(),
+                    "symbol": symbol,
+                    "side": side,
+                    "size": size,
+                    "leverage": leverage,
+                    "source": source,
+                    "reason": reason,
+                    "success": bool(success),
+                    "detail": str(detail or "")[:800],
+                    "context": ev_ctx,
+                }
+            )
+        except Exception:
+            pass
 
     async def get_recent_events(self, limit: int = 20) -> List[Dict[str, Any]]:
         lim = max(1, min(int(limit or 20), self._recent_events_limit))

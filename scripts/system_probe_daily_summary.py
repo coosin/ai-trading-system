@@ -45,7 +45,7 @@ def _suggestions(alert_counter: Counter[str]) -> List[str]:
     health = sum(v for k, v in alert_counter.items() if "unavailable" in k or "s1_verify_fail" in k)
 
     if health > 0:
-        tips.append("优先排查 API 可用性与网络连通，确认 /health 与 /api/v1/s1/verify 持续可用。")
+        tips.append("优先排查 API 可用性与网络连通，确认 /api/v1/system/health 与 /api/v1/s1/verify 持续可用。")
     if sp > 0:
         tips.append("价差拒绝偏高，建议放宽 max_spread_bps_to_trade 或减少低流动性时段交易。")
     if rr > 0:

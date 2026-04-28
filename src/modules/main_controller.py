@@ -53,6 +53,7 @@ from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 
 # 导入新增的升级模块
 from src.modules.core.dynamic_position_manager import DynamicPositionManager, DynamicPositionConfig
+from src.modules.core.trading_limits import resolve_position_limits
 from src.modules.core.correlation_monitor import CorrelationMonitor, CorrelationMonitorConfig
 from src.modules.core.strategy_hot_loader import StrategyHotLoader
 from src.modules.core.audit_logger import AuditLogger, AuditConfig, AuditEventType, AuditSeverity
@@ -946,7 +947,8 @@ class MainController:
             from src.modules.core.ai_learning_engine import AILearningEngine
             self.ai_learning_engine = AILearningEngine(
                 memory_manager=self.ai_memory_manager,
-                llm_integration=self.llm_integration
+                llm_integration=self.llm_integration,
+                config_manager=self.config_manager,
             )
             await self.ai_learning_engine.start()
             logger.info("✅ AI学习引擎初始化完成")
@@ -1400,11 +1402,48 @@ class MainController:
         # 初始化外部数据集成（多源冗余/健康报告；供主动性系统与司令部引用）
         try:
             from src.modules.data.data_integration import DataIntegration
+            from src.modules.data.data_integration import BinanceDataSource, CoinGeckoDataSource
             self.data_integration = DataIntegration(
                 config={},
                 third_party_integrator=getattr(self, "third_party_data_integrator", None),
             )
-            # Best-effort: no required sources, but allow future registration.
+            # Register sources from config/config.yaml:data.sources (and optional local overrides)
+            try:
+                data_cfg = await self.config_manager.get_config("data", {}) if self.config_manager else {}
+            except Exception:
+                data_cfg = {}
+            sources = (data_cfg.get("sources") or []) if isinstance(data_cfg, dict) else []
+            if isinstance(sources, list):
+                for s in sources:
+                    if not isinstance(s, dict):
+                        continue
+                    prov = str(s.get("provider") or "").strip().lower()
+                    enabled = bool(s.get("enabled", True))
+                    if not prov or not enabled:
+                        continue
+                    try:
+                        if prov == "binance":
+                            proxy_url = None
+                            try:
+                                proxy_url = str(os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip() or None
+                            except Exception:
+                                proxy_url = None
+                            self.data_integration.register_source("binance", BinanceDataSource(proxy_url=proxy_url))
+                        elif prov == "coingecko":
+                            proxy_url = None
+                            try:
+                                proxy_url = str(os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip() or None
+                            except Exception:
+                                proxy_url = None
+                            self.data_integration.register_source("coingecko", CoinGeckoDataSource(proxy_url=proxy_url))
+                    except Exception:
+                        continue
+            # Ensure at least one baseline source so health isn't empty.
+            try:
+                if getattr(self.data_integration, "_sources", {}) == {}:
+                    self.data_integration.register_source("coingecko", CoinGeckoDataSource(proxy_url=None))
+            except Exception:
+                pass
             try:
                 await self.data_integration.initialize_all()
             except Exception:
@@ -1547,10 +1586,17 @@ class MainController:
         
         # 初始化动态仓位管理器
         try:
+            # Align DynamicPositionManager caps with canonical trading.position_limits snapshot.
+            try:
+                limits = await resolve_position_limits(config_manager=self.config_manager)
+                sym_cap = float(limits.symbol_max_margin_ratio)
+            except Exception:
+                sym_cap = 0.2
             position_config = DynamicPositionConfig(
                 base_position_ratio=0.1,
                 max_position_ratio=0.3,
-                max_total_position_ratio=0.8
+                max_total_position_ratio=0.8,
+                max_single_position_ratio=max(0.01, min(0.92, sym_cap)),
             )
             self.dynamic_position_manager = DynamicPositionManager(position_config)
             await self.dynamic_position_manager.initialize()
@@ -1679,11 +1725,20 @@ class MainController:
                     eng = getattr(self, "ai_trading_engine", None)
                     rec = getattr(eng, "_record_stop_loss_feedback", None) if eng else None
                     if callable(rec):
+                        meta = getattr(order, "metadata", None) or {}
+                        event_id = (
+                            meta.get("sltp_order_id")
+                            or meta.get("trace_id")
+                            or meta.get("traceId")
+                            or getattr(order, "order_id", None)
+                            or getattr(order, "id", None)
+                        )
                         await rec(
                             symbol=str(order.symbol),
                             side=str(order.side),
                             current_price=float(current_price),
                             stop_loss=float(order.stop_loss_price or 0.0),
+                            event_id=str(event_id) if event_id else None,
                         )
                 except Exception:
                     pass
@@ -2187,6 +2242,7 @@ class MainController:
                         skill_manager=self.skill_manager,
                         memory_manager=self.hierarchical_memory,
                         notification_handler=self._send_notification_handler,
+                        main_controller=self,
                         interval=int(hb_cfg.get("interval_sec", 1800)) if isinstance(hb_cfg, dict) else 1800,
                         config_manager=self.config_manager,
                     )

@@ -6,7 +6,7 @@
 用法:
   python3 scripts/network_connectivity_smoke.py
   python3 scripts/network_connectivity_smoke.py --redis   # 需 REDIS_HOST / REDIS_PORT
-  python3 scripts/network_connectivity_smoke.py --api-url http://127.0.0.1:8000/health
+  python3 scripts/network_connectivity_smoke.py --api-url http://127.0.0.1:8000/api/v1/system/health
 """
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ def main() -> int:
     p.add_argument(
         "--api-url",
         default="",
-        help="可选：本机 API 健康检查 URL（如 http://127.0.0.1:8000/health）",
+        help="可选：本机 API 健康检查 URL（如 http://127.0.0.1:8000/api/v1/system/health）",
     )
     args = p.parse_args()
 

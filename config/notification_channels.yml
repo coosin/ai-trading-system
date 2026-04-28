@@ -1,0 +1,11 @@
+# 报警通知渠道配置
+channels:
+  - name: openclaw
+    type: webhook
+    url: http://127.0.0.1:8000/api/v1/notifications/webhook
+    enabled: true
+    events:
+      - high_profit
+      - high_loss
+      - system_error
+      - position_closed

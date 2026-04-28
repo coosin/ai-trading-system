@@ -22,7 +22,7 @@ echo "==> 启动 / 重建 trading-system 与 redis…"
 
 echo "==> 等待 API 就绪（最多 120s）…"
 for i in $(seq 1 24); do
-  if docker exec openclaw-trading curl -sf -o /dev/null "http://127.0.0.1:8000/health" 2>/dev/null; then
+  if docker exec openclaw-trading curl -sf -o /dev/null "http://127.0.0.1:8000/api/v1/system/health" 2>/dev/null; then
     echo "API 已就绪"
     break
   fi

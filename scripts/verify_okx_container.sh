@@ -8,8 +8,8 @@ if ! docker inspect "$C" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "=== GET /health ==="
-docker exec "$C" curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8000/health
+echo "=== GET /api/v1/system/health ==="
+docker exec "$C" curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8000/api/v1/system/health
 
 echo "=== GET /api/v1/exchanges ==="
 docker exec "$C" curl -sS http://127.0.0.1:8000/api/v1/exchanges

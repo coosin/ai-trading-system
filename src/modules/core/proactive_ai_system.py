@@ -153,6 +153,15 @@ class ProactiveMarketScanner:
         self._execute_min_confidence = float(
             self.config.get("proactive_execute_min_confidence", 0.78)
         )
+        # 是否允许同向加仓（默认禁止，避免“重复加仓直到可用资金耗尽”）
+        self._allow_scale_in = bool(self.config.get("proactive_allow_scale_in", False))
+        # 止损后冷却：避免“止损后立刻复仇单/重复突破再开”
+        self._stop_loss_cooldown_sec = float(self.config.get("proactive_stop_loss_cooldown_sec", 1800))
+        self._last_stop_loss_at: Dict[str, datetime] = {}
+        # 全局开仓预算：限制短时间内连开多个标的耗尽保证金
+        self._global_open_max_per_10m = int(self.config.get("proactive_global_open_max_per_10m", 1) or 1)
+        self._global_open_max_per_hour = int(self.config.get("proactive_global_open_max_per_hour", 3) or 3)
+        self._global_open_timestamps: List[datetime] = []
         # 均值回归：24h 涨跌幅绝对值低于此则不生成机会（原 5% 过易触发）
         self._mean_reversion_min_abs_change = float(
             self.config.get("mean_reversion_min_abs_change", 0.08)
@@ -883,6 +892,11 @@ class ProactiveMarketScanner:
 
     async def _evaluate_and_execute(self, opportunity: MarketOpportunity) -> bool:
         """评估并执行机会（僅在 proactive_auto_execute_opportunities=true 時由監控迴圈調用）"""
+        # Architecture guard: scanner is advisory-only.
+        # Even if legacy flags are toggled, execution must flow through unified analysis -> ai_core.
+        if not bool(self._auto_execute_opportunities):
+            await self._forward_opportunity_to_ai_core(opportunity)
+            return False
         logger.info(f"⚡ 评估机会: {opportunity.symbol} {self._zh_direction(opportunity.direction)}")
         trace_id = str(uuid.uuid4())
         # best-effort: push "intent" so we can trace every attempt in event stream
@@ -916,6 +930,102 @@ class ProactiveMarketScanner:
 
         sym_key = self._norm_symbol_key(opportunity.symbol)
         now = datetime.now()
+
+        # 0) Global open budget: throttle burst opens across symbols
+        try:
+            self._global_open_timestamps = [
+                t for t in self._global_open_timestamps if (now - t).total_seconds() < 7200
+            ]
+            opens_10m = sum(1 for t in self._global_open_timestamps if (now - t).total_seconds() < 600)
+            opens_1h = sum(1 for t in self._global_open_timestamps if (now - t).total_seconds() < 3600)
+            if opens_10m >= self._global_open_max_per_10m or opens_1h >= self._global_open_max_per_hour:
+                logger.warning(
+                    "⏳ 跳过机会(全局开仓预算)：10m=%s/%s 1h=%s/%s symbol=%s",
+                    opens_10m,
+                    self._global_open_max_per_10m,
+                    opens_1h,
+                    self._global_open_max_per_hour,
+                    sym_key,
+                )
+                return False
+        except Exception:
+            pass
+
+        # 0.1) Canonical position-count caps (avoid spamming execute_trade when already at cap)
+        try:
+            from src.modules.core.trading_limits import resolve_position_limits
+
+            engine = getattr(self.main_controller, "ai_trading_engine", None) if self.main_controller else None
+            if engine and hasattr(engine, "positions"):
+                limits = await resolve_position_limits(config_manager=getattr(self.main_controller, "config_manager", None))
+                pos = getattr(engine, "positions", {}) or {}
+                if isinstance(pos, dict):
+                    long_cnt = sum(1 for p in pos.values() if getattr(p, "side", "") == "long")
+                    short_cnt = sum(1 for p in pos.values() if getattr(p, "side", "") == "short")
+                    has_both = long_cnt > 0 and short_cnt > 0
+                    total_cap = int(limits.max_positions_hedge if has_both else limits.max_positions_oneway)
+                    hard_cap = int(limits.hard_max_positions)
+                    if len(pos) >= hard_cap and opportunity.symbol not in pos:
+                        logger.warning("⏳ 跳过机会(硬持仓上限=%s): %s", hard_cap, sym_key)
+                        return False
+                    if len(pos) >= total_cap and opportunity.symbol not in pos:
+                        logger.warning("⏳ 跳过机会(持仓上限=%s): %s", total_cap, sym_key)
+                        return False
+        except Exception:
+            pass
+
+        # 1) Stop-loss cooldown per symbol: avoid immediate re-open after stop_loss close
+        last_sl = self._last_stop_loss_at.get(f"sym:{sym_key}")
+        if last_sl and (now - last_sl).total_seconds() < self._stop_loss_cooldown_sec:
+            logger.warning(
+                "⏳ 跳过机会(止损后冷却 %ds): %s",
+                int(self._stop_loss_cooldown_sec),
+                sym_key,
+            )
+            return False
+
+        # best-effort sync stop-loss time from recent trade history (if available)
+        try:
+            ths = getattr(self.main_controller, "trade_history_service", None) if self.main_controller else None
+            if ths and hasattr(ths, "get_trades_by_symbol"):
+                rows = await ths.get_trades_by_symbol(str(opportunity.symbol), days=2, limit=20)
+                for r in rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    rsn = str(r.get("reasoning") or r.get("reason") or "").lower()
+                    if "stop_loss" not in rsn and "止损" not in rsn:
+                        continue
+                    ts_raw = r.get("timestamp") or r.get("time") or r.get("ts")
+                    if not ts_raw:
+                        continue
+                    try:
+                        t0 = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    self._last_stop_loss_at[f"sym:{sym_key}"] = t0
+                    if (now - t0).total_seconds() < self._stop_loss_cooldown_sec:
+                        logger.warning(
+                            "⏳ 跳过机会(止损后冷却 %ds, from history): %s",
+                            int(self._stop_loss_cooldown_sec),
+                            sym_key,
+                        )
+                        return False
+                    break
+        except Exception:
+            pass
+
+        # 2) Prevent scale-in by default: if already have same-side position, skip for ALL opp types
+        if not self._allow_scale_in:
+            try:
+                if await self._has_same_side_position(opportunity.symbol, opportunity.direction):
+                    logger.warning(
+                        "⏳ 跳过机会(禁止同向加仓): %s %s",
+                        sym_key,
+                        opportunity.direction,
+                    )
+                    return False
+            except Exception:
+                pass
         last_any = self._last_proactive_trade_at.get(f"sym:{sym_key}")
         if last_any and (now - last_any).total_seconds() < self._proactive_symbol_cooldown_sec:
             logger.info(
@@ -1015,7 +1125,8 @@ class ProactiveMarketScanner:
                         quantity=None,
                         stop_loss=opportunity.stop_loss,
                         take_profit=opportunity.take_profit,
-                        reasoning=opportunity.reasoning
+                        reasoning=opportunity.reasoning,
+                        confidence=float(opportunity.confidence or 0.0),
                     )
                     ok = bool(isinstance(result, dict) and result.get("success"))
                     if ok:
@@ -1547,26 +1658,34 @@ class ProactiveActionTrigger:
             self._last_action_time[str(cooldown_key or action_type)] = datetime.now()
     
     async def _execute_open_position(self, action: Dict) -> bool:
-        """执行开仓"""
+        """统一链路：主动模块只提交机会，不直连开仓执行。"""
         if not self.main_controller:
             return False
-        
-        engine = getattr(self.main_controller, 'ai_trading_engine', None)
-        if not engine:
-            return False
-        
         try:
-            result = await engine.execute_trade(
-                symbol=action.get('symbol'),
-                side=action.get('side'),
-                quantity=action.get('quantity'),
-                stop_loss=action.get('stop_loss'),
-                take_profit=action.get('take_profit'),
-                reasoning=action.get('reasoning', '主动性触发')
+            symbol = str(action.get("symbol") or "")
+            side = str(action.get("side") or "long")
+            confidence = float(action.get("confidence", 0.0) or 0.0)
+            entry = float(action.get("entry_price", 0.0) or 0.0)
+            sl = action.get("stop_loss")
+            tp = action.get("take_profit")
+            opp = MarketOpportunity(
+                symbol=symbol,
+                opportunity_type=OpportunityType.BREAKOUT,
+                direction=side,
+                confidence=confidence,
+                entry_price=entry if entry > 0 else 0.0,
+                stop_loss=float(sl) if sl is not None else 0.0,
+                take_profit=float(tp) if tp is not None else 0.0,
+                reasoning=str(action.get("reasoning") or "proactive_forward_only"),
+                timestamp=datetime.now(),
+                data_sources=["proactive_action_trigger"],
+                priority=int(action.get("priority", 5) or 5),
             )
-            return result is not None
+            await self._forward_opportunity_to_ai_core(opp)
+            logger.info("📨 主动开仓请求已改为分析层转发: %s %s", symbol, side)
+            return False
         except Exception as e:
-            logger.error(f"开仓执行失败: {e}")
+            logger.error(f"主动开仓转分析层失败: {e}")
             return False
     
     async def _execute_close_position(self, action: Dict) -> bool:

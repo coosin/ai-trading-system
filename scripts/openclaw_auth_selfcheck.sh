@@ -41,7 +41,7 @@ _curl_json() {
 echo "[INFO] BASE_URL=${BASE_URL}"
 echo "[INFO] source=${SOURCE}"
 echo "[STEP] 1/4 health"
-_curl_json GET "/health" >/dev/null
+_curl_json GET "/api/v1/system/health" >/dev/null
 echo "[OK] health reachable"
 
 echo "[STEP] 2/4 auth status"

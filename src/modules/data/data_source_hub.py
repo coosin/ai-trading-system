@@ -138,6 +138,9 @@ class DataSourceHub:
             # 经 HTTP 代理访问 OKX 时 2.8s 过短，会导致 exch.* 全 timeout → ticker fallback
             "fetch_timeout_sec": max(2.8, _ft),
             "snapshot_timeout_sec": max(6.0, _st),
+            # retry policy (borrowed from freqtrade-style resilient fetch pattern)
+            "fetch_retry_count": 2,
+            "fetch_retry_backoff_sec": 0.25,
             "include_klines_1h": True,
             "klines_1h_limit": 64,
             "exchange_collectors": [
@@ -159,16 +162,34 @@ class DataSourceHub:
             ],
             "extra_providers": [],
         }
+        # Explicit runtime config should be honored as a hard override.
+        cm_cfg: Dict[str, Any] = {}
+        try:
+            cm = getattr(mc, "config_manager", None) if mc else None
+            if cm is not None and hasattr(cm, "get_config_path_sync"):
+                x = cm.get_config_path_sync("data_source_hub", {})
+                if isinstance(x, dict):
+                    cm_cfg = dict(x)
+        except Exception:
+            cm_cfg = {}
         if mc and hasattr(mc, "get_ai_managed_config"):
             try:
                 cfg = await mc.get_ai_managed_config("data_source_hub", defaults)
                 out = cfg if isinstance(cfg, dict) else dict(defaults)
+                if cm_cfg:
+                    out.update(cm_cfg)
                 out["fetch_timeout_sec"] = max(6.0, float(out.get("fetch_timeout_sec", defaults["fetch_timeout_sec"]) or defaults["fetch_timeout_sec"]))
                 out["snapshot_timeout_sec"] = max(20.0, float(out.get("snapshot_timeout_sec", defaults["snapshot_timeout_sec"]) or defaults["snapshot_timeout_sec"]))
                 return out
             except Exception:
-                return dict(defaults)
-        return dict(defaults)
+                out = dict(defaults)
+                if cm_cfg:
+                    out.update(cm_cfg)
+                return out
+        out = dict(defaults)
+        if cm_cfg:
+            out.update(cm_cfg)
+        return out
 
     async def _legacy_enabled(self) -> bool:
         try:
@@ -195,27 +216,62 @@ class DataSourceHub:
         t0 = datetime.now()
         cfg = await self._cfg()
         to = float(timeout_sec if timeout_sec is not None else cfg.get("fetch_timeout_sec", 2.8) or 2.8)
-        try:
-            out = await asyncio.wait_for(coro, timeout=to)
-            if health is not None:
-                health[name] = {"status": "ok", "latency_ms": int((datetime.now() - t0).total_seconds() * 1000)}
-            return out
-        except asyncio.TimeoutError:
-            if health is not None:
-                health[name] = {"status": "timeout", "latency_ms": int((datetime.now() - t0).total_seconds() * 1000)}
-            if errors is not None:
-                errors.append(f"{name}:timeout")
-            return default
-        except Exception as e:
-            if health is not None:
-                health[name] = {
-                    "status": "error",
-                    "error": type(e).__name__,
-                    "latency_ms": int((datetime.now() - t0).total_seconds() * 1000),
-                }
-            if errors is not None:
-                errors.append(f"{name}:{type(e).__name__}")
-            return default
+        retry_count = max(1, int(cfg.get("fetch_retry_count", 2) or 2))
+        retry_backoff = max(0.0, float(cfg.get("fetch_retry_backoff_sec", 0.25) or 0.25))
+        last_err: Optional[Exception] = None
+        # Retry on transient timeout/connection errors to reduce false degradations.
+        for attempt in range(retry_count):
+            try:
+                out = await asyncio.wait_for(coro, timeout=to)
+                if health is not None:
+                    health[name] = {
+                        "status": "ok",
+                        "latency_ms": int((datetime.now() - t0).total_seconds() * 1000),
+                        "attempt": int(attempt + 1),
+                    }
+                return out
+            except asyncio.TimeoutError as e:
+                last_err = e
+                if attempt < retry_count - 1:
+                    await asyncio.sleep(retry_backoff * float(attempt + 1))
+                    continue
+                if health is not None:
+                    health[name] = {
+                        "status": "timeout",
+                        "latency_ms": int((datetime.now() - t0).total_seconds() * 1000),
+                        "attempt": int(attempt + 1),
+                    }
+                if errors is not None:
+                    errors.append(f"{name}:timeout")
+                return default
+            except Exception as e:
+                last_err = e
+                # Retry only likely transient transport failures.
+                en = type(e).__name__.lower()
+                transient = ("timeout" in en) or ("connection" in en) or ("network" in en)
+                if transient and attempt < retry_count - 1:
+                    await asyncio.sleep(retry_backoff * float(attempt + 1))
+                    continue
+                if health is not None:
+                    health[name] = {
+                        "status": "error",
+                        "error": type(e).__name__,
+                        "latency_ms": int((datetime.now() - t0).total_seconds() * 1000),
+                        "attempt": int(attempt + 1),
+                    }
+                if errors is not None:
+                    errors.append(f"{name}:{type(e).__name__}")
+                return default
+        if health is not None:
+            health[name] = {
+                "status": "error",
+                "error": type(last_err).__name__ if last_err else "UnknownError",
+                "latency_ms": int((datetime.now() - t0).total_seconds() * 1000),
+                "attempt": int(retry_count),
+            }
+        if errors is not None:
+            errors.append(f"{name}:{type(last_err).__name__ if last_err else 'UnknownError'}")
+        return default
 
     def _get_exchange(self) -> Any:
         if self._exchange_override is not None:
@@ -825,6 +881,7 @@ class DataSourceHub:
         defaults: Dict[str, Any] = {
             "ticker": {},
             "order_book": {},
+            "klines_1h": [],
             "open_interest": {},
             "funding_rate": None,
             "positions": [],
@@ -910,6 +967,17 @@ class DataSourceHub:
                     errors=errors,
                 )
             )
+        if bool(cfg.get("include_klines_1h", True)) and "klines_1h" in enabled:
+            task_specs["klines_1h"] = asyncio.create_task(
+                self._fetch_safe(
+                    "exch.klines_1h",
+                    self.get_klines(symbol, interval="1H", limit=int(cfg.get("klines_1h_limit", 64) or 64)),
+                    timeout_sec=self._collector_timeout("exch.klines_1h", cfg),
+                    default=[],
+                    health=health,
+                    errors=errors,
+                )
+            )
         budget_sec = float(os.getenv("OPENCLAW_DATA_HUB_EXCHANGE_BUDGET_SEC", "12") or "12")
         budget_sec = max(4.0, min(budget_sec, 20.0))
         done, pending = await asyncio.wait(set(task_specs.values()), timeout=budget_sec) if task_specs else (set(), set())
@@ -934,18 +1002,7 @@ class DataSourceHub:
         positions = results["positions"]
         orders = results["open_orders"]
         liq_proxy = results["liquidation_proxy"]
-
-        # Optional: include 1h klines so downstream analyzers (MI/gates) can reuse snapshot.
-        klines_1h: List[Dict[str, Any]] = []
-        if bool(cfg.get("include_klines_1h", True)) and "klines_1h" in enabled:
-            klines_1h = await self._fetch_safe(
-                "exch.klines_1h",
-                self.get_klines(symbol, interval="1H", limit=int(cfg.get("klines_1h_limit", 64) or 64)),
-                timeout_sec=self._collector_timeout("exch.klines_1h", cfg),
-                default=[],
-                health=health,
-                errors=errors,
-            )
+        klines_1h = results["klines_1h"]
         # Apply enabled filtering (keeps stable keys, but can drop heavy payloads)
         if "ticker" not in enabled:
             ticker = {}
