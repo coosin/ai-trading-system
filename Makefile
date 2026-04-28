@@ -1,4 +1,4 @@
-.PHONY: help install dev test lint format clean docker-up docker-down docker-build docker-logs
+.PHONY: help install dev test lint format clean docker-up docker-down docker-build docker-logs verify-trading verify-trading-gates
 
 # 默认目标
 .DEFAULT_GOAL := help
@@ -33,6 +33,8 @@ help:
 	@echo "  $(GREEN)make migrate$(NC)     - 运行数据库迁移"
 	@echo "  $(GREEN)make run$(NC)         - 运行开发服务器"
 	@echo "  $(GREEN)make coverage$(NC)    - 生成测试覆盖率报告"
+	@echo "  $(GREEN)make verify-trading$(NC) - 一键运行交易验收(fullcheck)"
+	@echo "  $(GREEN)make verify-trading-gates$(NC) - 运行微结构门控回归测试"
 	@echo ""
 
 # 安装依赖
@@ -151,6 +153,15 @@ coverage:
 	@echo "$(BLUE)生成测试覆盖率报告...$(NC)"
 	pytest --cov=src --cov-report=html --cov-report=term-missing
 	@echo "$(GREEN)覆盖率报告已生成，打开 htmlcov/index.html 查看$(NC)"
+
+# 统一验收入口
+verify-trading:
+	@echo "$(BLUE)运行交易验收 fullcheck...$(NC)"
+	python3 scripts/verify.py trading
+
+verify-trading-gates:
+	@echo "$(BLUE)运行微结构门控回归测试...$(NC)"
+	python3 scripts/verify.py trading-gates --kexpr microstructure
 
 # 预提交检查
 pre-commit:

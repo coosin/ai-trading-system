@@ -6,12 +6,13 @@
 - **要调参时，应该改哪个配置入口（并如何验证已生效）？**
 
 > 权威验证接口：`GET /api/v1/modules/commander/trading-diagnosis`
+> 调试手册：`docs/TRADING_DEBUG_PLAYBOOK.md`
 
 ---
 
-## 1) 你应该修改的“唯一入口/核心入口”
+## 1) 你应该修改的“主入口/核心入口”
 
-### 1.1 单币种/持仓数/加仓分层（唯一推荐入口）
+### 1.1 单币种/持仓数/加仓分层（主推荐入口）
 
 配置位置：`config/config.yaml` → `trading.position_limits`
 
@@ -45,11 +46,31 @@
 - `analysis_require_not_degraded_for_open`：是否拒绝降级数据路径开仓
 - `loss_streak_cooldown_*`：连续亏损冷却（降低震荡期追单）
 - `edge_after_cost_guard_*`：扣成本后的净边际收益门控
+- `microstructure_enable_funding_oi_gates`：是否启用 funding/OI 微结构门控
+- `microstructure_max_abs_funding_rate_to_trade`：资金费率绝对值上限（超限拒绝开仓）
+- `microstructure_min_open_interest_to_trade`：最小持仓量阈值（低流动性拒绝开仓）
 
 验证：
 
 - `GET /api/v1/modules/ai/frequency-profile`：看当前档位与 `min_confidence_to_trade` 等核心门槛。
 - `GET /api/v1/modules/commander/trading-diagnosis`：看 `ai_core.execution_guards.config` + `stats`（被哪些门控拦截）。
+
+### 1.2.2 微结构开仓门控（ai_trading 兼容链路）
+
+配置位置：`config/config.yaml` → `ai_trading.ai_config`
+
+- `enable_microstructure_open_gates`：开启 `spread/depth/funding/OI` 硬门控
+- `microstructure_max_spread_bps`：点差上限
+- `microstructure_max_abs_depth_imbalance`：盘口前5档深度失衡绝对值上限
+- `microstructure_max_abs_funding_rate`：资金费率绝对值上限
+- `microstructure_min_open_interest`：最小 open interest（可为空）
+
+诊断字段（`analysis_pipeline_assessment.market_analysis.samples[]`）：
+
+- `spread_bps`、`depth_imbalance`
+- `best_bid`、`best_ask`
+- `funding_rate`
+- `open_interest`
 
 ### 1.2.1 杠杆自适应（20~100，默认30）
 
@@ -164,6 +185,25 @@
 
 - `trading-diagnosis.data.execution_gateway.recent_events`
 - `trading-diagnosis.data.execution_attribution.top_reasons`
+- `trading-diagnosis.data.execution_reconciliation`：本地/交易所持仓与挂单是否漂移
+- `trading-diagnosis.data.execution_reconciliation_protection`：对账保护是否正在阻断新开仓
+- `trading-diagnosis.data.execution_safe_recovery`：系统已自动执行了哪些安全恢复动作
+- `GET /api/v1/modules/commander/decision-traces`：最近决策轨迹的聚合复盘（拒绝原因/执行失败/保护拦截）
+
+### 2.1 开仓参数变更最小流程（标准化）
+
+1. 修改 `config/config.yaml` 的相关门控参数（每次 1~2 项）
+2. 重启服务使配置生效
+3. 执行 `make verify-trading-gates`
+4. 执行 `make verify-trading`
+5. 观察 `decision-traces` 最近 20~50 条样本是否朝目标方向变化
+
+### 2.2 平仓参数变更最小流程（标准化）
+
+1. 修改 `stop_loss_take_profit.*` 下对应参数
+2. 运行 `python3 scripts/sltp_sr_simtest.py`
+3. 运行 `make verify-trading`
+4. 观察 `trading-diagnosis.data.sltp` 指标是否符合预期（触发率、锁盈、保本）
 
 ---
 
@@ -186,9 +226,21 @@
 
 - 运行态验证：`trading-diagnosis.data.ai_learning_engine.running == true`
 - 有效性验证：`total_lessons` 与 `reports_generated` 应随新增真实平仓样本持续增长（不是只看 running）
+- 轨迹反馈验证：`trading-diagnosis.data.trace_learning_feedback` 应能看到最近 `guard_rejected / execution_failed / reconciliation_blocked` 的聚合反馈
 - 闭环验证（需要写接口 token）：调用
   - `POST /api/v1/modules/commander/learning/seed-and-run`
   - 再看 `trading-diagnosis.data.ai_learning_engine.total_lessons/reports_generated` 是否递增
+
+补充：
+
+- `GET /api/v1/modules/commander/decision-traces/{trace_id}` 可按单条链路查看：
+  - AI 意图（intent）
+  - 门控结果（guard）
+  - 执行结果（execution）
+  - 对账保护命中（reconciliation）
+- `POST /api/v1/modules/commander/learning/seed-and-run` 适合做验收联调：
+  - 不会下真实单
+  - 但会写入学习样本、生成学习报告，并可能更新运行态配置覆盖，不属于严格只读
 
 注意：`seed-and-run` 是写接口，默认会返回 `401`（没有 token）或 `403`（角色不够），属于正常保护行为。
 

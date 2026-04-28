@@ -246,10 +246,14 @@ def run_checks(repo: Path, openapi: dict) -> CheckResult:
         "/api/v1/auth/status",
         "/api/v1/auth/write-policy",
         "/api/v1/trades/attribution/regime/health",
-        # Runtime-first commander diagnosis endpoint (may be absent in stale snapshot exports)
-        "/api/v1/modules/commander/trading-diagnosis",
-        # Runtime-first learning seed endpoint (auth-protected, not always in snapshot export)
-        "/api/v1/modules/commander/learning/seed-and-run",
+        # Historical removed endpoints can still appear in cleanup docs.
+        "/api/v1/commander",
+        "/api/v1/commander/_audit",
+        "/api/v1/commander/{path}",
+        "/api/v1/data-fusion/analyze",
+        "/api/v1/data-fusion/analyze/{symbol}",
+        "/api/v1/trade/history",
+        "/api/v1/trading/history",
     }
 
     ignore_prefixes = (

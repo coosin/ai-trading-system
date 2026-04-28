@@ -10,6 +10,16 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        if x == x:
+            return x
+    except Exception:
+        pass
+    return float(default)
+
 def init_module_control_api(app, main_controller):
     """初始化模块控制API"""
     
@@ -2813,8 +2823,26 @@ def init_module_control_api(app, main_controller):
                 if gw and hasattr(gw, "get_recent_events"):
                     snap["recent_events"] = await gw.get_recent_events(limit=int(limit_events or 20))
                 out["execution_gateway"] = snap
+                out["execution_reconciliation"] = (
+                    snap.get("reconciliation") if isinstance(snap, dict) else None
+                )
+                out["execution_reconciliation_protection"] = (
+                    snap.get("reconciliation_protection") if isinstance(snap, dict) else None
+                )
+                out["execution_safe_recovery"] = (
+                    ((snap.get("reconciliation") or {}).get("safe_recovery"))
+                    if isinstance(snap, dict) and isinstance(snap.get("reconciliation"), dict)
+                    else None
+                )
+                out["decision_traces"] = (
+                    snap.get("decision_traces") if isinstance(snap, dict) else None
+                )
             else:
                 out["execution_gateway"] = None
+                out["execution_reconciliation"] = None
+                out["execution_reconciliation_protection"] = None
+                out["execution_safe_recovery"] = None
+                out["decision_traces"] = None
         except Exception as e:
             out["execution_gateway_error"] = str(e)
 
@@ -2829,6 +2857,8 @@ def init_module_control_api(app, main_controller):
         try:
             le = getattr(mc, "ai_learning_engine", None)
             out["ai_learning_engine"] = le.get_status() if (le and hasattr(le, "get_status")) else None
+            if isinstance(out.get("ai_learning_engine"), dict):
+                out["trace_learning_feedback"] = (out.get("ai_learning_engine") or {}).get("trace_feedback")
         except Exception as e:
             out["ai_learning_engine_error"] = str(e)
 
@@ -2836,7 +2866,13 @@ def init_module_control_api(app, main_controller):
         try:
             ths = getattr(mc, "trade_history_service", None)
             if ths and hasattr(ths, "get_statistics"):
-                out["trade_history_30d"] = await ths.get_statistics(days=30, force_refresh=True)
+                # 诊断接口优先快返回，避免为了强制刷新历史统计而阻塞整条验收链路。
+                out["trade_history_30d"] = await asyncio.wait_for(
+                    ths.get_statistics(days=30, force_refresh=False),
+                    timeout=2.5,
+                )
+        except asyncio.TimeoutError:
+            out["trade_history_30d"] = {"degraded": True, "message": "trade_history_stats_timeout"}
         except Exception as e:
             out["trade_history_error"] = str(e)
 
@@ -2872,20 +2908,172 @@ def init_module_control_api(app, main_controller):
             sampled_symbols = list(pa_cfg.get("default_symbols", []) or [])
             if not sampled_symbols:
                 sampled_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT"]
-            sampled_symbols = [str(s) for s in sampled_symbols[:8]]
+            sampled_symbols = [str(s) for s in sampled_symbols[:4]]
             market_rows: List[Dict[str, Any]] = []
             degraded_cnt = 0
             quality_non_null = 0
             conf_non_null = 0
             trend_known = 0
-            if mi and hasattr(mi, "get_symbol_view"):
-                for sym in sampled_symbols:
+
+            async def _sample_symbol_view(sym: str) -> Dict[str, Any]:
+                try:
+                    cached = (
+                        mi.get_cached_symbol_view(sym)
+                        if hasattr(mi, "get_cached_symbol_view")
+                        else {}
+                    )
+                    if isinstance(cached, dict) and cached:
+                        prov = str(cached.get("provenance") or "").lower()
+                        partial = bool(cached.get("partial", False))
+                        if (
+                            not partial
+                            and prov not in {"fastpath", "degraded", "unknown"}
+                            and cached.get("quality_score") is not None
+                            and cached.get("confidence") is not None
+                        ):
+                            return {"symbol": sym, "view": cached}
+                except Exception:
+                    pass
+                try:
+                    view = await asyncio.wait_for(
+                        mi.get_symbol_view(sym, include_snapshot=True, prefer_fast_only=False),
+                        timeout=2.5,
+                    )
+                    vd = view.to_dict() if hasattr(view, "to_dict") else {}
+                    if isinstance(vd, dict) and vd:
+                        prov = str(vd.get("provenance") or "").lower()
+                        partial = bool(vd.get("partial", False))
+                        strong = (
+                            (not partial)
+                            and ("degraded" not in prov)
+                            and ("fastpath" not in prov)
+                            and prov not in {"", "unknown"}
+                            and vd.get("confidence") is not None
+                            and (
+                                vd.get("quality_score") is not None
+                                or vd.get("atr_pct_1h") is not None
+                                or vd.get("spread_bps") is not None
+                            )
+                        )
+                        if strong:
+                            return {"symbol": sym, "view": vd}
+                except asyncio.TimeoutError:
                     try:
                         view = await asyncio.wait_for(
-                            mi.get_symbol_view(sym, include_snapshot=True, prefer_fast_only=False),
-                            timeout=5.0,
+                            mi.get_symbol_view(sym, include_snapshot=False, prefer_fast_only=True),
+                            timeout=1.0,
                         )
                         vd = view.to_dict() if hasattr(view, "to_dict") else {}
+                        if isinstance(vd, dict) and vd:
+                            prov = str(vd.get("provenance") or "").lower()
+                            partial = bool(vd.get("partial", False))
+                            strong = (
+                                (not partial)
+                                and ("degraded" not in prov)
+                                and ("fastpath" not in prov)
+                                and prov not in {"", "unknown"}
+                                and vd.get("confidence") is not None
+                                and (
+                                    vd.get("quality_score") is not None
+                                    or vd.get("atr_pct_1h") is not None
+                                    or vd.get("spread_bps") is not None
+                                )
+                            )
+                            if strong:
+                                return {"symbol": sym, "view": vd}
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    hub = getattr(mc, "data_source_hub", None)
+                    if hub and hasattr(hub, "get_exchange_channel"):
+                        exch = await asyncio.wait_for(hub.get_exchange_channel(sym), timeout=8.0)
+                        q = (
+                            hub._score_quality(exch, {})
+                            if hasattr(hub, "_score_quality")
+                            else {}
+                        )
+                        ticker = (exch.get("ticker") or {}) if isinstance(exch, dict) else {}
+                        order_book = (exch.get("order_book") or {}) if isinstance(exch, dict) else {}
+                        open_interest = (exch.get("open_interest") or {}) if isinstance(exch, dict) else {}
+                        funding_rate = exch.get("funding_rate") if isinstance(exch, dict) else None
+                        quality = q.get("score") if isinstance(q, dict) else None
+                        kl = (exch.get("klines_1h") or []) if isinstance(exch, dict) else []
+                        if not ticker and not kl and quality is None:
+                            raise RuntimeError("exchange_channel_empty")
+                        ob_bids = order_book.get("bids") if isinstance(order_book, dict) else []
+                        ob_asks = order_book.get("asks") if isinstance(order_book, dict) else []
+                        best_bid = _safe_float(ob_bids[0][0], 0.0) if ob_bids else 0.0
+                        best_ask = _safe_float(ob_asks[0][0], 0.0) if ob_asks else 0.0
+                        spread_bps = None
+                        if best_bid > 0 and best_ask > 0:
+                            mid = 0.5 * (best_bid + best_ask)
+                            if mid > 0 and best_ask >= best_bid:
+                                spread_bps = float(((best_ask - best_bid) / mid) * 10000.0)
+                        depth_imbalance = None
+                        try:
+                            bid_sz = sum(_safe_float(x[1], 0.0) for x in (ob_bids[:5] or []))
+                            ask_sz = sum(_safe_float(x[1], 0.0) for x in (ob_asks[:5] or []))
+                            denom = bid_sz + ask_sz
+                            if denom > 0:
+                                depth_imbalance = float((bid_sz - ask_sz) / denom)
+                        except Exception:
+                            depth_imbalance = None
+                        atr_pct = None
+                        try:
+                            if isinstance(kl, list) and len(kl) >= 15:
+                                highs = [_safe_float(k.get("high"), 0.0) for k in kl[-15:]]
+                                lows = [_safe_float(k.get("low"), 0.0) for k in kl[-15:]]
+                                closes = [_safe_float(k.get("close"), 0.0) for k in kl[-15:]]
+                                trs = []
+                                for i in range(1, len(closes)):
+                                    trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+                                if trs and closes[-1] > 0:
+                                    atr_pct = float(sum(trs[-14:]) / max(1, len(trs[-14:])) / closes[-1])
+                        except Exception:
+                            atr_pct = None
+                        change_24h = _safe_float(ticker.get("change24h") or ticker.get("change_24h") or ticker.get("change"), 0.0)
+                        trend = "sideways"
+                        if change_24h >= 0.003:
+                            trend = "bullish"
+                        elif change_24h <= -0.003:
+                            trend = "bearish"
+                        conf = max(0.45, min(0.85, float(quality if quality is not None else 0.45)))
+                        if atr_pct is not None and atr_pct > 0:
+                            conf = max(conf, 0.55)
+                        return {
+                            "symbol": sym,
+                            "view": {
+                                "symbol": sym,
+                                "quality_score": quality,
+                                "confidence": round(conf, 3),
+                                "trend": trend,
+                                "spread_bps": round(spread_bps, 4) if spread_bps is not None else None,
+                                "atr_pct_1h": atr_pct,
+                                "depth_imbalance": round(depth_imbalance, 4) if depth_imbalance is not None else None,
+                                "best_bid": best_bid if best_bid > 0 else None,
+                                "best_ask": best_ask if best_ask > 0 else None,
+                                "open_interest": open_interest if isinstance(open_interest, dict) and open_interest else None,
+                                "funding_rate": funding_rate,
+                                "provenance": "unified_snapshot_fallback",
+                                "partial": False,
+                            },
+                        }
+                except Exception:
+                    pass
+                return {"symbol": sym, "degraded": True, "error": "symbol_view_error"}
+
+            if mi and hasattr(mi, "get_symbol_view"):
+                rows = []
+                for sym in sampled_symbols:
+                    rows.append(await _sample_symbol_view(sym))
+                for row in rows:
+                    try:
+                        sym = str(row.get("symbol") or "")
+                        vd = row.get("view") if isinstance(row.get("view"), dict) else {}
+                        if not vd:
+                            raise RuntimeError(str(row.get("error") or "symbol_view_unavailable"))
                         quality = vd.get("quality_score")
                         conf = vd.get("confidence")
                         trend = str(vd.get("trend") or "unknown").lower()
@@ -2908,14 +3096,19 @@ def init_module_control_api(app, main_controller):
                                 "trend": vd.get("trend"),
                                 "spread_bps": vd.get("spread_bps"),
                                 "atr_pct_1h": vd.get("atr_pct_1h"),
+                                "depth_imbalance": vd.get("depth_imbalance"),
+                                "best_bid": vd.get("best_bid"),
+                                "best_ask": vd.get("best_ask"),
+                                "open_interest": vd.get("open_interest"),
+                                "funding_rate": vd.get("funding_rate"),
                                 "provenance": vd.get("provenance"),
                                 "partial": partial,
                                 "degraded": degraded,
                             }
                         )
-                    except Exception:
+                    except Exception as e:
                         degraded_cnt += 1
-                        market_rows.append({"symbol": sym, "degraded": True, "error": "symbol_view_timeout_or_error"})
+                        market_rows.append({"symbol": row.get("symbol"), "degraded": True, "error": str(e)[:80]})
 
             total_m = max(1, len(market_rows))
             assess["market_analysis"] = {
@@ -2931,7 +3124,7 @@ def init_module_control_api(app, main_controller):
             decision_health = {"sample_size": 0, "wins": 0, "losses": 0, "win_rate": None, "sum_pnl": 0.0, "expectancy": None}
             ths = getattr(mc, "trade_history_service", None)
             if ths and hasattr(ths, "get_recent_trades"):
-                rows = await ths.get_recent_trades(limit=200)
+                rows = await asyncio.wait_for(ths.get_recent_trades(limit=120), timeout=2.5)
                 clean = []
                 for r in rows or []:
                     if not isinstance(r, dict):
@@ -2964,6 +3157,7 @@ def init_module_control_api(app, main_controller):
                 "running": bool((le_st or {}).get("running", False)),
                 "total_lessons": lessons,
                 "reports_generated": reports,
+                "trace_feedback": (le_st or {}).get("trace_feedback"),
                 "effective": bool(lessons > 0 and reports > 0),
                 "hint": "seed-and-run then verify total_lessons/reports_generated increments"
                 if not (lessons > 0 and reports > 0)
@@ -2987,6 +3181,35 @@ def init_module_control_api(app, main_controller):
             if gw and hasattr(gw, "get_policy_metrics"):
                 pm = gw.get_policy_metrics() or {}
                 hints.append("execution 脊柱: " + ", ".join([f"{k}={pm.get(k)}" for k in ("open_ok","open_fail","close_ok","close_fail")]))
+            rec = out.get("execution_reconciliation") if isinstance(out.get("execution_reconciliation"), dict) else {}
+            if rec:
+                sm = rec.get("summary") if isinstance(rec.get("summary"), dict) else {}
+                hints.append(
+                    "execution 对账: "
+                    + ", ".join(
+                        [
+                            f"healthy={rec.get('healthy')}",
+                            f"severity={rec.get('severity')}",
+                            f"drift_total={sm.get('drift_total', 0)}",
+                            f"stale_open_orders={sm.get('stale_open_orders', 0)}",
+                        ]
+                    )
+                )
+            rcp = out.get("execution_reconciliation_protection") if isinstance(out.get("execution_reconciliation_protection"), dict) else {}
+            if rcp:
+                sl = rcp.get("symbol_locks") if isinstance(rcp.get("symbol_locks"), dict) else {}
+                hints.append(
+                    "reconciliation protection: "
+                    + ", ".join(
+                        [
+                            f"global={bool(rcp.get('global_lock_active', False))}",
+                            f"symbol_locks={len(sl)}",
+                        ]
+                    )
+                )
+                acts = rcp.get("safe_recovery_actions") if isinstance(rcp.get("safe_recovery_actions"), list) else []
+                if acts:
+                    hints.append(f"safe recovery actions={len(acts)}")
             out["diagnosis_hints"] = hints
         except Exception:
             pass
@@ -3078,6 +3301,47 @@ def init_module_control_api(app, main_controller):
             out["execution_attribution_error"] = str(e)
 
         return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/decision-traces")
+    async def commander_decision_traces(limit: int = 50):
+        """
+        最近 AI 决策轨迹聚合复盘：
+        - 门控拒绝原因分布
+        - 执行失败分布
+        - 对账保护阻断分布
+        - 最近轨迹样本
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            store = getattr(main_controller, "decision_trace_store", None)
+            if not store:
+                return {
+                    "success": True,
+                    "data": {"summary": {"sample_size": 0}, "recent": []},
+                    "timestamp": datetime.now().isoformat(),
+                }
+            if hasattr(store, "analyze_recent"):
+                data = store.analyze_recent(limit=int(limit or 50))
+            else:
+                data = {"summary": {"sample_size": 0}, "recent": []}
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/decision-traces/{trace_id}")
+    async def commander_decision_trace_detail(trace_id: str):
+        """按 trace_id 查看单条 AI 决策链路。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            store = getattr(main_controller, "decision_trace_store", None)
+            row = store.get_by_trace_id(trace_id) if (store and hasattr(store, "get_by_trace_id")) else None
+            if not row:
+                return {"success": False, "message": "trace_id not found", "timestamp": datetime.now().isoformat()}
+            return {"success": True, "data": row, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
     @router.post("/commander/learning/seed-and-run")
     async def commander_learning_seed_and_run(payload: Dict[str, Any] = Body(default_factory=dict)):

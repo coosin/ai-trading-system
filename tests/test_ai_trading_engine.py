@@ -114,6 +114,127 @@ class TestAITradingEngine(AsyncTestCase):
         # 低置信度应该返回HOLD
         assert decision is not None
         assert decision.action.value == "hold"
+
+    @pytest.mark.asyncio
+    async def test_make_decision_microstructure_spread_gate(self, trading_engine):
+        """微结构门控：高点差应拒绝开仓。"""
+        from src.modules.core.ai_trading_engine import MarketContext
+
+        context = MarketContext(
+            symbol="BTC/USDT",
+            price=50000.0,
+            trend="bullish",
+            volatility=0.02,
+            volume_24h=1000000.0,
+            sentiment="neutral",
+            metadata={
+                "market_intelligence": {
+                    "spread_bps": 25.0,
+                    "depth_imbalance": 0.1,
+                    "funding_rate": 0.0001,
+                    "open_interest": 1000000.0,
+                }
+            },
+        )
+        trading_engine.llm_integration.generate_trading_signal = AsyncMock(
+            return_value={"signal": "buy", "confidence": 0.9, "reasoning": "Test buy"}
+        )
+
+        decision = await trading_engine._make_decision("BTC/USDT", context, None)
+        assert decision is not None
+        assert decision.action.value == "hold"
+        assert "微结构开仓门控触发" in (decision.reasoning or "")
+
+    @pytest.mark.asyncio
+    async def test_make_decision_microstructure_funding_gate(self, trading_engine):
+        """微结构门控：极端 funding 应拒绝开仓。"""
+        from src.modules.core.ai_trading_engine import MarketContext
+
+        context = MarketContext(
+            symbol="BTC/USDT",
+            price=50000.0,
+            trend="bullish",
+            volatility=0.02,
+            volume_24h=1000000.0,
+            sentiment="neutral",
+            metadata={
+                "market_intelligence": {
+                    "spread_bps": 2.0,
+                    "depth_imbalance": 0.1,
+                    "funding_rate": 0.005,
+                    "open_interest": 1000000.0,
+                }
+            },
+        )
+        trading_engine.llm_integration.generate_trading_signal = AsyncMock(
+            return_value={"signal": "buy", "confidence": 0.9, "reasoning": "Test buy"}
+        )
+
+        decision = await trading_engine._make_decision("BTC/USDT", context, None)
+        assert decision is not None
+        assert decision.action.value == "hold"
+        assert "funding_rate" in (decision.reasoning or "")
+
+    @pytest.mark.asyncio
+    async def test_make_decision_microstructure_oi_gate(self, trading_engine):
+        """微结构门控：低 open interest 应拒绝开仓。"""
+        from src.modules.core.ai_trading_engine import MarketContext
+
+        trading_engine.ai_config["microstructure_min_open_interest"] = 500000.0
+        context = MarketContext(
+            symbol="BTC/USDT",
+            price=50000.0,
+            trend="bullish",
+            volatility=0.02,
+            volume_24h=1000000.0,
+            sentiment="neutral",
+            metadata={
+                "market_intelligence": {
+                    "spread_bps": 2.0,
+                    "depth_imbalance": 0.1,
+                    "funding_rate": 0.0001,
+                    "open_interest": 10000.0,
+                }
+            },
+        )
+        trading_engine.llm_integration.generate_trading_signal = AsyncMock(
+            return_value={"signal": "buy", "confidence": 0.9, "reasoning": "Test buy"}
+        )
+
+        decision = await trading_engine._make_decision("BTC/USDT", context, None)
+        assert decision is not None
+        assert decision.action.value == "hold"
+        assert "open_interest" in (decision.reasoning or "")
+
+    @pytest.mark.asyncio
+    async def test_make_decision_microstructure_pass_allows_open(self, trading_engine):
+        """微结构门控通过时，不应拦截开仓。"""
+        from src.modules.core.ai_trading_engine import MarketContext
+
+        trading_engine._calculate_position_size = AsyncMock(return_value=0.001)
+        context = MarketContext(
+            symbol="BTC/USDT",
+            price=50000.0,
+            trend="bullish",
+            volatility=0.02,
+            volume_24h=1000000.0,
+            sentiment="neutral",
+            metadata={
+                "market_intelligence": {
+                    "spread_bps": 1.5,
+                    "depth_imbalance": 0.1,
+                    "funding_rate": 0.0001,
+                    "open_interest": 1000000.0,
+                }
+            },
+        )
+        trading_engine.llm_integration.generate_trading_signal = AsyncMock(
+            return_value={"signal": "buy", "confidence": 0.9, "reasoning": "Test buy"}
+        )
+
+        decision = await trading_engine._make_decision("BTC/USDT", context, None)
+        assert decision is not None
+        assert decision.action.value == "open_long"
     
     @pytest.mark.asyncio
     async def test_risk_check_max_positions(self, trading_engine):

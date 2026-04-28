@@ -196,6 +196,15 @@ class AITradingEngine:
             "low_quality_confidence_penalty": 0.08,
             "fallback_open_min_quality": 0.55,
             "fallback_open_block_seconds": 45,
+            # Microstructure hard gates for open actions.
+            "enable_microstructure_open_gates": True,
+            "microstructure_max_spread_bps": 12.0,
+            "microstructure_max_abs_depth_imbalance": 0.92,
+            "microstructure_max_abs_funding_rate": 0.0012,
+            "microstructure_min_open_interest": None,
+            "stop_loss_penalty_step_hits": 3,
+            "stop_loss_penalty_step_confidence": 0.05,
+            "stop_loss_penalty_max_confidence": 0.15,
         }
         
         # 运行状态
@@ -515,6 +524,17 @@ class AITradingEngine:
                 ai_config=self.ai_config,
                 ai_core_config=None,
             )
+            learning_feedback_cfg = await self.main_controller.config_manager.get_config(
+                "learning_feedback", {}
+            )
+            if isinstance(learning_feedback_cfg, dict):
+                for k in (
+                    "stop_loss_penalty_step_hits",
+                    "stop_loss_penalty_step_confidence",
+                    "stop_loss_penalty_max_confidence",
+                ):
+                    if learning_feedback_cfg.get(k) is not None:
+                        self.ai_config[k] = learning_feedback_cfg.get(k)
         await self._sync_symbols_from_selector(force=True)
         
         self._running = True
@@ -1373,9 +1393,21 @@ class AITradingEngine:
                 signal_key = self._build_signal_key(symbol, action, context)
                 stat = self._signal_stop_loss_stats.get(signal_key, {})
                 stop_loss_hits = int(stat.get("stop_loss_hits", 0) or 0)
-                penalty_steps = stop_loss_hits // 3
+                step_hits = max(
+                    1,
+                    int(self.ai_config.get("stop_loss_penalty_step_hits", 3) or 3),
+                )
+                step_conf = float(
+                    self.ai_config.get("stop_loss_penalty_step_confidence", 0.05)
+                    or 0.05
+                )
+                max_conf = float(
+                    self.ai_config.get("stop_loss_penalty_max_confidence", 0.15)
+                    or 0.15
+                )
+                penalty_steps = stop_loss_hits // step_hits
                 if penalty_steps > 0:
-                    extra_threshold = min(0.15, 0.05 * penalty_steps)
+                    extra_threshold = min(max_conf, step_conf * penalty_steps)
                     threshold = float(self.ai_config["min_confidence"]) + extra_threshold
                     if float(confidence) < threshold:
                         return AIDecision(
@@ -1390,6 +1422,109 @@ class AITradingEngine:
                             ),
                             risk_level=ai_decision.get("risk_level", "high"),
                             metadata={"ai_analysis": ai_decision, "market_context": context.__dict__},
+                        )
+
+            # 微结构硬门控：当盘口/资金费率/持仓量风险过高时，直接跳过开仓。
+            if action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]:
+                if bool(self.ai_config.get("enable_microstructure_open_gates", True)):
+                    mi_raw: Dict[str, Any] = {}
+                    if mi_view is not None and hasattr(mi_view, "to_dict"):
+                        try:
+                            mi_raw = mi_view.to_dict() or {}
+                        except Exception:
+                            mi_raw = {}
+                    if not isinstance(mi_raw, dict) or not mi_raw:
+                        md = context.metadata if isinstance(context.metadata, dict) else {}
+                        x = md.get("market_intelligence") if isinstance(md, dict) else {}
+                        mi_raw = x if isinstance(x, dict) else {}
+
+                    spread = mi_raw.get("spread_bps")
+                    depth_imb = (
+                        mi_raw.get("depth_imbalance")
+                        if mi_raw.get("depth_imbalance") is not None
+                        else mi_raw.get("depth_imbalance_top5")
+                    )
+                    funding = mi_raw.get("funding_rate")
+                    open_interest = mi_raw.get("open_interest")
+
+                    # Fallback to unified snapshot payload when MI view does not expose these fields.
+                    try:
+                        snap_a = (snap.get("渠道A_交易所实时执行数据") or {}) if isinstance(snap, dict) else {}
+                        if funding is None:
+                            funding = snap_a.get("funding_rate")
+                        if open_interest is None:
+                            oi_raw = snap_a.get("open_interest")
+                            if isinstance(oi_raw, dict):
+                                open_interest = oi_raw.get("open_interest")
+                            else:
+                                open_interest = oi_raw
+                    except Exception:
+                        pass
+
+                    violations: List[str] = []
+                    try:
+                        sp_v = float(spread) if spread is not None else None
+                    except Exception:
+                        sp_v = None
+                    try:
+                        di_v = float(depth_imb) if depth_imb is not None else None
+                    except Exception:
+                        di_v = None
+                    try:
+                        fr_v = float(funding) if funding is not None else None
+                    except Exception:
+                        fr_v = None
+                    try:
+                        oi_v = float(open_interest) if open_interest is not None else None
+                    except Exception:
+                        oi_v = None
+
+                    max_sp = float(self.ai_config.get("microstructure_max_spread_bps", 12.0) or 12.0)
+                    max_di = float(self.ai_config.get("microstructure_max_abs_depth_imbalance", 0.92) or 0.92)
+                    max_fr = float(self.ai_config.get("microstructure_max_abs_funding_rate", 0.0012) or 0.0012)
+                    min_oi_cfg = self.ai_config.get("microstructure_min_open_interest")
+                    try:
+                        min_oi = float(min_oi_cfg) if min_oi_cfg not in (None, "", "null") else None
+                    except Exception:
+                        min_oi = None
+
+                    if sp_v is not None and sp_v > max_sp:
+                        violations.append(f"spread_bps={sp_v:.4f}>{max_sp:.4f}")
+                    if di_v is not None and abs(di_v) > max_di:
+                        violations.append(f"depth_imbalance={di_v:.4f}>{max_di:.4f}")
+                    if fr_v is not None and abs(fr_v) > max_fr:
+                        violations.append(f"funding_rate={fr_v:.6f}>{max_fr:.6f}")
+                    if min_oi is not None and oi_v is not None and oi_v < min_oi:
+                        violations.append(f"open_interest={oi_v:.2f}<{min_oi:.2f}")
+
+                    if violations:
+                        return AIDecision(
+                            action=TradeAction.HOLD,
+                            symbol=symbol,
+                            price=context.price,
+                            quantity=0.0,
+                            confidence=confidence,
+                            reasoning=(
+                                f"微结构开仓门控触发: {'; '.join(violations)}，跳过开仓"
+                            ),
+                            risk_level="high",
+                            metadata={
+                                "ai_analysis": ai_decision,
+                                "market_context": context.__dict__,
+                                "microstructure_gate": {
+                                    "spread_bps": sp_v,
+                                    "depth_imbalance": di_v,
+                                    "funding_rate": fr_v,
+                                    "open_interest": oi_v,
+                                    "thresholds": {
+                                        "max_spread_bps": max_sp,
+                                        "max_abs_depth_imbalance": max_di,
+                                        "max_abs_funding_rate": max_fr,
+                                        "min_open_interest": min_oi,
+                                    },
+                                    "violations": violations,
+                                },
+                            },
                         )
             
             if action == TradeAction.HOLD:
@@ -2421,16 +2556,30 @@ class AITradingEngine:
         take_profit: Optional[float] = None,
         reasoning: str = "",
         confidence: Optional[float] = None,
+        *,
+        source: str = "manual",
+        context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        外部模块（主动性扫描、ProactiveActionTrigger 等）统一开仓入口。
-        经 ExecutionGateway、source=system，与 S1 一致；成功后可注册 StopLossTakeProfitManager。
+        手动/兼容开仓入口。
+        自动开仓主链必须走 ai_core，避免绕过统一意图记录、门控与轨迹审计。
         """
         mc = self.main_controller
         gw = getattr(mc, "execution_gateway", None) if mc else None
         if not gw or not self.exchange:
             logger.warning("execute_trade: 无 ExecutionGateway 或交易所，跳过")
             return None
+        src = str(source or "manual").strip().lower()
+        if src not in {"manual", "system"}:
+            logger.warning(
+                "execute_trade: 非手动来源(%s)已拒绝，请改走 ai_core 主决策链 symbol=%s",
+                src,
+                symbol,
+            )
+            return {
+                "success": False,
+                "error": f"legacy_open_path_blocked source={src}; route through ai_core",
+            }
         s = str(side or "long").strip().lower()
         if s in ("buy", "b"):
             s = "long"
@@ -2498,14 +2647,12 @@ class AITradingEngine:
                     qty = max(default_qty, float(notional / px))
             except Exception:
                 pass
-        # 重要：ExecutionGateway 默认禁止 source=system 开仓（见 ai_brain.policy.allow_system_open）。
-        # 主开仓权在 single_write_owner=ai_core，因此这里以 ai_core 作为 source，确保链路可执行且可审计。
         res = await gw.open_swap(
             symbol,
             s,
             qty,
             lev,
-            "ai_core",
+            src,
             reasoning or "execute_trade",
             margin_mode="cross",
             price=None,
@@ -2515,6 +2662,7 @@ class AITradingEngine:
                 "reasoning": reasoning,
                 "confidence": confidence,
                 "origin": "ai_trading_engine.execute_trade",
+                **(dict(context) if isinstance(context, dict) else {}),
             },
         )
         if not res.get("success"):

@@ -108,11 +108,45 @@ class AILearningEngine:
         
         self._running = False
         self._learning_task = None
+        self._trace_feedback_summary: Dict[str, Any] = {
+            "sample_size": 0,
+            "guard_rejected": 0,
+            "execution_failed": 0,
+            "reconciliation_blocked": 0,
+            "top_guard_reason": None,
+            "top_execution_failure": None,
+            "top_reconciliation_block": None,
+            "recommendations": [],
+            "updated_at": None,
+        }
         
         logger.info("✅ AI学习引擎初始化完成")
+
+    async def _load_runtime_config(self) -> None:
+        """从正式配置入口加载学习引擎阈值，避免仅靠硬编码默认值。"""
+        cm = self.config_manager
+        if cm is None or not hasattr(cm, "get_config"):
+            return
+        try:
+            cfg = await cm.get_config("ai_learning", {})
+            if not isinstance(cfg, dict):
+                return
+            for k in (
+                "min_trades_for_learning",
+                "learning_interval_hours",
+                "max_lessons_kept",
+                "min_confidence_for_application",
+                "pattern_similarity_threshold",
+                "min_abs_pnl_percent_for_lesson",
+            ):
+                if cfg.get(k) is not None:
+                    self.config[k] = cfg.get(k)
+        except Exception as e:
+            logger.debug("加载 AI 学习配置失败: %s", e)
     
     async def start(self) -> None:
         """启动学习引擎"""
+        await self._load_runtime_config()
         self._running = True
         self._learning_task = asyncio.create_task(self._learning_loop())
         logger.info("✅ AI学习引擎已启动")
@@ -150,6 +184,7 @@ class AILearningEngine:
                 )
 
                 await self._analyze_and_learn()
+                await self._analyze_decision_traces()
 
                 await self._generate_learning_report()
 
@@ -209,6 +244,69 @@ class AILearningEngine:
                     
         except Exception as e:
             logger.error(f"记录交易结果失败: {e}")
+
+    async def _analyze_decision_traces(self) -> None:
+        """分析最近的 decision traces，提取 guard/执行/保护层面的学习反馈。"""
+        try:
+            mm = self.memory_manager
+            mc = getattr(mm, "main_controller", None) if mm is not None else None
+            if mc is None:
+                mc = getattr(self, "main_controller", None)
+            store = getattr(mc, "decision_trace_store", None) if mc is not None else None
+            if not store or not hasattr(store, "analyze_recent"):
+                return
+
+            analysis = store.analyze_recent(limit=80)
+            sm = analysis.get("summary") if isinstance(analysis.get("summary"), dict) else {}
+            sample_size = int(sm.get("sample_size", 0) or 0)
+            if sample_size <= 0:
+                self._trace_feedback_summary = {
+                    "sample_size": 0,
+                    "guard_rejected": 0,
+                    "execution_failed": 0,
+                    "reconciliation_blocked": 0,
+                    "top_guard_reason": None,
+                    "top_execution_failure": None,
+                    "top_reconciliation_block": None,
+                    "recommendations": [],
+                    "updated_at": datetime.now().isoformat(),
+                }
+                return
+
+            top_guard = ((analysis.get("top_guard_reasons") or [None])[0] if isinstance(analysis.get("top_guard_reasons"), list) and (analysis.get("top_guard_reasons") or []) else None)
+            top_exec = ((analysis.get("top_execution_failures") or [None])[0] if isinstance(analysis.get("top_execution_failures"), list) and (analysis.get("top_execution_failures") or []) else None)
+            top_rec = ((analysis.get("top_reconciliation_blocks") or [None])[0] if isinstance(analysis.get("top_reconciliation_blocks"), list) and (analysis.get("top_reconciliation_blocks") or []) else None)
+
+            recommendations: List[str] = []
+            guard_rejected = int(sm.get("guard_rejected", 0) or 0)
+            execution_failed = int(sm.get("execution_failed", 0) or 0)
+            reconciliation_blocked = int(sm.get("reconciliation_blocked", 0) or 0)
+
+            if guard_rejected >= max(5, sample_size // 3):
+                recommendations.append("近期 guard_rejected 占比较高，建议复核开仓门槛是否过严，特别是 top_guard_reason。")
+            if execution_failed >= max(3, sample_size // 5):
+                recommendations.append("近期 execution_failed 偏高，建议优先优化执行层/交易所链路，而不是直接放松 AI 开仓条件。")
+            if reconciliation_blocked >= max(3, sample_size // 5):
+                recommendations.append("近期 reconciliation_blocked 偏高，建议优先处理本地状态一致性与孤儿订单问题。")
+
+            if isinstance(top_guard, dict) and str(top_guard.get("key") or "").startswith("loss_streak_cooldown"):
+                recommendations.append("连亏冷静期是主要拒绝原因，说明近期策略环境不稳定，应先降频而不是强行提高开仓率。")
+            if isinstance(top_rec, dict) and "side_mismatch" in str(top_rec.get("key") or ""):
+                recommendations.append("对账保护主要拦截 side_mismatch，说明 AI 依赖的本地持仓状态仍需进一步稳固。")
+
+            self._trace_feedback_summary = {
+                "sample_size": sample_size,
+                "guard_rejected": guard_rejected,
+                "execution_failed": execution_failed,
+                "reconciliation_blocked": reconciliation_blocked,
+                "top_guard_reason": top_guard,
+                "top_execution_failure": top_exec,
+                "top_reconciliation_block": top_rec,
+                "recommendations": recommendations[:6],
+                "updated_at": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            logger.error(f"分析 decision traces 失败: {e}")
     
     def _collect_recent_close_trades(self) -> List[Any]:
         """
@@ -752,6 +850,7 @@ class AILearningEngine:
                 {"type": l.lesson_type.value, "title": l.title, "impact": l.impact_score}
                 for l in self.lessons[-5:]
             ],
+            "trace_feedback": dict(self._trace_feedback_summary),
             "config": self.config
         }
 

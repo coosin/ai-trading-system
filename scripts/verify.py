@@ -23,6 +23,20 @@ def _run(script_name: str, extra_args: list[str]) -> int:
     return int(p.returncode or 0)
 
 
+def _run_pytest(extra_args: list[str]) -> int:
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pytest_bin = os.path.join(repo_root, ".venv", "bin", "pytest")
+    if not os.path.exists(pytest_bin):
+        pytest_bin = "pytest"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo_root + (
+        (os.pathsep + env["PYTHONPATH"]) if env.get("PYTHONPATH") else ""
+    )
+    cmd = [pytest_bin, *extra_args]
+    p = subprocess.run(cmd, check=False, cwd=repo_root, env=env)
+    return int(p.returncode or 0)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -36,6 +50,9 @@ def main() -> int:
     n = sub.add_parser("network", help="Run production network baseline checks")
     n.add_argument("--apply", action="store_true")
     n.add_argument("--check-only", action="store_true")
+
+    g = sub.add_parser("trading-gates", help="Run microstructure gate regression tests")
+    g.add_argument("--kexpr", default="microstructure")
 
     args = ap.parse_args()
     if args.cmd == "trading":
@@ -51,6 +68,15 @@ def main() -> int:
                 "--seed-symbol",
                 args.seed_symbol,
             ],
+        )
+    if args.cmd == "trading-gates":
+        return _run_pytest(
+            [
+                "-q",
+                "tests/test_ai_trading_engine.py",
+                "-k",
+                str(args.kexpr),
+            ]
         )
     return _run(
         "production_network_baseline.py",

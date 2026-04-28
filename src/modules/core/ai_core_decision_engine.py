@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
 from src.modules.core.trading_limits import resolve_position_limits
+from src.modules.core.decision_trace_store import DecisionTraceStore
 
 from src.modules.core.timing_constants import (
     SLEEP_1S,
@@ -129,6 +130,9 @@ class AICoreDecisionEngine:
             "min_rr_to_trade": 1.15,
             "max_spread_bps_to_trade": 40.0,
             "max_abs_depth_imbalance_to_trade": 0.92,
+            "microstructure_enable_funding_oi_gates": True,
+            "microstructure_max_abs_funding_rate_to_trade": 0.0012,
+            "microstructure_min_open_interest_to_trade": None,
             "degraded_data_quantity_factor": 0.68,
             "low_balance_usdt_threshold": 25.0,
             # 单笔保证金预算（用户要求：总资金 5%~10%）
@@ -254,6 +258,8 @@ class AICoreDecisionEngine:
             "loss_streak_cooldown_rejected": 0,
             "spread_rejected": 0,
             "depth_imbalance_rejected": 0,
+            "funding_rate_rejected": 0,
+            "open_interest_rejected": 0,
             "discretionary_close_suppressed": 0,
             "open_evidence_rejected": 0,
             "open_evidence_error": 0,
@@ -276,6 +282,8 @@ class AICoreDecisionEngine:
         self._frequency_profile: str = "balanced"
         self._last_frequency_profile_switch_at: Optional[datetime] = None
         self._last_frequency_profile_switch_detail: Dict[str, Any] = {}
+        self._trade_history: List[Dict[str, Any]] = []
+        self._trade_feedback_seen_keys: set[str] = set()
         # (symbol_base, side) -> 最近一次由主循环执行的「主观平仓」成功时间
         self._last_ai_discretionary_close_at: Dict[str, datetime] = {}
         # key -> (consecutive_close_signals, first_signal_at)
@@ -867,11 +875,69 @@ class AICoreDecisionEngine:
                 logger.error(f"策略管理循环错误: {e}")
                 await asyncio.sleep(SLEEP_5MIN)
 
+    async def _refresh_trade_feedback_from_service(self, limit: int = 120) -> None:
+        """从统一成交历史补齐 ai_core 的收益反馈真源，供自动调参与切档共用。"""
+        mc = getattr(self, "main_controller", None)
+        ths = getattr(mc, "trade_history_service", None) if mc else None
+        if ths is None or not hasattr(ths, "get_recent_trades"):
+            return
+        try:
+            rows = await asyncio.wait_for(ths.get_recent_trades(limit=max(20, int(limit or 120))), timeout=2.5)
+        except Exception:
+            return
+
+        changed = False
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                pnl = float(row.get("pnl", 0) or 0)
+                pnl_pct = float(row.get("pnl_percent", 0) or 0)
+            except Exception:
+                continue
+            if abs(pnl) <= 1e-12 and abs(pnl_pct) <= 1e-12:
+                continue
+            action = str(row.get("action") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            if action not in {"close", "closed"} and status not in {"closed", "filled"}:
+                continue
+            ts = row.get("timestamp") or row.get("time") or row.get("ts")
+            feedback_key = "|".join(
+                [
+                    str(row.get("order_id") or ""),
+                    str(row.get("symbol") or ""),
+                    str(ts or ""),
+                    f"{pnl:.8f}",
+                ]
+            )
+            if feedback_key in self._trade_feedback_seen_keys:
+                continue
+            self._trade_feedback_seen_keys.add(feedback_key)
+            self._trade_history.append(
+                {
+                    "symbol": str(row.get("symbol") or ""),
+                    "timestamp": ts,
+                    "decision": {
+                        "symbol": str(row.get("symbol") or ""),
+                        "action": "close",
+                        "source": str(row.get("source") or "trade_history_service"),
+                        "timestamp": ts,
+                        "pnl": pnl,
+                        "pnl_percent": pnl_pct,
+                    },
+                }
+            )
+            changed = True
+
+        if changed and len(self._trade_history) > 200:
+            self._trade_history = self._trade_history[-200:]
+
     async def _auto_tune_guard_thresholds(self) -> None:
         """基于近期交易结果自动微调 RR 与最大价差阈值。"""
         if not bool(self.config.get("auto_tune_guards", True)):
             return
         try:
+            await self._refresh_trade_feedback_from_service(limit=120)
             records: List[Dict[str, Any]] = []
             wins = 0
             losses = 0
@@ -1132,6 +1198,7 @@ class AICoreDecisionEngine:
         if not bool(self.config.get("auto_frequency_profile_switch", True)):
             return
         try:
+            await self._refresh_trade_feedback_from_service(limit=120)
             lookback = max(8, int(self.config.get("frequency_profile_lookback_trades", 20) or 20))
             cooldown = max(300, int(self.config.get("frequency_profile_cooldown_seconds", 1800) or 1800))
             if self._last_frequency_profile_switch_at:
@@ -1589,6 +1656,34 @@ class AICoreDecisionEngine:
         try:
             res = trade_analysis.get("result") if isinstance(trade_analysis.get("result"), dict) else {}
             pnl = float(res.get("pnl", trade_analysis.get("pnl", 0)) or 0)
+            pnl_pct = float(res.get("pnl_percent", trade_analysis.get("pnl_percent", 0)) or 0)
+            if abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12:
+                ts = trade_analysis.get("timestamp")
+                feedback_key = "|".join(
+                    [
+                        str(trade_analysis.get("symbol") or ""),
+                        str(ts or ""),
+                        f"{pnl:.8f}",
+                    ]
+                )
+                if feedback_key not in self._trade_feedback_seen_keys:
+                    self._trade_feedback_seen_keys.add(feedback_key)
+                    self._trade_history.append(
+                        {
+                            "symbol": str(trade_analysis.get("symbol") or ""),
+                            "timestamp": ts,
+                            "decision": {
+                                "symbol": str(trade_analysis.get("symbol") or ""),
+                                "action": str(trade_analysis.get("action") or ""),
+                                "source": "ai_core",
+                                "timestamp": ts,
+                                "pnl": pnl,
+                                "pnl_percent": pnl_pct,
+                            },
+                        }
+                    )
+                    if len(self._trade_history) > 200:
+                        self._trade_history = self._trade_history[-200:]
             exit_px = res.get("exit_price") or res.get("price") or res.get("close_price")
             entry_px = trade_analysis.get("entry_price")
             if exit_px is None:
@@ -1599,7 +1694,7 @@ class AICoreDecisionEngine:
                 "entry_price": float(entry_px or 0),
                 "exit_price": float(exit_px or 0),
                 "pnl": pnl,
-                "pnl_percent": float(res.get("pnl_percent", trade_analysis.get("pnl_percent", 0)) or 0),
+                "pnl_percent": pnl_pct,
                 "strategy": trade_analysis.get("strategy_used") or "ai_core",
                 "reason": str(trade_analysis.get("reasoning") or ""),
                 "timestamp": trade_analysis.get("timestamp"),
@@ -3650,15 +3745,64 @@ class AICoreDecisionEngine:
     
     async def _execute_decision(self, decision: TradeDecision, *, bypass_discretionary_close_gates: bool = False) -> bool:
         """执行AI决策 - 带余额检查"""
+        trace_id = str(uuid.uuid4())
+
+        def _trace_store() -> Optional[DecisionTraceStore]:
+            try:
+                mc = self.main_controller
+                if mc is not None and getattr(mc, "decision_trace_store", None) is None:
+                    mc.decision_trace_store = DecisionTraceStore()
+                return getattr(mc, "decision_trace_store", None) if mc else None
+            except Exception:
+                return None
+
+        def _record_intent(extras: Optional[Dict[str, Any]] = None) -> None:
+            try:
+                dts = _trace_store()
+                if dts:
+                    dts.record_intent(
+                        trace_id=trace_id,
+                        symbol=str(decision.symbol),
+                        side=str(decision.side),
+                        action="close" if decision.action == "close" else "open",
+                        source="ai_core",
+                        confidence=getattr(decision, "confidence", None),
+                        strategy_used=getattr(decision, "strategy_used", None),
+                        reasoning=getattr(decision, "reasoning", None),
+                        quantity=float(decision.quantity) if getattr(decision, "quantity", None) is not None else None,
+                        leverage=int(decision.leverage) if getattr(decision, "leverage", None) is not None else None,
+                        extras=extras,
+                    )
+            except Exception:
+                pass
+
+        def _record_guard(status: str, reason: str, stage: str, extras: Optional[Dict[str, Any]] = None) -> None:
+            try:
+                dts = _trace_store()
+                if dts:
+                    dts.record_guard_result(
+                        trace_id=trace_id,
+                        status=status,
+                        reason=reason,
+                        stage=stage,
+                        extras=extras,
+                    )
+            except Exception:
+                pass
+
         if decision.action == 'hold':
             return True
         
         if decision.symbol in self.blacklist:
             logger.warning(f"⚠️ {decision.symbol} 在黑名单中，不执行交易")
+            _record_intent()
+            _record_guard("rejected", "symbol_blacklist", "precheck")
             return False
         
         if not self.exchange:
             logger.error("交易所未连接，无法执行交易")
+            _record_intent()
+            _record_guard("rejected", "exchange_unavailable", "precheck")
             return False
         
         try:
@@ -3679,6 +3823,8 @@ class AICoreDecisionEngine:
                         int(self._execution_guards_stats.get("discretionary_close_suppressed", 0)) + 1
                     )
                     logger.info("🧷 AI主观平仓暂缓: %s %s — %s", decision.symbol, decision.side, why_dc)
+                    _record_intent()
+                    _record_guard("rejected", str(why_dc), "discretionary_close")
                     return False
             if is_open and bool(self.config.get("loss_streak_cooldown_enable", True)):
                 try:
@@ -3694,6 +3840,8 @@ class AICoreDecisionEngine:
                             max(1, left),
                         )
                         self._adaptive_guard_profile["loss_streak_cooldown_left_sec"] = max(1, left)
+                        _record_intent()
+                        _record_guard("rejected", f"loss_streak_cooldown_active:{max(1,left)}s", "loss_streak")
                         return False
                     trigger = max(2, int(self.config.get("loss_streak_trigger", 3) or 3))
                     streak = self._get_recent_loss_streak()
@@ -3712,6 +3860,8 @@ class AICoreDecisionEngine:
                             decision.symbol,
                         )
                         self._adaptive_guard_profile["loss_streak_cooldown_left_sec"] = int(cool_sec)
+                        _record_intent()
+                        _record_guard("rejected", f"loss_streak_cooldown_triggered:{cool_sec}s", "loss_streak")
                         return False
                 except Exception:
                     pass
@@ -3724,6 +3874,8 @@ class AICoreDecisionEngine:
             
             if current_price <= 0:
                 logger.error(f"无法获取 {decision.symbol} 的价格")
+                _record_intent()
+                _record_guard("rejected", "price_unavailable", "market_data")
                 return False
 
             # 开仓前的“证据完整性门控”：必须拿到 K线/盘口等关键证据，否则不允许开仓（避免只看 ticker 追涨杀跌）。
@@ -3747,6 +3899,8 @@ class AICoreDecisionEngine:
                                 decision.symbol,
                                 errs[:6],
                             )
+                            _record_intent()
+                            _record_guard("rejected", "open_evidence_rejected:klines_missing", "evidence", {"errors": errs[:6]})
                             return False
                 except Exception:
                     # 若取证异常，宁可不下单。
@@ -3755,6 +3909,8 @@ class AICoreDecisionEngine:
                         self._execution_guards_stats.get("open_evidence_error", 0)
                     ) + 1
                     logger.warning("⛔ 开仓证据获取失败，拒绝开仓: %s", decision.symbol)
+                    _record_intent()
+                    _record_guard("rejected", "open_evidence_error", "evidence")
                     return False
             
             decision.entry_price = current_price
@@ -3880,6 +4036,8 @@ class AICoreDecisionEngine:
                 # 3.2 数据退化时自动降仓（避免单点数据故障造成激进下单）
                 if "data_quality_guard" in str(decision.reasoning or ""):
                     logger.warning("⚠️ 数据质量保护触发，跳过执行")
+                    _record_intent()
+                    _record_guard("skipped", "data_quality_guard_hold", "reasoning_guard")
                     return True
                 if "degraded=" in str(decision.reasoning or ""):
                     try:
@@ -4120,6 +4278,23 @@ class AICoreDecisionEngine:
                 except Exception as e:
                     logger.debug(f"执行前订单簿检查失败: {e}")
 
+                funding_rate = None
+                open_interest = None
+                try:
+                    if hasattr(self.exchange, "get_funding_rate"):
+                        funding_rate = await self.exchange.get_funding_rate(decision.symbol)
+                except Exception as e:
+                    logger.debug(f"执行前 funding 检查失败: {e}")
+                try:
+                    if hasattr(self.exchange, "get_open_interest"):
+                        oi = await self.exchange.get_open_interest(decision.symbol)
+                        if isinstance(oi, dict):
+                            open_interest = oi.get("open_interest")
+                        else:
+                            open_interest = oi
+                except Exception as e:
+                    logger.debug(f"执行前 open_interest 检查失败: {e}")
+
                 if spread_bps is not None and spread_bps > max_spread_bps:
                     self._execution_guards_stats["spread_rejected"] += 1
                     logger.warning(
@@ -4134,6 +4309,53 @@ class AICoreDecisionEngine:
                         abs(depth_imbalance), max_abs_imb, decision.symbol
                     )
                     return False
+                if bool(self.config.get("microstructure_enable_funding_oi_gates", True)):
+                    try:
+                        max_abs_fr = float(
+                            self.config.get("microstructure_max_abs_funding_rate_to_trade", 0.0012) or 0.0012
+                        )
+                    except Exception:
+                        max_abs_fr = 0.0012
+                    min_oi_raw = self.config.get("microstructure_min_open_interest_to_trade")
+                    try:
+                        min_oi = (
+                            float(min_oi_raw)
+                            if min_oi_raw not in (None, "", "null")
+                            else None
+                        )
+                    except Exception:
+                        min_oi = None
+                    try:
+                        fr_v = float(funding_rate) if funding_rate is not None else None
+                    except Exception:
+                        fr_v = None
+                    try:
+                        oi_v = float(open_interest) if open_interest is not None else None
+                    except Exception:
+                        oi_v = None
+
+                    if fr_v is not None and abs(fr_v) > max_abs_fr:
+                        self._execution_guards_stats["funding_rate_rejected"] = int(
+                            self._execution_guards_stats.get("funding_rate_rejected", 0)
+                        ) + 1
+                        logger.warning(
+                            "⚠️ 执行门控拒绝: funding 过高 |fr|=%.6f > %.6f symbol=%s",
+                            abs(fr_v),
+                            max_abs_fr,
+                            decision.symbol,
+                        )
+                        return False
+                    if min_oi is not None and oi_v is not None and oi_v < min_oi:
+                        self._execution_guards_stats["open_interest_rejected"] = int(
+                            self._execution_guards_stats.get("open_interest_rejected", 0)
+                        ) + 1
+                        logger.warning(
+                            "⚠️ 执行门控拒绝: open_interest 过低 oi=%.2f < %.2f symbol=%s",
+                            oi_v,
+                            min_oi,
+                            decision.symbol,
+                        )
+                        return False
                 # 3.3.3 净边际收益门控：避免“看起来有 RR，但扣成本后几乎无收益”的交易。
                 try:
                     if bool(self.config.get("edge_after_cost_guard_enable", True)):
@@ -4206,7 +4428,15 @@ class AICoreDecisionEngine:
             logger.info(f"   策略: {decision.strategy_used}")
             
             order = None
-            trace_id = str(uuid.uuid4())
+            _record_intent(
+                {
+                    "rr": rr,
+                    "spread_bps": spread_bps,
+                    "depth_imbalance": depth_imbalance,
+                    "guard_profile": getattr(self, "_adaptive_guard_profile", None),
+                }
+            )
+            _record_guard("passed", "ready_for_execution", "execution_preflight")
 
             # Trade intent event (best-effort): for frontend/TG + audit correlation
             try:
@@ -4775,6 +5005,9 @@ class AICoreDecisionEngine:
                 "min_rr_to_trade",
                 "max_spread_bps_to_trade",
                 "max_abs_depth_imbalance_to_trade",
+                "microstructure_enable_funding_oi_gates",
+                "microstructure_max_abs_funding_rate_to_trade",
+                "microstructure_min_open_interest_to_trade",
                 "degraded_data_quantity_factor",
                 "boost_on_low_risk",
                 "low_risk_rr_multiplier",
@@ -4828,38 +5061,55 @@ class AICoreDecisionEngine:
                 "auto_tune_cooldown_seconds",
                 "auto_tune_min_rr_delta",
                 "auto_tune_min_spread_delta_bps",
+                "auto_tune_rr_bounds",
+                "auto_tune_spread_bounds",
                 "auto_tune_sltp_params",
                 "auto_tune_sltp_cooldown_seconds",
                 "auto_tune_sltp_step_tighten",
                 "auto_tune_sltp_step_extend",
+                "auto_tune_sltp_tighten_bounds",
+                "auto_tune_sltp_extend_bounds",
             )
+            bool_keys = {
+                "auto_adaptive_guards",
+                "auto_tune_guards",
+                "auto_tune_by_symbol_group",
+                "auto_tune_by_session",
+                "auto_tune_global_enabled",
+                "auto_tune_sltp_params",
+                "regime_enable",
+                "pnl_health_sizing_enable",
+                "edge_after_cost_guard_enable",
+                "loss_streak_cooldown_enable",
+                "boost_on_low_risk",
+                "auto_frequency_profile_switch",
+                "frequency_profile_switch_telegram_notify",
+                "microstructure_enable_funding_oi_gates",
+            }
+            optional_float_keys = {
+                "auto_tune_group_step_rr",
+                "auto_tune_group_step_spread_bps",
+                "low_balance_usdt_threshold",
+                "default_max_margin_fraction",
+                "low_balance_margin_fraction",
+                "microstructure_min_open_interest_to_trade",
+            }
+            passthrough_keys = {
+                "regime_profile_overrides",
+                "auto_tune_rr_bounds",
+                "auto_tune_spread_bounds",
+                "auto_tune_sltp_tighten_bounds",
+                "auto_tune_sltp_extend_bounds",
+            }
             for k in keys:
                 if k in overrides and overrides[k] is not None:
-                    if k in (
-                        "auto_adaptive_guards",
-                        "auto_tune_guards",
-                        "auto_tune_by_symbol_group",
-                        "auto_tune_by_session",
-                        "auto_tune_global_enabled",
-                        "auto_tune_sltp_params",
-                        "regime_enable",
-                        "pnl_health_sizing_enable",
-                        "edge_after_cost_guard_enable",
-                        "loss_streak_cooldown_enable",
-                        "boost_on_low_risk",
-                        "auto_frequency_profile_switch",
-                        "frequency_profile_switch_telegram_notify",
-                    ):
+                    if k in bool_keys:
                         self.config[k] = bool(overrides[k])
-                    elif k in (
-                        "auto_tune_group_step_rr",
-                        "auto_tune_group_step_spread_bps",
-                        "low_balance_usdt_threshold",
-                        "default_max_margin_fraction",
-                        "low_balance_margin_fraction",
-                    ):
+                    elif k in optional_float_keys:
                         v = overrides[k]
                         self.config[k] = None if v == "" or v == "null" else float(v)
+                    elif k in passthrough_keys:
+                        self.config[k] = overrides[k]
                     else:
                         self.config[k] = float(overrides[k])
         except Exception as e:

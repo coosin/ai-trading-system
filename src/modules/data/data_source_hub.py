@@ -1095,7 +1095,7 @@ class DataSourceHub:
         t = exchange_channel.get("ticker") or {}
         px = float(t.get("price") or t.get("last") or 0.0)
         if px > 0:
-            score += 0.35
+            score += 0.28
         else:
             if (not enabled) or ("ticker" in enabled):
                 reasons.append("交易所行情缺失")
@@ -1109,19 +1109,37 @@ class DataSourceHub:
                 score += 0.2
             else:
                 reasons.append("订单簿深度不足")
-        if exchange_channel.get("positions") is not None:
-            score += 0.15
-        if intel_channel.get("health", {}).get("third_party", "").startswith("ok"):
-            score += 0.15
-        else:
+        if (not enabled) or ("klines_1h" in enabled):
+            if exchange_channel.get("klines_1h"):
+                score += 0.17
+            else:
+                reasons.append("K线样本不足")
+        if (not enabled) or ("open_interest" in enabled):
+            if exchange_channel.get("open_interest"):
+                score += 0.1
+            else:
+                reasons.append("持仓量数据缺失")
+        if (not enabled) or ("funding_rate" in enabled):
+            if exchange_channel.get("funding_rate") is not None:
+                score += 0.1
+            else:
+                reasons.append("资金费率缺失")
+        intel_health = intel_channel.get("health", {}) if isinstance(intel_channel, dict) else {}
+        if str(intel_health.get("third_party", "")).startswith("ok"):
+            score += 0.075
+        elif intel_channel:
             reasons.append("舆情/新闻通道退化")
+        else:
+            reasons.append("舆情/新闻通道未接入")
         on_h = str((intel_channel.get("health", {}) or {}).get("onchain", "") or "")
         if on_h == "mock":
             reasons.append("链上通道为 mock（未配置真实链上 API）")
         elif on_h.startswith("ok"):
-            score += 0.15
-        else:
+            score += 0.075
+        elif intel_channel:
             reasons.append("链上通道退化")
+        else:
+            reasons.append("链上通道未接入")
         score = round(min(1.0, max(0.0, score)), 4)
         return {"score": score, "grade": "A" if score >= 0.85 else "B" if score >= 0.7 else "C" if score >= 0.5 else "D", "reasons": reasons}
 

@@ -950,6 +950,7 @@ class MainController:
                 llm_integration=self.llm_integration,
                 config_manager=self.config_manager,
             )
+            self.ai_learning_engine.main_controller = self
             await self.ai_learning_engine.start()
             logger.info("✅ AI学习引擎初始化完成")
         except Exception as e:
@@ -1954,17 +1955,21 @@ class MainController:
             try:
                 from src.modules.trading.unified_trade_system import UnifiedTradeSystem
                 unified_trade_cfg = await self.get_ai_managed_config("unified_trade_system", {})
-                self.unified_trade_system = UnifiedTradeSystem(
-                    unified_trade_cfg,
-                    config_manager=self.config_manager,
-                )
-                # 复用已初始化的组件
-                if self.trading_monitor:
-                    self.unified_trade_system.monitor = self.trading_monitor
-                if self.simulation_exchange:
-                    self.unified_trade_system.set_execution_backend(self.simulation_exchange)
-                await self.unified_trade_system.initialize()
-                logger.info("✅ 统一交易系统已初始化（复用现有组件）")
+                if bool((unified_trade_cfg or {}).get("enabled", False)):
+                    self.unified_trade_system = UnifiedTradeSystem(
+                        unified_trade_cfg,
+                        config_manager=self.config_manager,
+                    )
+                    # 复用已初始化的组件
+                    if self.trading_monitor:
+                        self.unified_trade_system.monitor = self.trading_monitor
+                    if self.simulation_exchange:
+                        self.unified_trade_system.set_execution_backend(self.simulation_exchange)
+                    await self.unified_trade_system.initialize()
+                    logger.info("✅ 统一交易系统已初始化（复用现有组件）")
+                else:
+                    self.unified_trade_system = None
+                    logger.info("ℹ️ 统一交易系统默认关闭；当前主执行脊柱为 ExecutionGateway")
             except Exception as e:
                 logger.warning(f"⚠️ 统一交易系统初始化失败: {e}")
                 self.unified_trade_system = None

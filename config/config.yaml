@@ -536,7 +536,7 @@ proactive_scanner:
   - LINK/USDT
   - ATOM/USDT
 market_intelligence:
-  cache_ttl_sec: 20
+  cache_ttl_sec: 90
   push_interval_sec: 15
   prewarm_enabled: true
   prewarm_interval_sec: 45
@@ -636,6 +636,22 @@ ai_trading:
     max_loss_per_position: 0.05
     daily_loss_limit: 0.1
     max_drawdown_limit: 0.15
+    enable_microstructure_open_gates: true
+    microstructure_max_spread_bps: 12.0
+    microstructure_max_abs_depth_imbalance: 0.92
+    microstructure_max_abs_funding_rate: 0.0012
+    microstructure_min_open_interest: null
+learning_feedback:
+  stop_loss_penalty_step_hits: 3
+  stop_loss_penalty_step_confidence: 0.05
+  stop_loss_penalty_max_confidence: 0.15
+ai_learning:
+  min_trades_for_learning: 5
+  learning_interval_hours: 6
+  max_lessons_kept: 200
+  min_confidence_for_application: 0.7
+  pattern_similarity_threshold: 0.8
+  min_abs_pnl_percent_for_lesson: 0.6
 proactive_ai:
   scan_interval: 90
   deep_scan_interval: 600
@@ -719,7 +735,8 @@ unified_info_collector:
   enabled: true
   update_interval: 60
 unified_strategy_system: {}
-unified_trade_system: {}
+unified_trade_system:
+  enabled: false
 unified_risk_system: {}
 memory:
   provider: native

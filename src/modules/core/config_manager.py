@@ -6,6 +6,7 @@
 
 业务可调参数**仅**从各配置目录下的 ``config.yaml``（或 ``config.yml``）加载；
 可选同目录 ``local.yaml`` / ``local.yml`` / ``local.json`` 做本机覆盖（勿提交 Git）。
+运行态 ``set_config()`` 写回会持久化到 ``local.json``，确保热更新在重启后仍可重放。
 合并后由 ``config_runtime_validate`` 校验。其它 ``config/*.yaml`` 若需使用请由业务代码自行读取，不经本管理器自动合并。
 """
 
@@ -642,23 +643,39 @@ class ConfigManager:
         logger.debug("已加载环境变量配置")
 
     async def _save_section_to_file(self, section: str) -> None:
-        """保存配置段到文件"""
-        config_file = self.config_dir / f"{section}.json"
+        """保存运行态配置段到 local.json，确保重启后仍会被自动加载。"""
+        config_file = self.config_dir / "local.json"
+        legacy_section_file = self.config_dir / f"{section}.json"
 
         try:
             section_config = self._config.get(section, {})
+            root_config: Dict[str, Any] = {}
+            if config_file.exists():
+                try:
+                    with open(config_file, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        root_config = loaded
+                except Exception:
+                    root_config = {}
 
-            # 如果配置为空，删除文件
-            if not section_config and config_file.exists():
+            if section_config:
+                root_config[section] = section_config
+            else:
+                root_config.pop(section, None)
+
+            if root_config:
+                with open(config_file, "w", encoding="utf-8") as f:
+                    json.dump(root_config, f, indent=2, ensure_ascii=False)
+                self._file_timestamps[str(config_file)] = config_file.stat().st_mtime
+            elif config_file.exists():
                 config_file.unlink()
-                return
+                self._file_timestamps.pop(str(config_file), None)
 
-            # 保存到文件
-            with open(config_file, "w", encoding="utf-8") as f:
-                json.dump(section_config, f, indent=2, ensure_ascii=False)
-
-            # 更新文件时间戳
-            self._file_timestamps[str(config_file)] = config_file.stat().st_mtime
+            # 清理旧版 section.json 持久化文件，避免与 local.json 形成双写漂移。
+            if legacy_section_file.exists():
+                legacy_section_file.unlink()
+                self._file_timestamps.pop(str(legacy_section_file), None)
 
             logger.debug(f"已保存配置到文件: {config_file}")
 

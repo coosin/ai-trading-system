@@ -154,6 +154,28 @@ class HeartbeatMonitor:
         diag = await self._build_trading_diagnosis(limit_events=6)
         gw = (diag.get("execution_gateway") or {}) if isinstance(diag.get("execution_gateway"), dict) else {}
         sltp = (diag.get("sltp") or {}) if isinstance(diag.get("sltp"), dict) else {}
+        rec = (
+            (diag.get("execution_gateway") or {}).get("reconciliation")
+            if isinstance(diag.get("execution_gateway"), dict)
+            else {}
+        )
+        if not isinstance(rec, dict):
+            rec = {}
+        rcp = (
+            (diag.get("execution_gateway") or {}).get("reconciliation_protection")
+            if isinstance(diag.get("execution_gateway"), dict)
+            else {}
+        )
+        if not isinstance(rcp, dict):
+            rcp = {}
+        safe_rec = (
+            (diag.get("execution_gateway") or {}).get("reconciliation", {}).get("safe_recovery")
+            if isinstance(diag.get("execution_gateway"), dict)
+            and isinstance((diag.get("execution_gateway") or {}).get("reconciliation"), dict)
+            else {}
+        )
+        if not isinstance(safe_rec, dict):
+            safe_rec = {}
 
         # --- 1) 即时告警：执行失败增量 / SR 分批止盈失败增量 ---
         if self.trading_diagnosis_alerts_enabled:
@@ -203,6 +225,53 @@ class HeartbeatMonitor:
                         + (f"- top_reason {top_code}\n" if top_code else "")
                         + f"建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_attribution.top_reasons。",
                         priority="high",
+                    )
+
+                rec_summary = rec.get("summary") if isinstance(rec.get("summary"), dict) else {}
+                rec_drift_total = int(rec_summary.get("drift_total", 0) or 0)
+                if (
+                    rec
+                    and bool(rec.get("healthy")) is False
+                    and rec_drift_total > 0
+                    and _cooldown_ok("trading_diag_reconciliation")
+                ):
+                    self._last_notice_at["trading_diag_reconciliation"] = now
+                    await self._send_notification(
+                        "⚠️ 交易状态对账异常",
+                        f"检测到本地/交易所状态漂移。\n"
+                        f"- severity={rec.get('severity')}\n"
+                        f"- drift_total={rec_drift_total}\n"
+                        f"- stale_open_orders={int(rec_summary.get('stale_open_orders', 0) or 0)}\n"
+                        f"建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_reconciliation。",
+                        priority="high" if str(rec.get("severity")) == "critical" else "medium",
+                    )
+
+                symbol_locks = rcp.get("symbol_locks") if isinstance(rcp.get("symbol_locks"), dict) else {}
+                if (
+                    rcp
+                    and (bool(rcp.get("global_lock_active", False)) or len(symbol_locks) > 0)
+                    and _cooldown_ok("trading_diag_reconciliation_protection")
+                ):
+                    self._last_notice_at["trading_diag_reconciliation_protection"] = now
+                    await self._send_notification(
+                        "🛡️ 对账保护已生效",
+                        f"检测到对账保护正在阻断新开仓。\n"
+                        f"- global_lock={bool(rcp.get('global_lock_active', False))}\n"
+                        f"- symbol_locks={len(symbol_locks)}\n"
+                        f"建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_reconciliation_protection。",
+                        priority="medium",
+                    )
+
+                auto_actions = safe_rec.get("automatic_actions_attempted") if isinstance(safe_rec.get("automatic_actions_attempted"), list) else []
+                applied_auto = [a for a in auto_actions if isinstance(a, dict) and a.get("status") == "applied"]
+                if applied_auto and _cooldown_ok("trading_diag_safe_recovery"):
+                    self._last_notice_at["trading_diag_safe_recovery"] = now
+                    await self._send_notification(
+                        "🧰 安全恢复已执行",
+                        "检测到系统已执行保守恢复动作（仅刷新本地状态/施加保护，不直接撤单或强平）。\n"
+                        f"- applied_actions={len(applied_auto)}\n"
+                        f"建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_safe_recovery。",
+                        priority="low",
                     )
 
                 # 细粒度告警：某一类失败原因突增（避免只看 open_fail/close_fail 总数）

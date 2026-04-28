@@ -38,6 +38,21 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     return float(default)
 
 
+def _normalize_symbol(symbol: Any) -> str:
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return ""
+    if "/" in s:
+        return s
+    if "-" in s:
+        parts = [p for p in s.split("-") if p]
+        if len(parts) >= 2:
+            if len(parts) >= 3 and parts[-1] == "SWAP":
+                return f"{parts[0]}/{parts[1]}/SWAP"
+            return f"{parts[0]}/{parts[1]}"
+    return s
+
+
 def _spread_bps(ticker: Dict[str, Any]) -> Optional[float]:
     last = _safe_float(ticker.get("last") or ticker.get("price") or 0)
     bid = _safe_float(ticker.get("bid") or 0)
@@ -547,7 +562,13 @@ class MarketIntelligenceEngine:
                 logger.debug("MarketIntelligence prewarm loop error: %s", e)
                 await asyncio.sleep(5)
 
-    async def _prewarm_symbols(self, symbols: List[str], *, include_snapshot: bool) -> None:
+    async def _prewarm_symbols(
+        self,
+        symbols: List[str],
+        *,
+        include_snapshot: bool,
+        force: bool = False,
+    ) -> None:
         self._prewarm_stats["cycles"] = int(self._prewarm_stats.get("cycles", 0) or 0) + 1
         self._prewarm_stats["last_cycle_at"] = _utc_iso()
         sem = asyncio.Semaphore(max(1, int(self._prewarm_batch_size)))
@@ -557,7 +578,7 @@ class MarketIntelligenceEngine:
         for s in symbols:
             h = self._prewarm_symbol_health.get(s) or {}
             next_ok_at = float(h.get("next_try_after_ts", 0.0) or 0.0)
-            if next_ok_at > now:
+            if (not force) and next_ok_at > now:
                 continue
             selected.append(s)
         if not selected:
@@ -600,11 +621,18 @@ class MarketIntelligenceEngine:
 
     async def refresh_symbol_async(self, symbol: str, *, include_snapshot: bool = True) -> None:
         """Public hook: trigger one-off background refresh for a symbol."""
-        sym = str(symbol or "").strip()
+        sym = _normalize_symbol(symbol)
         if not sym:
             return
         try:
-            await self._prewarm_symbols([sym], include_snapshot=bool(include_snapshot))
+            h = self._prewarm_symbol_health.get(sym) or {}
+            h["next_try_after_ts"] = 0.0
+            self._prewarm_symbol_health[sym] = h
+            await self._prewarm_symbols(
+                [sym],
+                include_snapshot=bool(include_snapshot),
+                force=True,
+            )
         except Exception:
             return
 
@@ -970,9 +998,9 @@ class MarketIntelligenceEngine:
         include_snapshot: bool = True,
         prefer_fast_only: bool = False,
     ) -> SymbolView:
-        sym = str(symbol or "").strip()
+        sym = _normalize_symbol(symbol)
         ts = _utc_iso()
-        cache_key = sym.upper()
+        cache_key = sym
         now = self._now()
         if cache_key in self._cache and (now - self._cache_ts.get(cache_key, 0)) < self._cache_ttl_sec:
             cached = self._cache[cache_key]
@@ -1690,10 +1718,10 @@ class MarketIntelligenceEngine:
         Returns cached symbol view if fresh; otherwise returns {} without fetching any data.
         """
         try:
-            sym = str(symbol or "").strip()
+            sym = _normalize_symbol(symbol)
             if not sym:
                 return {}
-            cache_key = sym.upper()
+            cache_key = sym
             now = self._now()
             if cache_key in self._cache and (now - self._cache_ts.get(cache_key, 0)) < self._cache_ttl_sec:
                 cached = self._cache.get(cache_key) or {}

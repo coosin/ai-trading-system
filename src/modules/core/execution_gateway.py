@@ -23,6 +23,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
+from src.modules.core.execution_reconciler import ExecutionReconciler
+from src.modules.core.decision_trace_store import DecisionTraceStore
+from src.modules.core.reconciliation_protection_manager import ReconciliationProtectionManager
+
 logger = logging.getLogger(__name__)
 
 # Closes when source != SWO: only SLTP and explicit user manual (main lane uses write_source=SWO).
@@ -79,6 +83,13 @@ class ExecutionGateway:
 
     def __init__(self, main_controller: Any) -> None:
         self._mc = main_controller
+        if self._mc is not None and getattr(self._mc, "decision_trace_store", None) is None:
+            try:
+                self._mc.decision_trace_store = DecisionTraceStore()
+            except Exception:
+                pass
+        self._reconciler = ExecutionReconciler(main_controller)
+        self._reconciliation_protection = ReconciliationProtectionManager()
         self._locks: Dict[str, asyncio.Lock] = {}
         self._snapshot = ExecutionGatewaySnapshot()
         self._idempotent_recent: Dict[str, float] = {}
@@ -109,6 +120,15 @@ class ExecutionGateway:
 
     def get_policy_metrics(self) -> Dict[str, int]:
         return dict(self._policy_metrics)
+
+    def get_reconciliation_protection_snapshot(self) -> Dict[str, Any]:
+        return self._reconciliation_protection.get_snapshot()
+
+    def _decision_trace_store(self) -> Optional[DecisionTraceStore]:
+        try:
+            return getattr(self._mc, "decision_trace_store", None)
+        except Exception:
+            return None
 
     def _push_recent_event(self, event: Dict[str, Any]) -> None:
         try:
@@ -955,6 +975,37 @@ class ExecutionGateway:
             self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context)
             return {"success": False, "error": msg}
 
+        try:
+            rec = await self._reconciler.build_snapshot(recent_events=list(self._snapshot.recent_events))
+            self._reconciliation_protection.ingest_reconciliation(rec)
+            protect_err = self._reconciliation_protection.allow_open(symbol)
+            if protect_err:
+                dts = self._decision_trace_store()
+                if dts:
+                    dts.record_reconciliation_result(
+                        trace_id=self._trace_id_from_context(context) or "",
+                        status="blocked",
+                        detail=protect_err,
+                        extras={"symbol": symbol},
+                    )
+                self._metric_inc("open_policy_denied")
+                logger.warning("ExecutionGateway.open_swap: reconciliation protection deny symbol=%s err=%s", symbol, protect_err)
+                self._record_order(
+                    source,
+                    "open",
+                    False,
+                    protect_err,
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    leverage=leverage,
+                    reason=reason,
+                    context=context,
+                )
+                return {"success": False, "error": protect_err}
+        except Exception as e:
+            logger.debug("ExecutionGateway.open_swap: reconciliation protection skipped: %s", e)
+
         ex = self._exchange()
         self._snapshot.exchange_connected = ex is not None
         if not ex:
@@ -1290,6 +1341,7 @@ class ExecutionGateway:
             ev_ctx: Dict[str, Any] = {}
             if isinstance(context, dict):
                 ev_ctx.update(context)
+            trace_id = self._trace_id_from_context(ev_ctx)
             self._push_recent_event(
                 {
                     "ts": self._snapshot.last_order_at,
@@ -1305,6 +1357,22 @@ class ExecutionGateway:
                     "context": ev_ctx,
                 }
             )
+            dts = self._decision_trace_store()
+            if dts and trace_id:
+                dts.record_execution_result(
+                    trace_id=trace_id,
+                    status="success" if bool(success) else "failed",
+                    detail=str(detail or "")[:500],
+                    source=source,
+                    op=op,
+                    extras={
+                        "symbol": symbol,
+                        "side": side,
+                        "size": size,
+                        "leverage": leverage,
+                        "reason": reason,
+                    },
+                )
         except Exception:
             pass
 
@@ -1337,4 +1405,21 @@ class ExecutionGateway:
             "open_cooldown_symbols": cooldown_symbols,
             "open_symbol_fail_count": dict(self._open_symbol_fail_count),
         }
+        try:
+            rec = await self._reconciler.build_snapshot(
+                recent_events=list(self._snapshot.recent_events)
+            )
+            self._reconciliation_protection.ingest_reconciliation(rec)
+            out["reconciliation"] = rec
+            out["reconciliation_protection"] = self._reconciliation_protection.get_snapshot()
+        except Exception as e:
+            out["reconciliation"] = {
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "healthy": False,
+                "severity": "warning",
+                "error": f"reconciliation_error:{type(e).__name__}",
+            }
+            out["reconciliation_protection"] = self._reconciliation_protection.get_snapshot()
+        dts = self._decision_trace_store()
+        out["decision_traces"] = dts.get_recent(limit=20) if dts else []
         return out

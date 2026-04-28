@@ -237,28 +237,19 @@ class EnhancedNaturalLanguageInterface:
                     side,
                     quantity,
                     leverage,
-                    "system",
+                    "manual",
                     "enhanced_nli_trade",
                     margin_mode="cross",
                     price=None,
+                    context={
+                        "manual_approved": True,
+                        "via": "enhanced_nli",
+                    },
                 )
                 return {
                     "success": bool(result.get("success")),
                     "message": f"{symbol} {side} {quantity} @ {leverage}x",
                     "detail": result,
-                }
-
-            okx = getattr(self.main_controller, "okx_exchange", None)
-            if okx and hasattr(okx, "open_swap_position"):
-                result = await okx.open_swap_position(
-                    symbol=symbol,
-                    side=side,
-                    size=quantity,
-                    leverage=leverage,
-                )
-                return {
-                    "success": result.get("success", False),
-                    "message": f"{symbol} {side} {quantity} @ {leverage}x",
                 }
 
             return {"success": False, "message": "交易所未连接"}

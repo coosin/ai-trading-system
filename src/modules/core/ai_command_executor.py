@@ -2155,6 +2155,12 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                         side=side,
                         quantity=qty,
                         reasoning=reason,
+                        source="manual",
+                        context={
+                            "via": "ai_command_executor_fallback",
+                            "user_input": str(user_input)[:240],
+                            "manual_approved": True,
+                        },
                     )
                 ok = bool((res or {}).get("success"))
                 sltp_created = False

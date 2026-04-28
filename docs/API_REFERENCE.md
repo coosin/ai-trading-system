@@ -4,7 +4,48 @@
 
 **在线文档（若服务已启动）:** `http://<host>:8000/docs`（Swagger UI）、`http://<host>:8000/redoc`
 
-**机器可读规范（与线上一致，由运行中服务导出）:** 同目录下 [`API_OPENAPI_FULL.json`](./API_OPENAPI_FULL.json)（OpenAPI 3.1，当前约 185 条路径；含请求体、查询参数、422 校验模型等）。
+**机器可读规范（与线上一致，由运行中服务导出）:** 同目录下 [`API_OPENAPI_FULL.json`](./API_OPENAPI_FULL.json)（OpenAPI 3.1，当前约 181 条路径；含请求体、查询参数、422 校验模型等）。
+
+## 开平仓 API 与调试总览（2026-04 收口版）
+
+### 1) 推荐读写入口
+
+- **决策/执行统一入口（推荐）**
+  - `POST /api/v1/modules/commander/dispatch`
+  - 推荐来源字段：`source=openclaw|api_chat|control_hub`
+- **执行审计与归因**
+  - `GET /api/v1/modules/commander/trading-diagnosis`
+  - `GET /api/v1/modules/commander/decision-traces`
+  - `GET /api/v1/modules/commander/decision-traces/{trace_id}`
+- **事件流（实时+补偿）**
+  - `GET /api/v1/trade/events`
+
+### 2) 开仓关键观察字段
+
+从 `trading-diagnosis.data.analysis_pipeline_assessment.market_analysis.samples[]` 读取：
+
+- `quality_score`
+- `spread_bps`
+- `depth_imbalance`
+- `funding_rate`
+- `open_interest`
+- `best_bid` / `best_ask`
+
+这些字段用于开仓门控（置信度、RR、点差、深度失衡、资金费率、流动性）排障定位。
+
+### 3) 调试与复测接口
+
+- `POST /api/v1/modules/commander/learning/seed-and-run`
+  - 用于学习闭环联调（不下实单，但会修改学习状态）
+- `GET /api/v1/modules/ai/learning-feedback`
+  - 查看止损惩罚与学习反馈命中状态
+
+### 4) 建议的一键验收命令
+
+- `make verify-trading`
+- `make verify-trading-gates`
+
+详见：`docs/TRADING_DEBUG_PLAYBOOK.md`
 
 ## 升级后实时链路（2026-04-13）
 
@@ -101,7 +142,37 @@
     - `max_positions_oneway`
     - `max_positions_hedge`
     - `hard_max_positions`
+  - 2026-04-28 补充关键诊断块：
+    - `data.execution_reconciliation`：本地/交易所状态对账摘要（仓位漂移、孤儿挂单、修复建议）
+    - `data.execution_reconciliation_protection`：对账保护层状态（symbol/global 锁）
+    - `data.execution_safe_recovery`：已自动执行的安全恢复动作（仅刷新/保护，不直接撤单或强平）
+    - `data.decision_traces`：最近决策轨迹样本
+    - `data.trace_learning_feedback`：学习引擎基于轨迹的反馈摘要
   - 支持 `limit_events` 参数控制 `execution_gateway.recent_events` 窗口大小。
+
+- **`GET /api/v1/modules/commander/decision-traces`**
+  - 最近 AI 决策轨迹聚合复盘接口。
+  - 用途：
+    - 查看 `guard_rejected` / `execution_failed` / `reconciliation_blocked` 分布
+    - 查看 `top_guard_reasons` / `top_execution_failures` / `top_reconciliation_blocks`
+    - 提取最近轨迹样本用于排障或验收
+
+- **`GET /api/v1/modules/commander/decision-traces/{trace_id}`**
+  - 查看单条 AI 决策链路。
+  - 返回：
+    - `intent`
+    - `guard`
+    - `execution`
+    - `reconciliation`
+
+- **`POST /api/v1/modules/commander/learning/seed-and-run`**
+  - 验收/联调用的学习闭环触发接口。
+  - 用途：
+    - 注入少量 synthetic trade-close 样本
+    - 立即触发学习引擎分析、报告与规则优化流程
+  - 注意：
+    - 不会下真实订单
+    - 但会修改学习状态、记忆与部分运行时配置覆盖，不属于只读接口
 
 - **`GET /api/v1/modules/ai/learning-feedback`**
   - 返回止损复盘与信号惩罚状态：
@@ -227,7 +298,7 @@
 - **OpenAPI 与文档一致性**
   - `python3 scripts/check_docs_runtime_consistency.py` -> OK（snapshot）
   - `python3 scripts/check_docs_runtime_consistency.py --runtime` -> OK（runtime build）
-  - 当前 OpenAPI：OpenAPI 3.1，约 185 条路径（与 `docs/API_OPENAPI_FULL.json` 一致）
+  - 当前 OpenAPI：OpenAPI 3.1，约 181 条路径（与 `docs/API_OPENAPI_FULL.json` 一致）
 
 - **系统状态**
   - `GET /api/v1/system/status` -> `running`（29/29 modules）
