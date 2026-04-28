@@ -36,6 +36,8 @@ htmlcov/
 logs/*.log
 logs/**/*.log
 logs/*.log.*
+logs/*.out
+logs/**/*.out
 logs/_tmp*.json
 logs/**/*.jsonl
 logs/**/*.json
