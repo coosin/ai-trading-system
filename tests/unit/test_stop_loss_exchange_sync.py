@@ -150,3 +150,47 @@ async def test_sync_refreshes_existing_active_quantity(tmp_path):
     a2 = await mgr.get_all_active_orders()
     assert a2[0].quantity == 2.0
     assert a2[0].remaining_quantity == 2.0
+
+
+@pytest.mark.asyncio
+async def test_stale_guard_heals_legacy_symbol_when_swap_inst_live(tmp_path):
+    """index_key 与交易所 instId 不一致时，按标的+方向自愈映射，不误标 stale。"""
+    cfg = StopLossTakeProfitConfig(
+        sync_exchange_positions_on_startup=True,
+        persist_file=str(tmp_path / "sltp_heal.json"),
+    )
+    mgr = StopLossTakeProfitManager(cfg)
+    await mgr.initialize()
+    oid = "legacy_oid"
+    bad_key = "pos:FOO-USDT-SWAP|long"
+    mgr.orders[oid] = StopLossTakeProfitOrder(
+        order_id=oid,
+        symbol="ATOM/USDT",
+        side="long",
+        entry_price=5.0,
+        quantity=10.0,
+        remaining_quantity=10.0,
+        status=StopLossTakeProfitStatus.ACTIVE,
+        metadata={"index_key": bad_key},
+    )
+    mgr.order_index[mgr._normalize_any_key(bad_key)] = oid
+    mgr.set_exchange(
+        _FakeEx(
+            [
+                {
+                    "instId": "ATOM-USDT-SWAP",
+                    "symbol": "ATOM/USDT/SWAP",
+                    "side": "long",
+                    "size": 10.0,
+                    "avgPx": 5.0,
+                }
+            ]
+        )
+    )
+    res = await mgr.sync_open_positions_from_exchange()
+    assert res.get("stale_cancelled", 0) == 0
+    assert res.get("stale_healed", 0) >= 1
+    o = mgr.orders[oid]
+    assert o.status == StopLossTakeProfitStatus.ACTIVE
+    assert o.symbol == "ATOM/USDT/SWAP"
+    assert mgr.order_index.get(mgr._normalize_any_key("pos:ATOM-USDT-SWAP|long")) == oid

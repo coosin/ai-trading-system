@@ -559,6 +559,72 @@ class StopLossTakeProfitManager:
                     return sz
         return None
 
+    def _note_close_failure_meta(
+        self, order: StopLossTakeProfitOrder, err: Any, reason: str
+    ) -> None:
+        """把最近一次平仓失败原因写回订单 metadata，便于运维对照 SR/分层 partial。"""
+        try:
+            m = dict(order.metadata or {})
+            m["last_close_error"] = str(err)[:800]
+            m["last_close_error_at"] = datetime.now().isoformat()
+            m["last_close_reason"] = str(reason)[:200]
+            order.metadata = m
+        except Exception:
+            pass
+
+    async def _quantize_partial_close_size(
+        self,
+        symbol: str,
+        side: str,
+        desired: float,
+        live_cap: Optional[float],
+    ) -> float:
+        """
+        按 OKX 永续 instruments 的 lotSz/minSz 向下取整，减少 partial 因张数步进被拒。
+        非 OKX 或未实现 get_swap_symbol_info 时原样返回（仍受交易所校验）。
+        """
+        want = max(0.0, float(desired))
+        if want <= 1e-12:
+            return 0.0
+        if live_cap is not None and float(live_cap) > 1e-12:
+            want = min(want, float(live_cap))
+        ex = self._exchange
+        mc = self._main_controller
+        if not ex and mc and hasattr(mc, "get_exchange"):
+            try:
+                ex = mc.get_exchange()
+            except Exception:
+                ex = None
+        if not ex:
+            return want
+        gss = getattr(ex, "get_swap_symbol_info", None)
+        if not callable(gss):
+            return want
+        try:
+            info = await gss(symbol)
+        except Exception:
+            info = {}
+        if not isinstance(info, dict):
+            info = {}
+        lot_sz = float(info.get("lotSz") or 0)
+        min_sz = float(info.get("minSz") or 0)
+        if lot_sz <= 0:
+            return want
+        steps = math.floor(want / lot_sz + 1e-12)
+        aligned = steps * lot_sz
+        if min_sz > 0 and 0 < aligned < min_sz - 1e-14:
+            cap = float(live_cap) if live_cap is not None else want
+            if min_sz <= want + 1e-12 and min_sz <= cap + 1e-9:
+                aligned = min_sz
+            else:
+                return 0.0
+        if aligned <= 1e-12:
+            return 0.0
+        if live_cap is not None and float(live_cap) > 1e-12 and aligned > float(live_cap) + 1e-9:
+            steps2 = math.floor(float(live_cap) / lot_sz + 1e-12) * lot_sz
+            aligned = min(aligned, max(0.0, steps2))
+        return float(aligned)
+
     async def _execute_exchange_close_on_trigger(
         self,
         order: StopLossTakeProfitOrder,
@@ -576,6 +642,7 @@ class StopLossTakeProfitManager:
                 ex = None
         if not ex:
             logger.warning("止盈止损触发但无交易所连接，跳过实盘平仓: %s", order.symbol)
+            self._note_close_failure_meta(order, "no_exchange", reason)
             return False
 
         gw = getattr(mc, "execution_gateway", None) if mc else None
@@ -587,6 +654,40 @@ class StopLossTakeProfitManager:
                 close_sz = None
         if close_sz is None or close_sz <= 0:
             close_sz = float(order.remaining_quantity or order.quantity or 0) or None
+
+        explicit_partial = close_size is not None and float(close_size) > 1e-12
+        if explicit_partial and close_sz is not None and float(close_sz) > 1e-12:
+            live_cap: Optional[float] = None
+            try:
+                live_cap = await self._fetch_live_position_size(order.symbol, order.side)
+            except Exception:
+                live_cap = None
+            rem_cap = float(order.remaining_quantity or order.quantity or 0) or None
+            if rem_cap is not None and rem_cap > 1e-12:
+                close_sz = min(float(close_sz), float(rem_cap))
+            q = await self._quantize_partial_close_size(
+                order.symbol, order.side, float(close_sz), live_cap
+            )
+            if q <= 1e-12:
+                msg = f"quantize_zero desired={close_size} live={live_cap}"
+                logger.warning(
+                    "⚠️ 部分平仓张数经 lot/min 对齐后为 0，跳过: %s reason=%s %s",
+                    order.symbol,
+                    reason,
+                    msg,
+                )
+                self._note_close_failure_meta(order, msg, reason)
+                return False
+            if abs(q - float(close_sz or 0)) > max(1e-12, float(close_sz or 0) * 1e-9):
+                logger.info(
+                    "部分平仓张数对齐 lotSz: %s reason=%s %.8f -> %.8f",
+                    order.symbol,
+                    reason,
+                    float(close_sz or 0),
+                    q,
+                )
+            close_sz = q
+
         try:
             if gw:
                 meta_ctx = order.metadata or {}
@@ -686,9 +787,11 @@ class StopLossTakeProfitManager:
             else:
                 err = res.get("error", res) if isinstance(res, dict) else res
                 logger.error("❌ 止盈止损实盘平仓失败: %s err=%s", order.symbol, err)
+                self._note_close_failure_meta(order, err, reason)
                 return False
         except Exception as e:
             logger.exception("止盈止损实盘平仓异常: %s", e)
+            self._note_close_failure_meta(order, e, reason)
             return False
     
     def set_audit_logger(self, audit_logger):
@@ -856,6 +959,115 @@ class StopLossTakeProfitManager:
 
         return changed
 
+    @staticmethod
+    def _strip_swap_market_suffix(symbol: str) -> str:
+        """ATOM/USDT/SWAP 与 ATOM/USDT 视为同一标的键（用于持仓匹配）。"""
+        s = str(symbol or "").strip()
+        if not s:
+            return s
+        s = s.replace("-", "/")
+        up = s.upper()
+        if up.endswith("/SWAP"):
+            return s[: -len("/SWAP")]
+        return s
+
+    def _expand_live_position_key_set(self, positions: Any) -> set[str]:
+        """
+        构建「交易所当前有仓」的全部索引别名（归一化后集合），供 stale 判断。
+        解决：本地 ACTIVE 使用 `ATOM/USDT|long` 而交易所 live 仅有 `pos:ATOM-USDT-SWAP|long` 时被误清理。
+        """
+        keys: set[str] = set()
+        for p in positions or []:
+            try:
+                if not isinstance(p, dict):
+                    continue
+                sz = float(p.get("size", 0) or 0)
+                if abs(sz) < 1e-12:
+                    continue
+                sym = self._canonical_symbol_from_position(p)
+                if not sym:
+                    continue
+                side = self._resolved_side_from_position(p)
+                inst_id = str(p.get("instId") or "").strip()
+                if inst_id:
+                    keys.add(self._normalize_any_key(self._build_pos_key(inst_id, side)))
+                keys.add(self._normalize_any_key(f"{sym}|{side}"))
+                for vk in self._index_key_lookup_variants(sym, side):
+                    keys.add(self._normalize_any_key(vk))
+                if sym.upper().endswith("/SWAP"):
+                    alt = sym[: -len("/SWAP")]
+                    if alt and alt != sym:
+                        keys.add(self._normalize_any_key(f"{alt}|{side}"))
+                        for vk in self._index_key_lookup_variants(alt, side):
+                            keys.add(self._normalize_any_key(vk))
+            except Exception:
+                continue
+        return keys
+
+    def _match_exchange_position_row(
+        self, order: "StopLossTakeProfitOrder", positions: Any
+    ) -> Optional[Dict[str, Any]]:
+        """在 index 键不一致时，按标的+方向在交易所持仓行中查找对应仓位。"""
+        want_side = str(order.side or "").strip().lower()
+        if want_side not in ("long", "short"):
+            return None
+        o_core = self._strip_swap_market_suffix(order.symbol)
+        if not o_core:
+            return None
+        for p in positions or []:
+            try:
+                if not isinstance(p, dict):
+                    continue
+                if abs(float(p.get("size", 0) or 0)) < 1e-12:
+                    continue
+                if self._resolved_side_from_position(p) != want_side:
+                    continue
+                psym = self._canonical_symbol_from_position(p)
+                p_core = self._strip_swap_market_suffix(psym)
+                if o_core.upper() == p_core.upper():
+                    return p
+            except Exception:
+                continue
+        return None
+
+    async def _heal_active_order_index_from_position(
+        self, order: "StopLossTakeProfitOrder", p: Dict[str, Any]
+    ) -> None:
+        """将本地 ACTIVE 单的 index/position 键与交易所 instId 对齐，并重建 order_index 映射。"""
+        inst_id = str(p.get("instId") or "").strip()
+        side = self._resolved_side_from_position(p)
+        sym = self._canonical_symbol_from_position(p)
+        for vk in self._order_index_keys_to_clear(order):
+            try:
+                if self.order_index.get(vk) == order.order_id:
+                    del self.order_index[vk]
+            except Exception:
+                pass
+        canonical, variants, meta_new = await self._resolve_canonical_and_variants(
+            symbol=sym,
+            side=side,
+            metadata={
+                "source": "sltp_sync_heal",
+                "instId": inst_id,
+                "posSide": side,
+            },
+        )
+        meta = dict(order.metadata or {})
+        meta.update(meta_new)
+        meta["healed_at"] = datetime.now().isoformat()
+        meta["heal_source"] = "exchange_sync_stale_guard"
+        order.metadata = meta
+        order.symbol = sym
+        for k in variants + [canonical]:
+            self.order_index[self._normalize_any_key(k)] = order.order_id
+        logger.info(
+            "SLTP: 已自愈 index 映射 order_id=%s symbol=%s side=%s canonical=%s",
+            order.order_id,
+            sym,
+            side,
+            canonical,
+        )
+
     async def sync_open_positions_from_exchange(self) -> Dict[str, Any]:
         """
         将交易所当前净持仓登记到本地止盈止损跟踪（解决「仓位在交易所但本模块未建单」的问题）。
@@ -879,6 +1091,7 @@ class StopLossTakeProfitManager:
         skipped = 0
         refreshed = 0
         stale_cancelled = 0
+        stale_healed = 0
         live_index_keys = set()
         raw_row_count = len(positions or [])
 
@@ -901,7 +1114,7 @@ class StopLossTakeProfitManager:
             except Exception:
                 continue
 
-        live_norm = {self._normalize_any_key(k) for k in live_index_keys}
+        live_norm = self._expand_live_position_key_set(positions)
 
         # 清理本地已不存在于交易所的活动跟踪单，避免历史脏数据长期残留。
         for oid, order in list(self.orders.items()):
@@ -911,6 +1124,11 @@ class StopLossTakeProfitManager:
                 idx_key = (order.metadata or {}).get("index_key") or f"{order.symbol}|{order.side}"
                 idx_key = self._normalize_any_key(idx_key)
                 if idx_key not in live_norm:
+                    match_p = self._match_exchange_position_row(order, positions)
+                    if match_p:
+                        await self._heal_active_order_index_from_position(order, match_p)
+                        stale_healed += 1
+                        continue
                     order.status = StopLossTakeProfitStatus.CANCELLED
                     order.trigger_reason = "stale_not_in_exchange"
                     order.updated_at = datetime.now()
@@ -992,18 +1210,21 @@ class StopLossTakeProfitManager:
             except Exception as e:
                 logger.warning(f"sync_open_positions: 处理单条持仓失败: {e}")
 
-        if stale_cancelled > 0 or refreshed > 0:
+        if stale_cancelled > 0 or refreshed > 0 or stale_healed > 0:
             await self._save_orders()
         logger.info(
             f"📌 交易所持仓→止盈止损跟踪: 新建 {synced}，已存在跳过 {skipped}（其中已对齐刷新 {refreshed}），"
-            f"清理陈旧 {stale_cancelled}，live_keys={len(live_index_keys)} raw_rows={raw_row_count}"
+            f"清理陈旧 {stale_cancelled}，index 自愈 {stale_healed}，"
+            f"live_keys={len(live_index_keys)} live_norm_keys={len(live_norm)} raw_rows={raw_row_count}"
         )
         return {
             "synced": synced,
             "skipped": skipped,
             "refreshed": refreshed,
             "stale_cancelled": stale_cancelled,
+            "stale_healed": stale_healed,
             "live_index_keys": sorted(live_index_keys),
+            "live_norm_key_count": len(live_norm),
             "raw_row_count": raw_row_count,
         }
     
