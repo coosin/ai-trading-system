@@ -155,6 +155,9 @@ class MarketIntelligenceEngine:
         self._prewarm_task: Optional[asyncio.Task] = None
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ts: Dict[str, float] = {}
+        # Keep last known-good non-partial view to smooth transient degraded spikes.
+        self._last_good_view: Dict[str, Dict[str, Any]] = {}
+        self._last_good_view_ts: Dict[str, float] = {}
         self._rolling: Dict[str, Dict[str, float]] = {}
         # anomaly debounce state: key -> {"count": int, "last_ts": float}
         self._anomaly_streak: Dict[str, Dict[str, float]] = {}
@@ -162,6 +165,7 @@ class MarketIntelligenceEngine:
         self._contract_cache_ts: Dict[str, float] = {}
         self._last_emitted: Dict[str, Dict[str, Any]] = {}
         self._cache_ttl_sec = float(self._cfg.get("cache_ttl_sec", 20) or 20)
+        self._last_good_view_ttl_sec = float(self._cfg.get("last_good_view_ttl_sec", 180) or 180)
         self._push_interval_sec = float(self._cfg.get("push_interval_sec", 15) or 15)
         self._watch_symbols: List[str] = list(self._cfg.get("watch_symbols") or [])
         self._prewarm_enabled: bool = bool(self._cfg.get("prewarm_enabled", True))
@@ -1700,11 +1704,57 @@ class MarketIntelligenceEngine:
             snapshot=snapshot if include_snapshot else {},
         )
 
+        # Stability guard:
+        # If this round is partial/degraded, prefer recent known-good view to reduce
+        # live<->unknown oscillation that can suppress downstream decisions.
+        try:
+            prov_now = str(view.provenance or "").lower()
+            weak_now = (
+                bool(view.partial)
+                or prov_now in {"degraded", "unknown", "fastpath", ""}
+                or view.quality_score is None
+                or view.confidence is None
+            )
+            now_ts = self._now()
+            lg = self._last_good_view.get(cache_key)
+            lg_ts = float(self._last_good_view_ts.get(cache_key, 0) or 0)
+            lg_fresh = bool(lg) and (now_ts - lg_ts) <= float(self._last_good_view_ttl_sec)
+            if weak_now and lg_fresh:
+                fb = dict(lg or {})
+                fb_errs = list((fb.get("errors") or []))
+                fb_errs.append("fallback_last_good_view")
+                fb["errors"] = fb_errs[-12:]
+                fb["partial"] = bool(view.partial)
+                fb["provenance"] = str(fb.get("provenance") or "live")
+                fb["timestamp"] = ts
+                if include_snapshot:
+                    fb["snapshot"] = snapshot
+                else:
+                    fb["snapshot"] = {}
+                view = SymbolView(**fb)
+        except Exception:
+            pass
+
         # Add UI-oriented helpers (Chinese display + bounded diff)
         try:
             d = view.to_dict()
             view.changeset = self._compute_changeset(cache_key, d)
             view.display_cn = self._build_display_cn(d)
+        except Exception:
+            pass
+
+        # Refresh last-good snapshot after final stabilization.
+        try:
+            prov_final = str(view.provenance or "").lower()
+            strong = (
+                not bool(view.partial)
+                and prov_final not in {"degraded", "unknown", "fastpath", ""}
+                and view.quality_score is not None
+                and view.confidence is not None
+            )
+            if strong:
+                self._last_good_view[cache_key] = dict(view.__dict__)
+                self._last_good_view_ts[cache_key] = self._now()
         except Exception:
             pass
 

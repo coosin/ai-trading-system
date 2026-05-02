@@ -19,8 +19,10 @@ from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
+from collections import Counter
 
 from src.modules.core.module_config_utils import resolve_module_config
+from src.modules.core.decision_trace_store import DecisionTraceStore
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,16 @@ class ProactiveMarketScanner:
             "actions_taken": 0,
             "insights_generated": 0,
         }
+        self._opportunity_type_counts: Counter[str] = Counter()
+        # Gate / forwarding observability for diagnosis (in-memory, bounded).
+        self._gate_reject_reasons: Counter[str] = Counter()
+        self._gate_reject_symbols: Counter[str] = Counter()
+        self._gate_reject_ticker_sources: Counter[str] = Counter()
+        self._gate_pass_count: int = 0
+        self._gate_reject_count: int = 0
+        self._forward_attempted: int = 0
+        self._forward_ok: int = 0
+        self._forward_fail: int = 0
 
         # 主动性下单节流：减少突破类重复开仓与同品种高频触发
         self._last_proactive_trade_at: Dict[str, datetime] = {}
@@ -373,6 +385,7 @@ class ProactiveMarketScanner:
                 
                 symbols = await self._get_active_symbols()
                 self._stats["last_scan_phase"] = "scan_symbols"
+                self._stats["last_scan_symbols_count"] = int(len(symbols or []))
                 
                 for symbol in symbols:
                     try:
@@ -382,6 +395,10 @@ class ProactiveMarketScanner:
                         if opportunity:
                             self._upsert_opportunity(opportunity)
                             self._stats["opportunities_found"] += 1
+                            try:
+                                self._opportunity_type_counts[str(opportunity.opportunity_type.value)] += 1
+                            except Exception:
+                                pass
                             
                             await self._notify_opportunity(opportunity)
                     except Exception as e:
@@ -471,8 +488,37 @@ class ProactiveMarketScanner:
             "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT",
             "DOT/USDT", "MATIC/USDT", "LINK/USDT", "ATOM/USDT"
         ])
+        want_n = int(self.config.get("scan_symbol_limit", 12) or 12)
+        want_n = max(4, min(40, want_n))
+
+        # Prefer dynamic symbol selector when available: improves "异动币种发现能力"
+        # by ranking candidates using liquidity/volume/volatility/trend rather than
+        # arbitrary exchange symbol ordering.
+        try:
+            mc = self.main_controller
+            selector = getattr(mc, "dynamic_symbol_selector", None) if mc else None
+            if selector and hasattr(selector, "get_trading_symbols"):
+                syms = await selector.get_trading_symbols()
+                if isinstance(syms, list) and syms:
+                    out = [str(s) for s in syms if s]
+                    # If selector returns too few, supplement with default symbols so
+                    # scanner still covers a reasonable universe for opportunity discovery.
+                    if len(out) < want_n:
+                        seen = {self._norm_symbol_key(s) for s in out}
+                        for s in default_symbols:
+                            if len(out) >= want_n:
+                                break
+                            if self._norm_symbol_key(s) in seen:
+                                continue
+                            out.append(str(s))
+                            seen.add(self._norm_symbol_key(s))
+                    self._stats["active_symbols_source"] = "dynamic_symbol_selector_plus_defaults"
+                    return out[:want_n]
+        except Exception:
+            pass
         
         if not self.exchange:
+            self._stats["active_symbols_source"] = "default_symbols_no_exchange"
             return default_symbols
         
         try:
@@ -481,10 +527,12 @@ class ProactiveMarketScanner:
                 symbols = await asyncio.wait_for(self.exchange.get_symbols(), timeout=6.0)
                 usdt_symbols = [s for s in symbols if '/USDT' in s or '-USDT' in s]
                 if usdt_symbols:
+                    self._stats["active_symbols_source"] = "exchange_symbols_head20"
                     return usdt_symbols[:20]
         except Exception as e:
             logger.debug(f"读取交易所交易对失败，使用默认列表: {e}")
         
+        self._stats["active_symbols_source"] = "default_symbols_fallback"
         return default_symbols
     
     async def _quick_scan_symbol(self, symbol: str) -> Optional[MarketOpportunity]:
@@ -497,6 +545,19 @@ class ProactiveMarketScanner:
                 cv = mi.get_cached_symbol_view(symbol) or {}
                 price = float(cv.get("price") or 0)
                 change_24h = float(cv.get("change_24h") or 0)
+                atr_pct_1h = float(cv.get("atr_pct_1h") or 0.0)
+                quality_score = cv.get("quality_score")
+                trend = str(cv.get("trend") or "unknown").lower()
+                spread_bps = None
+                depth_imbalance = None
+                try:
+                    spread_bps = float(cv.get("spread_bps")) if cv.get("spread_bps") is not None else None
+                except Exception:
+                    spread_bps = None
+                try:
+                    depth_imbalance = float(cv.get("depth_imbalance")) if cv.get("depth_imbalance") is not None else None
+                except Exception:
+                    depth_imbalance = None
                 if price > 0 and abs(change_24h) > self._mean_reversion_min_abs_change:
                     direction = "short" if change_24h > 0 else "long"
                     confidence = min(0.9, abs(change_24h) * 10)
@@ -516,6 +577,125 @@ class ProactiveMarketScanner:
                         priority=int(confidence * 10),
                         expires_at=datetime.now() + timedelta(minutes=30),
                     )
+                # Volatility spike: use MI-derived ATR% to detect abnormal regimes and
+                # create a structured opportunity that can later be filtered by gates.
+                try:
+                    min_atr = float(self.config.get("vol_spike_min_atr_pct_1h", 0.012) or 0.012)
+                    min_q = float(self.config.get("vol_spike_min_quality_score", 0.6) or 0.6)
+                    qv = float(quality_score) if quality_score is not None else 0.0
+                    if price > 0 and atr_pct_1h >= min_atr and qv >= min_q:
+                        if trend in ("bullish", "bearish"):
+                            direction = "long" if trend == "bullish" else "short"
+                            conf = min(0.88, 0.72 + atr_pct_1h * 8.0)
+                            sl_mult = 1.0 - (2.0 * atr_pct_1h) if direction == "long" else 1.0 + (2.0 * atr_pct_1h)
+                            tp_mult = 1.0 + (3.0 * atr_pct_1h) if direction == "long" else 1.0 - (3.0 * atr_pct_1h)
+                            return MarketOpportunity(
+                                symbol=symbol,
+                                opportunity_type=OpportunityType.VOLATILITY_SPIKE,
+                                direction=direction,
+                                confidence=conf,
+                                entry_price=price,
+                                stop_loss=price * sl_mult,
+                                take_profit=price * tp_mult,
+                                reasoning=(
+                                    f"1h ATR 异动: atr_pct_1h={atr_pct_1h:.4%} "
+                                    f"trend={trend} quality={qv:.2f} (来自统一快照缓存)"
+                                ),
+                                data_sources=["unified_snapshot_cache", "atr_pct_1h"],
+                                priority=8,
+                                expires_at=datetime.now() + timedelta(minutes=15),
+                            )
+                except Exception:
+                    pass
+
+                # Liquidity / microstructure event (two-tier: minor/major):
+                # spread widening + depth imbalance.
+                # This is primarily an "异动发现" signal. Downstream ai_core/microstructure gates
+                # still decide whether it is tradable.
+                try:
+                    min_q = float(self.config.get("liq_event_min_quality_score", 0.6) or 0.6)
+                    qv = float(quality_score) if quality_score is not None else 0.0
+
+                    minor_spread = float(self.config.get("liq_event_minor_min_spread_bps", 12.0) or 12.0)
+                    minor_imb = float(self.config.get("liq_event_minor_min_abs_depth_imbalance", 0.80) or 0.80)
+                    major_spread = float(self.config.get("liq_event_major_min_spread_bps", 18.0) or 18.0)
+                    major_imb = float(self.config.get("liq_event_major_min_abs_depth_imbalance", 0.88) or 0.88)
+
+                    # Dynamic thresholding by quality: high quality allows earlier trigger.
+                    # qv>=0.75 -> reduce thresholds a bit; qv<0.65 -> keep as-is.
+                    q_hi = float(self.config.get("liq_event_quality_high", 0.75) or 0.75)
+                    q_lo = float(self.config.get("liq_event_quality_low", 0.65) or 0.65)
+                    if qv >= q_hi:
+                        minor_spread = max(8.0, minor_spread * 0.85)
+                        minor_imb = max(0.72, minor_imb * 0.95)
+                        major_spread = max(12.0, major_spread * 0.90)
+                        major_imb = max(0.80, major_imb * 0.97)
+                    elif qv <= q_lo:
+                        # leave thresholds unchanged
+                        pass
+
+                    severity = None
+                    min_spread = None
+                    min_imb = None
+                    # Prefer major when both satisfied.
+                    if (
+                        spread_bps is not None
+                        and depth_imbalance is not None
+                        and spread_bps >= major_spread
+                        and abs(depth_imbalance) >= major_imb
+                    ):
+                        severity = "major"
+                        min_spread = major_spread
+                        min_imb = major_imb
+                    elif (
+                        spread_bps is not None
+                        and depth_imbalance is not None
+                        and spread_bps >= minor_spread
+                        and abs(depth_imbalance) >= minor_imb
+                    ):
+                        severity = "minor"
+                        min_spread = minor_spread
+                        min_imb = minor_imb
+                    if (
+                        price > 0
+                        and qv >= min_q
+                        and spread_bps is not None
+                        and depth_imbalance is not None
+                        and severity is not None
+                    ):
+                        direction = "long" if depth_imbalance > 0 else "short"
+                        conf_key = "liq_event_major_confidence" if severity == "major" else "liq_event_minor_confidence"
+                        conf = float(self.config.get(conf_key, 0.80) or 0.80)
+                        conf = max(0.72, min(0.88, conf))
+                        # Use ATR if available to size SL/TP; fallback to fixed buffers.
+                        atrp = max(0.0, float(atr_pct_1h or 0.0))
+                        sl_buf = (2.2 * atrp) if atrp > 0 else 0.018
+                        tp_buf = (3.2 * atrp) if atrp > 0 else 0.028
+                        if direction == "long":
+                            sl = price * (1.0 - sl_buf)
+                            tp = price * (1.0 + tp_buf)
+                        else:
+                            sl = price * (1.0 + sl_buf)
+                            tp = price * (1.0 - tp_buf)
+                        return MarketOpportunity(
+                            symbol=symbol,
+                            opportunity_type=OpportunityType.LIQUIDITY_EVENT,
+                            direction=direction,
+                            confidence=conf,
+                            entry_price=price,
+                            stop_loss=sl,
+                            take_profit=tp,
+                            reasoning=(
+                                f"盘口异动({severity}): spread_bps={spread_bps:.2f} "
+                                f"depth_imbalance={depth_imbalance:.3f} "
+                                f"atr_pct_1h={atr_pct_1h:.4%} quality={qv:.2f} (来自统一快照缓存)"
+                            ),
+                            data_sources=["unified_snapshot_cache", "orderbook_microstructure"],
+                            priority=9 if severity == "major" else 8,
+                            expires_at=datetime.now() + timedelta(minutes=10),
+                        )
+                except Exception:
+                    pass
                 # 缓存命中但无机会：直接返回，避免触发交易所直连请求拖慢扫描轮次
                 if cv:
                     return None
@@ -849,17 +1029,72 @@ class ProactiveMarketScanner:
 
         gate_metrics: Dict[str, Any] = {}
         gate_reason = ""
+        self._forward_attempted += 1
         if self._opportunity_gate:
             gr = await self._opportunity_gate.evaluate(
                 opportunity, self._insights.get(opportunity.symbol)
             )
             if not gr.passed:
+                self._gate_reject_count += 1
+                try:
+                    self._gate_reject_reasons[str(gr.reason or "unknown")] += 1
+                    self._gate_reject_symbols[str(opportunity.symbol or "unknown")] += 1
+                    m = dict(gr.metrics or {})
+                    # Best-effort attribute of why ticker was empty.
+                    if str(gr.reason or "") == "ticker_empty":
+                        if m.get("ticker_from_mi_view"):
+                            self._gate_reject_ticker_sources["mi_view"] += 1
+                        elif m.get("ticker_from_cached_symbol_view"):
+                            self._gate_reject_ticker_sources["mi_cached_symbol_view"] += 1
+                        else:
+                            self._gate_reject_ticker_sources["exchange_ticker_or_unknown"] += 1
+                except Exception:
+                    pass
+                # Persist scanner-side rejections to decision traces for replay.
+                try:
+                    mc = self.main_controller
+                    if mc is not None and getattr(mc, "decision_trace_store", None) is None:
+                        mc.decision_trace_store = DecisionTraceStore()
+                    dts = getattr(mc, "decision_trace_store", None) if mc is not None else None
+                    if dts:
+                        trace_id = (
+                            f"scanner-{self._norm_symbol_key(opportunity.symbol)}-"
+                            f"{opportunity.opportunity_type.value}-{opportunity.direction}-"
+                            f"{int(datetime.now().timestamp())}"
+                        )
+                        dts.record_intent(
+                            trace_id=trace_id,
+                            symbol=str(opportunity.symbol),
+                            side=str(opportunity.direction),
+                            action="open",
+                            source="proactive_scanner",
+                            confidence=float(getattr(opportunity, "confidence", 0.0) or 0.0),
+                            strategy_used="scanner_opportunity",
+                            reasoning=str(getattr(opportunity, "reasoning", "") or ""),
+                            quantity=None,
+                            leverage=None,
+                            extras={
+                                "opportunity_type": opportunity.opportunity_type.value,
+                                "priority": int(getattr(opportunity, "priority", 0) or 0),
+                                "data_sources": list(getattr(opportunity, "data_sources", []) or []),
+                            },
+                        )
+                        dts.record_guard_result(
+                            trace_id=trace_id,
+                            status="rejected",
+                            reason=str(gr.reason),
+                            stage="scanner_precheck",
+                            extras=dict(gr.metrics or {}),
+                        )
+                except Exception:
+                    pass
                 logger.info(
                     "⛔ 实时数据预检未通过，不报 ai_core: %s — %s",
                     opportunity.symbol,
                     gr.reason,
                 )
                 return
+            self._gate_pass_count += 1
             gate_reason = gr.reason
             gate_metrics = dict(gr.metrics or {})
 
@@ -881,6 +1116,7 @@ class ProactiveMarketScanner:
             payload["gate_metrics"] = gate_metrics
         try:
             await mi.ingest_scanner_opportunity(payload)
+            self._forward_ok += 1
             logger.info(
                 "📨 掃描機會已交給统一行情分析层二次研判并推送: %s %s %s",
                 opportunity.symbol,
@@ -888,6 +1124,7 @@ class ProactiveMarketScanner:
                 self._zh_opp_type(opportunity.opportunity_type.value),
             )
         except Exception as e:
+            self._forward_fail += 1
             logger.warning("掃描機會轉發分析层失敗: %s", e)
 
     async def _evaluate_and_execute(self, opportunity: MarketOpportunity) -> bool:
@@ -963,7 +1200,21 @@ class ProactiveMarketScanner:
     
     def get_stats(self) -> Dict[str, int]:
         """获取统计信息"""
-        return self._stats.copy()
+        out = dict(self._stats or {})
+
+        def _top(c: Counter[str], n: int = 8) -> List[Dict[str, Any]]:
+            return [{"key": k, "count": int(v)} for k, v in c.most_common(n)]
+
+        out["forward_attempted"] = int(self._forward_attempted)
+        out["gate_passed"] = int(self._gate_pass_count)
+        out["gate_rejected"] = int(self._gate_reject_count)
+        out["forward_ok"] = int(self._forward_ok)
+        out["forward_fail"] = int(self._forward_fail)
+        out["top_gate_reject_reasons"] = _top(self._gate_reject_reasons)
+        out["top_gate_reject_symbols"] = _top(self._gate_reject_symbols)
+        out["top_ticker_empty_sources"] = _top(self._gate_reject_ticker_sources)
+        out["top_opportunity_types"] = _top(self._opportunity_type_counts)
+        return out
 
 
 class ProactiveInformationCollector:

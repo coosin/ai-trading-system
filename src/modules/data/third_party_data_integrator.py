@@ -127,7 +127,7 @@ class BaseDataProvider(ABC):
 
     async def _throttle(self) -> None:
         """全局最小请求间隔，降低 Reddit/Twitter 等 429 概率（可按环境调参）。"""
-        min_iv = max(0.0, _env_float("OPENCLAW_THIRD_PARTY_MIN_INTERVAL_SEC", 1.1))
+        min_iv = max(0.0, _env_float("OPENCLAW_THIRD_PARTY_MIN_INTERVAL_SEC", 2.0))
         if min_iv <= 0:
             return
         now = time.monotonic()

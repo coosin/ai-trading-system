@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import ssl
+import tempfile
 import time
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
@@ -26,6 +27,40 @@ import certifi
 from .exchange_base import ExchangeBase, MarketData, OrderBook, Order, Balance, ExchangeInfo
 
 logger = logging.getLogger(__name__)
+
+_merged_okx_cafile_cache: Optional[str] = None
+
+
+def _okx_ssl_cafile_path() -> str:
+    """
+    Choose CA bundle for OKX REST/WS (aiohttp).
+
+    Priority:
+    1. Merge certifi + OPENCLAW_SSL_CA_BUNDLE when set (common for HTTPS-proxy MITM extra roots)
+    2. SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE when pointing at an existing file
+    3. certifi.where()
+    """
+    global _merged_okx_cafile_cache
+    extra = (os.getenv("OPENCLAW_SSL_CA_BUNDLE") or "").strip()
+    if extra and os.path.isfile(extra):
+        if _merged_okx_cafile_cache and os.path.isfile(_merged_okx_cafile_cache):
+            return _merged_okx_cafile_cache
+        try:
+            base = Path(certifi.where()).read_bytes().strip()
+            add = Path(extra).read_bytes().strip()
+            tmpdir = Path(os.getenv("TMPDIR") or tempfile.gettempdir())
+            merged = tmpdir / "openclaw_okx_merged_ca.pem"
+            merged.write_bytes(base + b"\n" + add + b"\n")
+            _merged_okx_cafile_cache = str(merged)
+            logger.info("OKX SSL: merged certifi + OPENCLAW_SSL_CA_BUNDLE -> %s", merged)
+            return _merged_okx_cafile_cache
+        except Exception as e:
+            logger.warning("OKX SSL: merge OPENCLAW_SSL_CA_BUNDLE failed (%s); falling back", e)
+    for envk in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        v = (os.getenv(envk) or "").strip()
+        if v and os.path.isfile(v):
+            return v
+    return certifi.where()
 
 
 def retry_on_error(max_retries=3, delay=1.0, backoff=2.0, allowed_exceptions=(Exception,)):
@@ -187,11 +222,30 @@ class OKXExchange(ExchangeBase):
 
     def _build_ssl_context(self) -> ssl.SSLContext:
         """
-        统一TLS上下文：
-        - 使用 certifi/system CA，避免证书链不一致
-        - 仅允许 TLS1.2+，提升兼容与安全性
+        统一 TLS：默认校验远端证书。
+
+        - OPENCLAW_OKX_INSECURE_SSL=1：关闭校验（仅建议开发/受信内网排障；生产请用 OPENCLAW_SSL_CA_BUNDLE）。
+        - OPENCLAW_SSL_CA_BUNDLE=/path/to/extra.pem：与 certifi 合并（HTTPS 代理 MITM 常见）。
+        - SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE：完整替代 CA 文件。
         """
-        ctx = ssl.create_default_context(cafile=certifi.where())
+        insecure = str(os.getenv("OPENCLAW_OKX_INSECURE_SSL", "0")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if insecure:
+            logger.warning(
+                "OKX TLS verification DISABLED (OPENCLAW_OKX_INSECURE_SSL=1). "
+                "Do not use in production unless you understand the risk."
+            )
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            return ctx
+        cafile = _okx_ssl_cafile_path()
+        ctx = ssl.create_default_context(cafile=cafile)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         return ctx
 

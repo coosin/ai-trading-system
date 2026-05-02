@@ -177,7 +177,10 @@ class DynamicSymbolSelector:
                 if symbol in self.config.always_exclude:
                     continue
                 
-                if market.get("type") not in ["swap", "future"]:
+                # Some exchange connectors do not reliably tag market "type".
+                # Treat missing/unknown types as eligible (we still filter by liquidity/volume later).
+                mtype = str(market.get("type") or "").lower()
+                if mtype and mtype not in ["swap", "future"]:
                     continue
                 
                 try:

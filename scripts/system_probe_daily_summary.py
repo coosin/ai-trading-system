@@ -74,6 +74,7 @@ def main() -> int:
     alerts_total = 0
     rounds_with_alerts = 0
     alert_counter: Counter[str] = Counter()
+    warmup_counter = 0
     hour_counter: Counter[str] = Counter()
 
     max_rr = 0
@@ -84,10 +85,12 @@ def main() -> int:
 
     for r in rows:
         alerts = list(r.get("alerts", []) or [])
-        if alerts:
+        non_warmup_alerts = [a for a in alerts if str(a) != "diagnosis_warming_up"]
+        warmup_counter += sum(1 for a in alerts if str(a) == "diagnosis_warming_up")
+        if non_warmup_alerts:
             rounds_with_alerts += 1
-        alerts_total += len(alerts)
-        for a in alerts:
+        alerts_total += len(non_warmup_alerts)
+        for a in non_warmup_alerts:
             alert_counter[str(a)] += 1
             hour_counter[_parse_ts_hour(str(r.get("ts", "")))] += 1
 
@@ -110,6 +113,7 @@ def main() -> int:
         f"- 总轮次: {total}",
         f"- 告警总数: {alerts_total}",
         f"- 含告警轮次: {rounds_with_alerts}",
+        f"- 预热轮次(降噪不计入告警): {warmup_counter}",
         "",
         "## 峰值指标",
         f"- RR拒绝单轮峰值: {max_rr}",

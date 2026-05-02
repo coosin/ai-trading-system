@@ -25,6 +25,7 @@
 
 | 文档 | 说明 |
 |------|------|
+| [**AI_HANDOFF_OPTIMIZATION_VERIFICATION_2026Q2.md**](./AI_HANDOFF_OPTIMIZATION_VERIFICATION_2026Q2.md) | **AI 维护交接**：2026 Q2 测试/优化结果固化、验证与调参方法 |
 | [**OPENCLAW_INTEGRATION_GUIDE.md**](./OPENCLAW_INTEGRATION_GUIDE.md) | OpenClaw 对接（读写接口、验收、审计） |
 | [**DAILY_HOSTING_ACCEPTANCE.md**](./DAILY_HOSTING_ACCEPTANCE.md) | 每日托管验收（值守快检） |
 | [**MCP_BASELINE.md**](./MCP_BASELINE.md) | MCP 基线与落地建议 |

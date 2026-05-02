@@ -178,6 +178,22 @@ def init_module_control_api(app, main_controller):
         fields: Optional[str] = None,
     ) -> Dict[str, Any]:
         """统一行情汇总：单品种视图（供前端/模块复用）。"""
+        def _normalize_market_symbol(raw: str) -> str:
+            s = str(raw or "").strip().upper().replace("-", "/")
+            if not s:
+                return "BTC/USDT"
+            # Bare asset symbol like BTC -> BTC/USDT to avoid false degraded reads.
+            if "/" not in s:
+                if s.endswith("USDT"):
+                    base = s[:-4].strip()
+                    return f"{base}/USDT" if base else "BTC/USDT"
+                return f"{s}/USDT"
+            parts = [p for p in s.split("/") if p]
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+            return "BTC/USDT"
+
+        symbol = _normalize_market_symbol(symbol)
         mc = main_controller
         mi = getattr(mc, "market_intelligence", None) if mc else None
         if not mi or not hasattr(mi, "get_symbol_view"):
@@ -867,6 +883,9 @@ def init_module_control_api(app, main_controller):
             "min_confidence_to_trade",
             "ai_core_min_confidence_to_open",
             "min_data_quality_to_trade",
+            "analysis_hard_gate_for_open",
+            "analysis_min_confidence_for_open",
+            "analysis_require_not_degraded_for_open",
             "min_rr_to_trade",
             "max_spread_bps_to_trade",
             "max_abs_depth_imbalance_to_trade",
@@ -913,6 +932,8 @@ def init_module_control_api(app, main_controller):
             "auto_tune_global_cooldown_seconds",
             "auto_tune_global_step_rr",
             "auto_tune_global_step_spread_bps",
+            "auto_tune_global_max_cumulative_rr_delta_from_baseline",
+            "auto_tune_global_max_cumulative_spread_bps_delta_from_baseline",
             "auto_tune_step_rr",
             "auto_tune_step_spread_bps",
             "auto_tune_group_step_rr",
@@ -933,6 +954,37 @@ def init_module_control_api(app, main_controller):
             "hold_avoidance_override_min_abs_sentiment",
             "hold_avoidance_override_min_mi_quality_score",
             "hold_avoidance_override_require_mi_trend_alignment",
+            "ai_autonomy_minimal_gates_enabled",
+            "ai_autonomy_min_conf_floor",
+            "ai_autonomy_min_mi_confidence",
+            "ai_autonomy_min_mi_quality_score",
+            "ai_autonomy_allow_neutral_with_trend",
+            "ai_autonomy_require_trend_alignment",
+            "ai_autonomy_enable_mtf_conflict_release",
+            "ai_autonomy_mtf_conflict_release_requires_mi_bias",
+            "ai_autonomy_conflict_subtype_release_enabled",
+            "ai_autonomy_conflict_release_min_rsi_1h_for_long",
+            "ai_autonomy_conflict_release_max_rsi_1h_for_short",
+            "ai_autonomy_conflict_release_min_abs_change_24h",
+            "ai_autonomy_conflict_release_require_mi_confidence",
+            "auto_tune_hold_override_enabled",
+            "auto_tune_hold_override_min_interval_seconds",
+            "auto_tune_hold_override_cooldown_seconds",
+            "auto_tune_hold_override_window_traces",
+            "auto_tune_hold_override_min_traces",
+            "auto_tune_hold_override_step_min_abs_sentiment",
+            "auto_tune_hold_override_step_min_mi_quality_score",
+            "auto_tune_hold_override_min_abs_sentiment_bounds",
+            "auto_tune_hold_override_min_mi_quality_score_bounds",
+            "auto_tune_hold_override_max_steps_per_cooldown",
+            "auto_tune_hold_override_hold_ratio_trigger",
+            "auto_tune_hold_override_open_ratio_trigger",
+            "auto_tune_hold_override_tighten_hold_ratio",
+            "auto_tune_hold_override_win_rate_floor",
+            "auto_tune_hold_override_avg_pnl_floor",
+            "auto_tune_hold_override_allow_relax_without_recent_pnl",
+            "auto_tune_hold_override_max_total_min_abs_sentiment_delta_from_baseline",
+            "auto_tune_hold_override_max_total_min_mi_quality_score_delta_from_baseline",
         }
         applied: Dict[str, Any] = {}
         for k, v in (config or {}).items():
@@ -948,21 +1000,55 @@ def init_module_control_api(app, main_controller):
                         "boost_on_low_risk",
                         "auto_frequency_profile_switch",
                         "frequency_profile_switch_telegram_notify",
+                        "auto_tune_hold_override_enabled",
+                        "auto_tune_hold_override_allow_relax_without_recent_pnl",
+                        "analysis_hard_gate_for_open",
+                        "analysis_require_not_degraded_for_open",
+                        "ai_autonomy_minimal_gates_enabled",
+                        "ai_autonomy_allow_neutral_with_trend",
+                        "ai_autonomy_require_trend_alignment",
+                        "ai_autonomy_enable_mtf_conflict_release",
+                        "ai_autonomy_mtf_conflict_release_requires_mi_bias",
+                        "ai_autonomy_conflict_subtype_release_enabled",
+                        "ai_autonomy_conflict_release_require_mi_confidence",
                     ):
                         ai_core.config[k] = bool(v)
                         applied[k] = bool(v)
-                    elif k in ("auto_tune_group_step_rr", "auto_tune_group_step_spread_bps"):
+                    elif k in (
+                        "auto_tune_group_step_rr",
+                        "auto_tune_group_step_spread_bps",
+                    ):
                         if isinstance(v, str) and v.strip().lower() in ("", "null", "none"):
                             ai_core.config[k] = None
                             applied[k] = None
                         else:
                             ai_core.config[k] = float(v)
                             applied[k] = float(ai_core.config[k])
+                    elif k in (
+                        "auto_tune_hold_override_min_abs_sentiment_bounds",
+                        "auto_tune_hold_override_min_mi_quality_score_bounds",
+                        "regime_profile_overrides",
+                    ):
+                        ai_core.config[k] = v
+                        applied[k] = v
                     else:
                         ai_core.config[k] = float(v)
                         applied[k] = float(v)
                 except Exception:
                     continue
+
+        # Persist applied keys to config_manager so ai_core runtime refresh
+        # will not overwrite API-updated values on next loop.
+        try:
+            cm = getattr(main_controller, "config_manager", None) if main_controller else None
+            if cm is not None and hasattr(cm, "set_config"):
+                for k, v in (applied or {}).items():
+                    try:
+                        await cm.set_config("ai_core_runtime", str(k), v, validate=False)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
         return {
             "success": True,
             "message": "执行门控配置已更新",
@@ -2902,6 +2988,25 @@ def init_module_control_api(app, main_controller):
                 "proactive_auto_execute_opportunities": bool(pa_cfg.get("proactive_auto_execute_opportunities", False)),
                 "expectation": "scanner_forward_only_then_ai_core_decides",
             }
+
+            # Proactive scanner observability (scan health + gate reject distribution)
+            try:
+                pa = getattr(mc, "proactive_ai", None)
+                if pa and hasattr(pa, "get_status"):
+                    pst = pa.get_status()
+                    if isinstance(pst, dict):
+                        ms = pst.get("market_scanner") if isinstance(pst.get("market_scanner"), dict) else {}
+                        assess["proactive_scanner"] = {
+                            "running": bool(pst.get("running", False)),
+                            "initialized": bool(pst.get("initialized", False)),
+                            "opportunities": int((ms or {}).get("opportunities", 0) or 0),
+                            "insights": int((ms or {}).get("insights", 0) or 0),
+                            "market_state": (ms or {}).get("market_state"),
+                            "runtime": (ms or {}).get("runtime"),
+                            "stats": (ms or {}).get("stats"),
+                        }
+            except Exception as e:
+                assess["proactive_scanner_error"] = str(e)
 
             # Market analysis sensitivity sample across default symbols.
             mi = getattr(mc, "market_intelligence", None)

@@ -10,8 +10,8 @@ system:
   log_level: INFO
   environment: production
 llm:
-  # 与 OpenClaw 网关保持一致：Baidu 主模型 + Ark 备用模型（OpenAI 兼容接口）
-  default_model: qianfan-code-latest
+  # 主模型：Volces Ark (北京) + 备用：百度千帆
+  default_model: ark-code-latest
   models:
   - provider: openai
     model_id: qianfan-code-latest
@@ -28,7 +28,7 @@ llm:
     supports_vision: true
     supports_reasoning: false
     enabled: true
-    priority: 30
+    priority: 20
     fallback_models:
     - ark-code-latest
   - provider: openai
@@ -39,41 +39,41 @@ llm:
     temperature: 0.6
     max_tokens: 8000
     timeout: 30.0
-    max_retries: 1
+    max_retries: 2
     cost_per_input_token: 0.0
     cost_per_output_token: 0.0
     context_window: 200000
     supports_vision: true
     supports_reasoning: false
     enabled: true
-    priority: 20
+    priority: 30
     fallback_models:
     - qianfan-code-latest
   task_model_mapping:
     general:
-    - qianfan-code-latest
     - ark-code-latest
+    - qianfan-code-latest
     market_analysis:
-    - qianfan-code-latest
     - ark-code-latest
+    - qianfan-code-latest
     strategy_generation:
-    - qianfan-code-latest
     - ark-code-latest
+    - qianfan-code-latest
     signal_generation:
-    - qianfan-code-latest
     - ark-code-latest
+    - qianfan-code-latest
     risk_assessment:
-    - qianfan-code-latest
     - ark-code-latest
+    - qianfan-code-latest
     news_analysis:
-    - qianfan-code-latest
     - ark-code-latest
+    - qianfan-code-latest
     code_generation:
-    - qianfan-code-latest
     - ark-code-latest
+    - qianfan-code-latest
     natural_language:
-    - qianfan-code-latest
     - ark-code-latest
+    - qianfan-code-latest
 trading:
   # 默认关注列表（动态选币开启时仍作 always_include 候选）
   symbols:
@@ -457,13 +457,18 @@ ai_core:
     skip_backtest_if_cpu_above: 85
     skip_optimize_if_cpu_above: 85
 ai_core_runtime:
-  # 试验：统一下调开仓相关置信度门槛 0.02
-  min_confidence_to_trade: 0.73
-  ai_core_min_confidence_to_open: 0.73
+  # 试验：小幅放宽开仓相关置信度门槛（仅微调）
+  min_confidence_to_trade: 0.71
+  ai_core_min_confidence_to_open: 0.71
   # 统一分析链路硬门槛：分析质量/置信不足或降级数据时，禁止开仓
   analysis_hard_gate_for_open: true
   analysis_min_confidence_for_open: 0.55
   analysis_require_not_degraded_for_open: true
+  # hold_avoidance_override：根据 8 小时复盘，hold_by_ai_decision 的信号质量更好
+  # 因此对反 HOLD 折返机制做“轻微放宽”，提升 HOLD->可执行开仓转换率。
+  hold_avoidance_override_min_abs_sentiment: 0.045
+  hold_avoidance_override_min_mi_quality_score: 0.58
+  hold_avoidance_override_require_mi_trend_alignment: false
 ai_brain:
   primary_controller: ai_core
   single_write_owner: ai_core
@@ -490,13 +495,15 @@ active_trader:
 proactive_scanner:
   scan_interval: 90
   deep_scan_interval: 600
+  # 均衡档：单轮扫描覆盖更多候选，但避免过大导致数据源压力/超时
+  scan_symbol_limit: 12
   # 开启后：扫描器对“高置信 + 通过实时数据预检”的机会会触发开仓（走 ExecutionGateway）
   proactive_auto_execute_opportunities: false
   # 转发给 ai_core 的冷却收敛到 60 秒
   proactive_ai_core_forward_cooldown_sec: 60
   # 均值回归机会的 confidence 由 |24h涨跌幅|×10 推导；0.55≈5.5% 才会触发执行评估。
-  # 统一提升开仓门槛：置信度 >=75% 才允许自动开仓评估
-  proactive_execute_min_confidence: 0.76
+  # 小幅放宽：置信度 >=74% 才允许自动开仓评估
+  proactive_execute_min_confidence: 0.74
   # 防止“连续开多个标的把可用资金耗尽”
   proactive_global_open_max_per_10m: 1
   proactive_global_open_max_per_hour: 3
@@ -505,18 +512,36 @@ proactive_scanner:
   # 止损后冷却：避免“止损后立刻再开/复仇单”
   proactive_stop_loss_cooldown_sec: 1800
   # 原值 0.08(8%) 过于激进，会导致多数时间“无机会”，从而看起来系统不产生开仓线索。
-  mean_reversion_min_abs_change: 0.02
-  breakout_min_volume_vs_prior_avg: 0
+  # 发现层小幅放宽：均值回归约 2.4% 即可入候选
+  mean_reversion_min_abs_change: 0.024
+  # 发现层小幅放宽：突破量能确认降低到 1.1
+  breakout_min_volume_vs_prior_avg: 1.1
   proactive_symbol_trade_cooldown_sec: 60
   breakout_trade_cooldown_sec: 60
   proactive_skip_breakout_if_same_side_position: true
+  # 发现层小幅放宽：更容易捕捉波动异动
+  vol_spike_min_atr_pct_1h: 0.012
+  vol_spike_min_quality_score: 0.6
+  # 均衡档：盘口/流动性异动发现（spread 变宽 + 深度失衡）
+  liq_event_min_quality_score: 0.6
+  # 两档：minor 更容易触发；major 更强信号
+  liq_event_minor_min_spread_bps: 10.0
+  liq_event_minor_min_abs_depth_imbalance: 0.76
+  liq_event_major_min_spread_bps: 18.0
+  liq_event_major_min_abs_depth_imbalance: 0.88
+  liq_event_minor_confidence: 0.78
+  liq_event_major_confidence: 0.84
+  # 按质量动态阈值（quality 越高越早触发）
+  liq_event_quality_high: 0.75
+  liq_event_quality_low: 0.65
   scanner_opportunity_gate:
     enabled: true
     max_spread_bps: 45.0
     # 允许入场价与最新价存在一定偏差（突破/均值回归会用K线收盘或关键价位作为entry），
     # 过严会导致机会全部被门控拦截，从而看起来“系统不自动开仓”。
     max_entry_vs_last_slippage_pct: 0.05
-    min_risk_reward: 1.2
+    # 微调放宽：RR 门槛小降，减少边界机会被预检拦截
+    min_risk_reward: 1.10
     min_abs_change_24h: 0.0
     require_insight_trend_alignment: true
     min_volume_vs_avg_ratio: 0.0
@@ -624,7 +649,7 @@ ai_trading:
     enabled: true
     model_id: qianfan-code-latest
     analysis_interval: 120
-    min_confidence: 0.76
+    min_confidence: 0.74
     max_positions: 4
     risk_per_trade: 0.01
     trade_mode: real

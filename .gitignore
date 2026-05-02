@@ -111,3 +111,8 @@ agents/
 
 # Generated experiments/backtests (never commit)
 data/backtest/
+
+# Local probe outputs / tuning run dumps / runtime JSON (never commit)
+workspace/probes/
+workspace/tuning_runs/
+data/runtime/

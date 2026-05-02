@@ -216,6 +216,7 @@ class MultiSourceDataFusion:
         prices = []
         volumes = []
         sentiments = []
+        sentiment_weights = []
         
         for dp in data_points:
             fused.sources.append(dp.source)
@@ -243,12 +244,24 @@ class MultiSourceDataFusion:
                         prices.append(dp.value["price"])
                     if "volume" in dp.value:
                         volumes.append(dp.value["volume"])
+                    # Sentiment weighting: prefer explicit sentiment over coarse price-change proxy.
+                    src_kind = str(dp.source_type.value if hasattr(dp.source_type, "value") else dp.source_type or "")
                     if "sentiment" in dp.value and dp.value["sentiment"] is not None:
-                        sentiments.append(dp.value["sentiment"])
+                        try:
+                            s = float(dp.value["sentiment"])
+                            s = max(-1.0, min(1.0, s))
+                            w = 1.0 if src_kind not in ("exchange", "market_data") else 0.8
+                            sentiments.append(s)
+                            sentiment_weights.append(w)
+                        except Exception:
+                            pass
                     elif "change_24h" in dp.value and dp.value.get("change_24h") is not None:
                         # 用 24h 变化率粗略映射情绪：正向->正，负向->负
                         try:
-                            sentiments.append(float(dp.value.get("change_24h")) / 5.0)
+                            s = float(dp.value.get("change_24h")) / 5.0
+                            s = max(-1.0, min(1.0, s))
+                            sentiments.append(s)
+                            sentiment_weights.append(0.6)
                         except Exception:
                             pass
                 else:
@@ -266,6 +279,7 @@ class MultiSourceDataFusion:
                             s = float(change_24h) / 5.0
                             s = max(-1.0, min(1.0, s))
                             sentiments.append(s)
+                            sentiment_weights.append(0.6)
                         except Exception:
                             pass
         
@@ -274,12 +288,33 @@ class MultiSourceDataFusion:
         if volumes:
             fused.volume = sum(volumes) / len(volumes)
         if sentiments:
-            fused.sentiment = sum(sentiments) / len(sentiments)
+            if sentiment_weights and len(sentiment_weights) == len(sentiments):
+                sw = sum(sentiment_weights) or 1.0
+                fused.sentiment = sum(s * w for s, w in zip(sentiments, sentiment_weights)) / sw
+            else:
+                fused.sentiment = sum(sentiments) / len(sentiments)
         
         # 置信度按“可用数据源数量/已注册数据源数量”归一化，
         # 避免因为写死分母导致即便多源都返回仍长期偏低。
         total_sources = len(self._sources) if self._sources else 1
-        fused.confidence = float(min(1.0, len(data_points) / max(1, total_sources)))
+        base_conf = float(min(1.0, len(data_points) / max(1, total_sources)))
+        source_health_scores = []
+        for dp in data_points:
+            src_base = str(dp.source or "").split(":", 1)[0]
+            health = self._last_source_health.get(src_base, {})
+            try:
+                source_health_scores.append(float(health.get("quality_score", 1.0) or 1.0))
+            except Exception:
+                source_health_scores.append(1.0)
+        health_factor = (sum(source_health_scores) / len(source_health_scores)) if source_health_scores else 1.0
+        evidence_bonus = 0.0
+        if fused.sentiment is not None and abs(float(fused.sentiment)) >= 0.12:
+            evidence_bonus += 0.08
+        if fused.technical_indicators.get("spread_bps") is not None:
+            evidence_bonus += 0.05
+        if fused.technical_indicators.get("depth_imbalance") is not None:
+            evidence_bonus += 0.05
+        fused.confidence = float(max(0.0, min(1.0, base_conf * health_factor + evidence_bonus)))
         
         return fused
     
@@ -370,7 +405,7 @@ class MultiSourceDataFusion:
                 quality_score = (sum(source_quality) / len(source_quality)) if source_quality else 0.0
                 result["quality_score"] = max(0.0, min(1.0, quality_score))
                 
-                # 技术指标可能不存在（目前 fuse_data 未生成）
+                # 优先用技术指标；若缺失则退化为“情绪+24h动量”方向判定，避免长期 neutral。
                 if fused_data.technical_indicators:
                     rsi = fused_data.technical_indicators.get("rsi", 50)
                     if rsi > 70:
@@ -384,6 +419,18 @@ class MultiSourceDataFusion:
                         result["spread_bps"] = fused_data.technical_indicators.get("spread_bps", 0)
                     if "depth_imbalance" in fused_data.technical_indicators:
                         result["depth_imbalance"] = fused_data.technical_indicators.get("depth_imbalance", 0)
+                if result.get("trend") in (None, "unknown", "neutral"):
+                    sent = result.get("sentiment")
+                    try:
+                        sf = float(sent) if sent is not None else 0.0
+                    except Exception:
+                        sf = 0.0
+                    if sf >= 0.10:
+                        result["trend"] = "bullish"
+                    elif sf <= -0.10:
+                        result["trend"] = "bearish"
+                    else:
+                        result["trend"] = "neutral"
                 if fused_data.onchain_metrics:
                     result["open_interest"] = fused_data.onchain_metrics.get("open_interest")
                     result["funding_rate"] = fused_data.onchain_metrics.get("funding_rate")

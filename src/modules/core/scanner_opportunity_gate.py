@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -96,6 +97,28 @@ class ScannerOpportunityGate:
     def _c(self, key: str, default: Any) -> Any:
         return self.config.get(key, default)
 
+    async def _fetch_ticker_resilient(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch ticker with symbol variants and lightweight retries."""
+        if not self.exchange or not hasattr(self.exchange, "get_ticker"):
+            return None
+        variants = [symbol]
+        sym_dash = symbol.replace("/", "-")
+        if sym_dash not in variants:
+            variants.append(sym_dash)
+        retries = max(1, int(self._c("ticker_retry_count", 2) or 2))
+        backoff = max(0.0, float(self._c("ticker_retry_backoff_sec", 0.2) or 0.2))
+        for attempt in range(retries):
+            for sym in variants:
+                try:
+                    ticker = await self.exchange.get_ticker(sym)
+                    if ticker:
+                        return ticker
+                except Exception:
+                    continue
+            if attempt < retries - 1:
+                await asyncio.sleep(backoff * float(attempt + 1))
+        return None
+
     async def evaluate(self, opportunity: Any, insight: Any = None) -> ScannerGateResult:
         if not self._c("enabled", True):
             return ScannerGateResult(True, "gate_disabled", {})
@@ -108,6 +131,9 @@ class ScannerOpportunityGate:
             return ScannerGateResult(False, "empty_symbol", {})
 
         metrics: Dict[str, Any] = {"symbol": sym}
+        mi_view_bid = None
+        mi_view_ask = None
+        mi_view_price = None
 
         # 优先使用统一行情情报引擎的门控建议（单一真源）
         try:
@@ -117,6 +143,20 @@ class ScannerOpportunityGate:
                 es = getattr(view, "execution_support", None)
                 guards = (es.get("guards") or {}) if isinstance(es, dict) else {}
                 q = getattr(view, "quality_score", None)
+                # When MI can provide a usable price/bid/ask, we can avoid hard dependency
+                # on exchange ticker endpoint (which is the #1 false-negative source).
+                try:
+                    mi_view_price = float(getattr(view, "price", None) or 0.0)
+                except Exception:
+                    mi_view_price = None
+                try:
+                    mi_view_bid = float(getattr(view, "best_bid", None) or 0.0)
+                except Exception:
+                    mi_view_bid = None
+                try:
+                    mi_view_ask = float(getattr(view, "best_ask", None) or 0.0)
+                except Exception:
+                    mi_view_ask = None
                 # unknown/partial 数据更保守：对点差/RR 门槛做收紧，避免“信息不全也照样开仓”
                 try:
                     partial = bool(getattr(view, "partial", False))
@@ -125,6 +165,12 @@ class ScannerOpportunityGate:
                 prov = str(getattr(view, "provenance", "") or "").strip().lower() or "unknown"
                 metrics["mi_partial"] = partial
                 metrics["mi_provenance"] = prov
+                if mi_view_price and mi_view_price > 0:
+                    metrics["mi_price"] = mi_view_price
+                if mi_view_bid and mi_view_bid > 0:
+                    metrics["mi_best_bid"] = mi_view_bid
+                if mi_view_ask and mi_view_ask > 0:
+                    metrics["mi_best_ask"] = mi_view_ask
                 if partial or prov == "unknown":
                     # 只在 gate 未显式配置得更严格时才覆写（尊重用户配置）
                     try:
@@ -158,6 +204,11 @@ class ScannerOpportunityGate:
                     try:
                         min_q = float(guards.get("min_quality_score_to_trade", 0) or 0)
                         qv = float(metrics.get("mi_quality_score")) if metrics.get("mi_quality_score") is not None else None
+                        # IMPORTANT: treat qv<=0 as "unknown / missing", not hard-fail.
+                        # We only hard-fail when MI produced a meaningful quality score.
+                        if qv is not None and qv <= 0:
+                            metrics["mi_quality_missing_or_zero"] = True
+                            qv = None
                         if min_q > 0 and qv is not None and qv < min_q:
                             return ScannerGateResult(False, f"mi_quality_low:{qv:.3f}<{min_q}", metrics)
                     except Exception:
@@ -165,14 +216,56 @@ class ScannerOpportunityGate:
         except Exception:
             pass
 
+        # If MI already gave a tradable price and at least one side of quote,
+        # accept MI-derived ticker to reduce ticker_empty false negatives.
+        ticker = None
         try:
-            ticker = await self.exchange.get_ticker(sym.replace("/", "-"))
-        except Exception as e:
-            logger.debug("ScannerGate ticker failed %s: %s", sym, e)
-            return ScannerGateResult(False, f"ticker_error:{e}", metrics)
+            if mi_view_price and float(mi_view_price or 0) > 0:
+                if (mi_view_bid and float(mi_view_bid or 0) > 0) or (mi_view_ask and float(mi_view_ask or 0) > 0):
+                    ticker = {
+                        "last": float(mi_view_price),
+                        "bid": float(mi_view_bid or 0) if mi_view_bid else 0,
+                        "ask": float(mi_view_ask or 0) if mi_view_ask else 0,
+                    }
+                    metrics["ticker_from_mi_view"] = True
+        except Exception:
+            ticker = None
+
+        if ticker is None:
+            ticker = await self._fetch_ticker_resilient(sym)
 
         if not ticker:
-            return ScannerGateResult(False, "ticker_empty", metrics)
+            # Fallback to MI cached symbol view to reduce false negatives when
+            # exchange ticker endpoint has transient timeout/empty payload.
+            try:
+                mi = getattr(self.main_controller, "market_intelligence", None) if self.main_controller else None
+                if mi and hasattr(mi, "get_cached_symbol_view"):
+                    cv = mi.get_cached_symbol_view(sym) or {}
+                    px = float(cv.get("price") or 0.0)
+                    bb = cv.get("best_bid")
+                    ba = cv.get("best_ask")
+                    ticker = {"last": px, "bid": bb, "ask": ba, "change24h": cv.get("change_24h")}
+                    metrics["ticker_from_cached_symbol_view"] = True
+            except Exception:
+                ticker = None
+            # Last-resort fallback: if ticker endpoints are flaky but opportunity
+            # already carries a valid entry_price, use it as provisional last price
+            # to avoid false-negative ticker_empty rejections.
+            if (not ticker or float(ticker.get("last") or ticker.get("close") or 0.0) <= 0) and float(
+                getattr(opportunity, "entry_price", 0) or 0
+            ) > 0:
+                try:
+                    ticker = {
+                        "last": float(getattr(opportunity, "entry_price", 0) or 0),
+                        "bid": 0.0,
+                        "ask": 0.0,
+                        "change24h": 0.0,
+                    }
+                    metrics["ticker_from_entry_fallback"] = True
+                except Exception:
+                    ticker = None
+            if not ticker or float(ticker.get("last") or ticker.get("close") or 0.0) <= 0:
+                return ScannerGateResult(False, "ticker_empty", metrics)
 
         last = float(ticker.get("last") or ticker.get("close") or 0)
         bid = float(ticker.get("bid") or 0)

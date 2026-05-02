@@ -1,11 +1,32 @@
 from __future__ import annotations
 
+import json
+import logging
+import os
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _default_persist_path() -> str:
+    """
+    Optional JSON snapshot for warm restart. Override with OPENCLAW_DECISION_TRACE_STORE_JSON.
+
+    Anchored to repo root (this file: src/modules/core/...) so persistence works even when
+    cwd is not the project directory (systemd/docker/exec from another folder).
+    """
+    p = (os.getenv("OPENCLAW_DECISION_TRACE_STORE_JSON") or "").strip()
+    if p:
+        return p
+    root = Path(__file__).resolve().parents[3]
+    return str(root / "data" / "runtime" / "decision_trace_store.json")
 
 
 class DecisionTraceStore:
@@ -13,10 +34,59 @@ class DecisionTraceStore:
     Lightweight in-memory trace store for decision -> guard -> execution lifecycle.
     """
 
-    def __init__(self, max_items: int = 300) -> None:
+    def __init__(self, max_items: int = 300, *, persist_path: Optional[str] = None) -> None:
         self._max_items = max(50, int(max_items or 300))
         self._items: List[Dict[str, Any]] = []
         self._by_trace_id: Dict[str, Dict[str, Any]] = {}
+        self._persist_path: Optional[str] = None
+        disabled = str(os.getenv("OPENCLAW_DECISION_TRACE_PERSIST", "1")).strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        path = (persist_path or _default_persist_path()).strip()
+        if (not disabled) and path:
+            self._persist_path = path
+            self._load_from_disk()
+
+    def _load_from_disk(self) -> None:
+        if not self._persist_path:
+            return
+        fp = Path(self._persist_path)
+        if not fp.is_file():
+            return
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                return
+            items: List[Dict[str, Any]] = []
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                tid = str(row.get("trace_id") or "").strip()
+                if not tid:
+                    continue
+                items.append(row)
+            while len(items) > self._max_items:
+                items.pop(0)
+            self._items = items
+            self._by_trace_id = {str(r.get("trace_id") or ""): r for r in items if r.get("trace_id")}
+        except Exception as e:
+            logger.warning("decision_trace_store load failed: %s", e)
+
+    def _persist_to_disk(self) -> None:
+        if not self._persist_path:
+            return
+        try:
+            fp = Path(self._persist_path)
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=".dts_", suffix=".tmp", dir=str(fp.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                json.dump(self._items, tmp, ensure_ascii=False)
+            os.replace(tmp_name, str(fp))
+        except Exception as e:
+            logger.warning("decision_trace_store persist failed: %s", e)
 
     def _touch(self, trace_id: str) -> Dict[str, Any]:
         tid = str(trace_id or "").strip()
@@ -74,6 +144,7 @@ class DecisionTraceStore:
             "leverage": leverage,
             "extras": dict(extras or {}),
         }
+        self._persist_to_disk()
 
     def record_guard_result(
         self,
@@ -92,6 +163,7 @@ class DecisionTraceStore:
             "stage": str(stage or "")[:120],
             "extras": dict(extras or {}),
         }
+        self._persist_to_disk()
 
     def record_execution_result(
         self,
@@ -112,6 +184,7 @@ class DecisionTraceStore:
             "op": op,
             "extras": dict(extras or {}),
         }
+        self._persist_to_disk()
 
     def record_reconciliation_result(
         self,
@@ -128,6 +201,7 @@ class DecisionTraceStore:
             "detail": str(detail or "")[:300],
             "extras": dict(extras or {}),
         }
+        self._persist_to_disk()
 
     def get_recent(self, limit: int = 30) -> List[Dict[str, Any]]:
         lim = max(1, min(int(limit or 30), self._max_items))
@@ -154,6 +228,7 @@ class DecisionTraceStore:
         execution_details: Dict[str, int] = {}
         reconciliation_details: Dict[str, int] = {}
         symbol_counts: Dict[str, int] = {}
+        hold_reason_tags: Dict[str, int] = {}
 
         for row in rows:
             if not isinstance(row, dict):
@@ -163,6 +238,12 @@ class DecisionTraceStore:
                 symbol_counts[sym] = int(symbol_counts.get(sym, 0)) + 1
 
             guard = row.get("guard") if isinstance(row.get("guard"), dict) else {}
+            extras_g = guard.get("extras") if isinstance(guard.get("extras"), dict) else {}
+            hrt = extras_g.get("hold_reason_tags")
+            if isinstance(hrt, dict):
+                for tk, tv in hrt.items():
+                    if tv:
+                        hold_reason_tags[str(tk)] = int(hold_reason_tags.get(str(tk), 0)) + 1
             g_status = str(guard.get("status") or "")
             g_reason = str(guard.get("reason") or "")
             if g_status == "rejected":
@@ -196,6 +277,7 @@ class DecisionTraceStore:
         return {
             "summary": summary,
             "top_guard_reasons": _top(guard_reasons),
+            "top_hold_reason_tags": _top(hold_reason_tags),
             "top_execution_failures": _top(execution_details),
             "top_reconciliation_blocks": _top(reconciliation_details),
             "top_symbols": _top(symbol_counts),

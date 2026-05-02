@@ -64,7 +64,7 @@ class ModelConfig:
     base_url: str = ""
     temperature: float = 0.7
     max_tokens: int = 2000
-    timeout: float = 60.0
+    timeout: float = 75.0
     max_retries: int = 3
     cost_per_input_token: float = 0.0
     cost_per_output_token: float = 0.0
@@ -138,8 +138,13 @@ class BaseLLMProvider(ABC):
             else (os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"))
         )
         proxy = None if self._base_host_bypasses_process_proxy() else env_proxy
-        total = float(self.config.timeout or 60.0)
-        connect_cap = min(30.0, max(5.0, total))
+        env_t = (os.getenv("OPENCLAW_LLM_REQUEST_TIMEOUT_SEC") or "").strip()
+        if env_t:
+            total = float(env_t)
+        else:
+            total = float(self.config.timeout or 75.0)
+        total = max(25.0, min(300.0, total))
+        connect_cap = min(45.0, max(8.0, min(30.0, total * 0.45)))
         timeout = httpx.Timeout(total, connect=connect_cap, read=total, write=total, pool=connect_cap)
         # 根因：对端/代理/中间盒常提前关空闲 TCP，复用池内连接时触发 RemoteProtocolError: Server disconnected。
         # 默认关闭 keep-alive；稳定链路可设 OPENCLAW_LLM_ENABLE_KEEPALIVE=1。

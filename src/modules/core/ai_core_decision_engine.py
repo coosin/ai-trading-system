@@ -234,6 +234,48 @@ class AICoreDecisionEngine:
             "hold_avoidance_override_min_abs_sentiment": 0.06,
             "hold_avoidance_override_min_mi_quality_score": 0.62,
             "hold_avoidance_override_require_mi_trend_alignment": True,
+            # AI 自主放权（最小门禁）模式
+            "ai_autonomy_minimal_gates_enabled": True,
+            "ai_autonomy_min_conf_floor": 0.52,
+            "ai_autonomy_min_mi_confidence": 0.58,
+            "ai_autonomy_min_mi_quality_score": 0.55,
+            "ai_autonomy_allow_neutral_with_trend": True,
+            "ai_autonomy_require_trend_alignment": True,
+            # 多周期冲突释放：1H/4H 与 MI 同向时，允许忽略 1D 冲突的一刀切 hold。
+            "ai_autonomy_enable_mtf_conflict_release": True,
+            "ai_autonomy_mtf_conflict_release_requires_mi_bias": True,
+            # 冲突子类释放（更严格）：仅在“动量/波动证据充足”时放行。
+            "ai_autonomy_conflict_subtype_release_enabled": True,
+            "ai_autonomy_conflict_release_min_rsi_1h_for_long": 56.0,
+            "ai_autonomy_conflict_release_max_rsi_1h_for_short": 44.0,
+            "ai_autonomy_conflict_release_min_abs_change_24h": 0.006,
+            "ai_autonomy_conflict_release_require_mi_confidence": True,
+
+            # auto_tune_guard：全局/分组阈值已有边界与冷却；但为避免“无限漂移”，
+            # 我们对累计漂移也做额外限制，并把调参写回 config_manager 以确保热刷新不会覆盖。
+            "auto_tune_global_max_cumulative_rr_delta_from_baseline": 0.20,
+            "auto_tune_global_max_cumulative_spread_bps_delta_from_baseline": 12.0,
+
+            # 有界自调（finite range）：仅对 hold_avoidance_override 的数值门控做有限步长微调。
+            "auto_tune_hold_override_enabled": True,
+            # 评估频率（用于 30~60 分钟窗口可观测）；真正调参仍受 cooldown 限制。
+            "auto_tune_hold_override_min_interval_seconds": 900,
+            "auto_tune_hold_override_cooldown_seconds": 7200,
+            "auto_tune_hold_override_window_traces": 80,
+            "auto_tune_hold_override_min_traces": 12,
+            "auto_tune_hold_override_step_min_abs_sentiment": 0.005,
+            "auto_tune_hold_override_step_min_mi_quality_score": 0.04,
+            "auto_tune_hold_override_min_abs_sentiment_bounds": [0.03, 0.08],
+            "auto_tune_hold_override_min_mi_quality_score_bounds": [0.45, 0.70],
+            "auto_tune_hold_override_max_steps_per_cooldown": 2,
+            "auto_tune_hold_override_hold_ratio_trigger": 0.60,
+            "auto_tune_hold_override_open_ratio_trigger": 0.15,
+            "auto_tune_hold_override_tighten_hold_ratio": 0.45,
+            "auto_tune_hold_override_win_rate_floor": 0.50,
+            "auto_tune_hold_override_avg_pnl_floor": 0.0,
+            "auto_tune_hold_override_allow_relax_without_recent_pnl": True,
+            "auto_tune_hold_override_max_total_min_abs_sentiment_delta_from_baseline": 0.02,
+            "auto_tune_hold_override_max_total_min_mi_quality_score_delta_from_baseline": 0.10,
         }
 
         # 开仓 RR 门控与主配置 stop_loss_take_profit（移动止损）对齐
@@ -288,6 +330,16 @@ class AICoreDecisionEngine:
         self._last_ai_discretionary_close_at: Dict[str, datetime] = {}
         # key -> (consecutive_close_signals, first_signal_at)
         self._discretionary_close_streak: Dict[str, tuple] = {}
+
+        # --- Finite-range self tuning state ---
+        self._auto_tune_global_baseline_guard: Optional[Dict[str, float]] = None
+        self._auto_tune_hold_override_last_at: Optional[datetime] = None
+        self._auto_tune_hold_override_last_eval_at: Optional[datetime] = None
+        self._auto_tune_hold_override_steps_in_cooldown: int = 0
+        self._auto_tune_hold_override_baseline: Optional[Dict[str, float]] = None
+        self._auto_tune_hold_override_last_action: str = "never"
+        self._auto_tune_hold_override_last_skip_reason: Optional[str] = None
+        self._auto_tune_hold_override_last_change: Dict[str, Any] = {}
         # 主动性扫描器推送的机会（默认不自动开仓，仅进入本引擎决策上下文）
         self._scanner_hints: Dict[str, Dict[str, Any]] = {}
         self._scanner_hint_ttl_sec: float = 5400.0
@@ -702,6 +754,36 @@ class AICoreDecisionEngine:
                             if success:
                                 await self._report_decision(decision)
                         else:
+                            try:
+                                mc = self.main_controller
+                                if mc is not None and getattr(mc, "decision_trace_store", None) is None:
+                                    mc.decision_trace_store = DecisionTraceStore()
+                                dts = getattr(mc, "decision_trace_store", None) if mc is not None else None
+                                if dts:
+                                    trace_id = f"hold-{symbol.replace('/', '_')}-{int(datetime.now().timestamp())}"
+                                    hold_extras = self._build_hold_trace_extras(decision=decision, source="main_decision_loop")
+                                    dts.record_intent(
+                                        trace_id=trace_id,
+                                        symbol=str(decision.symbol or symbol),
+                                        side=str(decision.side or "unknown"),
+                                        action="hold",
+                                        source="ai_core",
+                                        confidence=getattr(decision, "confidence", None),
+                                        strategy_used=getattr(decision, "strategy_used", None),
+                                        reasoning=getattr(decision, "reasoning", None),
+                                        quantity=None,
+                                        leverage=None,
+                                        extras=hold_extras,
+                                    )
+                                    dts.record_guard_result(
+                                        trace_id=trace_id,
+                                        status="rejected",
+                                        reason="hold_by_ai_decision",
+                                        stage="decision",
+                                        extras=hold_extras,
+                                    )
+                            except Exception:
+                                pass
                             logger.info(f"📊 {symbol} 暂无机会，继续监控")
                     
                     await asyncio.sleep(SLEEP_2S)
@@ -868,6 +950,9 @@ class AICoreDecisionEngine:
                 # 根据近期交易表现自动微调执行门控阈值（小步、带边界）
                 await self._auto_tune_guard_thresholds()
 
+                # 有界自调（finite range）：减少 hold_by_ai_decision 过度抑制导致的“无开仓”
+                await self._auto_tune_hold_avoidance_override()
+
                 # 自动切换频率档位（稳健/中频/积极），带冷却防抖
                 await self._auto_switch_frequency_profile()
                 
@@ -995,6 +1080,16 @@ class AICoreDecisionEngine:
             min_rr_delta = float(self.config.get("auto_tune_min_rr_delta", 0.01) or 0.01)
             min_sp_delta = float(self.config.get("auto_tune_min_spread_delta_bps", 0.5) or 0.5)
 
+            # Set finite-range baseline once (global thresholds).
+            if self._auto_tune_global_baseline_guard is None:
+                try:
+                    self._auto_tune_global_baseline_guard = {
+                        "min_rr_to_trade": float(self.config.get("min_rr_to_trade", 1.2) or 1.2),
+                        "max_spread_bps_to_trade": float(self.config.get("max_spread_bps_to_trade", 35.0) or 35.0),
+                    }
+                except Exception:
+                    self._auto_tune_global_baseline_guard = {}
+
             # ---------- 全局基准：慢速漂移（可与分组解耦；冷却更长、步长更小） ----------
             if bool(self.config.get("auto_tune_global_enabled", True)):
                 g_rr_step = float(self.config.get("auto_tune_global_step_rr", 0.02) or 0.02)
@@ -1022,6 +1117,22 @@ class AICoreDecisionEngine:
                         changed = True
                     if changed:
                         if abs(rr - old_rr) >= min_rr_delta or abs(spread - old_sp) >= min_sp_delta:
+                            # Clamp by finite cumulative delta budget (prevents unbounded drift).
+                            base = self._auto_tune_global_baseline_guard or {}
+                            base_rr = float(base.get("min_rr_to_trade", rr) or rr)
+                            base_sp = float(base.get("max_spread_bps_to_trade", spread) or spread)
+                            rr_budget = float(
+                                self.config.get("auto_tune_global_max_cumulative_rr_delta_from_baseline", 0.20) or 0.20
+                            )
+                            sp_budget = float(
+                                self.config.get("auto_tune_global_max_cumulative_spread_bps_delta_from_baseline", 12.0) or 12.0
+                            )
+
+                            rr = max(float(rr_min), min(float(rr_max), rr))
+                            spread = max(float(sp_min), min(float(sp_max), spread))
+                            rr = max(base_rr - rr_budget, min(base_rr + rr_budget, rr))
+                            spread = max(base_sp - sp_budget, min(base_sp + sp_budget, spread))
+
                             self.config["min_rr_to_trade"] = float(rr)
                             self.config["max_spread_bps_to_trade"] = float(spread)
                             self._last_global_tune_at = now_utc
@@ -1029,6 +1140,22 @@ class AICoreDecisionEngine:
                                 "🛠️ 自动调参(全局基准): win_rate=%.2f avg_pnl=%.4f RR %.2f->%.2f spread %.1f->%.1f",
                                 win_rate, avg_pnl, old_rr, rr, old_sp, spread,
                             )
+
+                            # Persist so hot-refresh won't overwrite finite-range auto-tune.
+                            cm = getattr(self.main_controller, "config_manager", None) if self.main_controller else None
+                            if cm is not None and hasattr(cm, "set_config"):
+                                try:
+                                    await cm.set_config(
+                                        "ai_core_runtime", "min_rr_to_trade", float(rr), validate=False
+                                    )
+                                    await cm.set_config(
+                                        "ai_core_runtime",
+                                        "max_spread_bps_to_trade",
+                                        float(spread),
+                                        validate=False,
+                                    )
+                                except Exception:
+                                    pass
 
             # ---------- 分组/时段：较快响应（独立步长与冷却） ----------
             # 可选：按交易对分组独立学习，避免不同币种波动相互污染
@@ -1125,6 +1252,246 @@ class AICoreDecisionEngine:
                                 )
         except Exception as e:
             logger.debug(f"自动调参(执行门控)失败: {e}")
+
+    async def _auto_tune_hold_avoidance_override(self) -> None:
+        """
+        Finite-range self tuning for hold_avoidance_override thresholds.
+
+        It reduces over-suppression when:
+          - hold_by_ai_decision dominates recent decision traces
+          - open rate is too low
+          - and opened trades appear not too bad (best-effort from execution success + pnl history)
+        All changes are bounded by:
+          - bounds
+          - cooldown
+          - delta budget from baseline
+          - max steps per cooldown
+        """
+        try:
+            if not bool(self.config.get("auto_tune_hold_override_enabled", True)):
+                self._auto_tune_hold_override_last_action = "skipped"
+                self._auto_tune_hold_override_last_skip_reason = "disabled"
+                return
+
+            now_utc = datetime.utcnow()
+            min_interval = float(self.config.get("auto_tune_hold_override_min_interval_seconds", 1800) or 1800)
+            if self._auto_tune_hold_override_last_eval_at and min_interval > 0:
+                if (now_utc - self._auto_tune_hold_override_last_eval_at).total_seconds() < min_interval:
+                    self._auto_tune_hold_override_last_action = "skipped"
+                    self._auto_tune_hold_override_last_skip_reason = "min_interval_not_reached"
+                    return
+            self._auto_tune_hold_override_last_eval_at = now_utc
+
+            cooldown = float(self.config.get("auto_tune_hold_override_cooldown_seconds", 7200) or 7200)
+            if self._auto_tune_hold_override_last_at and cooldown > 0:
+                if (now_utc - self._auto_tune_hold_override_last_at).total_seconds() < cooldown:
+                    self._auto_tune_hold_override_last_action = "skipped"
+                    self._auto_tune_hold_override_last_skip_reason = "cooldown_active"
+                    return
+
+            window = int(self.config.get("auto_tune_hold_override_window_traces", 80) or 80)
+            min_traces = int(self.config.get("auto_tune_hold_override_min_traces", 12) or 12)
+            max_steps = int(self.config.get("auto_tune_hold_override_max_steps_per_cooldown", 2) or 2)
+            step_abs_sent = float(self.config.get("auto_tune_hold_override_step_min_abs_sentiment", 0.005) or 0.005)
+            step_mi_q = float(self.config.get("auto_tune_hold_override_step_min_mi_quality_score", 0.04) or 0.04)
+
+            min_abs_lo, min_abs_hi = self.config.get("auto_tune_hold_override_min_abs_sentiment_bounds", [0.03, 0.08])
+            mi_q_lo, mi_q_hi = self.config.get("auto_tune_hold_override_min_mi_quality_score_bounds", [0.45, 0.70])
+
+            hold_ratio_trigger = float(self.config.get("auto_tune_hold_override_hold_ratio_trigger", 0.60) or 0.60)
+            open_ratio_trigger = float(self.config.get("auto_tune_hold_override_open_ratio_trigger", 0.15) or 0.15)
+            tighten_hold_ratio = float(self.config.get("auto_tune_hold_override_tighten_hold_ratio", 0.45) or 0.45)
+
+            win_floor = float(self.config.get("auto_tune_hold_override_win_rate_floor", 0.50) or 0.50)
+            pnl_floor = float(self.config.get("auto_tune_hold_override_avg_pnl_floor", 0.0) or 0.0)
+            allow_relax_without_recent_pnl = bool(
+                self.config.get("auto_tune_hold_override_allow_relax_without_recent_pnl", True)
+            )
+
+            # Baseline for finite delta budget.
+            cur_min_abs = float(self.config.get("hold_avoidance_override_min_abs_sentiment", 0.06) or 0.06)
+            cur_mi_q = float(self.config.get("hold_avoidance_override_min_mi_quality_score", 0.62) or 0.62)
+            if self._auto_tune_hold_override_baseline is None:
+                self._auto_tune_hold_override_baseline = {
+                    "min_abs_sentiment": float(cur_min_abs),
+                    "min_mi_quality_score": float(cur_mi_q),
+                }
+            base = self._auto_tune_hold_override_baseline or {}
+            base_abs = float(base.get("min_abs_sentiment", cur_min_abs) or cur_min_abs)
+            base_mi = float(base.get("min_mi_quality_score", cur_mi_q) or cur_mi_q)
+            max_abs_delta = float(
+                self.config.get("auto_tune_hold_override_max_total_min_abs_sentiment_delta_from_baseline", 0.02) or 0.02
+            )
+            max_mi_delta = float(
+                self.config.get("auto_tune_hold_override_max_total_min_mi_quality_score_delta_from_baseline", 0.10) or 0.10
+            )
+
+            # Reset step counter at the start of a new cooldown window.
+            if self._auto_tune_hold_override_last_at is None:
+                self._auto_tune_hold_override_steps_in_cooldown = 0
+
+            dts = getattr(self.main_controller, "decision_trace_store", None) if self.main_controller else None
+            if dts is None or not hasattr(dts, "get_recent"):
+                self._auto_tune_hold_override_last_action = "skipped"
+                self._auto_tune_hold_override_last_skip_reason = "decision_trace_store_unavailable"
+                return
+
+            recent = dts.get_recent(limit=window)
+            total = 0
+            hold_by_ai = 0
+            open_count = 0
+            open_exec_success = 0
+            open_exec_total = 0
+
+            for r in recent:
+                if not isinstance(r, dict):
+                    continue
+                a = r.get("action")
+                guard = r.get("guard") if isinstance(r.get("guard"), dict) else {}
+                reason = guard.get("reason")
+                exe = r.get("execution") if isinstance(r.get("execution"), dict) else {}
+
+                if isinstance(a, str):
+                    total += 1
+                    if a == "hold" and reason == "hold_by_ai_decision":
+                        hold_by_ai += 1
+                    elif a == "open":
+                        open_count += 1
+                        e_status = str(exe.get("status") or "")
+                        if e_status:
+                            open_exec_total += 1
+                        if e_status == "success":
+                            open_exec_success += 1
+
+            if total < max(1, min_traces):
+                self._auto_tune_hold_override_last_action = "skipped"
+                self._auto_tune_hold_override_last_skip_reason = f"insufficient_traces:{total}<min:{min_traces}"
+                return
+
+            hold_ratio = hold_by_ai / total if total else 0.0
+            open_ratio = open_count / total if total else 0.0
+            open_success_ratio = open_exec_success / max(1, open_exec_total)
+
+            # Best-effort quality gating from last trade feedback.
+            pnls = []
+            for rec in list(getattr(self, "_trade_history", []) or [])[-40:]:
+                d = rec.get("decision") if isinstance(rec, dict) else {}
+                if isinstance(d, dict):
+                    pnl = d.get("pnl")
+                    if pnl is None:
+                        continue
+                    try:
+                        pnls.append(float(pnl))
+                    except Exception:
+                        continue
+            win_rate = sum(1 for x in pnls if x > 0) / len(pnls) if len(pnls) >= 8 else 0.0
+            avg_pnl = sum(pnls) / len(pnls) if pnls else 0.0
+            has_recent_pnl_evidence = len(pnls) >= 8
+
+            changed = False
+            new_min_abs = cur_min_abs
+            new_mi_q = cur_mi_q
+
+            # Relax.
+            if (
+                hold_ratio >= hold_ratio_trigger
+                and open_ratio <= open_ratio_trigger
+                and (
+                    open_success_ratio >= 0.60
+                    or (has_recent_pnl_evidence and win_rate >= win_floor and avg_pnl >= pnl_floor)
+                    or (allow_relax_without_recent_pnl and not has_recent_pnl_evidence and open_exec_total == 0)
+                )
+            ):
+                if self._auto_tune_hold_override_steps_in_cooldown < max_steps:
+                    new_min_abs = max(float(min_abs_lo), cur_min_abs - step_abs_sent)
+                    new_mi_q = max(float(mi_q_lo), cur_mi_q - step_mi_q)
+                    changed = (new_min_abs != cur_min_abs) or (new_mi_q != cur_mi_q)
+
+            # Tighten (only when we already have enough opens but performance is poor).
+            elif (
+                hold_ratio <= tighten_hold_ratio
+                and open_ratio > open_ratio_trigger
+                and (open_success_ratio < 0.50 and (win_rate < win_floor or avg_pnl < pnl_floor))
+            ):
+                if self._auto_tune_hold_override_steps_in_cooldown < max_steps:
+                    new_min_abs = min(float(min_abs_hi), cur_min_abs + step_abs_sent)
+                    new_mi_q = min(float(mi_q_hi), cur_mi_q + step_mi_q)
+                    changed = (new_min_abs != cur_min_abs) or (new_mi_q != cur_mi_q)
+
+            if not changed:
+                self._auto_tune_hold_override_last_action = "skipped"
+                self._auto_tune_hold_override_last_skip_reason = "no_change_condition_matched"
+                return
+
+            # Enforce bounds.
+            new_min_abs = max(float(min_abs_lo), min(float(min_abs_hi), new_min_abs))
+            new_mi_q = max(float(mi_q_lo), min(float(mi_q_hi), new_mi_q))
+
+            # Enforce baseline delta budget (finite range).
+            new_min_abs = max(base_abs - max_abs_delta, min(base_abs + max_abs_delta, new_min_abs))
+            new_mi_q = max(base_mi - max_mi_delta, min(base_mi + max_mi_delta, new_mi_q))
+
+            if new_min_abs == cur_min_abs and new_mi_q == cur_mi_q:
+                self._auto_tune_hold_override_last_action = "skipped"
+                self._auto_tune_hold_override_last_skip_reason = "bounded_to_current_values"
+                return
+
+            # Apply + persist.
+            self.config["hold_avoidance_override_min_abs_sentiment"] = float(new_min_abs)
+            self.config["hold_avoidance_override_min_mi_quality_score"] = float(new_mi_q)
+            self._auto_tune_hold_override_steps_in_cooldown += 1
+            self._auto_tune_hold_override_last_at = now_utc
+            self._auto_tune_hold_override_last_action = "updated"
+            self._auto_tune_hold_override_last_skip_reason = None
+            self._auto_tune_hold_override_last_change = {
+                "at": now_utc.isoformat(),
+                "hold_ratio": float(hold_ratio),
+                "open_ratio": float(open_ratio),
+                "open_success_ratio": float(open_success_ratio),
+                "win_rate": float(win_rate),
+                "avg_pnl": float(avg_pnl),
+                "old_min_abs_sentiment": float(cur_min_abs),
+                "new_min_abs_sentiment": float(new_min_abs),
+                "old_min_mi_quality_score": float(cur_mi_q),
+                "new_min_mi_quality_score": float(new_mi_q),
+                "steps_in_cooldown": int(self._auto_tune_hold_override_steps_in_cooldown),
+            }
+
+            cm = getattr(self.main_controller, "config_manager", None) if self.main_controller else None
+            if cm is not None and hasattr(cm, "set_config"):
+                try:
+                    await cm.set_config(
+                        "ai_core_runtime",
+                        "hold_avoidance_override_min_abs_sentiment",
+                        float(new_min_abs),
+                        validate=False,
+                    )
+                    await cm.set_config(
+                        "ai_core_runtime",
+                        "hold_avoidance_override_min_mi_quality_score",
+                        float(new_mi_q),
+                        validate=False,
+                    )
+                except Exception:
+                    pass
+
+            logger.info(
+                "🧭 自我调参(有限 hold_avoidance): hold_ratio=%.2f open_ratio=%.2f open_success=%.2f win_rate=%.2f avg_pnl=%.4f "
+                "min_abs_sent %.3f->%.3f mi_q %.3f->%.3f",
+                hold_ratio,
+                open_ratio,
+                open_success_ratio,
+                win_rate,
+                avg_pnl,
+                cur_min_abs,
+                new_min_abs,
+                cur_mi_q,
+                new_mi_q,
+            )
+        except Exception as e:
+            self._auto_tune_hold_override_last_action = "error"
+            self._auto_tune_hold_override_last_skip_reason = str(e)[:200]
+            logger.debug(f"auto_tune_hold_avoidance_override failed: {e}")
 
     def _get_frequency_profiles(self) -> Dict[str, Dict[str, Any]]:
         return {
@@ -2620,6 +2987,9 @@ class AICoreDecisionEngine:
         
         try:
             await self._refresh_runtime_guard_config()
+            # 让有限自调在 30~60 分钟窗口内可观察：评估频率提高，
+            # 但真正参数变更仍受 cooldown/边界预算约束。
+            await self._auto_tune_hold_avoidance_override()
             # 1. 获取市场数据 - 实时
             market_data = await self._get_market_data(symbol)
             logger.info(f"   ✅ 市场数据: 价格={market_data.get('price', 0)}")
@@ -2716,9 +3086,66 @@ class AICoreDecisionEngine:
             
             response = await self.llm.generate(prompt, is_user_input=False)
             
-            if not response:
-                logger.warning(f"AI未返回决策: {symbol}")
-                return None
+            if (not response) or (not str(getattr(response, "content", "") or "").strip()):
+                logger.warning(f"AI未返回决策，启用规则兜底: {symbol}")
+                try:
+                    t1 = str(technical.get("trend_1h", "unknown") or "unknown").lower()
+                    t4 = str(technical.get("trend_4h", "unknown") or "unknown").lower()
+                    risk_level = str(risk_assessment.get("level", "unknown") or "unknown").lower()
+                    strat_count = int(strategy_advice.get("count", 0) or 0)
+                    fusion_conf = float(multi_source_analysis.get("confidence", 0) or 0)
+                    mi_q = float(getattr(mi_view, "quality_score", 0.0) or 0.0) if mi_view is not None else 0.0
+                    mi_conf = float(getattr(mi_view, "confidence", 0.0) or 0.0) if mi_view is not None else 0.0
+                    min_q = float(self.config.get("ai_autonomy_min_mi_quality_score", 0.55) or 0.55)
+                    min_mi_conf = float(self.config.get("ai_autonomy_min_mi_confidence", 0.58) or 0.58)
+                    min_floor = float(self.config.get("ai_autonomy_min_conf_floor", 0.52) or 0.52)
+                    eff_conf = max(fusion_conf, mi_conf)
+                    tech_bull = t1 in ("bullish", "up", "long") and t4 in ("bullish", "up", "long")
+                    tech_bear = t1 in ("bearish", "down", "short") and t4 in ("bearish", "down", "short")
+                    ready = (
+                        self.authorization.get("full_authorization")
+                        and risk_level in ("low", "medium")
+                        and strat_count > 0
+                        and mi_q >= min_q
+                        and mi_conf >= min_mi_conf
+                        and eff_conf >= min_floor
+                    )
+                    if ready and (tech_bull or tech_bear):
+                        side = "long" if tech_bull else "short"
+                        action = "buy" if tech_bull else "sell"
+                        return TradeDecision(
+                            symbol=symbol,
+                            action=action,
+                            side=side,
+                            quantity=1,
+                            leverage=int(self.config.get("default_leverage", 1) or 1),
+                            entry_price=float(market_data.get("price", 0) or 0),
+                            stop_loss=0.0,
+                            take_profit=0.0,
+                            confidence=float(min(1.0, max(min_floor, eff_conf))),
+                            reasoning=(
+                                "llm_unavailable_rule_fallback:"
+                                f" t1={t1} t4={t4} mi_q={mi_q:.2f} mi_conf={mi_conf:.2f} fusion_conf={fusion_conf:.2f}"
+                            ),
+                            strategy_used="s1_llm_unavailable_fallback",
+                            risk_level=risk_level,
+                        )
+                except Exception:
+                    pass
+                return TradeDecision(
+                    symbol=symbol,
+                    action="hold",
+                    side="long",
+                    quantity=0,
+                    leverage=int(self.config.get("default_leverage", 1) or 1),
+                    entry_price=float(market_data.get("price", 0) or 0),
+                    stop_loss=0.0,
+                    take_profit=0.0,
+                    confidence=0.0,
+                    reasoning="llm_unavailable_fallback_hold",
+                    strategy_used="s1_llm_unavailable_fallback",
+                    risk_level=str(risk_assessment.get("level", "medium") or "medium"),
+                )
             
             decision = self._parse_ai_decision(response.content, symbol)
 
@@ -2731,65 +3158,173 @@ class AICoreDecisionEngine:
                     fusion_sent = multi_source_analysis.get("sentiment", 0)
                     strat_count = int(strategy_advice.get("count", 0) or 0)
                     risk_level = risk_assessment.get("level", "unknown")
-                    tech_trend_1h = technical.get("trend_1h", "unknown")
                     min_conf = float(self.config.get("min_confidence_to_trade", 0.6))
                     min_abs_sent = float(self.config.get("hold_avoidance_override_min_abs_sentiment", 0.06) or 0.06)
                     mi_q_min = float(self.config.get("hold_avoidance_override_min_mi_quality_score", 0.62) or 0.62)
                     require_mi_align = bool(self.config.get("hold_avoidance_override_require_mi_trend_alignment", True))
                     cooldown = float(self.config.get("hold_avoidance_override_cooldown_sec", 1200) or 1200)
+                    autonomy_enabled = bool(self.config.get("ai_autonomy_minimal_gates_enabled", True))
+                    autonomy_conf_floor = float(self.config.get("ai_autonomy_min_conf_floor", 0.52) or 0.52)
+                    autonomy_mi_conf_min = float(self.config.get("ai_autonomy_min_mi_confidence", 0.58) or 0.58)
+                    autonomy_mi_q_min = float(self.config.get("ai_autonomy_min_mi_quality_score", 0.55) or 0.55)
+                    autonomy_allow_neutral = bool(self.config.get("ai_autonomy_allow_neutral_with_trend", True))
+                    autonomy_require_align = bool(self.config.get("ai_autonomy_require_trend_alignment", True))
+                    mtf_release_enabled = bool(self.config.get("ai_autonomy_enable_mtf_conflict_release", True))
+                    mtf_release_need_mi_bias = bool(
+                        self.config.get("ai_autonomy_mtf_conflict_release_requires_mi_bias", True)
+                    )
+                    conflict_subtype_release_enabled = bool(
+                        self.config.get("ai_autonomy_conflict_subtype_release_enabled", True)
+                    )
+                    conflict_release_min_rsi_long = float(
+                        self.config.get("ai_autonomy_conflict_release_min_rsi_1h_for_long", 56.0) or 56.0
+                    )
+                    conflict_release_max_rsi_short = float(
+                        self.config.get("ai_autonomy_conflict_release_max_rsi_1h_for_short", 44.0) or 44.0
+                    )
+                    conflict_release_min_abs_chg = float(
+                        self.config.get("ai_autonomy_conflict_release_min_abs_change_24h", 0.006) or 0.006
+                    )
+                    conflict_release_need_mi_conf = bool(
+                        self.config.get("ai_autonomy_conflict_release_require_mi_confidence", True)
+                    )
 
                     mi_trend = getattr(mi_view, "trend", None) if mi_view else None
+                    mi_bias = getattr(mi_view, "action_bias", None) if mi_view else None
                     mi_q = getattr(mi_view, "quality_score", None) if mi_view else None
                     mi_conf = getattr(mi_view, "confidence", None) if mi_view else None
                     try:
                         mi_qf = float(mi_q) if mi_q is not None else 0.0
                     except Exception:
                         mi_qf = 0.0
+                    try:
+                        mi_conff = float(mi_conf) if mi_conf is not None else 0.0
+                    except Exception:
+                        mi_conff = 0.0
 
                     now = datetime.now()
+                    t1 = str(technical.get("trend_1h", "unknown") or "unknown").lower()
+                    t4 = str(technical.get("trend_4h", "unknown") or "unknown").lower()
+                    t1d = str(technical.get("trend_1d", "unknown") or "unknown").lower()
+                    mi_tr = str(mi_trend or "").lower()
+                    mi_bi = str(mi_bias or "").lower()
+                    try:
+                        rsi_1h = float(technical.get("rsi_1h", 50.0) or 50.0)
+                    except Exception:
+                        rsi_1h = 50.0
+                    raw_chg_24h = (
+                        market_data.get("change_24h")
+                        if isinstance(market_data, dict)
+                        else None
+                    )
+                    if raw_chg_24h is None and isinstance(market_data, dict):
+                        raw_chg_24h = market_data.get("change")
+                    try:
+                        chg_24h = float(raw_chg_24h or 0.0)
+                    except Exception:
+                        chg_24h = 0.0
+                    tech_bull = t1 in ("bullish", "up", "long") and t4 in ("bullish", "up", "long")
+                    tech_bear = t1 in ("bearish", "down", "short") and t4 in ("bearish", "down", "short")
+                    mi_bull = mi_tr in ("bullish", "up", "long")
+                    mi_bear = mi_tr in ("bearish", "down", "short")
+                    bias_bull = mi_bi in ("buy", "bullish", "long", "up")
+                    bias_bear = mi_bi in ("sell", "bearish", "short", "down")
+                    sentiment_bull = isinstance(fusion_sent, (int, float)) and float(fusion_sent) > min_abs_sent
+                    sentiment_bear = isinstance(fusion_sent, (int, float)) and float(fusion_sent) < -min_abs_sent
+                    decision_conf = float(decision.confidence or 0.0)
+                    effective_conf = max(decision_conf, mi_conff, fusion_conf)
+                    strict_ready = (
+                        fusion_conf >= min_conf
+                        and isinstance(fusion_sent, (int, float))
+                        and abs(float(fusion_sent)) >= min_abs_sent
+                        and mi_qf >= mi_q_min
+                    )
+                    autonomy_ready = (
+                        autonomy_enabled
+                        and mi_qf >= autonomy_mi_q_min
+                        and mi_conff >= autonomy_mi_conf_min
+                        and effective_conf >= autonomy_conf_floor
+                    )
+                    bull_evidence = tech_bull or mi_bull or bias_bull or sentiment_bull
+                    bear_evidence = tech_bear or mi_bear or bias_bear or sentiment_bear
+                    if autonomy_require_align:
+                        bull_evidence = bull_evidence and (not mi_tr or tech_bull or mi_bull or bias_bull)
+                        bear_evidence = bear_evidence and (not mi_tr or tech_bear or mi_bear or bias_bear)
+                    if not autonomy_allow_neutral and mi_tr in ("neutral", "sideways", "range", "mixed"):
+                        bull_evidence = False
+                        bear_evidence = False
+                    # 规则层补强：当短中周期(1H/4H)一致，且 MI 方向支持时，
+                    # 即便 1D 出现冲突也允许放行，避免长期被 mtf_conflict 锁死。
+                    day_conflict = (
+                        (tech_bull and t1d in ("bearish", "down", "short"))
+                        or (tech_bear and t1d in ("bullish", "up", "long"))
+                    )
+                    if mtf_release_enabled and day_conflict:
+                        bull_release = tech_bull and (mi_bull or bias_bull)
+                        bear_release = tech_bear and (mi_bear or bias_bear)
+                        if mtf_release_need_mi_bias:
+                            bull_release = tech_bull and bias_bull
+                            bear_release = tech_bear and bias_bear
+                        if conflict_subtype_release_enabled:
+                            # 仅放行“冲突中的可交易子类”：短中周期同向 + MI支持 + 动量达标
+                            bull_release = (
+                                bull_release
+                                and rsi_1h >= conflict_release_min_rsi_long
+                                and abs(chg_24h) >= conflict_release_min_abs_chg
+                            )
+                            bear_release = (
+                                bear_release
+                                and rsi_1h <= conflict_release_max_rsi_short
+                                and abs(chg_24h) >= conflict_release_min_abs_chg
+                            )
+                            if conflict_release_need_mi_conf:
+                                bull_release = bull_release and (mi_conff >= autonomy_mi_conf_min)
+                                bear_release = bear_release and (mi_conff >= autonomy_mi_conf_min)
+                        bull_evidence = bull_evidence or bull_release
+                        bear_evidence = bear_evidence or bear_release
 
                     if (
                         self.authorization.get("full_authorization")
                         and risk_level in ("low", "medium")
                         and strat_count > 0
-                        and fusion_conf >= min_conf
-                        and isinstance(fusion_sent, (int, float))
-                        and abs(float(fusion_sent)) >= min_abs_sent
-                        and mi_qf >= mi_q_min
+                        and (strict_ready or autonomy_ready)
                     ):
                         # rate limit per symbol-side
-                        key = f"{symbol}:{'long' if float(fusion_sent) > 0 else 'short'}"
+                        side_hint = "long" if (sentiment_bull or tech_bull or mi_bull) else "short"
+                        key = f"{symbol}:{side_hint}"
                         last = self._last_hold_override_at.get(key)
                         if last and (now - last).total_seconds() < cooldown:
                             raise RuntimeError("hold_avoidance_override cooldown")
 
-                        if tech_trend_1h == "bearish" and fusion_sent < -0.05:
+                        if bear_evidence:
                             if require_mi_align and str(mi_trend or "").lower() not in ("bearish", "down", "short"):
                                 raise RuntimeError("hold_avoidance_override mi trend mismatch")
                             decision.action = "sell"
                             decision.side = "short"
                             decision.quantity = max(1, int(decision.quantity or 1))
                             decision.leverage = int(self.config.get("default_leverage", 1) or 1)
-                            decision.confidence = float(max(decision.confidence or 0, min(1.0, fusion_conf)))
+                            decision.confidence = float(max(decision.confidence or 0, min(1.0, max(fusion_conf, mi_conff))))
                             decision.reasoning = (
-                                f"hold_avoidance_override: fusion_conf={fusion_conf:.2f}, fusion_sent={fusion_sent:.3f}, "
-                                f"tech_trend_1h=bearish"
+                                f"ai_autonomy_override: strict={strict_ready} autonomy={autonomy_ready} "
+                                f"fusion_conf={fusion_conf:.2f} mi_conf={mi_conff:.2f} mi_q={mi_qf:.2f} "
+                                f"t1={t1} t4={t4} t1d={t1d} mi_trend={mi_tr} mi_bias={mi_bi}"
                             )
-                            decision.strategy_used = decision.strategy_used or "s1_fusion_override"
+                            decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
                             self._last_hold_override_at[key] = now
-                        elif tech_trend_1h == "bullish" and fusion_sent > 0.05:
+                        elif bull_evidence:
                             if require_mi_align and str(mi_trend or "").lower() not in ("bullish", "up", "long"):
                                 raise RuntimeError("hold_avoidance_override mi trend mismatch")
                             decision.action = "buy"
                             decision.side = "long"
                             decision.quantity = max(1, int(decision.quantity or 1))
                             decision.leverage = int(self.config.get("default_leverage", 1) or 1)
-                            decision.confidence = float(max(decision.confidence or 0, min(1.0, fusion_conf)))
+                            decision.confidence = float(max(decision.confidence or 0, min(1.0, max(fusion_conf, mi_conff))))
                             decision.reasoning = (
-                                f"hold_avoidance_override: fusion_conf={fusion_conf:.2f}, fusion_sent={fusion_sent:.3f}, "
-                                f"tech_trend_1h=bullish"
+                                f"ai_autonomy_override: strict={strict_ready} autonomy={autonomy_ready} "
+                                f"fusion_conf={fusion_conf:.2f} mi_conf={mi_conff:.2f} mi_q={mi_qf:.2f} "
+                                f"t1={t1} t4={t4} t1d={t1d} mi_trend={mi_tr} mi_bias={mi_bi}"
                             )
-                            decision.strategy_used = decision.strategy_used or "s1_fusion_override"
+                            decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
                             self._last_hold_override_at[key] = now
                 except Exception as e:
                     logger.debug(f"hold override skipped: {e}")
@@ -2996,15 +3531,48 @@ class AICoreDecisionEngine:
         
         return ""
     
+    def _symbol_fetch_variants(self, symbol: str) -> List[str]:
+        """Build robust symbol variants for exchange fetch calls."""
+        base = str(symbol or "").strip().upper()
+        if not base:
+            return []
+        slash = base.replace("-", "/")
+        dash = base.replace("/", "-")
+        out: List[str] = []
+        for s in (base, slash, dash):
+            if s and s not in out:
+                out.append(s)
+        extra: List[str] = []
+        for s in list(out):
+            if "SWAP" in s:
+                continue
+            if "/" in s:
+                extra.append(f"{s}/SWAP")
+            if "-" in s:
+                extra.append(f"{s}-SWAP")
+        for s in extra:
+            if s and s not in out:
+                out.append(s)
+        return out
+
     async def _get_market_data(self, symbol: str) -> Dict:
         """获取市场数据"""
         if not self.exchange:
             return {}
         
         try:
-            ticker = await self.exchange.get_ticker(symbol.replace('/', '-'))
+            variants = self._symbol_fetch_variants(symbol)
+            ticker = {}
+            for sym_v in variants:
+                try:
+                    t = await self.exchange.get_ticker(sym_v)
+                    if isinstance(t, dict) and float(t.get("last") or t.get("price") or 0) > 0:
+                        ticker = t
+                        break
+                except Exception:
+                    continue
             return {
-                "price": ticker.get('last', 0),
+                "price": ticker.get('last', ticker.get("price", 0)),
                 "high": ticker.get('high', 0),
                 "low": ticker.get('low', 0),
                 "volume": ticker.get('volume', 0),
@@ -3019,10 +3587,19 @@ class AICoreDecisionEngine:
             return {}
         
         try:
+            variants = self._symbol_fetch_variants(symbol)
             # 获取多个周期的K线数据
-            klines_1h = await self.exchange.get_klines(symbol.replace('/', '-'), '1H', limit=100)
-            klines_4h = await self.exchange.get_klines(symbol.replace('/', '-'), '4H', limit=50)
-            klines_1d = await self.exchange.get_klines(symbol.replace('/', '-'), '1D', limit=30)
+            klines_1h, klines_4h, klines_1d = [], [], []
+            for sym_v in variants:
+                try:
+                    k1 = await self.exchange.get_klines(sym_v, '1H', limit=100)
+                    k4 = await self.exchange.get_klines(sym_v, '4H', limit=50)
+                    k1d = await self.exchange.get_klines(sym_v, '1D', limit=30)
+                    if k1:
+                        klines_1h, klines_4h, klines_1d = (k1 or []), (k4 or []), (k1d or [])
+                        break
+                except Exception:
+                    continue
             
             if not klines_1h:
                 return {}
@@ -3435,6 +4012,14 @@ class AICoreDecisionEngine:
                 positions_detail += f"  - {pos.get('symbol', '')}: {pos.get('side', '')} {pos.get('size', 0)} | 入场价: {pos.get('entry_price', 0):.4f} | 盈亏: ${pos.get('pnl', 0):+.2f}\n"
 
         scanner_hint_block = self._format_scanner_hint_block(symbol)
+        autonomy_enabled = bool(self.config.get("ai_autonomy_minimal_gates_enabled", True))
+        autonomy_rule_block = (
+            f"启用（最小门禁）: min_conf_floor={self.config.get('ai_autonomy_min_conf_floor', 0.52)}, "
+            f"mi_conf>={self.config.get('ai_autonomy_min_mi_confidence', 0.58)}, "
+            f"mi_quality>={self.config.get('ai_autonomy_min_mi_quality_score', 0.55)}"
+            if autonomy_enabled
+            else "关闭（严格门禁）"
+        )
         
         prompt = f"""你是一个拥有完整控制权的量化交易AI，正在24小时不间断运行。
 
@@ -3505,8 +4090,13 @@ class AICoreDecisionEngine:
 - 默认杠杆: {self.config['default_leverage']}x
 - 最大持仓数: {self.config['max_positions']}
 - 最小交易置信度: {self.config.get('min_confidence_to_trade', 0.6)}
+- AI自主放权模式: {autonomy_rule_block}
 - 主观平仓要求: 仅在「多周期趋势已实质反转」或风险不可接受时 action=close；不要因单根K线、短时反弹/回踩或单一指标抖动平仓；若证据不足请 hold。
-- 重要: 若在理由中写出「多周期矛盾」「大周期与短周期方向不一致」等，则 **必须 action=hold**，由 SLTP 管理出场；不得同时写矛盾又输出 close，也不得把「可用余额为 0」单独作为平仓主因（平仓不会创造可用保证金逻辑）。
+- 重要: 若出现「多周期矛盾」「大周期与短周期方向不一致」，默认应 action=hold；但满足“最小门禁”即可开仓：
+  (a) 置信度达到基础底线（>= {self.config.get('ai_autonomy_min_conf_floor', 0.52)}）；
+  (b) 统一行情 quality_score >= {self.config.get('ai_autonomy_min_mi_quality_score', 0.55)}；
+  (c) 至少一类方向证据成立（技术趋势一致 / MI趋势一致 / 多源sentiment显著）。
+  仅当证据不足时才 hold。若输出 close，仍需满足「趋势实质反转」证据，不得把「可用余额为 0」单独作为平仓主因（平仓不会创造可用保证金逻辑）。
 
 【决策要求】
 你必须综合分析以上所有数据，做出交易决策。特别注意：
@@ -3515,7 +4105,7 @@ class AICoreDecisionEngine:
 3. 风险评估等级是否允许开仓
 4. 历史经验中是否有类似情况的教训
 5. 已有持仓时：优先让交易所侧止盈止损（SLTP）管理价位平仓；除非趋势明确反转，否则避免频繁 close
-6. confidence 应反映真实不确定性：存在周期冲突时 confidence 不得超过 0.75，且 action 应为 hold
+6. confidence 应反映真实不确定性：存在周期冲突时默认 confidence 不得超过 0.75 且倾向 hold；但满足最小门禁与方向证据时，允许输出 buy/sell。
 
 请做出交易决策，返回JSON格式：
 
@@ -3535,6 +4125,56 @@ class AICoreDecisionEngine:
 只返回JSON。"""
         
         return prompt
+
+    def _build_hold_trace_extras(
+        self,
+        decision: Optional[TradeDecision] = None,
+        raw_reasoning: Optional[str] = None,
+        source: str = "unknown",
+        confidence: Optional[float] = None,
+        strategy_used: Optional[str] = None,
+        risk_level: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build structured extras for hold-by-ai traces."""
+        txt = str(
+            raw_reasoning
+            if raw_reasoning is not None
+            else getattr(decision, "reasoning", "") or ""
+        )
+        low = txt.lower()
+        conf = confidence if confidence is not None else getattr(decision, "confidence", None)
+        strat = strategy_used if strategy_used is not None else getattr(decision, "strategy_used", None)
+        risk = risk_level if risk_level is not None else getattr(decision, "risk_level", None)
+        min_conf = float(self.config.get("min_confidence_to_trade", 0.6) or 0.6)
+
+        tags = {
+            "mtf_conflict": ("多周期" in txt and "矛盾" in txt)
+            or ("方向不一致" in txt)
+            or ("conflict" in low and "timeframe" in low),
+            "low_confidence": ("置信度" in txt and ("不足" in txt or "偏低" in txt))
+            or ("confidence" in low and ("low" in low or "insufficient" in low))
+            or (isinstance(conf, (int, float)) and float(conf) < min_conf),
+            "quality_insufficient": ("quality" in low and ("low" in low or "insufficient" in low))
+            or ("质量" in txt and ("不足" in txt or "偏低" in txt)),
+            "trend_misalignment": ("趋势" in txt and ("不一致" in txt or "不匹配" in txt))
+            or ("trend" in low and ("misalign" in low or "mismatch" in low)),
+            "evidence_incomplete": ("证据" in txt and ("不足" in txt or "不完整" in txt))
+            or ("evidence" in low and ("insufficient" in low or "incomplete" in low)),
+            "neutral_market": ("震荡" in txt or "盘整" in txt or "中性" in txt)
+            or ("choppy" in low or "sideways" in low or "neutral" in low),
+        }
+
+        return {
+            "decision_action": "hold",
+            "trace_source": source,
+            "decision_confidence": conf,
+            "min_confidence_to_trade": min_conf,
+            "confidence_gap": (float(conf) - min_conf) if isinstance(conf, (int, float)) else None,
+            "strategy_used": str(strat or ""),
+            "risk_level": str(risk or ""),
+            "reasoning_excerpt": txt[:280],
+            "hold_reason_tags": tags,
+        }
     
     def _parse_ai_decision(self, response: str, symbol: str) -> Optional[TradeDecision]:
         """解析AI决策"""
@@ -3594,6 +4234,43 @@ class AICoreDecisionEngine:
             
             action = data.get('action', 'hold')
             if action == 'hold':
+                try:
+                    mc = self.main_controller
+                    if mc is not None and getattr(mc, "decision_trace_store", None) is None:
+                        mc.decision_trace_store = DecisionTraceStore()
+                    dts = getattr(mc, "decision_trace_store", None) if mc is not None else None
+                    if dts:
+                        trace_id = f"parsed-hold-{symbol.replace('/', '_')}-{int(datetime.now().timestamp())}"
+                        hold_extras = self._build_hold_trace_extras(
+                            decision=None,
+                            raw_reasoning=str(data.get("reasoning") or ""),
+                            source="parse_ai_decision",
+                            confidence=float(data.get("confidence", 0.0) or 0.0),
+                            strategy_used=str(data.get("strategy_used") or ""),
+                            risk_level=str(data.get("risk_level") or ""),
+                        )
+                        dts.record_intent(
+                            trace_id=trace_id,
+                            symbol=str(symbol),
+                            side=str(data.get("side") or ""),
+                            action="hold",
+                            source="ai_core",
+                            confidence=float(data.get("confidence", 0.0) or 0.0),
+                            strategy_used=str(data.get("strategy_used") or ""),
+                            reasoning=str(data.get("reasoning") or ""),
+                            quantity=None,
+                            leverage=None,
+                            extras=hold_extras,
+                        )
+                        dts.record_guard_result(
+                            trace_id=trace_id,
+                            status="rejected",
+                            reason="hold_by_ai_decision",
+                            stage="decision_parse",
+                            extras=hold_extras,
+                        )
+                except Exception:
+                    pass
                 return TradeDecision(
                     symbol=symbol,
                     action='hold',
@@ -3746,6 +4423,7 @@ class AICoreDecisionEngine:
     async def _execute_decision(self, decision: TradeDecision, *, bypass_discretionary_close_gates: bool = False) -> bool:
         """执行AI决策 - 带余额检查"""
         trace_id = str(uuid.uuid4())
+        hold_trace_extras = self._build_hold_trace_extras(decision=decision, source="_execute_decision")
 
         def _trace_store() -> Optional[DecisionTraceStore]:
             try:
@@ -3791,6 +4469,10 @@ class AICoreDecisionEngine:
                 pass
 
         if decision.action == 'hold':
+            # Record HOLD as an explicit trace so "no-trade" paths are observable
+            # in decision-traces replay/analytics.
+            _record_intent(hold_trace_extras)
+            _record_guard("rejected", "hold_by_ai_decision", "decision", hold_trace_extras)
             return True
         
         if decision.symbol in self.blacklist:
@@ -3869,14 +4551,75 @@ class AICoreDecisionEngine:
             # 开仓：不再做应用层「最小可用 USDT」硬门槛；实际能否成交由交易所 minSz/余额 决定。平仓不因低 USDT 阻塞。
 
             # 2. 获取当前价格
-            ticker = await self.exchange.get_ticker(decision.symbol.replace('/', '-'))
-            current_price = ticker.get('last', 0)
+            variants = self._symbol_fetch_variants(decision.symbol)
+            ticker = {}
+            current_price = 0.0
+            for sym_v in variants:
+                try:
+                    tk = await self.exchange.get_ticker(sym_v)
+                    px = float((tk or {}).get("last") or (tk or {}).get("price") or 0)
+                    if px > 0:
+                        ticker = tk or {}
+                        current_price = px
+                        break
+                except Exception:
+                    continue
             
             if current_price <= 0:
-                logger.error(f"无法获取 {decision.symbol} 的价格")
-                _record_intent()
-                _record_guard("rejected", "price_unavailable", "market_data")
-                return False
+                # Fallbacks: avoid hard-stopping on transient ticker failures.
+                # Order safety still relies on later evidence/microstructure gates.
+                tried = list(variants or [])
+                fb_used = None
+                # (a) Prefer MarketIntelligence cached price (try each symbol variant; cache key may differ)
+                try:
+                    mc = self.main_controller
+                    mi = getattr(mc, "market_intelligence", None) if mc else None
+                    if mi and hasattr(mi, "get_cached_symbol_view"):
+                        for sym_try in tried or [decision.symbol]:
+                            cv = mi.get_cached_symbol_view(sym_try) or {}
+                            px = float(cv.get("price") or 0.0)
+                            if px > 0:
+                                current_price = px
+                                fb_used = f"mi_cached_symbol_view.price({sym_try})"
+                                break
+                except Exception:
+                    pass
+                # (b) Use decision.entry_price if already filled upstream
+                if current_price <= 0:
+                    try:
+                        px = float(getattr(decision, "entry_price", 0.0) or 0.0)
+                        if px > 0:
+                            current_price = px
+                            fb_used = "decision.entry_price"
+                    except Exception:
+                        pass
+                # (c) Last resort: use market_data price field if present
+                if current_price <= 0:
+                    try:
+                        px = float(ticker.get("last") or 0.0) if isinstance(ticker, dict) else 0.0
+                        if px > 0:
+                            current_price = px
+                            fb_used = "ticker.last"
+                    except Exception:
+                        pass
+                if current_price <= 0:
+                    logger.error(f"无法获取 {decision.symbol} 的价格")
+                    _record_intent({"tried_symbols": tried})
+                    _record_guard(
+                        "rejected",
+                        "price_unavailable",
+                        "market_data",
+                        {"tried_symbols": tried},
+                    )
+                    return False
+                else:
+                    logger.warning(
+                        "⚠️ 价格兜底命中: symbol=%s price=%.8f source=%s tried=%s",
+                        decision.symbol,
+                        float(current_price),
+                        str(fb_used),
+                        tried[:6],
+                    )
 
             # 开仓前的“证据完整性门控”：必须拿到 K线/盘口等关键证据，否则不允许开仓（避免只看 ticker 追涨杀跌）。
             if is_open and bool(self.config.get("open_requires_full_snapshot", True)):
@@ -4856,6 +5599,14 @@ class AICoreDecisionEngine:
                 if getattr(cfg, "enabled", True):
                     sm_enabled += 1
                     sm_ids.append(sid)
+        uth_cache_len = 0
+        try:
+            ths = getattr(self.main_controller, "trade_history_service", None) if self.main_controller else None
+            c = getattr(ths, "_cache", None) if ths else None
+            if isinstance(c, list):
+                uth_cache_len = len(c)
+        except Exception:
+            uth_cache_len = 0
         return {
             "running": self._running,
             "blacklist": list(self.blacklist),
@@ -4885,7 +5636,13 @@ class AICoreDecisionEngine:
             "last_strategy_check": self._last_strategy_check.isoformat() if self._last_strategy_check else None,
             "active_positions": len(self._current_positions) if hasattr(self, '_current_positions') else 0,
             "positions": self._current_positions if hasattr(self, '_current_positions') else {},
+            # legacy field: was often misread as "exchange lifetime trades"; it is the ai_core ring buffer only
             "total_trades": len(self._trade_history) if hasattr(self, '_trade_history') else 0,
+            "trade_counters": {
+                "session_ring_records": len(self._trade_history) if hasattr(self, "_trade_history") else 0,
+                "unified_history_cache_records": uth_cache_len,
+                "position_symbols_tracked": len(self._current_positions) if hasattr(self, "_current_positions") else 0,
+            },
             "execution_guards": {
                 "config": {
                     "min_trade_interval": self.config.get("min_trade_interval"),
@@ -4952,11 +5709,44 @@ class AICoreDecisionEngine:
                     "auto_tune_sltp_cooldown_seconds": self.config.get("auto_tune_sltp_cooldown_seconds"),
                     "auto_tune_sltp_step_tighten": self.config.get("auto_tune_sltp_step_tighten"),
                     "auto_tune_sltp_step_extend": self.config.get("auto_tune_sltp_step_extend"),
+                    "auto_tune_global_max_cumulative_rr_delta_from_baseline": self.config.get("auto_tune_global_max_cumulative_rr_delta_from_baseline"),
+                    "auto_tune_global_max_cumulative_spread_bps_delta_from_baseline": self.config.get("auto_tune_global_max_cumulative_spread_bps_delta_from_baseline"),
                     "hold_avoidance_override_enabled": self.config.get("hold_avoidance_override_enabled"),
                     "hold_avoidance_override_cooldown_sec": self.config.get("hold_avoidance_override_cooldown_sec"),
                     "hold_avoidance_override_min_abs_sentiment": self.config.get("hold_avoidance_override_min_abs_sentiment"),
                     "hold_avoidance_override_min_mi_quality_score": self.config.get("hold_avoidance_override_min_mi_quality_score"),
                     "hold_avoidance_override_require_mi_trend_alignment": self.config.get("hold_avoidance_override_require_mi_trend_alignment"),
+                    "ai_autonomy_minimal_gates_enabled": self.config.get("ai_autonomy_minimal_gates_enabled"),
+                    "ai_autonomy_min_conf_floor": self.config.get("ai_autonomy_min_conf_floor"),
+                    "ai_autonomy_min_mi_confidence": self.config.get("ai_autonomy_min_mi_confidence"),
+                    "ai_autonomy_min_mi_quality_score": self.config.get("ai_autonomy_min_mi_quality_score"),
+                    "ai_autonomy_allow_neutral_with_trend": self.config.get("ai_autonomy_allow_neutral_with_trend"),
+                    "ai_autonomy_require_trend_alignment": self.config.get("ai_autonomy_require_trend_alignment"),
+                    "ai_autonomy_enable_mtf_conflict_release": self.config.get("ai_autonomy_enable_mtf_conflict_release"),
+                    "ai_autonomy_mtf_conflict_release_requires_mi_bias": self.config.get("ai_autonomy_mtf_conflict_release_requires_mi_bias"),
+                    "ai_autonomy_conflict_subtype_release_enabled": self.config.get("ai_autonomy_conflict_subtype_release_enabled"),
+                    "ai_autonomy_conflict_release_min_rsi_1h_for_long": self.config.get("ai_autonomy_conflict_release_min_rsi_1h_for_long"),
+                    "ai_autonomy_conflict_release_max_rsi_1h_for_short": self.config.get("ai_autonomy_conflict_release_max_rsi_1h_for_short"),
+                    "ai_autonomy_conflict_release_min_abs_change_24h": self.config.get("ai_autonomy_conflict_release_min_abs_change_24h"),
+                    "ai_autonomy_conflict_release_require_mi_confidence": self.config.get("ai_autonomy_conflict_release_require_mi_confidence"),
+                    "auto_tune_hold_override_enabled": self.config.get("auto_tune_hold_override_enabled"),
+                    "auto_tune_hold_override_min_interval_seconds": self.config.get("auto_tune_hold_override_min_interval_seconds"),
+                    "auto_tune_hold_override_cooldown_seconds": self.config.get("auto_tune_hold_override_cooldown_seconds"),
+                    "auto_tune_hold_override_window_traces": self.config.get("auto_tune_hold_override_window_traces"),
+                    "auto_tune_hold_override_min_traces": self.config.get("auto_tune_hold_override_min_traces"),
+                    "auto_tune_hold_override_step_min_abs_sentiment": self.config.get("auto_tune_hold_override_step_min_abs_sentiment"),
+                    "auto_tune_hold_override_step_min_mi_quality_score": self.config.get("auto_tune_hold_override_step_min_mi_quality_score"),
+                    "auto_tune_hold_override_min_abs_sentiment_bounds": self.config.get("auto_tune_hold_override_min_abs_sentiment_bounds"),
+                    "auto_tune_hold_override_min_mi_quality_score_bounds": self.config.get("auto_tune_hold_override_min_mi_quality_score_bounds"),
+                    "auto_tune_hold_override_max_steps_per_cooldown": self.config.get("auto_tune_hold_override_max_steps_per_cooldown"),
+                    "auto_tune_hold_override_hold_ratio_trigger": self.config.get("auto_tune_hold_override_hold_ratio_trigger"),
+                    "auto_tune_hold_override_open_ratio_trigger": self.config.get("auto_tune_hold_override_open_ratio_trigger"),
+                    "auto_tune_hold_override_tighten_hold_ratio": self.config.get("auto_tune_hold_override_tighten_hold_ratio"),
+                    "auto_tune_hold_override_win_rate_floor": self.config.get("auto_tune_hold_override_win_rate_floor"),
+                    "auto_tune_hold_override_avg_pnl_floor": self.config.get("auto_tune_hold_override_avg_pnl_floor"),
+                    "auto_tune_hold_override_allow_relax_without_recent_pnl": self.config.get("auto_tune_hold_override_allow_relax_without_recent_pnl"),
+                    "auto_tune_hold_override_max_total_min_abs_sentiment_delta_from_baseline": self.config.get("auto_tune_hold_override_max_total_min_abs_sentiment_delta_from_baseline"),
+                    "auto_tune_hold_override_max_total_min_mi_quality_score_delta_from_baseline": self.config.get("auto_tune_hold_override_max_total_min_mi_quality_score_delta_from_baseline"),
                 },
                 "adaptive_profile": dict(self._adaptive_guard_profile),
                 "group_overrides": dict(self._symbol_group_guard_overrides),
@@ -4971,6 +5761,22 @@ class AICoreDecisionEngine:
                     self._last_global_tune_at.isoformat() if self._last_global_tune_at else None
                 ),
                 "stats": dict(self._execution_guards_stats),
+                "hold_override_auto_tune_state": {
+                    "last_eval_at": (
+                        self._auto_tune_hold_override_last_eval_at.isoformat()
+                        if self._auto_tune_hold_override_last_eval_at
+                        else None
+                    ),
+                    "last_update_at": (
+                        self._auto_tune_hold_override_last_at.isoformat()
+                        if self._auto_tune_hold_override_last_at
+                        else None
+                    ),
+                    "last_action": self._auto_tune_hold_override_last_action,
+                    "last_skip_reason": self._auto_tune_hold_override_last_skip_reason,
+                    "steps_in_cooldown": int(self._auto_tune_hold_override_steps_in_cooldown),
+                    "last_change": dict(self._auto_tune_hold_override_last_change or {}),
+                },
                 "frequency_profile": self._frequency_profile,
                 "last_frequency_profile_switch_at": (
                     self._last_frequency_profile_switch_at.isoformat()
@@ -5069,6 +5875,46 @@ class AICoreDecisionEngine:
                 "auto_tune_sltp_step_extend",
                 "auto_tune_sltp_tighten_bounds",
                 "auto_tune_sltp_extend_bounds",
+                "auto_tune_global_max_cumulative_rr_delta_from_baseline",
+                "auto_tune_global_max_cumulative_spread_bps_delta_from_baseline",
+                # hold_avoidance_override：反 HOLD 折返机制（用于放宽 hold_by_ai_decision 的保守性）
+                "hold_avoidance_override_enabled",
+                "hold_avoidance_override_cooldown_sec",
+                "hold_avoidance_override_min_abs_sentiment",
+                "hold_avoidance_override_min_mi_quality_score",
+                "hold_avoidance_override_require_mi_trend_alignment",
+                "ai_autonomy_minimal_gates_enabled",
+                "ai_autonomy_min_conf_floor",
+                "ai_autonomy_min_mi_confidence",
+                "ai_autonomy_min_mi_quality_score",
+                "ai_autonomy_allow_neutral_with_trend",
+                "ai_autonomy_require_trend_alignment",
+                "ai_autonomy_enable_mtf_conflict_release",
+                "ai_autonomy_mtf_conflict_release_requires_mi_bias",
+                "ai_autonomy_conflict_subtype_release_enabled",
+                "ai_autonomy_conflict_release_min_rsi_1h_for_long",
+                "ai_autonomy_conflict_release_max_rsi_1h_for_short",
+                "ai_autonomy_conflict_release_min_abs_change_24h",
+                "ai_autonomy_conflict_release_require_mi_confidence",
+                # finite-range self tuning for hold_avoidance_override
+                "auto_tune_hold_override_enabled",
+                "auto_tune_hold_override_min_interval_seconds",
+                "auto_tune_hold_override_cooldown_seconds",
+                "auto_tune_hold_override_window_traces",
+                "auto_tune_hold_override_min_traces",
+                "auto_tune_hold_override_step_min_abs_sentiment",
+                "auto_tune_hold_override_step_min_mi_quality_score",
+                "auto_tune_hold_override_min_abs_sentiment_bounds",
+                "auto_tune_hold_override_min_mi_quality_score_bounds",
+                "auto_tune_hold_override_max_steps_per_cooldown",
+                "auto_tune_hold_override_hold_ratio_trigger",
+                "auto_tune_hold_override_open_ratio_trigger",
+                "auto_tune_hold_override_tighten_hold_ratio",
+                "auto_tune_hold_override_win_rate_floor",
+                "auto_tune_hold_override_avg_pnl_floor",
+                "auto_tune_hold_override_allow_relax_without_recent_pnl",
+                "auto_tune_hold_override_max_total_min_abs_sentiment_delta_from_baseline",
+                "auto_tune_hold_override_max_total_min_mi_quality_score_delta_from_baseline",
             )
             bool_keys = {
                 "auto_adaptive_guards",
@@ -5085,6 +5931,15 @@ class AICoreDecisionEngine:
                 "auto_frequency_profile_switch",
                 "frequency_profile_switch_telegram_notify",
                 "microstructure_enable_funding_oi_gates",
+                "auto_tune_hold_override_enabled",
+                "auto_tune_hold_override_allow_relax_without_recent_pnl",
+                "ai_autonomy_minimal_gates_enabled",
+                "ai_autonomy_allow_neutral_with_trend",
+                "ai_autonomy_require_trend_alignment",
+                "ai_autonomy_enable_mtf_conflict_release",
+                "ai_autonomy_mtf_conflict_release_requires_mi_bias",
+                "ai_autonomy_conflict_subtype_release_enabled",
+                "ai_autonomy_conflict_release_require_mi_confidence",
             }
             optional_float_keys = {
                 "auto_tune_group_step_rr",
@@ -5100,6 +5955,8 @@ class AICoreDecisionEngine:
                 "auto_tune_spread_bounds",
                 "auto_tune_sltp_tighten_bounds",
                 "auto_tune_sltp_extend_bounds",
+                "auto_tune_hold_override_min_abs_sentiment_bounds",
+                "auto_tune_hold_override_min_mi_quality_score_bounds",
             }
             for k in keys:
                 if k in overrides and overrides[k] is not None:

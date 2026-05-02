@@ -106,12 +106,22 @@ class DataSourceBase(ABC):
                     if resp.status == 200:
                         return True, await resp.json()
                     last_err = f"HTTP {resp.status}"
+                    if resp.status >= 500 and attempt < retries - 1:
+                        logger.debug("%s ServerError (attempt %s/%s): %s", log_label, attempt + 1, retries, last_err)
+                        await asyncio.sleep(0.25 * (attempt + 1))
+                        continue
             except aiohttp.ClientError as e:
                 last_err = f"{type(e).__name__}: {e}"
                 if attempt < retries - 1:
                     logger.debug("%s ClientError (attempt %s/%s): %s", log_label, attempt + 1, retries, last_err)
                     await self._recycle_session()
                     await asyncio.sleep(0.25 * (attempt + 1))
+            except asyncio.TimeoutError:
+                last_err = "ConnectionTimeoutError: datasource timeout"
+                if attempt < retries - 1:
+                    logger.debug("%s Timeout (attempt %s/%s)", log_label, attempt + 1, retries)
+                    await self._recycle_session()
+                    await asyncio.sleep(0.3 * (attempt + 1))
             except Exception as e:
                 last_err = str(e)
                 break
