@@ -1176,7 +1176,38 @@ class APIServer:
             兼容老前端：GET /api/v1/positions
             - 返回 positions 列表（与 OKXExchange.get_positions 对齐）
             - 失败时返回 ok=false + message
+            - 补充 CCXT 风格别名：contracts≈size、notional≈notional_value（避免监控/前端读缺省字段误判为 0）
             """
+
+            def _positions_with_legacy_aliases(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                out_rows: List[Dict[str, Any]] = []
+                for raw in rows or []:
+                    if not isinstance(raw, dict):
+                        continue
+                    r = dict(raw)
+                    if r.get("contracts") is None:
+                        try:
+                            r["contracts"] = float(r.get("size") or 0.0)
+                        except Exception:
+                            r["contracts"] = r.get("size")
+                    if r.get("notional") is None:
+                        nv = r.get("notional_value")
+                        try:
+                            if nv is not None and float(nv) != 0.0:
+                                r["notional"] = float(nv)
+                        except Exception:
+                            pass
+                        if r.get("notional") is None:
+                            try:
+                                mk = float(r.get("mark_px") or r.get("mark_price") or 0.0)
+                                szz = float(r.get("size") or 0.0)
+                                if mk > 0 and szz > 0:
+                                    r["notional"] = abs(mk * szz)
+                            except Exception:
+                                pass
+                    out_rows.append(r)
+                return out_rows
+
             mc = self.main_controller
             ex = mc.get_exchange() if (mc and hasattr(mc, "get_exchange")) else None
             if not ex or not hasattr(ex, "get_positions"):
@@ -1209,11 +1240,12 @@ class APIServer:
                 ttl_s = 15.0
             max_stale_age_s = max(60.0, ttl_s * 10.0)
             if cached_positions and cached_positions_age_s is not None and cached_positions_age_s <= max_stale_age_s:
+                aliased = _positions_with_legacy_aliases(cached_positions)
                 return {
                     "ok": True,
-                    "positions": cached_positions,
-                    "count": len(cached_positions),
-                    "data": cached_positions,
+                    "positions": aliased,
+                    "count": len(aliased),
+                    "data": aliased,
                     "source": "cache",
                     "stale": bool(cached_positions_age_s > (ttl_s or 0.0)),
                     "stale_age_s": cached_positions_age_s,
@@ -1234,14 +1266,16 @@ class APIServer:
                         sz = 0.0
                     if abs(sz) > 1e-12:
                         out.append(row)
-                return {"ok": True, "positions": out, "count": len(out), "data": out}
+                aliased = _positions_with_legacy_aliases(out)
+                return {"ok": True, "positions": aliased, "count": len(aliased), "data": aliased}
             except asyncio.TimeoutError as e:
                 if cached_positions:
+                    aliased = _positions_with_legacy_aliases(cached_positions)
                     return {
                         "ok": True,
-                        "positions": cached_positions,
-                        "count": len(cached_positions),
-                        "data": cached_positions,
+                        "positions": aliased,
+                        "count": len(aliased),
+                        "data": aliased,
                         "source": "cache",
                         "stale": True,
                         "stale_age_s": cached_positions_age_s,
@@ -1249,11 +1283,12 @@ class APIServer:
                     }
             except Exception as e:
                 if cached_positions:
+                    aliased = _positions_with_legacy_aliases(cached_positions)
                     return {
                         "ok": True,
-                        "positions": cached_positions,
-                        "count": len(cached_positions),
-                        "data": cached_positions,
+                        "positions": aliased,
+                        "count": len(aliased),
+                        "data": aliased,
                         "source": "cache",
                         "stale": True,
                         "stale_age_s": cached_positions_age_s,
@@ -1287,11 +1322,12 @@ class APIServer:
                         except Exception:
                             continue
                     if out:
+                        aliased = _positions_with_legacy_aliases(out)
                         return {
                             "ok": True,
-                            "positions": out,
-                            "count": len(out),
-                            "data": out,
+                            "positions": aliased,
+                            "count": len(aliased),
+                            "data": aliased,
                             "source": "stop_loss_active_orders",
                             "stale": True,
                         }
