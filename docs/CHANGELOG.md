@@ -2,7 +2,7 @@
 
 ## 2026-05-02 — AI 维护交接文档与优化结果固化
 
-- **文档：** 新增 `docs/AI_HANDOFF_OPTIMIZATION_VERIFICATION_2026Q2.md`，汇总本轮系统测试与代码侧优化项、环境变量、验证命令（`health` / `trading-diagnosis` / `decision-traces`）、调参约束、`events.db` 裁剪脚本与重启注意点；`docs/README.md` 已索引。
+- **文档：** 新增 `docs/AI_HANDOFF_OPTIMIZATION_VERIFICATION_2026Q2.md`，汇总本轮系统测试与代码侧优化项、环境变量、验证命令（`health` / `trading-diagnosis` / `decision-traces`）、调参约束、`events.db` 裁剪脚本与重启注意点；`docs/README.md` 已索引。后续补充 **§4.2c**：监控数据源优先级（持仓 vs `recent_events`）、`GET /api/v1/positions` 的 `size`/`notional_value` 与 CCXT 别名字段说明。
 - **变更摘要（实现已于同期合入仓库）：** 决策轨迹持久化与 `top_hold_reason_tags`；`ai_core` 取价兜底与 `trade_counters`；OKX TLS（合并 CA / 应急开关）；LLM 超时可调；第三方采集默认限速；`scripts/prune_events_db.py`；`.env.example` 补充 TLS/LLM 相关说明。
 
 ## 2026-04-26 — 安全加固、鉴权回归测试与文档同步

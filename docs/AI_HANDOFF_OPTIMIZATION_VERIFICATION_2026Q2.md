@@ -30,6 +30,7 @@
 | LLM 客户端超时 | `src/modules/core/enhanced_llm_manager.py`：`BaseLLMProvider._build_httpx_client` |
 | 第三方 HTTP 限速 | `src/modules/data/third_party_data_integrator.py`：`OPENCLAW_THIRD_PARTY_MIN_INTERVAL_SEC` |
 | 司令台诊断 / 门控 API | `src/modules/api/module_control_api.py`：`trading-diagnosis`、`/modules/ai/guards` |
+| 兼容持仓列表（含 CCXT 别名） | `src/modules/api/server.py`：`GET /api/v1/positions`（`contracts`/`notional` 见 §4.2c） |
 
 ---
 
@@ -107,6 +108,25 @@ curl -sS -X POST "${BASE}/api/v1/modules/ai/guards" \
 ```
 
 **警示**：`ai_autonomy_min_conf_floor` 若设得过低（例如 `0.15`），相对默认约 `0.52` 会显著抬高开仓面；应小步调整并在 **`decision-traces`** 中观察 `open_ratio` / 拒单占比。
+
+### 4.2c 监控数据源优先级与 `GET /api/v1/positions` 字段（避免误判）
+
+智能体或老前端做**持仓与健康结论**时，请按下述优先级取数；**不要**仅用 `execution_spine.recent_events` 反推净持仓（除非自行实现按 `instId`/方向聚合并与交易所对账）。
+
+| 优先级 | 用途 | 推荐入口 |
+|--------|------|----------|
+| 1 | **持仓真相源**（与张数、方向核对） | `GET /api/v1/modules/commander/trading-diagnosis` → `data.ai_core.positions`；或 **`GET /api/v1/positions`**（与 `OKXExchange.get_positions` 对齐的列表） |
+| 2 | **执行流水 / 开平审计** | `GET /api/v1/s1/verify` → `details.execution_spine.recent_events`；`logs/executions/*.jsonl`；网关快照中的 `recent_events` |
+| 3 | **决策与 hold 归因** | `GET /api/v1/modules/commander/decision-traces`；`data/runtime/decision_trace_store.json` |
+
+**`GET /api/v1/positions` 字段说明**：适配层长期以 **`size`（张数/数量）**、**`notional_value`（名义 USDT）** 表达持仓；与部分 CCXT 形态客户端期望的 **`contracts` / `notional` 键不一致** 时，若只读后者会误判为「全 0」。当前 `legacy_positions`（`src/modules/api/server.py`）已对每条记录**补充别名**：`contracts` ≈ `size`，`notional` ≈ `notional_value`（缺失时用 `mark_px * size` 估算）。监控仍应优先信任 **`size` / `notional_value`**。
+
+**双向对冲**：OKX 在 `long_short_mode` 下同一 `instId` 可能出现多行（多 `posSide`）；若只看到一行或净张数与预期不符，请以**原始 `get_positions` 行数**与交易所 APP 对账，勿单凭单笔 `open` 事件推断净仓。
+
+```bash
+BASE=http://127.0.0.1:8000
+curl -sS "${BASE}/api/v1/positions" | jq '{ok, count, source, stale, first: .positions[0]}'
+```
 
 ### 4.3 拒单与 hold 标签（轨迹）
 
