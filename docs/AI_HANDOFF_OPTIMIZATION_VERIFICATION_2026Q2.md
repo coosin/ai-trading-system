@@ -74,6 +74,40 @@ curl -sS --max-time 60 'http://127.0.0.1:8000/api/v1/modules/commander/trading-d
 - `data.execution_gateway`：`policy_metrics`、`reconciliation`；重启后短期内 `last_order_*` 可能为空，直至下一笔经网关的下单。
 - `data.analysis_pipeline_assessment`：数据质量与决策结果健康度摘要。
 
+### 4.2b PnL 健康与门控热更新（OpenAPI 一致示例）
+
+以下与 `module_control_api` 中路由定义一致：`APIRouter(prefix="/api/v1/modules")` + `commander/trading-diagnosis`、`ai/guards`。
+
+```bash
+BASE=http://127.0.0.1:8000   # 按部署修改主机/端口
+
+# PnL 健康（司令台诊断子树）
+curl -sS "${BASE}/api/v1/modules/commander/trading-diagnosis" | \
+  jq '.data.ai_core.execution_guards.adaptive_profile.pnl_health'
+
+# 无 jq 时：
+curl -sS "${BASE}/api/v1/modules/commander/trading-diagnosis" | python3 -c \
+  "import json,sys;d=json.load(sys.stdin);ai=(d.get('data')or{}).get('ai_core')or{};eg=ai.get('execution_guards')or{};ap=eg.get('adaptive_profile')or{};print(json.dumps(ap.get('pnl_health'),indent=2))"
+```
+
+**`pnl_health.expectancy` 语义**：该字段为近期平仓记录在 `ai_core` 内存环中的 **`decision.pnl` 算术平均值（USDT 绝对盈亏）**；字段名沿用 `expectancy`，**不要**按「每笔收益率」去误读成百分比。`max_drawdown` 与门限比对用于 `health=bad`；深入分析时请交叉 **`data/trade_history/trades.jsonl`** 与交易所对账。
+
+```bash
+# 读取当前门控与自适应档位（热更新前必做）
+curl -sS "${BASE}/api/v1/modules/ai/guards" | \
+  jq '{success, frequency_profile, adaptive_profile, sample_config_keys: (.config | keys | .[0:12])}'
+
+# 热更新：POST 体为顶层扁平 JSON，键须在 update_ai_execution_guards 的 allowed 白名单内
+curl -sS -X POST "${BASE}/api/v1/modules/ai/guards" \
+  -H 'Content-Type: application/json' \
+  -d '{"hold_avoidance_override_min_abs_sentiment": 0.02, "ai_autonomy_min_conf_floor": 0.50}' | \
+  jq '{success, applied, message}'
+
+# 路由自检：curl -sS "${BASE}/openapi.json" | grep -F 'ai/guards'
+```
+
+**警示**：`ai_autonomy_min_conf_floor` 若设得过低（例如 `0.15`），相对默认约 `0.52` 会显著抬高开仓面；应小步调整并在 **`decision-traces`** 中观察 `open_ratio` / 拒单占比。
+
 ### 4.3 拒单与 hold 标签（轨迹）
 
 ```bash
@@ -113,7 +147,7 @@ grep -E 'ERROR|SSL|price_unavailable|价格兜底|hold_by_ai_decision' logs/runt
 2. **验证窗口**：线上观察建议 **30～60 分钟**（或约定样本量），结合 `decision-traces` 的占比变化，而非单次成交。
 3. **生效路径**：  
    - 静态：`config/config.yaml` + `data/config/local.json`（或 `local.yaml`）。  
-   - 热更新：优先 **`POST /api/v1/modules/ai/guards`**，请求体为**扁平 JSON**（不要用 `{ "config": { ... } }` 外层包裹）；允许多数字段见实现中的 `allowed` 集合。  
+   - 热更新：优先 **`POST /api/v1/modules/ai/guards`**，请求体为**扁平 JSON**（不要用 `{ "config": { ... } }` 外层包裹）；允许多数字段见实现中的 `allowed` 集合。**可复制命令与 `BASE` 写法见 §4.2b。**  
    - 持久化：确认接口会把关键项写入 `ConfigManager`/本地配置，避免仅内存生效后被刷新覆盖。
 4. **归因顺序**：先看 **`price_unavailable` / `ticker_empty` / `klines_missing`**（数据通路），再看 **`hold_by_ai_decision` + `top_hold_reason_tags`**（策略与 AI），最后看执行网关与对账。
 5. **回滚**：保留上一份门控快照；若 `open_ratio` 恶化或异常拒单飙升，按快照恢复。
@@ -132,7 +166,8 @@ grep -E 'ERROR|SSL|price_unavailable|价格兜底|hold_by_ai_decision' logs/runt
 - 示例：
 
 ```bash
-# 停交易进程后
+# 在仓库根目录 ai-trading-system；停交易进程后再执行，避免 database is locked
+cd /path/to/ai-trading-system
 .venv/bin/python scripts/prune_events_db.py --db data/events.db --keep-days 30 --vacuum
 ```
 
