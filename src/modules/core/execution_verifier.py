@@ -789,6 +789,53 @@ class ExecutionVerifier:
     def _generate_execution_id(self) -> str:
         """生成执行ID"""
         return f"exec_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+    async def record_close_audit(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        size: Optional[float],
+        success: bool,
+        reason: str,
+        source: str = "stop_loss_take_profit",
+        details: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """
+        供 SLTP / 其他绕过 execute() 的平仓路径写入 logs/executions/*.jsonl（与 open 记录同格式族）。
+        """
+        execution_id = self._generate_execution_id()
+        det = dict(details or {})
+        sd = str(side or "").strip().lower()
+        action = "close_short" if sd == "short" else "close_long"
+        oid = det.get("order_id")
+        verified = bool(success) and bool(oid)
+        result = ExecutionResult(
+            execution_id=execution_id,
+            command_type=CommandType.CLOSE_POSITION,
+            action=action,
+            status=ExecutionStatus.SUCCESS if success else ExecutionStatus.FAILED,
+            symbol=str(symbol or "").strip() or None,
+            details=det,
+            error_message=error_message,
+            timestamp=datetime.now(),
+            duration_ms=0.0,
+            verified=verified,
+            verification_details="订单ID已确认" if verified else None,
+        )
+        self.execution_history[execution_id] = result
+        self._stats["total_executions"] += 1
+        if success:
+            self._stats["successful"] += 1
+        else:
+            self._stats["failed"] += 1
+        await self._log_execution(result)
+        try:
+            if self._audit_logger:
+                await self._audit_log(result)
+        except Exception:
+            pass
     
     async def get_execution_status(self, execution_id: str) -> Optional[ExecutionResult]:
         """获取执行状态"""

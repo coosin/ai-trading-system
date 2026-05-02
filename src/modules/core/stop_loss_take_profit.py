@@ -625,6 +625,70 @@ class StopLossTakeProfitManager:
             aligned = min(aligned, max(0.0, steps2))
         return float(aligned)
 
+    async def _emit_close_execution_audit(
+        self,
+        order: StopLossTakeProfitOrder,
+        reason: str,
+        close_sz: Optional[float],
+        ok: bool,
+        res: Any,
+        *,
+        gw_used: bool,
+    ) -> None:
+        """将 SLTP 触发的平仓写入 logs/executions（与 ExecutionVerifier 管线对齐）。"""
+        mc = getattr(self, "_main_controller", None)
+        if not mc:
+            return
+        ev = getattr(mc, "execution_verifier", None)
+        rec = getattr(ev, "record_close_audit", None) if ev else None
+        if not callable(rec):
+            return
+        meta = order.metadata or {}
+        det: Dict[str, Any] = {
+            "gateway": bool(gw_used),
+            "source": "stop_loss_take_profit",
+            "reason": str(reason),
+            "side": str(order.side),
+            "sltp_order_id": getattr(order, "order_id", None),
+            "trace_id": meta.get("trace_id") or meta.get("traceId"),
+        }
+        if close_sz is not None:
+            try:
+                det["quantity"] = float(close_sz)
+            except Exception:
+                det["quantity"] = close_sz
+        if isinstance(res, dict):
+            oid = res.get("orderId")
+            if oid is None:
+                oid = res.get("order_id")
+            if oid is not None:
+                det["order_id"] = oid
+            det["status"] = "filled" if ok else "failed"
+            if res.get("post_close_check") is not None:
+                det["post_close_check"] = res.get("post_close_check")
+            if res.get("skipped"):
+                det["skipped"] = True
+        err_msg: Optional[str] = None
+        if not ok:
+            if isinstance(res, dict):
+                err_msg = str(res.get("error") or res)[:800]
+            elif res is not None:
+                err_msg = str(res)[:800]
+            if not err_msg:
+                err_msg = str(meta.get("last_close_error") or "")[:800] or None
+        try:
+            await rec(
+                symbol=order.symbol,
+                side=order.side,
+                size=float(close_sz) if close_sz is not None else None,
+                success=bool(ok),
+                reason=reason,
+                details=det,
+                error_message=err_msg,
+            )
+        except Exception:
+            logger.debug("SLTP close execution audit skipped", exc_info=True)
+
     async def _execute_exchange_close_on_trigger(
         self,
         order: StopLossTakeProfitOrder,
@@ -643,6 +707,20 @@ class StopLossTakeProfitManager:
         if not ex:
             logger.warning("止盈止损触发但无交易所连接，跳过实盘平仓: %s", order.symbol)
             self._note_close_failure_meta(order, "no_exchange", reason)
+            audit_sz: Optional[float] = None
+            if close_size is not None and float(close_size) > 1e-12:
+                audit_sz = float(close_size)
+            else:
+                rq = float(order.remaining_quantity or order.quantity or 0)
+                audit_sz = rq if rq > 1e-12 else None
+            await self._emit_close_execution_audit(
+                order,
+                reason,
+                audit_sz,
+                False,
+                {"error": "no_exchange"},
+                gw_used=False,
+            )
             return False
 
         gw = getattr(mc, "execution_gateway", None) if mc else None
@@ -677,6 +755,14 @@ class StopLossTakeProfitManager:
                     msg,
                 )
                 self._note_close_failure_meta(order, msg, reason)
+                await self._emit_close_execution_audit(
+                    order,
+                    reason,
+                    close_sz,
+                    False,
+                    {"error": msg},
+                    gw_used=bool(gw),
+                )
                 return False
             if abs(q - float(close_sz or 0)) > max(1e-12, float(close_sz or 0) * 1e-9):
                 logger.info(
@@ -688,8 +774,10 @@ class StopLossTakeProfitManager:
                 )
             close_sz = q
 
+        used_gateway = False
         try:
             if gw:
+                used_gateway = True
                 meta_ctx = order.metadata or {}
                 res = await gw.close_swap(
                     symbol=order.symbol,
@@ -712,6 +800,15 @@ class StopLossTakeProfitManager:
                 close_fn = getattr(ex, "close_swap_position", None) or getattr(ex, "close_position", None)
                 if not callable(close_fn):
                     logger.error("交易所缺少 close_swap_position/close_position，无法实盘平仓")
+                    self._note_close_failure_meta(order, "no_close_swap_fn", reason)
+                    await self._emit_close_execution_audit(
+                        order,
+                        reason,
+                        close_sz,
+                        False,
+                        {"error": "no_close_swap_fn"},
+                        gw_used=False,
+                    )
                     return False
                 res = await close_fn(
                     order.symbol,
@@ -783,15 +880,29 @@ class StopLossTakeProfitManager:
                     await self._save_orders()
                 except Exception:
                     pass
+                await self._emit_close_execution_audit(
+                    order, reason, close_sz, True, res, gw_used=used_gateway
+                )
                 return True
             else:
                 err = res.get("error", res) if isinstance(res, dict) else res
                 logger.error("❌ 止盈止损实盘平仓失败: %s err=%s", order.symbol, err)
                 self._note_close_failure_meta(order, err, reason)
+                await self._emit_close_execution_audit(
+                    order, reason, close_sz, False, res, gw_used=used_gateway
+                )
                 return False
         except Exception as e:
             logger.exception("止盈止损实盘平仓异常: %s", e)
             self._note_close_failure_meta(order, e, reason)
+            await self._emit_close_execution_audit(
+                order,
+                reason,
+                close_sz,
+                False,
+                {"error": str(e)},
+                gw_used=used_gateway,
+            )
             return False
     
     def set_audit_logger(self, audit_logger):
@@ -2011,14 +2122,17 @@ class StopLossTakeProfitManager:
                                     else:
                                         self._stats["sr_partial_tp_failed"] += 1
                                         self._record_sr_event(
-                                            {
-                                                "symbol": order.symbol,
-                                                "side": order.side,
-                                                "event": "sr_near_resistance_partial_tp_failed",
-                                                "pnl_percent": float(pnl),
-                                                "close_qty": float(close_qty),
-                                                "sr": dict(sr_snapshot),
-                                            }
+                                            self._enrich_sr_event_with_close_error(
+                                                order,
+                                                {
+                                                    "symbol": order.symbol,
+                                                    "side": order.side,
+                                                    "event": "sr_near_resistance_partial_tp_failed",
+                                                    "pnl_percent": float(pnl),
+                                                    "close_qty": float(close_qty),
+                                                    "sr": dict(sr_snapshot),
+                                                },
+                                            )
                                         )
                             lock_sl = float(order.entry_price or 0.0) * (1.0 + lock_pct)
                             if lock_sl > 0 and (float(order.stop_loss_price or 0.0) < lock_sl):
@@ -2074,14 +2188,17 @@ class StopLossTakeProfitManager:
                                     else:
                                         self._stats["sr_partial_tp_failed"] += 1
                                         self._record_sr_event(
-                                            {
-                                                "symbol": order.symbol,
-                                                "side": order.side,
-                                                "event": "sr_near_support_partial_tp_failed",
-                                                "pnl_percent": float(pnl),
-                                                "close_qty": float(close_qty),
-                                                "sr": dict(sr_snapshot),
-                                            }
+                                            self._enrich_sr_event_with_close_error(
+                                                order,
+                                                {
+                                                    "symbol": order.symbol,
+                                                    "side": order.side,
+                                                    "event": "sr_near_support_partial_tp_failed",
+                                                    "pnl_percent": float(pnl),
+                                                    "close_qty": float(close_qty),
+                                                    "sr": dict(sr_snapshot),
+                                                },
+                                            )
                                         )
                             lock_sl = float(order.entry_price or 0.0) * (1.0 - lock_pct)
                             cur_sl = float(order.stop_loss_price or 0.0)
@@ -2851,6 +2968,18 @@ class StopLossTakeProfitManager:
             "single_active_per_index": True,
             "sr_recent_events": list(self._sr_recent_events)[-self._sr_recent_events_cap :],
         }
+
+    def _enrich_sr_event_with_close_error(
+        self, order: StopLossTakeProfitOrder, event: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """SR 分批失败时附带最近一次平仓错误（与 order.metadata 中 last_close_* 对齐）。"""
+        e = dict(event or {})
+        meta = order.metadata or {}
+        for k in ("last_close_error", "last_close_error_at", "last_close_reason"):
+            v = meta.get(k)
+            if v:
+                e[k] = v
+        return e
 
     def _record_sr_event(self, event: Dict[str, Any]) -> None:
         """记录 SR 关键位出场事件（轻量，不影响主流程）。"""
