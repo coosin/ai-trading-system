@@ -248,22 +248,6 @@ class ScannerOpportunityGate:
                     metrics["ticker_from_cached_symbol_view"] = True
             except Exception:
                 ticker = None
-            # Last-resort fallback: if ticker endpoints are flaky but opportunity
-            # already carries a valid entry_price, use it as provisional last price
-            # to avoid false-negative ticker_empty rejections.
-            if (not ticker or float(ticker.get("last") or ticker.get("close") or 0.0) <= 0) and float(
-                getattr(opportunity, "entry_price", 0) or 0
-            ) > 0:
-                try:
-                    ticker = {
-                        "last": float(getattr(opportunity, "entry_price", 0) or 0),
-                        "bid": 0.0,
-                        "ask": 0.0,
-                        "change24h": 0.0,
-                    }
-                    metrics["ticker_from_entry_fallback"] = True
-                except Exception:
-                    ticker = None
             if not ticker or float(ticker.get("last") or ticker.get("close") or 0.0) <= 0:
                 return ScannerGateResult(False, "ticker_empty", metrics)
 

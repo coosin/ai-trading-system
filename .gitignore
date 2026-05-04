@@ -116,3 +116,14 @@ data/backtest/
 workspace/probes/
 workspace/tuning_runs/
 data/runtime/
+
+# Process bookkeeping (PID files); keep directory only in git
+runtime/*
+!runtime/.gitkeep
+
+# Ad-hoc config backups (never commit)
+config/config.yaml.bak.*
+config/*.bak.*
+
+# Runtime collaboration / MCP logs under logs/
+logs/collaboration/

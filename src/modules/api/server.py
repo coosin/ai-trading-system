@@ -506,7 +506,8 @@ class APIServer:
                     host=self.host,
                     port=self.port,
                     log_level="warning",
-                    access_log=False
+                    access_log=False,
+                    log_config=None,
                 )
                 
                 server = uvicorn.Server(config)

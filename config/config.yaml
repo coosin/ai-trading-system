@@ -117,7 +117,6 @@ trading:
     # 默认开仓数量（USDT 永续合约张数/数量，按交易所合约规则解释）
     # 以前代码写死 0.01，这里改为配置项，便于按风险/账户规模调整
     default_quantity: 0.01
-    max_positions_oneway: 4
     max_positions_hedge: 8
     grid_trading: true
     grid_levels: 5
@@ -131,7 +130,8 @@ trading:
     enable_auto_discovery: true
     always_exclude: []
   analysis_interval: 60
-  min_confidence: 0.63
+  # 略降：低波动期仍要求证据，但避免与执行层 0.71 双重过紧
+  min_confidence: 0.615
   max_positions: 5
   risk_per_trade: 0.02
   # 统一仓位/持仓入口（唯一推荐入口）
@@ -457,18 +457,59 @@ ai_core:
     skip_backtest_if_cpu_above: 85
     skip_optimize_if_cpu_above: 85
 ai_core_runtime:
-  # 试验：小幅放宽开仓相关置信度门槛（仅微调）
-  min_confidence_to_trade: 0.71
-  ai_core_min_confidence_to_open: 0.71
+  # 均衡：略降开仓置信门槛，仍高于分析硬门槛与 scale-in 分层要求
+  min_confidence_to_trade: 0.695
+  ai_core_min_confidence_to_open: 0.695
+  # Batch1 tune (2026-05-04): small-step relaxation; keep >1.0 to avoid quality collapse.
+  min_rr_to_trade: 1.10
+  max_spread_bps_to_trade: 42.0
   # 统一分析链路硬门槛：分析质量/置信不足或降级数据时，禁止开仓
   analysis_hard_gate_for_open: true
-  analysis_min_confidence_for_open: 0.55
+  analysis_min_confidence_for_open: 0.53
+  min_data_quality_to_trade: 0.53
   analysis_require_not_degraded_for_open: true
-  # hold_avoidance_override：根据 8 小时复盘，hold_by_ai_decision 的信号质量更好
-  # 因此对反 HOLD 折返机制做“轻微放宽”，提升 HOLD->可执行开仓转换率。
-  hold_avoidance_override_min_abs_sentiment: 0.045
-  hold_avoidance_override_min_mi_quality_score: 0.58
+  # 低波动缓趋势：与引擎内 low_vol_grind 市况对齐（可热更新）
+  regime_trend_threshold: 0.0048
+  # Batch1 tune: raise grind trend floor to filter sideways noise.
+  regime_grind_min_trend_abs: 0.0007
+  regime_grind_max_atr_mult: 1.25
+  low_vol_grind_profile_min_rr_mult: 0.98
+  low_vol_grind_profile_spread_mult: 1.06
+  regime_profile_overrides:
+    trend:
+      min_rr_mult: 0.95
+      spread_mult: 1.06
+      qty_mult: 1.05
+      min_conf_add: -0.005
+    range:
+      min_rr_mult: 1.02
+      spread_mult: 0.98
+      qty_mult: 0.92
+      min_conf_add: 0.008
+    high_vol:
+      min_rr_mult: 1.08
+      spread_mult: 0.92
+      qty_mult: 0.72
+      min_conf_add: 0.02
+    low_liquidity:
+      min_rr_mult: 1.12
+      spread_mult: 0.82
+      qty_mult: 0.68
+      min_conf_add: 0.03
+    low_vol_grind:
+      min_rr_mult: 0.96
+      spread_mult: 1.07
+      qty_mult: 0.88
+      min_conf_add: -0.012
+  # 净边际：低波动时边际更薄，略降仍要求为正
+  edge_min_net_reward_pct: 0.0025
+  # hold_avoidance_override：缓趋势下 fusion sentiment 往往较小，略放宽
+  hold_avoidance_override_min_abs_sentiment: 0.034
+  hold_avoidance_override_min_mi_quality_score: 0.545
   hold_avoidance_override_require_mi_trend_alignment: false
+  ai_autonomy_min_conf_floor: 0.51
+  ai_autonomy_min_mi_confidence: 0.565
+  ai_autonomy_min_mi_quality_score: 0.535
 ai_brain:
   primary_controller: ai_core
   single_write_owner: ai_core
@@ -520,7 +561,8 @@ proactive_scanner:
   breakout_trade_cooldown_sec: 60
   proactive_skip_breakout_if_same_side_position: true
   # 发现层小幅放宽：更容易捕捉波动异动
-  vol_spike_min_atr_pct_1h: 0.012
+  # 略降：低波动期仍能发现「相对放大」的异动
+  vol_spike_min_atr_pct_1h: 0.009
   vol_spike_min_quality_score: 0.6
   # 均衡档：盘口/流动性异动发现（spread 变宽 + 深度失衡）
   liq_event_min_quality_score: 0.6
@@ -541,7 +583,8 @@ proactive_scanner:
     # 过严会导致机会全部被门控拦截，从而看起来“系统不自动开仓”。
     max_entry_vs_last_slippage_pct: 0.05
     # 微调放宽：RR 门槛小降，减少边界机会被预检拦截
-    min_risk_reward: 1.10
+    # Batch1 tune: small relaxation only; avoid one-shot drop to 1.0.
+    min_risk_reward: 1.05
     min_abs_change_24h: 0.0
     require_insight_trend_alignment: true
     min_volume_vs_avg_ratio: 0.0
@@ -662,7 +705,8 @@ ai_trading:
     daily_loss_limit: 0.1
     max_drawdown_limit: 0.15
     enable_microstructure_open_gates: true
-    microstructure_max_spread_bps: 12.0
+    # 低波动时点差常极窄；略放宽仍远严于扫描门控上限
+    microstructure_max_spread_bps: 13.5
     microstructure_max_abs_depth_imbalance: 0.92
     microstructure_max_abs_funding_rate: 0.0012
     microstructure_min_open_interest: null
@@ -765,6 +809,11 @@ unified_trade_system:
 unified_risk_system: {}
 memory:
   provider: native
+  # 启动时 JSON 载入：缓解 experience 目录极多文件导致的冷启动延迟；可在不改代码前提下调节
+  startup:
+    working_days_recent: 3
+    # experience/*.json 按 mtime 只载入最新 N 条；0 或与 key 组合的显式 null 表示不限制
+    experience_json_max_files: 1200
   default_scope: global
   scopes:
     enabled: true

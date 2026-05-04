@@ -48,6 +48,8 @@ class TradeDecision:
     reasoning: str
     strategy_used: str
     risk_level: str
+    # 供 execution 层 analysis_hard_gate 校验；由 _ai_analyze_and_decide 在返回开仓前写入
+    market_analysis: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -147,14 +149,24 @@ class AICoreDecisionEngine:
             "regime_enable": True,
             "regime_low_vol_atr_pct": 0.005,
             "regime_high_vol_atr_pct": 0.02,
-            "regime_trend_threshold": 0.004,
+            # 略抬高：把「慢涨/慢跌」更多划入 low_vol_grind，由专用 profile 控风险与仓位
+            "regime_trend_threshold": 0.0048,
             "regime_low_liquidity_spread_bps": 55.0,
             "regime_profile_overrides": {
-                "trend": {"min_rr_mult": 0.96, "spread_mult": 1.05, "qty_mult": 1.10, "min_conf_add": 0.0},
-                "range": {"min_rr_mult": 1.04, "spread_mult": 0.95, "qty_mult": 0.90, "min_conf_add": 0.01},
-                "high_vol": {"min_rr_mult": 1.10, "spread_mult": 0.90, "qty_mult": 0.75, "min_conf_add": 0.02},
-                "low_liquidity": {"min_rr_mult": 1.12, "spread_mult": 0.80, "qty_mult": 0.70, "min_conf_add": 0.03},
+                # 强趋势：略放宽 RR/点差容忍，小幅提高参与；仍靠执行门控与 SLTP 控风险
+                "trend": {"min_rr_mult": 0.95, "spread_mult": 1.06, "qty_mult": 1.05, "min_conf_add": -0.005},
+                # 横盘：略收紧于旧版 range，减少纯震荡噪声单
+                "range": {"min_rr_mult": 1.02, "spread_mult": 0.98, "qty_mult": 0.92, "min_conf_add": 0.008},
+                "high_vol": {"min_rr_mult": 1.08, "spread_mult": 0.92, "qty_mult": 0.72, "min_conf_add": 0.02},
+                "low_liquidity": {"min_rr_mult": 1.12, "spread_mult": 0.82, "qty_mult": 0.68, "min_conf_add": 0.03},
+                # 低波动 + 有方向但未到「强趋势」阈值：典型「慢涨/慢磨」
+                "low_vol_grind": {"min_rr_mult": 0.96, "spread_mult": 1.07, "qty_mult": 0.88, "min_conf_add": -0.012},
             },
+            # MA5-MA20 价差占价比低于强趋势阈值、但超过此值时视为「缓趋势」而非无方向震荡
+            "regime_grind_min_trend_abs": 0.00035,
+            "regime_grind_max_atr_mult": 1.25,
+            "low_vol_grind_profile_min_rr_mult": 0.98,
+            "low_vol_grind_profile_spread_mult": 1.06,
             "pnl_health_sizing_enable": True,
             "pnl_health_lookback_trades": 20,
             "pnl_health_bad_expectancy": -0.0015,
@@ -175,6 +187,10 @@ class AICoreDecisionEngine:
             "loss_streak_lookback": 8,
             "loss_streak_cooldown_sec": 1800,
             "loss_streak_min_abs_loss": 0.001,
+            # 连亏冷静期可被“强信号”穿透，避免错过高质量趋势段。
+            "loss_streak_override_enable": True,
+            "loss_streak_override_min_confidence": 0.90,
+            "loss_streak_override_min_quality": 0.72,
             "auto_frequency_profile_switch": True,
             "frequency_profile_switch_telegram_notify": True,
             "frequency_profile_cooldown_seconds": 1800,
@@ -2976,6 +2992,76 @@ class AICoreDecisionEngine:
             "sharpe_ratio": float(sharpe_ratio),
             "trade_count": int(trade_count),
         }
+
+    def _ensure_open_market_analysis_payload(
+        self,
+        decision: Optional[TradeDecision],
+        *,
+        multi_source_analysis: Dict[str, Any],
+        mi_view: Any,
+    ) -> None:
+        """为开仓决策补齐 market_analysis，满足 analysis_hard_gate 对 quality/confidence 的要求。"""
+        if decision is None:
+            return
+        if str(decision.action or "").lower() not in ("buy", "sell"):
+            return
+        ms = multi_source_analysis if isinstance(multi_source_analysis, dict) else {}
+        try:
+            q_ms = float(ms.get("quality_score", 0) or 0)
+        except Exception:
+            q_ms = 0.0
+        c_ms: Optional[float] = None
+        try:
+            raw_c = ms.get("confidence")
+            if raw_c is not None:
+                c_ms = float(raw_c)
+        except Exception:
+            c_ms = None
+        mi_q = 0.0
+        mi_c: Optional[float] = None
+        if mi_view is not None:
+            try:
+                mi_q = float(getattr(mi_view, "quality_score", 0) or 0)
+            except Exception:
+                mi_q = 0.0
+            try:
+                mc = getattr(mi_view, "confidence", None)
+                if mc is not None:
+                    mi_c = float(mc)
+            except Exception:
+                mi_c = None
+        eff_q = max(q_ms, mi_q)
+        if c_ms is not None and mi_c is not None:
+            eff_c = max(c_ms, mi_c)
+        elif c_ms is not None:
+            eff_c = c_ms
+        elif mi_c is not None:
+            eff_c = mi_c
+        else:
+            eff_c = None
+        degraded_ct = int(ms.get("degraded_count", 0) or 0)
+        prov_parts: List[str] = []
+        if str(ms.get("status") or "").lower() == "available":
+            prov_parts.append("multi_source_fusion")
+        if mi_view is not None:
+            prov_parts.append("market_intelligence")
+        provenance = "+".join(prov_parts) if prov_parts else "n/a"
+        partial = degraded_ct > 0 or bool(ms.get("partial", False))
+        conf_out: Optional[float] = float(eff_c) if eff_c is not None else None
+        if conf_out is None:
+            try:
+                dc = float(getattr(decision, "confidence", 0) or 0)
+                if dc > 0:
+                    conf_out = dc
+            except Exception:
+                pass
+        payload: Dict[str, Any] = {
+            "quality_score": float(eff_q),
+            "confidence": conf_out,
+            "provenance": provenance,
+            "partial": partial,
+        }
+        decision.market_analysis = payload
     
     async def _ai_analyze_and_decide(self, symbol: str) -> Optional[TradeDecision]:
         """AI分析市场并做出决策 - 使用所有模块数据，全部实时获取"""
@@ -3113,7 +3199,7 @@ class AICoreDecisionEngine:
                     if ready and (tech_bull or tech_bear):
                         side = "long" if tech_bull else "short"
                         action = "buy" if tech_bull else "sell"
-                        return TradeDecision(
+                        fb_decision = TradeDecision(
                             symbol=symbol,
                             action=action,
                             side=side,
@@ -3130,6 +3216,12 @@ class AICoreDecisionEngine:
                             strategy_used="s1_llm_unavailable_fallback",
                             risk_level=risk_level,
                         )
+                        self._ensure_open_market_analysis_payload(
+                            fb_decision,
+                            multi_source_analysis=multi_source_analysis,
+                            mi_view=mi_view,
+                        )
+                        return fb_decision
                 except Exception:
                     pass
                 return TradeDecision(
@@ -3332,6 +3424,11 @@ class AICoreDecisionEngine:
             if decision:
                 self._last_decision_time[symbol] = datetime.now()
                 logger.info(f"✅ AI决策完成: {symbol} {decision.action} {decision.side}")
+                self._ensure_open_market_analysis_payload(
+                    decision,
+                    multi_source_analysis=multi_source_analysis,
+                    mi_view=mi_view,
+                )
             
             return decision
             
@@ -4012,6 +4109,32 @@ class AICoreDecisionEngine:
                 positions_detail += f"  - {pos.get('symbol', '')}: {pos.get('side', '')} {pos.get('size', 0)} | 入场价: {pos.get('entry_price', 0):.4f} | 盈亏: ${pos.get('pnl', 0):+.2f}\n"
 
         scanner_hint_block = self._format_scanner_hint_block(symbol)
+        mr_hint = ""
+        try:
+            px = float(technical.get("price") or market_data.get("price") or 0) or 0.0
+            m5 = float(technical.get("ma5_1h") or 0) or 0.0
+            m20 = float(technical.get("ma20_1h") or 0) or 0.0
+            atr_pct = abs(m5 - m20) / max(1e-9, px) if px > 0 else 0.0
+            tdir = (m5 - m20) / max(1e-9, px) if px > 0 else 0.0
+            gmn = float(self.config.get("regime_grind_min_trend_abs", 0.00035) or 0.00035)
+            gmx = float(self.config.get("regime_trend_threshold", 0.0048) or 0.0048)
+            lov = float(self.config.get("regime_low_vol_atr_pct", 0.005) or 0.005)
+            ghiv = float(self.config.get("regime_high_vol_atr_pct", 0.02) or 0.02)
+            if atr_pct <= lov * 1.25 and abs(tdir) >= gmn and abs(tdir) < gmx:
+                mr_hint = """
+【市况提示：低波动 / 缓趋势（常见「慢涨」或阴跌）】
+- 近端绝对波动偏小，不要仅因「波动不大」就长期 hold。
+- 若 1H/4H 轻微同向、统一行情情报质量与 confidence 达标，且风险与盈亏比在系统阈值内，可输出有依据的 buy/sell；仓位宁小勿大，出场交给 SLTP。
+- 若多周期明显矛盾或证据不足，仍应 hold。
+"""
+            elif atr_pct >= ghiv * 0.85:
+                mr_hint = """
+【市况提示：波动偏高】
+更重视滑点、止损距离与杠杆；证据一般时倾向 hold 或更小仓位。
+"""
+        except Exception:
+            mr_hint = ""
+
         autonomy_enabled = bool(self.config.get("ai_autonomy_minimal_gates_enabled", True))
         autonomy_rule_block = (
             f"启用（最小门禁）: min_conf_floor={self.config.get('ai_autonomy_min_conf_floor', 0.52)}, "
@@ -4036,7 +4159,7 @@ class AICoreDecisionEngine:
 10. 历史经验 - 过往交易经验
 
 {aggressive_note}
-
+{mr_hint}
 【交易对】{symbol}
 {scanner_hint_block}
 【市场数据 - 实时】
@@ -4511,40 +4634,82 @@ class AICoreDecisionEngine:
             if is_open and bool(self.config.get("loss_streak_cooldown_enable", True)):
                 try:
                     now = datetime.utcnow()
+                    ma = decision.market_analysis if isinstance(getattr(decision, "market_analysis", None), dict) else {}
+                    conf_open = float(getattr(decision, "confidence", 0.0) or 0.0)
+                    q_open = ma.get("quality_score")
+                    quality_open = float(q_open) if q_open is not None else None
+                    override_enabled = bool(self.config.get("loss_streak_override_enable", True))
+                    override_min_conf = float(self.config.get("loss_streak_override_min_confidence", 0.90) or 0.90)
+                    override_min_quality = float(self.config.get("loss_streak_override_min_quality", 0.72) or 0.72)
+                    override_open = bool(
+                        override_enabled
+                        and conf_open >= override_min_conf
+                        and quality_open is not None
+                        and quality_open >= override_min_quality
+                    )
+                    self._adaptive_guard_profile["loss_streak_override_ready"] = bool(override_open)
                     if self._loss_streak_cooldown_until and now < self._loss_streak_cooldown_until:
                         left = int((self._loss_streak_cooldown_until - now).total_seconds())
-                        self._execution_guards_stats["loss_streak_cooldown_rejected"] = int(
-                            self._execution_guards_stats.get("loss_streak_cooldown_rejected", 0)
-                        ) + 1
-                        logger.warning(
-                            "🧊 连亏冷静期生效，拒绝开仓: symbol=%s left=%ss",
-                            decision.symbol,
-                            max(1, left),
-                        )
-                        self._adaptive_guard_profile["loss_streak_cooldown_left_sec"] = max(1, left)
-                        _record_intent()
-                        _record_guard("rejected", f"loss_streak_cooldown_active:{max(1,left)}s", "loss_streak")
-                        return False
+                        if override_open:
+                            self._execution_guards_stats["loss_streak_cooldown_overridden"] = int(
+                                self._execution_guards_stats.get("loss_streak_cooldown_overridden", 0)
+                            ) + 1
+                            logger.warning(
+                                "🔥 连亏冷静期强信号放行: symbol=%s left=%ss conf=%.3f quality=%.3f",
+                                decision.symbol,
+                                max(1, left),
+                                conf_open,
+                                float(quality_open),
+                            )
+                            _record_guard("allowed", f"loss_streak_overridden:{max(1,left)}s", "loss_streak")
+                        else:
+                            self._execution_guards_stats["loss_streak_cooldown_rejected"] = int(
+                                self._execution_guards_stats.get("loss_streak_cooldown_rejected", 0)
+                            ) + 1
+                            logger.warning(
+                                "🧊 连亏冷静期生效，拒绝开仓: symbol=%s left=%ss",
+                                decision.symbol,
+                                max(1, left),
+                            )
+                            self._adaptive_guard_profile["loss_streak_cooldown_left_sec"] = max(1, left)
+                            _record_intent()
+                            _record_guard("rejected", f"loss_streak_cooldown_active:{max(1,left)}s", "loss_streak")
+                            return False
                     trigger = max(2, int(self.config.get("loss_streak_trigger", 3) or 3))
                     streak = self._get_recent_loss_streak()
                     self._adaptive_guard_profile["recent_loss_streak"] = int(streak)
                     if streak >= trigger:
                         cool_sec = max(300, int(self.config.get("loss_streak_cooldown_sec", 1800) or 1800))
                         self._loss_streak_cooldown_until = now + timedelta(seconds=cool_sec)
-                        self._execution_guards_stats["loss_streak_cooldown_rejected"] = int(
-                            self._execution_guards_stats.get("loss_streak_cooldown_rejected", 0)
-                        ) + 1
-                        logger.warning(
-                            "🧊 连亏冷静期触发: streak=%s trigger=%s cooldown=%ss symbol=%s",
-                            streak,
-                            trigger,
-                            cool_sec,
-                            decision.symbol,
-                        )
-                        self._adaptive_guard_profile["loss_streak_cooldown_left_sec"] = int(cool_sec)
-                        _record_intent()
-                        _record_guard("rejected", f"loss_streak_cooldown_triggered:{cool_sec}s", "loss_streak")
-                        return False
+                        if override_open:
+                            self._execution_guards_stats["loss_streak_cooldown_overridden"] = int(
+                                self._execution_guards_stats.get("loss_streak_cooldown_overridden", 0)
+                            ) + 1
+                            logger.warning(
+                                "🔥 连亏冷静期触发但强信号放行: streak=%s trigger=%s cooldown=%ss symbol=%s conf=%.3f quality=%.3f",
+                                streak,
+                                trigger,
+                                cool_sec,
+                                decision.symbol,
+                                conf_open,
+                                float(quality_open),
+                            )
+                            _record_guard("allowed", f"loss_streak_trigger_overridden:{cool_sec}s", "loss_streak")
+                        else:
+                            self._execution_guards_stats["loss_streak_cooldown_rejected"] = int(
+                                self._execution_guards_stats.get("loss_streak_cooldown_rejected", 0)
+                            ) + 1
+                            logger.warning(
+                                "🧊 连亏冷静期触发: streak=%s trigger=%s cooldown=%ss symbol=%s",
+                                streak,
+                                trigger,
+                                cool_sec,
+                                decision.symbol,
+                            )
+                            self._adaptive_guard_profile["loss_streak_cooldown_left_sec"] = int(cool_sec)
+                            _record_intent()
+                            _record_guard("rejected", f"loss_streak_cooldown_triggered:{cool_sec}s", "loss_streak")
+                            return False
                 except Exception:
                     pass
 
@@ -4633,18 +4798,28 @@ class AICoreDecisionEngine:
                         errs = list(getattr(view, "errors", []) or [])
                         # 若缺少K线证据则拒绝开仓；这类情形是“判断能力不足”，应保守等待。
                         if partial and any("klines_missing" in str(e) for e in errs):
-                            self._execution_guards_stats["data_quality_guard_hold"] += 1
-                            self._execution_guards_stats["open_evidence_rejected"] = int(
-                                self._execution_guards_stats.get("open_evidence_rejected", 0)
-                            ) + 1
-                            logger.warning(
-                                "⛔ 开仓证据不足(缺K线)，拒绝开仓: symbol=%s errors=%s",
-                                decision.symbol,
-                                errs[:6],
-                            )
-                            _record_intent()
-                            _record_guard("rejected", "open_evidence_rejected:klines_missing", "evidence", {"errors": errs[:6]})
-                            return False
+                            # 快照超时场景下允许降级放行（默认开启），避免“网络抖动=全盘拒单”。
+                            timeout_only = any("snapshot_fetch_failed:TimeoutError" in str(e) for e in errs)
+                            allow_timeout_fallback = bool(self.config.get("open_allow_snapshot_timeout_fallback", True))
+                            if timeout_only and allow_timeout_fallback:
+                                logger.warning(
+                                    "⚠️ 开仓证据降级放行: symbol=%s reason=snapshot_timeout_with_klines_missing errors=%s",
+                                    decision.symbol,
+                                    errs[:6],
+                                )
+                            else:
+                                self._execution_guards_stats["data_quality_guard_hold"] += 1
+                                self._execution_guards_stats["open_evidence_rejected"] = int(
+                                    self._execution_guards_stats.get("open_evidence_rejected", 0)
+                                ) + 1
+                                logger.warning(
+                                    "⛔ 开仓证据不足(缺K线)，拒绝开仓: symbol=%s errors=%s",
+                                    decision.symbol,
+                                    errs[:6],
+                                )
+                                _record_intent()
+                                _record_guard("rejected", "open_evidence_rejected:klines_missing", "evidence", {"errors": errs[:6]})
+                                return False
                 except Exception:
                     # 若取证异常，宁可不下单。
                     self._execution_guards_stats["data_quality_guard_hold"] += 1
@@ -4663,6 +4838,50 @@ class AICoreDecisionEngine:
             leverage = float(decision.leverage or self.config.get("default_leverage", 20))
             leverage = min(max(leverage, lev_min), lev_max)
             low_thr = float(self.config.get("low_balance_usdt_threshold") or 25.0)
+            symbol_info: Dict[str, Any] = {}
+            ct_val_num: Optional[float] = None
+            ct_val_is_base = False
+
+            def _to_float(v: Any) -> Optional[float]:
+                try:
+                    x = float(v)
+                    return x if x > 0 else None
+                except Exception:
+                    return None
+
+            # IMPORTANT: OKX SWAP size is in contracts, not base coins.
+            # Use ctVal/ctValCcy to estimate notional and margin correctly.
+            try:
+                if hasattr(self.exchange, "get_swap_symbol_info"):
+                    symbol_info = await self.exchange.get_swap_symbol_info(decision.symbol) or {}
+                    ct_val_num = _to_float(symbol_info.get("ctVal"))
+                    ccy = str(symbol_info.get("ctValCcy") or "").upper()
+                    base = str(decision.symbol or "").split("/")[0].upper()
+                    ct_val_is_base = bool(ct_val_num and ccy and base and ccy == base)
+            except Exception as e:
+                logger.debug(f"读取合约信息失败，回退旧仓位估算: {e}")
+
+            def _estimate_notional(qty: float, px: float) -> float:
+                q = max(0.0, float(qty or 0.0))
+                p = max(0.0, float(px or 0.0))
+                if q <= 0 or p <= 0:
+                    return 0.0
+                if ct_val_num and ct_val_num > 0:
+                    return q * ct_val_num * p if ct_val_is_base else q * ct_val_num
+                return q * p
+
+            def _qty_from_notional(target_notional: float, px: float) -> int:
+                tn = max(0.0, float(target_notional or 0.0))
+                p = max(0.0, float(px or 0.0))
+                if tn <= 0 or p <= 0:
+                    return 1
+                if ct_val_num and ct_val_num > 0:
+                    per_contract_notional = (ct_val_num * p) if ct_val_is_base else ct_val_num
+                    if per_contract_notional <= 0:
+                        return 1
+                    return max(1, int(tn / per_contract_notional))
+                return max(1, int(tn / p))
+
             if is_open:
                 # 3. 根据余额动态调整数量：低余额时允许用更高比例的可用作保证金（仍受杠杆上限约束）
                 if available < low_thr:
@@ -4682,14 +4901,16 @@ class AICoreDecisionEngine:
                     sym_cap = 0.2
                 max_margin = min(available * margin_frac, available * max(0.01, min(0.92, sym_cap)))
                 max_position_value = max_margin * leverage
-                max_quantity = int(max_position_value / max(current_price, 1e-9))
+                max_quantity = _qty_from_notional(max_position_value, current_price)
                 logger.info(
-                    "📊 资金预算: available=%.2f margin_frac=%.2f margin=%.2f lev=%s max_qty=%s (低余额阈值=%.2f)",
+                    "📊 资金预算: available=%.2f margin_frac=%.2f margin=%.2f lev=%s max_qty=%s ctVal=%s ctValIsBase=%s (低余额阈值=%.2f)",
                     available,
                     margin_frac,
                     max_margin,
                     leverage,
                     max_quantity,
+                    f"{ct_val_num:.8f}" if ct_val_num else "n/a",
+                    ct_val_is_base,
                     low_thr,
                 )
 
@@ -4708,7 +4929,7 @@ class AICoreDecisionEngine:
                 if dpm:
                     positions = await self.exchange.get_positions()
                     current_positions = {p.get("symbol"): p for p in (positions or []) if p.get("symbol")}
-                    base_value = float(decision.quantity) * float(current_price)
+                    base_value = _estimate_notional(float(decision.quantity), float(current_price))
                     adjusted_value, details = await dpm.calculate_dynamic_position_size(
                         symbol=decision.symbol,
                         base_size=base_value,
@@ -4716,7 +4937,7 @@ class AICoreDecisionEngine:
                         current_positions=current_positions,
                         market_data={"volatility": 0.02},
                     )
-                    new_qty = max(1, int(float(adjusted_value) / float(current_price)))
+                    new_qty = _qty_from_notional(float(adjusted_value), float(current_price))
                     if new_qty != decision.quantity:
                         logger.info(f"📊 动态仓位调整数量: {decision.quantity} -> {new_qty}")
                         decision.quantity = new_qty
@@ -4731,6 +4952,43 @@ class AICoreDecisionEngine:
                         )
             except Exception as e:
                 logger.debug(f"动态仓位调整失败: {e}")
+
+            # Final hard guard (post all quantity adjustments):
+            # ensure required margin never exceeds computed max_margin budget.
+            if is_open:
+                try:
+                    target_margin = max(
+                        1e-9,
+                        min(
+                            float(available) * max(0.05, min(0.92, float(self.config.get("default_max_margin_fraction") or 0.30))),
+                            float(available) * max(0.01, min(0.92, float(sym_cap if 'sym_cap' in locals() else 0.2))),
+                        ),
+                    )
+                    projected_notional = _estimate_notional(float(decision.quantity), float(current_price))
+                    required_margin = projected_notional / max(1.0, float(leverage))
+                    if required_margin > target_margin * 1.0001:
+                        capped_notional = target_margin * max(1.0, float(leverage))
+                        new_qty = _qty_from_notional(capped_notional, float(current_price))
+                        if new_qty < 1:
+                            logger.warning(
+                                "⛔ 开仓保证金超限且无法缩量到合法张数，拒绝开仓: symbol=%s req=%.2f cap=%.2f",
+                                decision.symbol,
+                                required_margin,
+                                target_margin,
+                            )
+                            return False
+                        if new_qty != int(decision.quantity):
+                            logger.warning(
+                                "📉 开仓保证金硬限缩量: %s qty %s->%s req=%.2f cap=%.2f",
+                                decision.symbol,
+                                decision.quantity,
+                                new_qty,
+                                required_margin,
+                                target_margin,
+                            )
+                            decision.quantity = int(new_qty)
+                except Exception as e:
+                    logger.debug(f"开仓保证金硬限校验失败: {e}")
             
             decision.leverage = int(round(leverage))
 
@@ -4820,6 +5078,8 @@ class AICoreDecisionEngine:
                     ma20 = float(tech.get("ma20_1h", 0) or 0)
                     atr_proxy = abs(ma5 - ma20)
                     atr_pct = (atr_proxy / max(1e-9, price_ref)) if price_ref > 0 else 0.0
+                    trend_now = float((ma5 - ma20) / max(1e-9, price_ref)) if price_ref > 0 else 0.0
+                    grind_min = float(self.config.get("regime_grind_min_trend_abs", 0.00035) or 0.00035)
                     profile = "normal"
                     if atr_pct >= 0.02:
                         profile = "high_vol"
@@ -4828,9 +5088,16 @@ class AICoreDecisionEngine:
                         max_abs_imb = min(0.98, max_abs_imb * 1.05)
                     elif atr_pct <= 0.005:
                         profile = "low_vol"
-                        min_rr = min_rr * 1.10
-                        max_spread_bps = max(5.0, max_spread_bps * 0.80)
-                        max_abs_imb = max(0.80, max_abs_imb * 0.95)
+                        # 低波动但 MA 结构已有轻微方向：避免「一律抬 RR + 压点差」把慢涨行情完全锁死
+                        if abs(trend_now) >= grind_min:
+                            min_rr = min_rr * float(self.config.get("low_vol_grind_profile_min_rr_mult", 0.98) or 0.98)
+                            max_spread_bps = max_spread_bps * float(
+                                self.config.get("low_vol_grind_profile_spread_mult", 1.06) or 1.06
+                            )
+                        else:
+                            min_rr = min_rr * 1.10
+                            max_spread_bps = max(5.0, max_spread_bps * 0.80)
+                            max_abs_imb = max(0.80, max_abs_imb * 0.95)
 
                     if bool(self.config.get("regime_enable", True)):
                         low_vol_thr = float(self.config.get("regime_low_vol_atr_pct", 0.005) or 0.005)
@@ -4838,11 +5105,18 @@ class AICoreDecisionEngine:
                         trend_thr = float(self.config.get("regime_trend_threshold", 0.004) or 0.004)
                         low_liq_spread = float(self.config.get("regime_low_liquidity_spread_bps", 55.0) or 55.0)
                         spread_now = float(spread_bps) if spread_bps is not None else 0.0
-                        trend_now = float((ma5 - ma20) / max(1e-9, price_ref)) if price_ref > 0 else 0.0
+                        grind_max_atr = low_vol_thr * float(self.config.get("regime_grind_max_atr_mult", 1.25) or 1.25)
                         if spread_now >= low_liq_spread:
                             regime = "low_liquidity"
                         elif atr_pct >= high_vol_thr:
                             regime = "high_vol"
+                        elif (
+                            spread_now < low_liq_spread
+                            and atr_pct <= grind_max_atr
+                            and abs(trend_now) >= grind_min
+                            and abs(trend_now) < trend_thr
+                        ):
+                            regime = "low_vol_grind"
                         elif abs(trend_now) >= trend_thr:
                             regime = "trend"
                         elif atr_pct <= low_vol_thr:
@@ -4882,6 +5156,7 @@ class AICoreDecisionEngine:
                         "session_group": session_group,
                         "composite_group": composite_group,
                         "atr_pct_1h": float(atr_pct),
+                        "trend_signed_ma5_ma20_pct": float(trend_now),
                         "effective_min_rr": float(min_rr),
                         "effective_max_spread_bps": float(max_spread_bps),
                         "effective_max_abs_depth_imbalance": float(max_abs_imb),
@@ -5306,23 +5581,14 @@ class AICoreDecisionEngine:
                         order = None
 
                 if order is None and not gw:
-                    if decision.action == 'close':
-                        order = await self.exchange.close_position(
-                            symbol=decision.symbol.replace('/', '-'),
-                            side=decision.side
-                        )
-                    else:
-                        await self.exchange.set_leverage(
-                            symbol=decision.symbol.replace('/', '-'),
-                            leverage=decision.leverage,
-                            margin_mode='cross'
-                        )
-                        order = await self.exchange.open_swap_position(
-                            symbol=decision.symbol.replace('/', '-'),
-                            side=decision.side,
-                            size=decision.quantity,
-                            leverage=decision.leverage
-                        )
+                    logger.error(
+                        "S1: ExecutionGateway 不可用，拒绝实盘交易（禁止交易所直连兜底） symbol=%s action=%s",
+                        decision.symbol,
+                        decision.action,
+                    )
+                    _record_intent()
+                    _record_guard("rejected", "execution_gateway_unavailable", "execution_spine")
+                    return False
                 elif order is None and gw:
                     logger.error(
                         "S1: ExecutionGateway 未成功下单且 Gateway 已启用，已跳过交易所直连兜底 symbol=%s",
@@ -5666,6 +5932,8 @@ class AICoreDecisionEngine:
                     "regime_high_vol_atr_pct": self.config.get("regime_high_vol_atr_pct"),
                     "regime_trend_threshold": self.config.get("regime_trend_threshold"),
                     "regime_low_liquidity_spread_bps": self.config.get("regime_low_liquidity_spread_bps"),
+                    "regime_grind_min_trend_abs": self.config.get("regime_grind_min_trend_abs"),
+                    "regime_grind_max_atr_mult": self.config.get("regime_grind_max_atr_mult"),
                     "regime_profile_overrides": self.config.get("regime_profile_overrides"),
                     "pnl_health_sizing_enable": self.config.get("pnl_health_sizing_enable"),
                     "pnl_health_lookback_trades": self.config.get("pnl_health_lookback_trades"),
@@ -5825,6 +6093,10 @@ class AICoreDecisionEngine:
                 "regime_high_vol_atr_pct",
                 "regime_trend_threshold",
                 "regime_low_liquidity_spread_bps",
+                "regime_grind_min_trend_abs",
+                "regime_grind_max_atr_mult",
+                "low_vol_grind_profile_min_rr_mult",
+                "low_vol_grind_profile_spread_mult",
                 "regime_profile_overrides",
                 "pnl_health_sizing_enable",
                 "pnl_health_lookback_trades",
@@ -5844,6 +6116,9 @@ class AICoreDecisionEngine:
                 "loss_streak_lookback",
                 "loss_streak_cooldown_sec",
                 "loss_streak_min_abs_loss",
+                "loss_streak_override_enable",
+                "loss_streak_override_min_confidence",
+                "loss_streak_override_min_quality",
                 "low_balance_usdt_threshold",
                 "default_max_margin_fraction",
                 "low_balance_margin_fraction",
@@ -5927,6 +6202,7 @@ class AICoreDecisionEngine:
                 "pnl_health_sizing_enable",
                 "edge_after_cost_guard_enable",
                 "loss_streak_cooldown_enable",
+                "loss_streak_override_enable",
                 "boost_on_low_risk",
                 "auto_frequency_profile_switch",
                 "frequency_profile_switch_telegram_notify",

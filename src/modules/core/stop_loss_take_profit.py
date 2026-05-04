@@ -59,6 +59,8 @@ class StopLossConfig:
     """止损配置"""
     stop_type: StopType = StopType.PERCENTAGE
     stop_value: float = 0.03        # 止损值（百分比或固定价格）
+    # ATR_BASED 下优先使用该绝对 ATR 值（价格单位）；<=0 时回退兼容 stop_value。
+    atr_value: float = 0.0
     trailing_offset: float = 0.02   # 移动止损偏移量
     atr_multiplier: float = 2.0     # ATR倍数
     time_limit_hours: int = 0       # 时间限制（小时），0表示无限制
@@ -797,24 +799,17 @@ class StopLossTakeProfitManager:
                     },
                 )
             else:
-                close_fn = getattr(ex, "close_swap_position", None) or getattr(ex, "close_position", None)
-                if not callable(close_fn):
-                    logger.error("交易所缺少 close_swap_position/close_position，无法实盘平仓")
-                    self._note_close_failure_meta(order, "no_close_swap_fn", reason)
-                    await self._emit_close_execution_audit(
-                        order,
-                        reason,
-                        close_sz,
-                        False,
-                        {"error": "no_close_swap_fn"},
-                        gw_used=False,
-                    )
-                    return False
-                res = await close_fn(
-                    order.symbol,
-                    order.side,
+                logger.error("ExecutionGateway 不可用，拒绝直连交易所平仓（S1 强制单链路）")
+                self._note_close_failure_meta(order, "execution_gateway_unavailable", reason)
+                await self._emit_close_execution_audit(
+                    order,
+                    reason,
                     close_sz,
+                    False,
+                    {"error": "execution_gateway_unavailable"},
+                    gw_used=False,
                 )
+                return False
             ok = bool(isinstance(res, dict) and res.get("success"))
             # Partial TP often fails on minSz/lot rounding for tiny residual legs.
             # Retry once with live position size as a fallback sizing source.
@@ -1604,8 +1599,16 @@ class StopLossTakeProfitManager:
                 return entry_price * (1 + config.stop_value)
         
         elif config.stop_type == StopType.ATR_BASED:
-            return entry_price - config.atr_multiplier * config.stop_value if side == "long" \
-                   else entry_price + config.atr_multiplier * config.stop_value
+            atr_abs = float(getattr(config, "atr_value", 0.0) or 0.0)
+            if atr_abs <= 0:
+                # backward-compatible fallback:
+                # - stop_value in (0,1): treat as % of entry to synthesize ATR-like absolute distance
+                # - otherwise: treat stop_value as absolute ATR unit
+                sv = float(config.stop_value or 0.0)
+                atr_abs = (entry_price * sv) if (0.0 < sv < 1.0) else sv
+            atr_abs = max(1e-9, atr_abs)
+            dist = float(config.atr_multiplier or 2.0) * atr_abs
+            return entry_price - dist if side == "long" else entry_price + dist
 
         elif config.stop_type == StopType.TRAILING:
             off = float(getattr(config, "trailing_offset", None) or config.stop_value or 0.023)
@@ -2135,7 +2138,8 @@ class StopLossTakeProfitManager:
                                             )
                                         )
                             lock_sl = float(order.entry_price or 0.0) * (1.0 + lock_pct)
-                            if lock_sl > 0 and (float(order.stop_loss_price or 0.0) < lock_sl):
+                            # 多单止损上移时，禁止推到当前价之上（避免立即触发）。
+                            if lock_sl > 0 and lock_sl < float(current_price or 0.0) and (float(order.stop_loss_price or 0.0) < lock_sl):
                                 order.stop_loss_price = lock_sl
                                 self._stats["sr_breakeven_lock_applied"] += 1
                                 self._record_sr_event(
@@ -2202,7 +2206,8 @@ class StopLossTakeProfitManager:
                                         )
                             lock_sl = float(order.entry_price or 0.0) * (1.0 - lock_pct)
                             cur_sl = float(order.stop_loss_price or 0.0)
-                            if lock_sl > 0 and (cur_sl <= 0 or cur_sl > lock_sl):
+                            # 空单止损下移时，禁止推到当前价之下（避免立即触发）。
+                            if lock_sl > 0 and lock_sl > float(current_price or 0.0) and (cur_sl <= 0 or cur_sl > lock_sl):
                                 order.stop_loss_price = lock_sl
                                 self._stats["sr_breakeven_lock_applied"] += 1
                                 self._record_sr_event(

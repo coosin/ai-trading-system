@@ -208,12 +208,21 @@ class OptimizedMemorySystem:
         storage_path: Optional[str] = None,
         workspace_path: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
-        config_manager: Any = None
+        config_manager: Any = None,
+        *,
+        working_days_recent: int = 3,
+        experience_json_max_files: Optional[int] = 1200,
     ):
         if hasattr(self, '_initialized') and self._initialized:
             return
         
         self.config = config or {}
+        # 启动期加载策略：减小冷启动时间；0 或未设置正数语义见 get_memory_system
+        try:
+            self._working_days_recent = max(1, int(working_days_recent))
+        except Exception:
+            self._working_days_recent = 3
+        self._experience_json_max_files = experience_json_max_files
         
         if os.path.exists("/.dockerenv"):
             # 容器环境固定到可持久化挂载目录，避免配置漂移到不可写路径
@@ -354,12 +363,12 @@ class OptimizedMemorySystem:
         
         logger.info(f"✓ 加载核心记忆: {self._stats['by_layer'][MemoryLayer.CORE]} 条")
     
-    async def _load_recent_working_memories(self, days: int = 3):
+    async def _load_recent_working_memories(self, days: Optional[int] = None):
         """加载最近的工作记忆"""
         working_dir = self.storage_path / "working"
         if not working_dir.exists():
             return
-        
+        days = days if days is not None else int(getattr(self, "_working_days_recent", 3) or 3)
         cutoff_date = datetime.now() - timedelta(days=days)
         
         for file_path in working_dir.glob("*.json"):
@@ -380,12 +389,31 @@ class OptimizedMemorySystem:
         logger.info(f"✓ 加载工作记忆: {self._stats['by_layer'][MemoryLayer.WORKING]} 条")
     
     async def _load_experience_memories(self):
-        """加载经验记忆（长期）"""
+        """加载经验记忆（长期）。
+
+        experience_json_max_files: 限制启动时载入的 JSON 条数（按 mtime 新→旧）。
+        None 表示不限制。未载入的文件仍保存在磁盘；后续若有按需加载可增强。
+        """
         experience_dir = self.storage_path / "experience"
         if not experience_dir.exists():
             return
-        
-        for file_path in experience_dir.glob("*.json"):
+
+        paths = sorted(
+            experience_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        cap = getattr(self, "_experience_json_max_files", None)
+        if isinstance(cap, int) and cap > 0 and len(paths) > cap:
+            skipped = len(paths) - cap
+            paths = paths[:cap]
+            logger.info(
+                "经验记忆启动加载限流: 载入 newest=%s，跳过较旧=%s（memory.startup.experience_json_max_files）",
+                len(paths),
+                skipped,
+            )
+
+        for file_path in paths:
             try:
                 async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
                     data = json.loads(await f.read())
@@ -908,14 +936,28 @@ _memory_instance: Optional[OptimizedMemorySystem] = None
 
 async def get_memory_system(
     storage_path: Optional[str] = None,
-    workspace_path: Optional[str] = None
+    workspace_path: Optional[str] = None,
+    *,
+    working_days_recent: int = 3,
+    experience_json_max_files: Optional[int] = 1200,
 ) -> OptimizedMemorySystem:
-    """获取记忆系统单例"""
+    """获取记忆系统单例。
+
+    experience_json_max_files:
+      - None: 不限制（冷启动可能较慢）
+      - 0 或负数: 与 None 相同（不限制），便于配置显式关闭限流
+      - 正整数: 仅按修改时间载入最新的这么多条 JSON
+    """
     global _memory_instance
+    eff_cap = experience_json_max_files
+    if isinstance(eff_cap, int) and eff_cap <= 0:
+        eff_cap = None
     if _memory_instance is None:
         _memory_instance = OptimizedMemorySystem(
             storage_path=storage_path,
-            workspace_path=workspace_path
+            workspace_path=workspace_path,
+            working_days_recent=working_days_recent,
+            experience_json_max_files=eff_cap,
         )
         await _memory_instance.initialize()
     return _memory_instance

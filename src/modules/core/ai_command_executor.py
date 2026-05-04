@@ -2096,9 +2096,14 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                         symbol=symbol,
                         side=side,
                         size=qty if (qty is not None and qty > 0) else None,
-                        source="system",
+                        source="manual",
                         reason=reason,
-                        force=True,
+                        force=False,
+                        context={
+                            "via": "ai_command_executor_force_close",
+                            "manual_approved": True,
+                            "user_input": str(user_input)[:240],
+                        },
                     )
                     ok = bool((res or {}).get("success"))
                     return {

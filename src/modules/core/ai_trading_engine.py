@@ -703,11 +703,22 @@ class AITradingEngine:
         try:
             symbols = await selector.get_trading_symbols()
             symbols = [str(s) for s in symbols if s]
-            if symbols:
-                symbols = symbols[: max(1, int(self._max_dynamic_symbols or 12))]
-                if symbols != self.symbols:
-                    self.symbols = symbols
-                    logger.info(f"🔁 动态交易对同步完成: {self.symbols}")
+            if not symbols:
+                # Selector may temporarily degrade under upstream jitter; keep the engine tradable.
+                fallback_symbols = list(self.symbols or [])
+                if not fallback_symbols:
+                    fallback_symbols = [
+                        "BTC/USDT",
+                        "ETH/USDT",
+                        "SOL/USDT",
+                        "BNB/USDT",
+                    ]
+                symbols = [str(s) for s in fallback_symbols if s]
+                logger.warning("动态交易对为空，回退使用默认/当前交易对: %s", symbols[:8])
+            symbols = symbols[: max(1, int(self._max_dynamic_symbols or 12))]
+            if symbols != self.symbols:
+                self.symbols = symbols
+                logger.info(f"🔁 动态交易对同步完成: {self.symbols}")
         except Exception as e:
             logger.debug(f"动态交易对同步失败: {e}")
         finally:
@@ -1838,7 +1849,31 @@ class AITradingEngine:
                         return False
 
                 # 资金链保护：检查本次开仓后是否超总敞口
-                projected_value = float(decision.quantity or 0.0) * float(decision.price or 0.0)
+                # 注意：OKX SWAP 的 quantity 是“张”，不能直接 quantity*price 当作名义价值。
+                qty = float(decision.quantity or 0.0)
+                px = float(getattr(decision, "price", 0.0) or 0.0)
+                if px <= 0:
+                    try:
+                        md = decision.metadata if isinstance(decision.metadata, dict) else {}
+                        mctx = md.get("market_context", {}) if isinstance(md, dict) else {}
+                        px = float((mctx or {}).get("price", 0.0) or 0.0)
+                    except Exception:
+                        px = 0.0
+                ct_val = 0.0
+                ct_is_base = False
+                try:
+                    if self.exchange and hasattr(self.exchange, "get_swap_symbol_info"):
+                        info = await self.exchange.get_swap_symbol_info(decision.symbol)
+                        ct_val = float((info or {}).get("ctVal") or 0.0)
+                        ccy = str((info or {}).get("ctValCcy") or "").upper()
+                        base = str(decision.symbol or "").split("/")[0].upper()
+                        ct_is_base = bool(ct_val > 0 and ccy and base and ccy == base)
+                except Exception:
+                    pass
+                if ct_val > 0 and qty > 0 and px > 0:
+                    projected_value = qty * ct_val * px if ct_is_base else qty * ct_val
+                else:
+                    projected_value = qty * max(0.0, px)
                 if projected_value > 0:
                     available = 10000.0
                     if self.exchange:
@@ -1917,14 +1952,15 @@ class AITradingEngine:
                             logger.warning("📊 风险管理器拒绝该订单: symbol=%s", decision.symbol)
                             return False
                 except Exception as e:
-                    logger.warning("风险管理器检查异常（fail-open）: %s", e)
+                    logger.error("风险管理器检查异常（fail-closed）: %s", e)
+                    return False
             
             logger.info(f"✅ AI自主决策通过: {decision.action.value} {decision.symbol}")
             return True
             
         except Exception as e:
             logger.error(f"风险检查失败: {e}")
-            return True
+            return False
 
     async def _refresh_positions_for_risk_gate(self) -> None:
         """开仓前短冷却刷新持仓，确保硬限制基于交易所权威数据。"""
@@ -2108,7 +2144,7 @@ class AITradingEngine:
             
             # 确定仓位方向
             is_close = decision.action in [TradeAction.CLOSE_LONG, TradeAction.CLOSE_SHORT]
-            if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG]:
+            if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT]:
                 pos_side = "long"
             elif decision.action in [TradeAction.OPEN_SHORT, TradeAction.CLOSE_SHORT]:
                 pos_side = "short"
@@ -3070,6 +3106,46 @@ class AITradingEngine:
                 logger.error(f"监控循环错误: {e}")
                 await asyncio.sleep(30)
     
+    async def _trade_rows_for_optimization(self) -> List[Dict[str, Any]]:
+        """
+        合并引擎内存 trade_history 与 TradeHistoryService 持久化记录。
+        主链路若走 ai_core/ExecutionGateway，内存列表常为 0，但 JSONL/SQLite 仍有成交。
+        """
+        merged: List[Dict[str, Any]] = list(self.trade_history)
+        seen_oid: set = set()
+        for t in merged:
+            try:
+                orr = t.get("order_result") if isinstance(t.get("order_result"), dict) else {}
+                oid = str(orr.get("order_id") or orr.get("orderId") or "").strip()
+                if oid:
+                    seen_oid.add(oid)
+            except Exception:
+                pass
+        svc = getattr(self, "trade_history_service", None)
+        if svc:
+            try:
+                for tr in await svc.get_recent_trades(limit=800):
+                    if not isinstance(tr, dict):
+                        continue
+                    oid = str(tr.get("order_id") or "").strip()
+                    if oid and oid in seen_oid:
+                        continue
+                    pnl = float(tr.get("pnl") or 0.0)
+                    wrapped = {
+                        "decision": {
+                            "pnl": pnl,
+                            "symbol": tr.get("symbol", ""),
+                            "action": str((tr.get("metadata") or {}).get("action", "") or ""),
+                        },
+                        "order_result": {"order_id": tr.get("order_id", "")},
+                    }
+                    merged.append(wrapped)
+                    if oid:
+                        seen_oid.add(oid)
+            except Exception as e:
+                logger.debug("合并 TradeHistoryService 到优化样本失败: %s", e)
+        return merged
+
     async def _optimization_loop(self) -> None:
         """优化循环 - 策略自我优化"""
         while self._running:
@@ -3080,22 +3156,26 @@ class AITradingEngine:
                 logger.info("🔄 开始策略自我优化...")
                 
                 # 分析交易历史
-                n_hist = len(self.trade_history)
+                opt_rows = await self._trade_rows_for_optimization()
+                n_hist = len(opt_rows)
+                n_mem = len(self.trade_history)
                 if n_hist >= 10:
-                    await self._optimize_strategy()
+                    await self._optimize_strategy(opt_rows)
                 else:
                     logger.info(
-                        "⏭️ 跳过本周期策略优化：trade_history 不足 10 条（当前 %s）；"
+                        "⏭️ 跳过本周期策略优化：合并样本不足 10 条（合并=%s 内存=%s）；"
                         " 学习引擎与记忆平仓另计。",
                         n_hist,
+                        n_mem,
                     )
                 
             except Exception as e:
                 logger.error(f"优化循环错误: {e}")
     
-    async def _optimize_strategy(self) -> None:
+    async def _optimize_strategy(self, trade_rows: Optional[List[Dict[str, Any]]] = None) -> None:
         """策略优化"""
         try:
+            rows = trade_rows if trade_rows is not None else list(self.trade_history)
             # 兼容壳 StrategyOptimizer 无实质分析；若走该分支会提前 return，导致下方胜率统计永不执行
             opt = self.strategy_optimizer
             if opt and not getattr(opt, "is_compat_shim", False):
@@ -3116,9 +3196,8 @@ class AITradingEngine:
                 )
 
             # 备用：原有的简单优化逻辑（胜率 → min_confidence 微调 + 记忆落库）
-            profitable_trades = sum(1 for t in self.trade_history 
-                                   if t.get("decision", {}).get("pnl", 0) > 0)
-            total_trades = len(self.trade_history)
+            profitable_trades = sum(1 for t in rows if t.get("decision", {}).get("pnl", 0) > 0)
+            total_trades = len(rows)
             win_rate = profitable_trades / total_trades if total_trades > 0 else 0
             
             logger.info(f"📊 策略性能: 胜率={win_rate:.2%}, 总交易={total_trades}")

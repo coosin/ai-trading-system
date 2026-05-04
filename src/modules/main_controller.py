@@ -16,6 +16,7 @@ import logging
 import os
 import traceback
 import uuid
+from pathlib import Path
 import pandas as pd
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -54,6 +55,45 @@ from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 # 导入新增的升级模块
 from src.modules.core.dynamic_position_manager import DynamicPositionManager, DynamicPositionConfig
 from src.modules.core.trading_limits import resolve_position_limits
+
+
+def _snapshot_pid_bookkeeping(process_pid: int) -> Dict[str, Any]:
+    """For dashboards: explain PID bookkeeping files vs this process."""
+
+    paths: List[Path] = [Path("/tmp/openclaw-trading.pid")]
+    try:
+        paths.append(Path(__file__).resolve().parents[2] / "runtime" / "openclaw-trading.pid")
+    except Exception:
+        pass
+    home = os.environ.get("HOME")
+    if home:
+        paths.append(Path(home) / ".openclaw-trading" / "runtime" / "openclaw-trading.pid")
+
+    files: List[Dict[str, Any]] = []
+    for p in paths:
+        slot: Dict[str, Any] = {
+            "path": str(p),
+            "exists": False,
+            "file_pid": None,
+            "matches_process": False,
+        }
+        try:
+            if p.is_file():
+                slot["exists"] = True
+                raw = p.read_text(encoding="utf-8", errors="ignore").strip().split()
+                if raw:
+                    slot["file_pid"] = int(raw[0])
+                    slot["matches_process"] = int(raw[0]) == int(process_pid)
+        except Exception:
+            slot["matches_process"] = False
+        files.append(slot)
+
+    any_match = bool(any(isinstance(x.get("matches_process"), bool) and x.get("matches_process") for x in files))
+    return {
+        "process_pid": int(process_pid),
+        "pid_files": files,
+        "any_pid_file_matches_process": any_match,
+    }
 from src.modules.core.correlation_monitor import CorrelationMonitor, CorrelationMonitorConfig
 from src.modules.core.strategy_hot_loader import StrategyHotLoader
 from src.modules.core.audit_logger import AuditLogger, AuditConfig, AuditEventType, AuditSeverity
@@ -817,8 +857,39 @@ class MainController:
             cfg_workspace_path = None
 
         workspace_path = cfg_workspace_path or os.environ.get("WORKSPACE_PATH", "/app/workspace")
-        
-        optimized_memory = await get_memory_system(workspace_path=workspace_path)
+
+        mem_startup: Dict[str, Any] = {}
+        try:
+            mcfg = await self.config_manager.get_config("memory", {}) or {}
+            if isinstance(mcfg, dict) and isinstance(mcfg.get("startup"), dict):
+                mem_startup = mcfg.get("startup") or {}
+        except Exception:
+            mem_startup = {}
+
+        try:
+            working_days = int(mem_startup.get("working_days_recent", 3) or 3)
+        except Exception:
+            working_days = 3
+        working_days = max(1, min(14, working_days))
+
+        experience_cap: Optional[int]
+        if "experience_json_max_files" not in mem_startup:
+            experience_cap = 1200
+        else:
+            exp_cap_raw = mem_startup.get("experience_json_max_files")
+            if exp_cap_raw is None:
+                experience_cap = 0  # get_memory_system: <=0 -> 不限制载入条数
+            else:
+                try:
+                    experience_cap = int(exp_cap_raw)
+                except Exception:
+                    experience_cap = 1200
+
+        optimized_memory = await get_memory_system(
+            workspace_path=workspace_path,
+            working_days_recent=working_days,
+            experience_json_max_files=experience_cap,
+        )
         logger.info("✅ 优化记忆系统初始化完成（唯一后端）")
 
         # 统一记忆网关（单入口）：结构化记忆可召回，workspace markdown 作为日志层
@@ -1256,8 +1327,9 @@ class MainController:
             _swo = str(_pol.get("single_write_owner", "ai_core")).strip().lower()
             logger.info("✅ ExecutionGateway 已就绪 single_write_owner=%s", _swo)
         except Exception as e:
-            logger.warning("⚠️ ExecutionGateway 初始化失败: %s", e)
+            logger.error("❌ ExecutionGateway 初始化失败（fail-closed）: %s", e)
             self.execution_gateway = None
+            raise RuntimeError(f"ExecutionGateway init failed: {e}")
         
         if self.ai_trading_engine and hasattr(self.ai_trading_engine, 'risk_monitor'):
             self.risk_monitor = self.ai_trading_engine.risk_monitor
@@ -3121,6 +3193,17 @@ class MainController:
                     out["execution_spine"] = await self.execution_gateway.get_snapshot()
                 except Exception as e:
                     out["execution_spine"] = {"error": str(e)}
+            try:
+                limits = await resolve_position_limits(config_manager=self.config_manager)
+                out["position_limits_snapshot"] = limits.to_dict()
+            except Exception as e:
+                out["position_limits_snapshot_error"] = str(e)
+
+            try:
+                out["runtime_bookkeeping"] = _snapshot_pid_bookkeeping(int(os.getpid()))
+            except Exception as e:
+                out["runtime_bookkeeping_error"] = str(e)
+
             return out
 
     async def get_event_history(

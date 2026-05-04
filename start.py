@@ -16,6 +16,7 @@ sys.path.insert(0, str(project_root))
 # 加载环境变量
 from src.utils.env_config import load_environment
 load_environment()
+from src.utils.process_lock import ProcessLock
 
 from src.modules.core.config_manager import get_config_manager
 from src.modules.main_controller import MainController
@@ -50,47 +51,57 @@ async def main():
     # 打印环境变量摘要
     EnvConfig.print_env_summary()
     
-    # 初始化配置管理器
-    logger.info("\n📋 初始化配置管理器...")
-    config_manager = await get_config_manager()
-    
-    # 初始化主控制器
-    logger.info("\n🔧 初始化主控制器...")
-    controller = MainController(config_manager)
-    await controller.initialize()
-    
-    # 启动系统
-    logger.info("\n🚀 启动系统...")
-    success = await controller.start_system()
-    
-    if success:
-        logger.info("\n" + "=" * 80)
-        logger.info("✅ 系统启动成功!")
-        logger.info("=" * 80)
-        logger.info("\n📊 系统状态:")
-        logger.info(f"  - 运行模式: {os.getenv('MODE', 'simulation')}")
-        logger.info(f"  - 交易对: {os.getenv('TRADING_SYMBOLS', 'BTC/USDT,ETH/USDT')}")
-        logger.info("  - AI模型: gemini-2.5-flash（经本地 AIClient OpenAI 兼容端点）")
-        logger.info(f"  - API端口: {os.getenv('API_PORT', '8000')}")
-        logger.info("\n💡 提示:")
-        logger.info("  - 访问 http://localhost:8000/docs 查看API文档")
-        logger.info("  - 按 Ctrl+C 停止系统")
-        logger.info("=" * 80 + "\n")
-        
-        try:
-            # 保持运行
-            while True:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("\n\n🛑 收到停止信号...")
-    else:
-        logger.error("❌ 系统启动失败")
+    # 与 src/main.py 保持一致：强制单实例运行，避免并发双控。
+    proc_lock = ProcessLock("openclaw-trading-system")
+    if not proc_lock.acquire():
+        logger.error("❌ 另一个实例已在运行，请先停止后再启动")
         sys.exit(1)
-    
-    # 清理
-    logger.info("\n🧹 清理资源...")
-    await controller.cleanup()
-    logger.info("✅ 系统已安全关闭")
+
+    controller = None
+    try:
+        # 初始化配置管理器
+        logger.info("\n📋 初始化配置管理器...")
+        config_manager = await get_config_manager()
+        
+        # 初始化主控制器
+        logger.info("\n🔧 初始化主控制器...")
+        controller = MainController(config_manager)
+        await controller.initialize()
+        
+        # 启动系统
+        logger.info("\n🚀 启动系统...")
+        success = await controller.start_system()
+        
+        if success:
+            logger.info("\n" + "=" * 80)
+            logger.info("✅ 系统启动成功!")
+            logger.info("=" * 80)
+            logger.info("\n📊 系统状态:")
+            logger.info(f"  - 运行模式: {os.getenv('MODE', 'simulation')}")
+            logger.info(f"  - 交易对: {os.getenv('TRADING_SYMBOLS', 'BTC/USDT,ETH/USDT')}")
+            logger.info("  - AI模型: gemini-2.5-flash（经本地 AIClient OpenAI 兼容端点）")
+            logger.info(f"  - API端口: {os.getenv('API_PORT', '8000')}")
+            logger.info("\n💡 提示:")
+            logger.info("  - 访问 http://localhost:8000/docs 查看API文档")
+            logger.info("  - 按 Ctrl+C 停止系统")
+            logger.info("=" * 80 + "\n")
+            
+            try:
+                # 保持运行
+                while True:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                logger.info("\n\n🛑 收到停止信号...")
+        else:
+            logger.error("❌ 系统启动失败")
+            sys.exit(1)
+        
+        # 清理
+        logger.info("\n🧹 清理资源...")
+        await controller.cleanup()
+        logger.info("✅ 系统已安全关闭")
+    finally:
+        proc_lock.release()
 
 
 if __name__ == "__main__":

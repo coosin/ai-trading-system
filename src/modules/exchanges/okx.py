@@ -211,6 +211,13 @@ class OKXExchange(ExchangeBase):
         self._last_positions_log_ts: float = 0.0
         self._last_positions_nonzero_count: Optional[int] = None
         self._ws_hub = None  # OKXWebSocketHub，可选
+        # 私有接口签名时间偏移（本机时间 + offset），用于修复 50102 Timestamp expired。
+        self._server_time_offset_ms: float = 0.0
+        self._last_time_sync_ts: float = 0.0
+
+    def bust_positions_cache(self) -> None:
+        """下单/平仓后丢弃持仓内存缓存，避免下游用旧快照误判 position_unchanged。"""
+        self._positions_cache = (0.0, [])
 
     @property
     def is_connected(self) -> bool:
@@ -396,9 +403,10 @@ class OKXExchange(ExchangeBase):
 
     def _get_headers(self, method: str, endpoint: str, body: str = "") -> Dict[str, str]:
         """获取请求头"""
-        # 使用 UTC 时间戳（ISO 8601 格式）
+        # 使用 UTC 时间戳（ISO 8601 格式），并叠加服务器时钟偏移量。
         from datetime import datetime, timezone
-        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        ts_ms = (time.time() * 1000.0) + float(getattr(self, "_server_time_offset_ms", 0.0) or 0.0)
+        timestamp = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
         signature = self._generate_signature(timestamp, method, endpoint, body)
         
         headers = {
@@ -411,6 +419,36 @@ class OKXExchange(ExchangeBase):
         if self._should_use_simulated_header(endpoint):
             headers["x-simulated-trading"] = "1"
         return headers
+
+    async def _sync_server_time_offset(self, proxy: Optional[str] = None, force: bool = False) -> bool:
+        """与 OKX 公共时间对齐，修复私有签名时间漂移导致的 50102。"""
+        now = time.time()
+        if (not force) and (now - float(getattr(self, "_last_time_sync_ts", 0.0) or 0.0) < 30.0):
+            return False
+        try:
+            timeout = aiohttp.ClientTimeout(total=5, connect=3, sock_read=3)
+            async with self._session.get(
+                self.api_url + "/api/v5/public/time",
+                timeout=timeout,
+                proxy=proxy,
+            ) as resp:
+                payload = await resp.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            row = data[0] if isinstance(data, list) and data else {}
+            server_ts = float((row or {}).get("ts") or 0)
+            if server_ts <= 0:
+                return False
+            local_ts = time.time() * 1000.0
+            self._server_time_offset_ms = float(server_ts - local_ts)
+            self._last_time_sync_ts = now
+            logger.warning(
+                "OKX 时间同步完成: offset_ms=%.0f (server-local)",
+                self._server_time_offset_ms,
+            )
+            return True
+        except Exception as e:
+            logger.warning("OKX 时间同步失败: %s", e)
+            return False
 
     def _build_request_path(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> str:
         """
@@ -792,6 +830,13 @@ class OKXExchange(ExchangeBase):
                             else:
                                 error_code = data.get('code', '')
                                 error_msg = self._extract_okx_error_message(data)
+                                if str(error_code) == "50102" and attempt < max_retries:
+                                    synced = await self._sync_server_time_offset(proxy=proxy, force=True)
+                                    if synced:
+                                        headers = self._get_headers(method, request_path, body_str)
+                                        logger.warning("⚠️ OKX 50102: 已同步服务器时间并重试 %s %s", method, endpoint)
+                                        await asyncio.sleep(min(0.2, retry_delay))
+                                        continue
                                 if error_code == "51001":
                                     logger.debug(f"OKX API交易对不存在: {method} {endpoint} - {error_msg}")
                                 else:
@@ -824,6 +869,13 @@ class OKXExchange(ExchangeBase):
                                 await self._mark_request_success()
                                 return data.get("data", [])
                             else:
+                                if str(data.get("code") or "") == "50102" and attempt < max_retries:
+                                    synced = await self._sync_server_time_offset(proxy=proxy, force=True)
+                                    if synced:
+                                        headers = self._get_headers(method, request_path, body_str)
+                                        logger.warning("⚠️ OKX 50102: 已同步服务器时间并重试 %s %s", method, endpoint)
+                                        await asyncio.sleep(min(0.2, retry_delay))
+                                        continue
                                 error_msg = self._extract_okx_error_message(data)
                                 logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={error_msg}")
                                 raise Exception(f"OKX API错误: {error_msg}")
@@ -855,6 +907,13 @@ class OKXExchange(ExchangeBase):
                             else:
                                 error_code = data.get('code', '')
                                 error_msg = self._extract_okx_error_message(data)
+                                if str(error_code) == "50102" and attempt < max_retries:
+                                    synced = await self._sync_server_time_offset(proxy=proxy, force=True)
+                                    if synced:
+                                        headers = self._get_headers(method, request_path, body_str)
+                                        logger.warning("⚠️ OKX 50102: 已同步服务器时间并重试 %s %s", method, endpoint)
+                                        await asyncio.sleep(min(0.2, retry_delay))
+                                        continue
                                 if error_code == "51001":
                                     logger.debug(f"OKX API交易对不存在: {method} {endpoint}")
                                 else:
@@ -1630,8 +1689,12 @@ class OKXExchange(ExchangeBase):
         if last_error:
             logger.error(f"获取OKX持仓信息失败: {last_error}")
         if cached_positions:
-            logger.warning("⚠️ 使用持仓缓存降级返回（age=%.1fs）", max(0.0, now - cached_ts))
-            return list(cached_positions)
+            age = max(0.0, now - cached_ts)
+            stale_max = float(os.getenv("OPENCLAW_OKX_POSITIONS_STALE_MAX", "45") or "45")
+            if age <= max(1.0, stale_max):
+                logger.warning("⚠️ 使用持仓缓存降级返回（age=%.1fs）", age)
+                return list(cached_positions)
+            logger.warning("⚠️ 持仓缓存已过期（age=%.1fs > %.1fs），返回空以避免幽灵仓位", age, stale_max)
         return []
     
     async def get_exchange_info(self) -> ExchangeInfo:
@@ -1960,6 +2023,7 @@ class OKXExchange(ExchangeBase):
             data = await self._make_request("POST", endpoint, body=body)
             order_data = data[0] if isinstance(data, list) and len(data) > 0 else data
             logger.info(f"✅ 开仓成功: {symbol} {side} {size} @ {leverage}x")
+            self.bust_positions_cache()
             return {
                 "success": True,
                 "orderId": order_data.get("ordId"),
@@ -2102,6 +2166,7 @@ class OKXExchange(ExchangeBase):
         try:
             data = await self._make_request("POST", endpoint, body=body)
             logger.info(f"✅ 平仓成功: {symbol} {side} {size}")
+            self.bust_positions_cache()
             return {
                 "success": True,
                 "orderId": data.get("ordId") if isinstance(data, dict) else data[0].get("ordId") if isinstance(data, list) else None,
@@ -2118,6 +2183,7 @@ class OKXExchange(ExchangeBase):
                     alt_body["side"] = "buy" if str(body.get("side")) == "sell" else "sell"
                     data2 = await self._make_request("POST", endpoint, body=alt_body)
                     logger.info(f"✅ 平仓成功(反向side兜底): {symbol} {side} {size}")
+                    self.bust_positions_cache()
                     return {
                         "success": True,
                         "orderId": data2.get("ordId") if isinstance(data2, dict) else data2[0].get("ordId") if isinstance(data2, list) else None,
@@ -2140,6 +2206,7 @@ class OKXExchange(ExchangeBase):
                     }
                     fb = await self._make_request("POST", "/api/v5/trade/close-position", body=fallback_body)
                     logger.info(f"✅ 平仓成功(close-position兜底): {symbol}")
+                    self.bust_positions_cache()
                     return {
                         "success": True,
                         "orderId": None,

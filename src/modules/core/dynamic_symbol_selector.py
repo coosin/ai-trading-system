@@ -102,7 +102,9 @@ class DynamicSymbolSelector:
         self._stats = {
             "total_discovered": 0,
             "total_selected": 0,
-            "selection_rounds": 0
+            "selection_rounds": 0,
+            "empty_discovery_fallbacks": 0,
+            "last_empty_discovery_at": None,
         }
         
         logger.info("动态币种筛选器初始化完成")
@@ -205,6 +207,14 @@ class DynamicSymbolSelector:
         # IMPORTANT: discovery may legitimately return 0 (API timeout/limited markets).
         # Never let this empty result wipe the monitoring universe.
         if not discovered:
+            self._stats["empty_discovery_fallbacks"] = int(
+                self._stats.get("empty_discovery_fallbacks", 0)
+            ) + 1
+            self._stats["last_empty_discovery_at"] = datetime.now().isoformat()
+            logger.warning(
+                "动态选币发现结果为空，回退到 always_include: %s",
+                self.config.always_include,
+            )
             return list(self.config.always_include)
 
         if self.config.restricted_universe and self.config.allowed_symbols:

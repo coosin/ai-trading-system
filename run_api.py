@@ -24,7 +24,13 @@ async def main():
     
     # 使用uvicorn运行
     import uvicorn
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, reload=False)
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        log_config=None,
+    )
     server = uvicorn.Server(config)
     await server.serve()
 

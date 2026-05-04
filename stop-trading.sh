@@ -1,5 +1,9 @@
 #!/bin/bash
 # 停止完全独立的加密货币交易系统
+#
+# 历史说明：此处按端口/进程名（openclaw.*18790）匹配的“独立交易系统实例”，
+# 与仓库内推荐的 `scripts/stop-openclaw-trading.sh`（python -m src.main）不一定相同。
+# 若你运维的是 ai-trading-system 主链路，请以 scripts 下的脚本为准。
 
 set -e
 

@@ -1094,21 +1094,32 @@ class DataSourceHub:
             enabled = set()
         t = exchange_channel.get("ticker") or {}
         px = float(t.get("price") or t.get("last") or 0.0)
+        t_src = str(t.get("source") or "").strip().lower()
         if px > 0:
             score += 0.28
         else:
             if (not enabled) or ("ticker" in enabled):
                 reasons.append("交易所行情缺失")
+        if t_src in {"fallback", "cache"}:
+            score -= 0.08
+            reasons.append(f"行情来源退化({t_src})")
+        elif t_src == "derived_order_book":
+            score -= 0.05
+            reasons.append("行情由盘口推导，非交易所原始ticker")
         ex_col = exchange_channel.get("collector") or {}
         for note in ex_col.get("ticker_quality_notes") or []:
             if isinstance(note, str) and note:
                 reasons.append(note)
         # 订单簿深度：只有在 collector 启用时才作为扣分项，避免在“禁用重接口保活”时被误判为低质量
         if (not enabled) or ("order_book" in enabled):
-            if exchange_channel.get("order_book", {}).get("bids"):
+            ob = exchange_channel.get("order_book", {}) or {}
+            if ob.get("bids"):
                 score += 0.2
             else:
                 reasons.append("订单簿深度不足")
+            if str(ob.get("source") or "").strip().lower() == "cache":
+                score -= 0.05
+                reasons.append("订单簿来自缓存")
         if (not enabled) or ("klines_1h" in enabled):
             if exchange_channel.get("klines_1h"):
                 score += 0.17
@@ -1124,6 +1135,23 @@ class DataSourceHub:
                 score += 0.1
             else:
                 reasons.append("资金费率缺失")
+        # Collector runtime health penalties (timeout/error/budget timeout/stale cache)
+        try:
+            h = ex_col.get("health") if isinstance(ex_col, dict) else {}
+            if isinstance(h, dict) and h:
+                bad_cnt = 0
+                for _, hv in h.items():
+                    st = str((hv or {}).get("status") if isinstance(hv, dict) else "").lower()
+                    if st in {"timeout", "error", "budget_timeout"}:
+                        bad_cnt += 1
+                if bad_cnt > 0:
+                    score -= min(0.22, 0.04 * float(bad_cnt))
+                    reasons.append(f"交易所采集通道异常({bad_cnt})")
+        except Exception:
+            pass
+        if bool(ex_col.get("partial")):
+            score -= 0.04
+            reasons.append("交易所采集为 partial")
         intel_health = intel_channel.get("health", {}) if isinstance(intel_channel, dict) else {}
         if str(intel_health.get("third_party", "")).startswith("ok"):
             score += 0.075
@@ -1150,8 +1178,12 @@ class DataSourceHub:
         # NOTE: this is a control-plane API dependency (MarketIntelligenceEngine).
         # Keep it responsive by default; heavy collectors are already protected by per-collector timeouts.
         budget = float(cfg.get("snapshot_timeout_sec", 2.5) or 2.5)
-        budget_cap = float(os.getenv("OPENCLAW_DATA_HUB_SNAPSHOT_BUDGET_CAP", "6") or "6")
-        budget = max(1.5, min(budget, budget_cap))
+        # Keep snapshot budget >= exchange channel budget (+small slack), otherwise
+        # unified snapshot may cancel healthy exchange tasks too early.
+        exchange_budget = float(os.getenv("OPENCLAW_DATA_HUB_EXCHANGE_BUDGET_SEC", "12") or "12")
+        budget_cap = float(os.getenv("OPENCLAW_DATA_HUB_SNAPSHOT_BUDGET_CAP", "20") or "20")
+        budget = max(3.0, min(budget, budget_cap))
+        budget = max(budget, min(budget_cap, exchange_budget + 2.0))
         try:
             # 全局 budget 仅作为保护上限，不阻断已完成子通道结果。
             # 具体超时在各 collector 内部按字段分级处理，避免一次整体 timeout 导致整包清空。

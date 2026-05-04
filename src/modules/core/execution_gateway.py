@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Set
 from src.modules.core.execution_reconciler import ExecutionReconciler
 from src.modules.core.decision_trace_store import DecisionTraceStore
 from src.modules.core.reconciliation_protection_manager import ReconciliationProtectionManager
+from src.modules.core.trading_limits import resolve_position_limits
 
 logger = logging.getLogger(__name__)
 
@@ -338,37 +339,13 @@ class ExecutionGateway:
         return src == swo
 
     def _allow_open(self, source: str, swo: str) -> bool:
-        """开仓仅允许 SWO 或显式人工/指令执行链路，防止辅环误开仓。"""
+        """开仓仅允许 SWO 或 manual；强制单链路，杜绝旁路开仓。"""
         src = (source or "").strip().lower()
-        # manual：人工显式触发允许开仓（用于运维/人工测试）。
+        # manual：人工显式触发允许开仓（用于运维/人工测试）
         if src == "manual":
             return True
-        # system：默认不允许开仓，避免“遗漏即特权”；仅在策略显式配置打开时放行。
-        if src == "system":
-            try:
-                pol = {}
-                if self._mc and hasattr(self._mc, "config_manager") and self._mc.config_manager:
-                    pol = self._mc.config_manager.get_config_sync("ai_brain", {}) or {}
-                if isinstance(pol, dict):
-                    allow = (
-                        (pol.get("policy") or {}).get("allow_system_open", False)
-                        if isinstance(pol.get("policy"), dict)
-                        else bool(pol.get("allow_system_open", False))
-                    )
-                    return bool(allow)
-            except Exception:
-                return False
-            return False
-        # 用户显式开启双控时，允许 ai_core 与 ai_trading_engine 并行开仓。
-        # 这是一个受配置开关控制的特例，默认关闭。
-        try:
-            pol = {}
-            if self._mc and hasattr(self._mc, "config_manager") and self._mc.config_manager:
-                pol = self._mc.config_manager.get_config_sync("ai_brain", {}) or {}
-            if isinstance(pol, dict) and bool(pol.get("enable_secondary_controller", False)) and src in {"ai_core", "ai_trading_engine"}:
-                return True
-        except Exception:
-            pass
+        # 禁止任何系统旁路来源（system/proactive/secondary 等）直接开仓。
+        # 若未来需要切换主控，只需切换 single_write_owner，不需要开放多来源。
         return src == swo
 
     @staticmethod
@@ -522,6 +499,13 @@ class ExecutionGateway:
         swo = await self.single_write_owner()
         self._snapshot.single_write_owner = swo
 
+        if force and str(source or "").strip().lower() != "manual":
+            self._metric_inc("close_policy_denied")
+            msg = f"force_close_denied_non_manual source={source}"
+            logger.error("ExecutionGateway.close_swap: %s", msg)
+            self._record_order(source, "close", False, msg, symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
+            return {"success": False, "error": msg}
+
         if not force and not self._allow_discretionary(source, swo):
             self._metric_inc("close_policy_denied")
             msg = f"policy_denied source={source} swo={swo}"
@@ -601,11 +585,16 @@ class ExecutionGateway:
                     get_positions = getattr(ex, "get_positions", None)
                     if callable(get_positions):
                         rows = await get_positions()
+                        want_leg = str(side or "").strip().lower()
                         for p in rows or []:
                             ps = str(p.get("symbol") or p.get("instId") or "")
-                            if normalized_symbol.split("/USDT")[0] in ps:
-                                before_size = float(p.get("size") or 0.0)
-                                break
+                            if normalized_symbol.split("/USDT")[0] not in ps:
+                                continue
+                            leg = str(p.get("side") or "").strip().lower()
+                            if want_leg and leg and leg != want_leg:
+                                continue
+                            before_size = float(p.get("size") or 0.0)
+                            break
                 except Exception:
                     before_size = None
 
@@ -634,12 +623,17 @@ class ExecutionGateway:
                             rows = await get_positions()
                             after_size = 0.0
                             found = False
+                            want_leg2 = str(side or "").strip().lower()
                             for p in rows or []:
                                 ps = str(p.get("symbol") or p.get("instId") or "")
-                                if normalized_symbol.split("/USDT")[0] in ps:
-                                    after_size = float(p.get("size") or 0.0)
-                                    found = True
-                                    break
+                                if normalized_symbol.split("/USDT")[0] not in ps:
+                                    continue
+                                leg2 = str(p.get("side") or "").strip().lower()
+                                if want_leg2 and leg2 and leg2 != want_leg2:
+                                    continue
+                                after_size = float(p.get("size") or 0.0)
+                                found = True
+                                break
                             if not found:
                                 post_check = {
                                     "status": "position_closed",
@@ -675,6 +669,36 @@ class ExecutionGateway:
 
                     if isinstance(res, dict):
                         res["post_close_check"] = post_check
+                    post_status = str(post_check.get("status") or "")
+                    if post_status in {"position_unchanged", "check_failed"}:
+                        ok = False
+                        self._metric_inc("close_fail")
+                        detail = f"post_close_check_failed:{post_status}"
+                        if isinstance(res, dict):
+                            res["success"] = False
+                            res["error"] = detail
+                        self._record_order(
+                            source,
+                            "close",
+                            False,
+                            detail,
+                            symbol=symbol,
+                            side=side,
+                            size=size,
+                            leverage=None,
+                            reason=reason,
+                            context=context,
+                        )
+                        logger.error(
+                            "ExecutionGateway: close verification failed symbol=%s side=%s source=%s status=%s before=%s after=%s",
+                            symbol,
+                            side,
+                            source,
+                            post_status,
+                            post_check.get("before_size"),
+                            post_check.get("after_size"),
+                        )
+                        return {"success": False, "error": detail, "post_close_check": post_check, "raw": res}
                     self._metric_inc("close_ok")
                     logger.info(
                         "ExecutionGateway: close_swap ok symbol=%s side=%s source=%s reason=%s",
@@ -1082,6 +1106,115 @@ class ExecutionGateway:
                                 lot_sz,
                             )
                         size = float(adj)
+
+                        # Unified per-symbol margin hard cap for ALL sources.
+                        # Prevents route differences (ai_core vs ai_trading_engine/proactive) from bypassing 20% rule.
+                        try:
+                            bal = await ex.get_balance() if hasattr(ex, "get_balance") else {}
+                            usdt = bal.get("USDT", 0) if isinstance(bal, dict) else 0
+                            available = float(usdt.get("free", usdt.get("available", 0)) if isinstance(usdt, dict) else usdt or 0)
+                            available = max(0.0, available)
+
+                            limits = await resolve_position_limits(
+                                config_manager=(self._mc.config_manager if self._mc else None),
+                                ai_config=None,
+                                trading_config=None,
+                            )
+                            sym_cap = max(0.01, min(0.92, float(limits.symbol_max_margin_ratio)))
+                            cap_margin = available * sym_cap
+
+                            ticker = await ex.get_ticker(sym) if hasattr(ex, "get_ticker") else {}
+                            px = float((ticker or {}).get("last") or (ticker or {}).get("price") or 0.0)
+                            lev_f = max(1.0, float(lev))
+                            ct_val = float(info.get("ctVal", 0) or 0)
+                            ct_ccy = str(info.get("ctValCcy") or "").upper()
+                            base = str(sym).split("/")[0].upper()
+                            ct_is_base = bool(ct_val > 0 and ct_ccy and base and ct_ccy == base)
+
+                            def _notional(q: float) -> float:
+                                q = max(0.0, float(q or 0))
+                                if q <= 0 or px <= 0:
+                                    return 0.0
+                                if ct_val > 0:
+                                    return q * ct_val * px if ct_is_base else q * ct_val
+                                return q * px
+
+                            projected_notional = _notional(size)
+                            required_margin = projected_notional / lev_f
+                            # Include existing same-symbol exposure in cap check (not just single order),
+                            # so scale-in cannot push total symbol margin above cap.
+                            existing_margin = 0.0
+                            try:
+                                get_positions = getattr(ex, "get_positions", None)
+                                if callable(get_positions):
+                                    rows = await get_positions()
+                                    norm = str(sym).upper().replace("-", "/")
+                                    base = norm.split("/USDT")[0]
+                                    for p in rows or []:
+                                        ps = str(p.get("symbol") or p.get("instId") or "").upper()
+                                        if base not in ps:
+                                            continue
+                                        sz = float(p.get("size") or 0.0)
+                                        if sz <= 0:
+                                            continue
+                                        # notional_value from adapter is preferred
+                                        n0 = float(p.get("notional_value") or 0.0)
+                                        if n0 <= 0:
+                                            mark = float(p.get("mark_px") or p.get("mark_price") or px or 0.0)
+                                            if mark > 0:
+                                                if ct_val > 0:
+                                                    n0 = sz * ct_val * mark if ct_is_base else sz * ct_val
+                                                else:
+                                                    n0 = sz * mark
+                                        existing_margin += max(0.0, n0 / lev_f)
+                            except Exception:
+                                existing_margin = max(0.0, existing_margin)
+                            total_margin_after = existing_margin + required_margin
+                            if cap_margin > 0 and required_margin > cap_margin:
+                                capped_notional = cap_margin * lev_f
+                                if ct_val > 0:
+                                    per_contract_notional = (ct_val * px) if ct_is_base else ct_val
+                                    new_size = max(1.0, math.floor(capped_notional / max(1e-12, per_contract_notional)))
+                                else:
+                                    new_size = max(1.0, math.floor(capped_notional / max(1e-12, px)))
+                                if lot_sz > 0:
+                                    new_size = math.floor(new_size / lot_sz) * lot_sz
+                                if min_sz > 0 and new_size < min_sz:
+                                    err = (
+                                        f"margin_cap_denied req={required_margin:.2f} cap={cap_margin:.2f} "
+                                        f"symbol={sym} size={size}"
+                                    )
+                                    self._metric_inc("open_fail")
+                                    self._record_order(
+                                        source, "open", False, err, symbol=sym, side=side, size=size, leverage=lev, reason=reason, context=context
+                                    )
+                                    return {"success": False, "error": err}
+                                logger.warning(
+                                    "ExecutionGateway: margin hard-cap resize symbol=%s source=%s size=%s->%s req=%.2f cap=%.2f ctVal=%s",
+                                    sym,
+                                    source,
+                                    size,
+                                    new_size,
+                                    required_margin,
+                                    cap_margin,
+                                    ct_val if ct_val > 0 else "n/a",
+                                )
+                                size = float(new_size)
+                                projected_notional = _notional(size)
+                                required_margin = projected_notional / lev_f
+                                total_margin_after = existing_margin + required_margin
+                            if cap_margin > 0 and total_margin_after > cap_margin * 1.0001:
+                                err = (
+                                    f"symbol_margin_total_cap_denied existing={existing_margin:.2f} "
+                                    f"new={required_margin:.2f} cap={cap_margin:.2f} symbol={sym}"
+                                )
+                                self._metric_inc("open_fail")
+                                self._record_order(
+                                    source, "open", False, err, symbol=sym, side=side, size=size, leverage=lev, reason=reason, context=context
+                                )
+                                return {"success": False, "error": err}
+                        except Exception as e:
+                            logger.debug("ExecutionGateway: margin hard-cap check skipped: %s", e)
                 except Exception as e:
                     logger.debug("ExecutionGateway: preflight check skipped: %s", e)
                 # 杠杆设置职责：默认交由交易所适配器（例如 OKX 的 open_swap_position 内已设置杠杆），避免重复调用。

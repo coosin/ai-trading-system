@@ -11,7 +11,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # 加载环境变量
 from dotenv import load_dotenv
@@ -63,20 +63,60 @@ def _resolve_app_log_path() -> str:
     return "/dev/null"
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        # IMPORTANT: use rotation to avoid filling disk
-        logging.handlers.RotatingFileHandler(
-            _resolve_app_log_path(),
-            encoding="utf-8",
-            maxBytes=int(20 * 1024 * 1024),  # 20MB per file
-            backupCount=10,
-        ),
-    ],
-)
+def _configure_root_logging() -> None:
+    """
+    Configure root handlers once.
+
+    Dedupe guards against accidental duplicate Stream/File handlers pointing at the
+    same stream or path (would duplicate every log line in app.log).
+    """
+    root = logging.getLogger()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.handlers.RotatingFileHandler(
+                _resolve_app_log_path(),
+                encoding="utf-8",
+                maxBytes=int(20 * 1024 * 1024),
+                backupCount=10,
+            ),
+        ],
+        force=True,
+    )
+
+    stream_keys: set = set()
+    file_keys: set = set()
+    kept: List[logging.Handler] = []
+    for h in list(root.handlers):
+        try:
+            if isinstance(h, logging.StreamHandler):
+                try:
+                    sk = getattr(h.stream, "fileno", lambda: None)()
+                except Exception:
+                    sk = None
+                key = ("stream", sk if sk is not None else id(h.stream))
+                if key in stream_keys:
+                    continue
+                stream_keys.add(key)
+            elif isinstance(h, (logging.handlers.RotatingFileHandler, logging.FileHandler)):
+                bk = getattr(h, "baseFilename", None)
+                fn = str(bk) if bk else str(id(h))
+                key = ("file", fn)
+                if key in file_keys:
+                    continue
+                file_keys.add(key)
+        except Exception:
+            pass
+        kept.append(h)
+    root.handlers.clear()
+    for h in kept:
+        root.addHandler(h)
+
+
+_configure_root_logging()
 
 logger = logging.getLogger(__name__)
 

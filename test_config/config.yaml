@@ -488,6 +488,9 @@ unified_trade_system: {}
 unified_risk_system: {}
 memory:
   provider: native
+  startup:
+    working_days_recent: 3
+    experience_json_max_files: 1200
   default_scope: global
   scopes:
     enabled: true

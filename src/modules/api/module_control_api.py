@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -2879,7 +2880,11 @@ def init_module_control_api(app, main_controller):
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
     @router.get("/commander/trading-diagnosis")
-    async def commander_trading_diagnosis(limit_events: int = 20):
+    async def commander_trading_diagnosis(
+        limit_events: int = 20,
+        include_deep: bool = False,
+        timeout_sec: float = 8.0,
+    ):
         """
         全面体检：开/平仓技术判断、执行脊柱、SLTP 出场、学习引擎是否在运转与写回。
         用于验收“智能体是否正常运用性能、并能自总结经验教训自动优化策略”。
@@ -2888,6 +2893,12 @@ def init_module_control_api(app, main_controller):
             return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
         mc = main_controller
         out: Dict[str, Any] = {"timestamp": datetime.now().isoformat()}
+        started = time.monotonic()
+        total_budget = max(2.0, min(30.0, float(timeout_sec or 8.0)))
+
+        def _remaining(default: float) -> float:
+            left = total_budget - (time.monotonic() - started)
+            return max(0.25, min(float(default), left))
 
         # 1) ai_core / ai_trading_engine 状态（技术判断路径）
         try:
@@ -2905,9 +2916,12 @@ def init_module_control_api(app, main_controller):
         try:
             gw = getattr(mc, "execution_gateway", None)
             if gw and hasattr(gw, "get_snapshot"):
-                snap = await gw.get_snapshot()
+                snap = await asyncio.wait_for(gw.get_snapshot(), timeout=_remaining(1.8))
                 if gw and hasattr(gw, "get_recent_events"):
-                    snap["recent_events"] = await gw.get_recent_events(limit=int(limit_events or 20))
+                    snap["recent_events"] = await asyncio.wait_for(
+                        gw.get_recent_events(limit=int(limit_events or 20)),
+                        timeout=_remaining(1.2),
+                    )
                 out["execution_gateway"] = snap
                 out["execution_reconciliation"] = (
                     snap.get("reconciliation") if isinstance(snap, dict) else None
@@ -2929,6 +2943,8 @@ def init_module_control_api(app, main_controller):
                 out["execution_reconciliation_protection"] = None
                 out["execution_safe_recovery"] = None
                 out["decision_traces"] = None
+        except asyncio.TimeoutError:
+            out["execution_gateway"] = {"degraded": True, "message": "execution_gateway_timeout"}
         except Exception as e:
             out["execution_gateway_error"] = str(e)
 
@@ -2938,6 +2954,70 @@ def init_module_control_api(app, main_controller):
             out["sltp"] = sltp.get_stats() if (sltp and hasattr(sltp, "get_stats")) else None
         except Exception as e:
             out["sltp_error"] = str(e)
+
+        # 3.1) Position consistency quick check (exchange vs ai_core/engine vs SLTP live index)
+        try:
+            ex_non_zero = None
+            ai_count = None
+            sltp_live = None
+            ex = mc.get_exchange() if hasattr(mc, "get_exchange") else None
+            if ex and hasattr(ex, "get_positions"):
+                try:
+                    ps = await asyncio.wait_for(ex.get_positions(), timeout=_remaining(1.2))
+                    if isinstance(ps, list):
+                        ex_non_zero = 0
+                        for p in ps:
+                            if not isinstance(p, dict):
+                                continue
+                            try:
+                                v = float(p.get("size", p.get("pos", 0)) or 0)
+                            except Exception:
+                                v = 0.0
+                            if abs(v) > 1e-12:
+                                ex_non_zero += 1
+                except Exception:
+                    ex_non_zero = None
+            try:
+                core = getattr(mc, "ai_core", None)
+                if core and isinstance(getattr(core, "positions", None), dict):
+                    ai_count = len(getattr(core, "positions", {}) or {})
+                elif getattr(mc, "ai_trading_engine", None) is not None and isinstance(
+                    getattr(mc.ai_trading_engine, "positions", None), dict
+                ):
+                    ai_count = len(getattr(mc.ai_trading_engine, "positions", {}) or {})
+            except Exception:
+                ai_count = None
+            try:
+                sltp_stats = out.get("sltp") if isinstance(out.get("sltp"), dict) else {}
+                # stop_loss_take_profit stats already expose live tracked orders count
+                if isinstance(sltp_stats, dict):
+                    sltp_live = int(
+                        sltp_stats.get("active_orders")
+                        or sltp_stats.get("live_norm_key_count")
+                        or 0
+                    )
+            except Exception:
+                sltp_live = None
+
+            deltas = {}
+            if ex_non_zero is not None and ai_count is not None:
+                deltas["exchange_vs_ai"] = int(ex_non_zero) - int(ai_count)
+            if ex_non_zero is not None and sltp_live is not None:
+                deltas["exchange_vs_sltp"] = int(ex_non_zero) - int(sltp_live)
+            healthy = True
+            for dv in deltas.values():
+                if abs(int(dv)) > 0:
+                    healthy = False
+                    break
+            out["position_consistency"] = {
+                "healthy": healthy if deltas else None,
+                "exchange_non_zero_positions": ex_non_zero,
+                "ai_tracked_positions": ai_count,
+                "sltp_live_tracked": sltp_live,
+                "deltas": deltas,
+            }
+        except Exception as e:
+            out["position_consistency_error"] = str(e)
 
         # 4) AI 学习引擎（经验教训/优化循环）
         try:
@@ -2962,313 +3042,92 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             out["trade_history_error"] = str(e)
 
-        # 5.1) Unified analysis pipeline assessment (data sensitivity + decision outcome health)
+        # 5.1) Unified analysis pipeline assessment (fast by default; deep optional)
         try:
             assess: Dict[str, Any] = {}
-            cfgm = getattr(mc, "config_manager", None)
-            pa_cfg = {}
-            if cfgm and hasattr(cfgm, "get_config_path_sync"):
-                try:
-                    pa_cfg = cfgm.get_config_path_sync("proactive_scanner", {}) or {}
-                except Exception:
-                    pa_cfg = {}
-            if not isinstance(pa_cfg, dict):
-                pa_cfg = {}
-
             gw = getattr(mc, "execution_gateway", None)
             swo = "ai_core"
             try:
                 if gw and hasattr(gw, "single_write_owner"):
-                    swo = await gw.single_write_owner()
+                    swo = await asyncio.wait_for(gw.single_write_owner(), timeout=_remaining(0.8))
             except Exception:
                 swo = "ai_core"
-
             assess["pipeline"] = {
                 "single_write_owner": str(swo or "ai_core"),
-                "proactive_auto_execute_opportunities": bool(pa_cfg.get("proactive_auto_execute_opportunities", False)),
-                "expectation": "scanner_forward_only_then_ai_core_decides",
+                "include_deep": bool(include_deep),
+                "mode": "deep" if bool(include_deep) else "fast",
             }
 
-            # Proactive scanner observability (scan health + gate reject distribution)
-            try:
-                pa = getattr(mc, "proactive_ai", None)
-                if pa and hasattr(pa, "get_status"):
-                    pst = pa.get_status()
-                    if isinstance(pst, dict):
-                        ms = pst.get("market_scanner") if isinstance(pst.get("market_scanner"), dict) else {}
-                        assess["proactive_scanner"] = {
-                            "running": bool(pst.get("running", False)),
-                            "initialized": bool(pst.get("initialized", False)),
-                            "opportunities": int((ms or {}).get("opportunities", 0) or 0),
-                            "insights": int((ms or {}).get("insights", 0) or 0),
-                            "market_state": (ms or {}).get("market_state"),
-                            "runtime": (ms or {}).get("runtime"),
-                            "stats": (ms or {}).get("stats"),
-                        }
-            except Exception as e:
-                assess["proactive_scanner_error"] = str(e)
-
-            # Market analysis sensitivity sample across default symbols.
+            # fast mode: use cached symbol views only, avoid slow snapshot calls
             mi = getattr(mc, "market_intelligence", None)
-            sampled_symbols = list(pa_cfg.get("default_symbols", []) or [])
-            if not sampled_symbols:
-                sampled_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT"]
-            sampled_symbols = [str(s) for s in sampled_symbols[:4]]
-            market_rows: List[Dict[str, Any]] = []
+            sampled_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT"]
+            rows: List[Dict[str, Any]] = []
             degraded_cnt = 0
-            quality_non_null = 0
-            conf_non_null = 0
-            trend_known = 0
-
-            async def _sample_symbol_view(sym: str) -> Dict[str, Any]:
-                try:
-                    cached = (
-                        mi.get_cached_symbol_view(sym)
-                        if hasattr(mi, "get_cached_symbol_view")
-                        else {}
-                    )
-                    if isinstance(cached, dict) and cached:
-                        prov = str(cached.get("provenance") or "").lower()
-                        partial = bool(cached.get("partial", False))
-                        if (
-                            not partial
-                            and prov not in {"fastpath", "degraded", "unknown"}
-                            and cached.get("quality_score") is not None
-                            and cached.get("confidence") is not None
-                        ):
-                            return {"symbol": sym, "view": cached}
-                except Exception:
-                    pass
-                try:
-                    view = await asyncio.wait_for(
-                        mi.get_symbol_view(sym, include_snapshot=True, prefer_fast_only=False),
-                        timeout=2.5,
-                    )
-                    vd = view.to_dict() if hasattr(view, "to_dict") else {}
-                    if isinstance(vd, dict) and vd:
-                        prov = str(vd.get("provenance") or "").lower()
-                        partial = bool(vd.get("partial", False))
-                        strong = (
-                            (not partial)
-                            and ("degraded" not in prov)
-                            and ("fastpath" not in prov)
-                            and prov not in {"", "unknown"}
-                            and vd.get("confidence") is not None
-                            and (
-                                vd.get("quality_score") is not None
-                                or vd.get("atr_pct_1h") is not None
-                                or vd.get("spread_bps") is not None
-                            )
-                        )
-                        if strong:
-                            return {"symbol": sym, "view": vd}
-                except asyncio.TimeoutError:
-                    try:
-                        view = await asyncio.wait_for(
-                            mi.get_symbol_view(sym, include_snapshot=False, prefer_fast_only=True),
-                            timeout=1.0,
-                        )
-                        vd = view.to_dict() if hasattr(view, "to_dict") else {}
-                        if isinstance(vd, dict) and vd:
-                            prov = str(vd.get("provenance") or "").lower()
-                            partial = bool(vd.get("partial", False))
-                            strong = (
-                                (not partial)
-                                and ("degraded" not in prov)
-                                and ("fastpath" not in prov)
-                                and prov not in {"", "unknown"}
-                                and vd.get("confidence") is not None
-                                and (
-                                    vd.get("quality_score") is not None
-                                    or vd.get("atr_pct_1h") is not None
-                                    or vd.get("spread_bps") is not None
-                                )
-                            )
-                            if strong:
-                                return {"symbol": sym, "view": vd}
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                try:
-                    hub = getattr(mc, "data_source_hub", None)
-                    if hub and hasattr(hub, "get_exchange_channel"):
-                        exch = await asyncio.wait_for(hub.get_exchange_channel(sym), timeout=8.0)
-                        q = (
-                            hub._score_quality(exch, {})
-                            if hasattr(hub, "_score_quality")
-                            else {}
-                        )
-                        ticker = (exch.get("ticker") or {}) if isinstance(exch, dict) else {}
-                        order_book = (exch.get("order_book") or {}) if isinstance(exch, dict) else {}
-                        open_interest = (exch.get("open_interest") or {}) if isinstance(exch, dict) else {}
-                        funding_rate = exch.get("funding_rate") if isinstance(exch, dict) else None
-                        quality = q.get("score") if isinstance(q, dict) else None
-                        kl = (exch.get("klines_1h") or []) if isinstance(exch, dict) else []
-                        if not ticker and not kl and quality is None:
-                            raise RuntimeError("exchange_channel_empty")
-                        ob_bids = order_book.get("bids") if isinstance(order_book, dict) else []
-                        ob_asks = order_book.get("asks") if isinstance(order_book, dict) else []
-                        best_bid = _safe_float(ob_bids[0][0], 0.0) if ob_bids else 0.0
-                        best_ask = _safe_float(ob_asks[0][0], 0.0) if ob_asks else 0.0
-                        spread_bps = None
-                        if best_bid > 0 and best_ask > 0:
-                            mid = 0.5 * (best_bid + best_ask)
-                            if mid > 0 and best_ask >= best_bid:
-                                spread_bps = float(((best_ask - best_bid) / mid) * 10000.0)
-                        depth_imbalance = None
-                        try:
-                            bid_sz = sum(_safe_float(x[1], 0.0) for x in (ob_bids[:5] or []))
-                            ask_sz = sum(_safe_float(x[1], 0.0) for x in (ob_asks[:5] or []))
-                            denom = bid_sz + ask_sz
-                            if denom > 0:
-                                depth_imbalance = float((bid_sz - ask_sz) / denom)
-                        except Exception:
-                            depth_imbalance = None
-                        atr_pct = None
-                        try:
-                            if isinstance(kl, list) and len(kl) >= 15:
-                                highs = [_safe_float(k.get("high"), 0.0) for k in kl[-15:]]
-                                lows = [_safe_float(k.get("low"), 0.0) for k in kl[-15:]]
-                                closes = [_safe_float(k.get("close"), 0.0) for k in kl[-15:]]
-                                trs = []
-                                for i in range(1, len(closes)):
-                                    trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
-                                if trs and closes[-1] > 0:
-                                    atr_pct = float(sum(trs[-14:]) / max(1, len(trs[-14:])) / closes[-1])
-                        except Exception:
-                            atr_pct = None
-                        change_24h = _safe_float(ticker.get("change24h") or ticker.get("change_24h") or ticker.get("change"), 0.0)
-                        trend = "sideways"
-                        if change_24h >= 0.003:
-                            trend = "bullish"
-                        elif change_24h <= -0.003:
-                            trend = "bearish"
-                        conf = max(0.45, min(0.85, float(quality if quality is not None else 0.45)))
-                        if atr_pct is not None and atr_pct > 0:
-                            conf = max(conf, 0.55)
-                        return {
-                            "symbol": sym,
-                            "view": {
-                                "symbol": sym,
-                                "quality_score": quality,
-                                "confidence": round(conf, 3),
-                                "trend": trend,
-                                "spread_bps": round(spread_bps, 4) if spread_bps is not None else None,
-                                "atr_pct_1h": atr_pct,
-                                "depth_imbalance": round(depth_imbalance, 4) if depth_imbalance is not None else None,
-                                "best_bid": best_bid if best_bid > 0 else None,
-                                "best_ask": best_ask if best_ask > 0 else None,
-                                "open_interest": open_interest if isinstance(open_interest, dict) and open_interest else None,
-                                "funding_rate": funding_rate,
-                                "provenance": "unified_snapshot_fallback",
-                                "partial": False,
-                            },
-                        }
-                except Exception:
-                    pass
-                return {"symbol": sym, "degraded": True, "error": "symbol_view_error"}
-
-            if mi and hasattr(mi, "get_symbol_view"):
-                rows = []
+            if mi and hasattr(mi, "get_cached_symbol_view"):
                 for sym in sampled_symbols:
-                    rows.append(await _sample_symbol_view(sym))
-                for row in rows:
+                    vd = {}
                     try:
-                        sym = str(row.get("symbol") or "")
-                        vd = row.get("view") if isinstance(row.get("view"), dict) else {}
-                        if not vd:
-                            raise RuntimeError(str(row.get("error") or "symbol_view_unavailable"))
-                        quality = vd.get("quality_score")
-                        conf = vd.get("confidence")
-                        trend = str(vd.get("trend") or "unknown").lower()
-                        prov = str(vd.get("provenance") or "")
-                        partial = bool(vd.get("partial", False))
-                        degraded = partial or ("degraded" in prov) or ("fastpath" in prov)
-                        if degraded:
-                            degraded_cnt += 1
-                        if quality is not None:
-                            quality_non_null += 1
-                        if conf is not None:
-                            conf_non_null += 1
-                        if trend not in {"", "unknown", "none", "null"}:
-                            trend_known += 1
-                        market_rows.append(
-                            {
-                                "symbol": sym,
-                                "quality_score": quality,
-                                "confidence": conf,
-                                "trend": vd.get("trend"),
-                                "spread_bps": vd.get("spread_bps"),
-                                "atr_pct_1h": vd.get("atr_pct_1h"),
-                                "depth_imbalance": vd.get("depth_imbalance"),
-                                "best_bid": vd.get("best_bid"),
-                                "best_ask": vd.get("best_ask"),
-                                "open_interest": vd.get("open_interest"),
-                                "funding_rate": vd.get("funding_rate"),
-                                "provenance": vd.get("provenance"),
-                                "partial": partial,
-                                "degraded": degraded,
-                            }
-                        )
-                    except Exception as e:
+                        vd = mi.get_cached_symbol_view(sym) or {}
+                    except Exception:
+                        vd = {}
+                    if not isinstance(vd, dict) or not vd:
                         degraded_cnt += 1
-                        market_rows.append({"symbol": row.get("symbol"), "degraded": True, "error": str(e)[:80]})
-
-            total_m = max(1, len(market_rows))
+                        rows.append({"symbol": sym, "degraded": True, "error": "cached_symbol_view_missing"})
+                        continue
+                    prov = str(vd.get("provenance") or "")
+                    partial = bool(vd.get("partial", False))
+                    degraded = partial or ("degraded" in prov.lower()) or ("fastpath" in prov.lower())
+                    if degraded:
+                        degraded_cnt += 1
+                    rows.append(
+                        {
+                            "symbol": sym,
+                            "quality_score": vd.get("quality_score"),
+                            "confidence": vd.get("confidence"),
+                            "trend": vd.get("trend"),
+                            "provenance": prov,
+                            "partial": partial,
+                            "degraded": degraded,
+                        }
+                    )
             assess["market_analysis"] = {
                 "sampled_symbols": sampled_symbols,
-                "degraded_ratio": round(float(degraded_cnt) / float(total_m), 4),
-                "quality_coverage": round(float(quality_non_null) / float(total_m), 4),
-                "confidence_coverage": round(float(conf_non_null) / float(total_m), 4),
-                "trend_known_coverage": round(float(trend_known) / float(total_m), 4),
-                "samples": market_rows,
+                "degraded_ratio": round(float(degraded_cnt) / float(max(1, len(sampled_symbols))), 4),
+                "samples": rows,
             }
 
-            # Decision outcome health from recent realized non-zero trades.
-            decision_health = {"sample_size": 0, "wins": 0, "losses": 0, "win_rate": None, "sum_pnl": 0.0, "expectancy": None}
+            # lightweight recent outcome
+            decision_health = {"sample_size": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "sum_pnl": 0.0, "expectancy": 0.0}
             ths = getattr(mc, "trade_history_service", None)
             if ths and hasattr(ths, "get_recent_trades"):
-                rows = await asyncio.wait_for(ths.get_recent_trades(limit=120), timeout=2.5)
-                clean = []
-                for r in rows or []:
-                    if not isinstance(r, dict):
-                        continue
-                    pnl = float(r.get("pnl", 0) or 0)
-                    pnl_pct = float(r.get("pnl_percent", 0) or 0)
-                    if abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12:
-                        clean.append({"pnl": pnl, "reasoning": r.get("reasoning"), "symbol": r.get("symbol")})
-                recent = clean[:40]
-                w = sum(1 for r in recent if float(r.get("pnl", 0) or 0) > 0)
-                l = sum(1 for r in recent if float(r.get("pnl", 0) or 0) < 0)
-                total = len(recent)
-                sum_pnl = float(sum(float(r.get("pnl", 0) or 0) for r in recent))
-                decision_health = {
-                    "sample_size": total,
-                    "wins": w,
-                    "losses": l,
-                    "win_rate": round((float(w) / float(total)) if total else 0.0, 4),
-                    "sum_pnl": round(sum_pnl, 6),
-                    "expectancy": round((sum_pnl / float(total)) if total else 0.0, 6),
-                }
+                recents = await asyncio.wait_for(ths.get_recent_trades(limit=40), timeout=_remaining(1.2))
+                vals = [float((r or {}).get("pnl", 0) or 0) for r in (recents or []) if isinstance(r, dict)]
+                if vals:
+                    w = sum(1 for v in vals if v > 0)
+                    l = sum(1 for v in vals if v < 0)
+                    total = len(vals)
+                    sum_pnl = float(sum(vals))
+                    decision_health = {
+                        "sample_size": total,
+                        "wins": w,
+                        "losses": l,
+                        "win_rate": round(float(w) / float(total), 4),
+                        "sum_pnl": round(sum_pnl, 6),
+                        "expectancy": round(sum_pnl / float(total), 6),
+                    }
             assess["decision_outcome_recent"] = decision_health
 
-            # Learning effectiveness readiness.
             le = getattr(mc, "ai_learning_engine", None)
             le_st = le.get_status() if (le and hasattr(le, "get_status")) else {}
-            lessons = int((le_st or {}).get("total_lessons", 0) or 0)
-            reports = int((le_st or {}).get("reports_generated", 0) or 0)
             assess["learning_effectiveness"] = {
                 "running": bool((le_st or {}).get("running", False)),
-                "total_lessons": lessons,
-                "reports_generated": reports,
+                "total_lessons": int((le_st or {}).get("total_lessons", 0) or 0),
+                "reports_generated": int((le_st or {}).get("reports_generated", 0) or 0),
                 "trace_feedback": (le_st or {}).get("trace_feedback"),
-                "effective": bool(lessons > 0 and reports > 0),
-                "hint": "seed-and-run then verify total_lessons/reports_generated increments"
-                if not (lessons > 0 and reports > 0)
-                else "learning feedback loop active",
             }
             out["analysis_pipeline_assessment"] = assess
+        except asyncio.TimeoutError:
+            out["analysis_pipeline_assessment"] = {"degraded": True, "message": "analysis_pipeline_timeout"}
         except Exception as e:
             out["analysis_pipeline_assessment_error"] = str(e)
 
@@ -3330,7 +3189,6 @@ def init_module_control_api(app, main_controller):
 
         # 7) Execution failures attribution: Top reasons + samples + action hints
         try:
-            gw = getattr(mc, "execution_gateway", None)
             eg = out.get("execution_gateway") if isinstance(out.get("execution_gateway"), dict) else {}
             events = (eg.get("recent_events") or []) if isinstance(eg.get("recent_events"), list) else []
             # focus on failures only
@@ -3384,7 +3242,7 @@ def init_module_control_api(app, main_controller):
                     "POST_CHECK_ANOMALY": "平仓后复核异常：检查 positions 刷新延迟/是否实际成交；必要时二次 close-position。",
                 }.get(code, "查看 detail/endpoint/trace_id 对照交易所返回，补齐映射或加更具体的重试/降级。")
 
-            top = []
+            top: List[Dict[str, Any]] = []
             for k, v in top_keys:
                 # k = op:code:phase
                 parts = k.split(":")
