@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-
 def _now() -> str:
     return datetime.now().isoformat()
 
@@ -75,7 +74,8 @@ def main() -> int:
     ap.add_argument("--base-url", default=os.environ.get("BASE_URL", os.environ.get("ACCEPTANCE_BASE", "http://127.0.0.1:8000")))
     ap.add_argument("--timeout-sec", type=float, default=12.0)
     ap.add_argument("--diag-timeout-sec", type=float, default=8.0)
-    ap.add_argument("--max-health-wait-sec", type=float, default=45.0)
+    # Cold start in production can take > 60s (module init + exchange + background tasks).
+    ap.add_argument("--max-health-wait-sec", type=float, default=150.0)
     ap.add_argument("--require-health", action="store_true", help="Fail if /system/health is not healthy (not just reachable)")
     args = ap.parse_args()
 
