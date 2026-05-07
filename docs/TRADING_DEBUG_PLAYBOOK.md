@@ -143,6 +143,13 @@
 2. 再看 `details[].match_method=time_window`（说明 order_id 链路不完整或历史样本缺失）
 3. 最后看 `abs(pnl_delta)` 最大的几笔，逐笔核对交易所成交明细
 
+超时与降级（2026-05-07 更新）：
+
+- 当 OKX 不可达（例如 `SSLCertVerificationError` / 代理 MITM 根证书缺失）时，对账端点可能在拉取 fills 时耗时较长。
+- `reconcile/report` 支持 `timeout_sec`（默认 8 秒），建议值守脚本显式设置：
+  - `GET /api/v1/trades/reconcile/report?days=7&top_n=20&timeout_sec=6`
+- 若触发超时会返回 `message=trade_reconcile_report_timeout`，此时应优先修复网络/TLS，再做收益口径核对。
+
 ---
 
 ## 5. 标准排障流程
@@ -166,6 +173,9 @@
   - 再排查：真实执行样本（`trade.fill`/`trade.position`）中的 `trace_id + strategy_id + sltp_reason`
 - **问题：诊断偶发超时**
   - 排查：`scripts/trading_exec_fullcheck.py` 是否启用重试；服务是否单实例运行
+- **问题：pytest 收集阶段报 `ModuleNotFoundError: No module named 'src'`**
+  - 说明：pytest 9 在不同 import 模式下，repo root 可能未被稳定加入 `sys.path`
+  - 处理：确保测试入口包含 `tests/conftest.py` 的路径注入（已在仓库默认提供）；或直接用 `make test` 从仓库根目录运行
 - **问题：诊断里 quality 低但行情看起来正常**
   - 排查：`market_analysis.samples[].provenance`、`quality_score` 与 `data_source_hub` collector 健康
 - **问题：本地与交易所持仓不一致**

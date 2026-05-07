@@ -2464,6 +2464,7 @@ class APIServer:
             symbol: Optional[str] = None,
             limit: int = 200,
             max_exchange_checks: int = 120,
+            exchange_call_timeout_sec: float = 2.5,
             exclude_bootstrap: bool = True,
             exclude_estimated_pnl: bool = True,
             include_time_window_fallback: bool = True,
@@ -2565,7 +2566,10 @@ class APIServer:
                     fills: List[Dict[str, Any]] = []
                     if oid:
                         try:
-                            fills = await get_fills(sym, oid)
+                            fills = await asyncio.wait_for(
+                                get_fills(sym, oid),
+                                timeout=float(exchange_call_timeout_sec or 2.5),
+                            )
                         except Exception:
                             fills = []
                         if fills:
@@ -2579,9 +2583,14 @@ class APIServer:
                         ts = _parse_ts(row.get("timestamp"))
                         if sym not in fallback_fills_by_symbol:
                             try:
-                                got = await get_history_fills(
-                                    symbol=sym,
-                                    limit=max(5, int(max_fallback_candidates_per_symbol or 30)),
+                                got = await asyncio.wait_for(
+                                    get_history_fills(
+                                        symbol=sym,
+                                        limit=max(
+                                            5, int(max_fallback_candidates_per_symbol or 30)
+                                        ),
+                                    ),
+                                    timeout=float(exchange_call_timeout_sec or 2.5),
                                 )
                                 fallback_fills_by_symbol[sym] = list(got or []) if isinstance(got, list) else []
                             except Exception:
@@ -2650,6 +2659,7 @@ class APIServer:
                         "exclude_bootstrap": bool(exclude_bootstrap),
                         "exclude_estimated_pnl": bool(exclude_estimated_pnl),
                         "max_exchange_checks": int(max_exchange_checks or 120),
+                        "exchange_call_timeout_sec": float(exchange_call_timeout_sec or 2.5),
                         "include_time_window_fallback": bool(include_time_window_fallback),
                         "fallback_time_window_sec": int(fallback_time_window_sec or 240),
                     },
@@ -2680,21 +2690,34 @@ class APIServer:
             days: int = 7,
             symbol: Optional[str] = None,
             top_n: int = 20,
+            timeout_sec: float = 8.0,
         ):
             """
             一键差异报告（摘要 + TOP 偏差列表），便于快速人工排查。
             """
-            raw = await reconcile_trades_with_exchange(
-                days=days,
-                symbol=symbol,
-                limit=max(20, int(top_n or 20)),
-                max_exchange_checks=max(50, int(top_n or 20) * 6),
-                exclude_bootstrap=True,
-                exclude_estimated_pnl=True,
-                include_time_window_fallback=True,
-                fallback_time_window_sec=240,
-                max_fallback_candidates_per_symbol=50,
-            )
+            try:
+                raw = await asyncio.wait_for(
+                    reconcile_trades_with_exchange(
+                        days=days,
+                        symbol=symbol,
+                        limit=max(20, int(top_n or 20)),
+                        max_exchange_checks=max(50, int(top_n or 20) * 6),
+                        exchange_call_timeout_sec=2.5,
+                        exclude_bootstrap=True,
+                        exclude_estimated_pnl=True,
+                        include_time_window_fallback=True,
+                        fallback_time_window_sec=240,
+                        max_fallback_candidates_per_symbol=50,
+                    ),
+                    timeout=float(timeout_sec or 8.0),
+                )
+            except asyncio.TimeoutError:
+                return {
+                    "success": False,
+                    "message": "trade_reconcile_report_timeout",
+                    "details": f"timeout_sec={float(timeout_sec or 8.0)}",
+                    "timestamp": datetime.now().isoformat(),
+                }
             if not isinstance(raw, dict) or not raw.get("success"):
                 return raw
 

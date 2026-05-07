@@ -308,7 +308,9 @@ class MultiSourceDataFusion:
                 source_health_scores.append(1.0)
         health_factor = (sum(source_health_scores) / len(source_health_scores)) if source_health_scores else 1.0
         evidence_bonus = 0.0
-        if fused.sentiment is not None and abs(float(fused.sentiment)) >= 0.12:
+        # Evidence bonus should not inflate confidence for a single-source snapshot.
+        # Keep 1/N baseline for unit tests and for "only one feed is available" scenarios.
+        if len(data_points) >= 2 and fused.sentiment is not None and abs(float(fused.sentiment)) >= 0.12:
             evidence_bonus += 0.08
         if fused.technical_indicators.get("spread_bps") is not None:
             evidence_bonus += 0.05

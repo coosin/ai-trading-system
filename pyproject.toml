@@ -94,6 +94,7 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "--tb=short",
+    "--import-mode=prepend",
     "--cov=src",
     "--cov-report=term-missing",
     "--cov-report=html",

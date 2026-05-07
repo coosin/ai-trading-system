@@ -131,6 +131,13 @@ curl -s 'http://localhost:8000/api/v1/modules/commander/account-diagnostics'
 
 - `GET /api/v1/trades/reconcile/report?days=7&top_n=20`
 
+超时与降级（2026-05-07 更新）：
+
+- 若交易所不可达（常见于 TLS 校验失败、代理 MITM 根证书缺失、网络不通），对账接口可能耗时较长。
+- 建议值守脚本显式设置 `timeout_sec`，避免接口卡死：
+  - `GET /api/v1/trades/reconcile/report?days=7&top_n=20&timeout_sec=6`
+- 超时会返回 `message=trade_reconcile_report_timeout`（结构化错误），可作为告警/降级展示依据。
+
 判读优先级：
 
 1. `missing_on_exchange` 高：可能是 order_id 不完整、fills 拉取失败、或记录口径混入非实盘来源

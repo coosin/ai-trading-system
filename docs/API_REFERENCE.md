@@ -74,12 +74,16 @@
     - `symbol`：只查单标的
     - `exclude_bootstrap=true`：排除 `db_bootstrap`
     - `exclude_estimated_pnl=true`：排除估算 PnL 样本（用于严格真实收益分析）
+    - `exchange_call_timeout_sec`：**单次交易所 fills 调用超时**（默认 2.5 秒；用于避免 TLS/网络异常时接口卡死）
     - `include_time_window_fallback=true`：允许无 order_id 的时间窗兜底匹配
     - `fallback_time_window_sec`：时间窗大小
 
 - `GET /api/v1/trades/reconcile/report`
   - 用途：一键差异报告（摘要 + Top 偏差列表）
   - 适合：值守快速定位“哪几笔最不一致”
+  - 超时治理（2026-05-07 更新）：
+    - `timeout_sec`：**整条报告最大执行时间**（默认 8 秒）
+    - 若交易所不可达（如 TLS 校验失败）会返回 `message=trade_reconcile_report_timeout`，用于脚本与前端友好降级展示
 
 ### 3) 交易历史接口的“严格真实模式”
 

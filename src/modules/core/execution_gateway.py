@@ -723,7 +723,9 @@ class ExecutionGateway:
                         if callable(get_positions):
                             # 给交易所状态一个极短传播窗口，降低“刚成交但仓位快照未刷新”的误报。
                             await asyncio.sleep(0.35)
-                            rows = await get_positions()
+                            rows = get_positions()
+                            if asyncio.iscoroutine(rows):
+                                rows = await rows
                             after_size = 0.0
                             found = False
                             want_leg2 = str(side or "").strip().lower()
@@ -773,7 +775,10 @@ class ExecutionGateway:
                     if isinstance(res, dict):
                         res["post_close_check"] = post_check
                     post_status = str(post_check.get("status") or "")
-                    if post_status in {"position_unchanged", "check_failed"}:
+                    # position_unchanged: exchange says ok but position not reduced -> treat as hard failure.
+                    # check_failed: do NOT fail-close; exchange state can be briefly inconsistent or
+                    # the exchange adapter may not support/allow position snapshots.
+                    if post_status in {"position_unchanged"}:
                         ok = False
                         self._metric_inc("close_fail")
                         detail = f"post_close_check_failed:{post_status}"
@@ -802,6 +807,14 @@ class ExecutionGateway:
                             post_check.get("after_size"),
                         )
                         return {"success": False, "error": detail, "post_close_check": post_check, "raw": res}
+                    if post_status == "check_failed":
+                        logger.warning(
+                            "ExecutionGateway: post_close_check skipped/failed symbol=%s side=%s source=%s err=%s",
+                            symbol,
+                            side,
+                            source,
+                            str(post_check.get("error") or "")[:240],
+                        )
                     self._metric_inc("close_ok")
                     logger.info(
                         "ExecutionGateway: close_swap ok symbol=%s side=%s source=%s reason=%s",
