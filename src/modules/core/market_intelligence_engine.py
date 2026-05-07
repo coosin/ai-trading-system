@@ -1776,11 +1776,49 @@ class MarketIntelligenceEngine:
             if cache_key in self._cache and (now - self._cache_ts.get(cache_key, 0)) < self._cache_ttl_sec:
                 cached = self._cache.get(cache_key) or {}
                 view = cached.get("view") or {}
-                # Never include the heavy snapshot in this fast-path.
                 out = dict(view) if isinstance(view, dict) else {}
+                # If cached view is weak/degraded, try replacing with recent last-good view.
+                try:
+                    prov = str(out.get("provenance") or "").strip().lower()
+                    weak_cached = (
+                        bool(out.get("partial", False))
+                        or prov in {"unknown", "degraded", "fastpath", ""}
+                        or out.get("quality_score") is None
+                        or out.get("confidence") is None
+                    )
+                    lg = self._last_good_view.get(cache_key)
+                    lg_ts = float(self._last_good_view_ts.get(cache_key, 0) or 0)
+                    lg_age = now - lg_ts
+                    lg_fresh = isinstance(lg, dict) and lg_age <= float(self._last_good_view_ttl_sec)
+                    if weak_cached and lg_fresh:
+                        out = dict(lg)
+                        errs = list(out.get("errors") or [])
+                        errs.append("cached_weak_fallback_last_good")
+                        out["errors"] = errs[-12:]
+                        out["fallback_last_good"] = True
+                        out["fallback_reason"] = "weak_cached_view"
+                        out["cache_age_sec"] = round(lg_age, 3)
+                except Exception:
+                    pass
+                # Never include the heavy snapshot in this fast-path.
                 out.pop("snapshot", None)
                 out.setdefault("cached_only", True)
                 out.setdefault("cache_age_sec", round(now - float(self._cache_ts.get(cache_key, 0) or 0), 3))
+                return out
+            # Fallback: if fresh cache is absent but we still have a recent last-good view,
+            # return it to avoid persistent "cached_symbol_view_missing" degradation in diagnosis.
+            lg = self._last_good_view.get(cache_key)
+            lg_ts = float(self._last_good_view_ts.get(cache_key, 0) or 0)
+            lg_age = now - lg_ts
+            if isinstance(lg, dict) and lg_age <= float(self._last_good_view_ttl_sec):
+                out = dict(lg)
+                out.pop("snapshot", None)
+                errs = list(out.get("errors") or [])
+                errs.append("cached_fallback_last_good")
+                out["errors"] = errs[-12:]
+                out["cached_only"] = True
+                out["fallback_last_good"] = True
+                out["cache_age_sec"] = round(lg_age, 3)
                 return out
         except Exception:
             return {}

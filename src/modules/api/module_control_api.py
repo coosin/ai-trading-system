@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -3004,13 +3005,18 @@ def init_module_control_api(app, main_controller):
                 deltas["exchange_vs_ai"] = int(ex_non_zero) - int(ai_count)
             if ex_non_zero is not None and sltp_live is not None:
                 deltas["exchange_vs_sltp"] = int(ex_non_zero) - int(sltp_live)
+            # Consistency policy:
+            # - exchange_vs_ai must be exactly 0 (authoritative position count alignment)
+            # - exchange_vs_sltp is only unhealthy when positive (exchange has more live positions than SLTP tracking)
+            #   negative means SLTP tracks equal/more entries (can happen with staged/duplicate keys), treat as non-fatal.
             healthy = True
-            for dv in deltas.values():
-                if abs(int(dv)) > 0:
-                    healthy = False
-                    break
+            if "exchange_vs_ai" in deltas and abs(int(deltas["exchange_vs_ai"])) > 0:
+                healthy = False
+            if "exchange_vs_sltp" in deltas and int(deltas["exchange_vs_sltp"]) > 0:
+                healthy = False
             out["position_consistency"] = {
                 "healthy": healthy if deltas else None,
+                "policy_version": "pc_v2_ex_ai_strict_ex_sltp_positive_only",
                 "exchange_non_zero_positions": ex_non_zero,
                 "ai_tracked_positions": ai_count,
                 "sltp_live_tracked": sltp_live,
@@ -3031,7 +3037,9 @@ def init_module_control_api(app, main_controller):
                 probe = getattr(ex_probe, "probe_public_api", None)
                 if callable(probe):
                     try:
-                        pr = await asyncio.wait_for(probe(timeout_sec=1.8), timeout=_remaining(2.2))
+                        # Avoid over-sensitive degraded spikes from short transient latency.
+                        # Keep bounded by overall diagnosis budget via _remaining().
+                        pr = await asyncio.wait_for(probe(timeout_sec=2.8), timeout=_remaining(3.4))
                     except Exception as _e:
                         pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
                     probe_status = str((pr or {}).get("status_text") or "").strip().lower()
@@ -3108,13 +3116,85 @@ def init_module_control_api(app, main_controller):
                         vd = mi.get_cached_symbol_view(sym) or {}
                     except Exception:
                         vd = {}
-                    if not isinstance(vd, dict) or not vd:
-                        degraded_cnt += 1
-                        rows.append({"symbol": sym, "degraded": True, "error": "cached_symbol_view_missing"})
-                        continue
+                    if not isinstance(vd, dict):
+                        vd = {}
                     prov = str(vd.get("provenance") or "")
                     partial = bool(vd.get("partial", False))
-                    degraded = partial or ("degraded" in prov.lower()) or ("fastpath" in prov.lower())
+                    conf_v = vd.get("confidence")
+                    trend_v = str(vd.get("trend") or "").strip().lower()
+                    try:
+                        conf_f = float(conf_v) if conf_v is not None else None
+                    except Exception:
+                        conf_f = None
+                    weak_but_usable = bool(
+                        partial
+                        and conf_f is not None
+                        and conf_f >= 0.4
+                        and trend_v in {"bullish", "bearish", "sideways"}
+                    )
+                    degraded = (
+                        (not bool(vd))
+                        or (partial and not weak_but_usable)
+                        or ("degraded" in prov.lower())
+                        or ("fastpath" in prov.lower() and not weak_but_usable)
+                    )
+                    fallback_used = False
+                    fallback_error = None
+                    # If cached view is degraded/unknown, do one bounded refresh attempt
+                    # to avoid persistent false degraded_ratio spikes caused by stale weak cache.
+                    if degraded or (not isinstance(vd, dict)) or (not vd):
+                        gv = getattr(mi, "get_symbol_view", None)
+                        if callable(gv):
+                            try:
+                                sv = await asyncio.wait_for(
+                                    # Need a full snapshot-quality refresh here; fastpath-only view
+                                    # is intentionally partial and would keep degraded=true.
+                                    gv(sym, include_snapshot=True, prefer_fast_only=False),
+                                    timeout=_remaining(1.8),
+                                )
+                                vd2 = sv.to_dict() if hasattr(sv, "to_dict") else (sv if isinstance(sv, dict) else {})
+                                if isinstance(vd2, dict) and vd2:
+                                    prov2 = str(vd2.get("provenance") or "")
+                                    partial2 = bool(vd2.get("partial", False))
+                                    conf2_v = vd2.get("confidence")
+                                    trend2_v = str(vd2.get("trend") or "").strip().lower()
+                                    try:
+                                        conf2_f = float(conf2_v) if conf2_v is not None else None
+                                    except Exception:
+                                        conf2_f = None
+                                    weak2_usable = bool(
+                                        partial2
+                                        and conf2_f is not None
+                                        and conf2_f >= 0.4
+                                        and trend2_v in {"bullish", "bearish", "sideways"}
+                                    )
+                                    degraded2 = (
+                                        (partial2 and not weak2_usable)
+                                        or ("degraded" in prov2.lower())
+                                        or ("fastpath" in prov2.lower() and not weak2_usable)
+                                    )
+                                    # use refreshed view if it is stronger, or if cache was empty
+                                    if (not degraded2) or (not vd):
+                                        vd = vd2
+                                        prov = prov2
+                                        partial = partial2
+                                        weak_but_usable = weak2_usable
+                                        degraded = degraded2
+                                        fallback_used = True
+                            except Exception as _e:
+                                fallback_error = type(_e).__name__
+                    error = None
+                    if not isinstance(vd, dict) or not vd:
+                        degraded = True
+                        error = "cached_symbol_view_missing"
+                    last_good_fresh = None
+                    try:
+                        lg_ts = float((getattr(mi, "_last_good_view_ts", {}) or {}).get(sym, 0) or 0)
+                        lg_ttl = float(getattr(mi, "_last_good_view_ttl_sec", 180) or 180)
+                        if lg_ts > 0:
+                            last_good_fresh = bool((time.time() - lg_ts) <= lg_ttl)
+                    except Exception:
+                        last_good_fresh = None
                     if degraded:
                         degraded_cnt += 1
                     rows.append(
@@ -3126,6 +3206,11 @@ def init_module_control_api(app, main_controller):
                             "provenance": prov,
                             "partial": partial,
                             "degraded": degraded,
+                            "weak_but_usable": weak_but_usable,
+                            "fallback_used": fallback_used,
+                            "fallback_error": fallback_error,
+                            "last_good_fresh": last_good_fresh,
+                            "error": error,
                         }
                     )
             assess["market_analysis"] = {
@@ -3133,7 +3218,6 @@ def init_module_control_api(app, main_controller):
                 "degraded_ratio": round(float(degraded_cnt) / float(max(1, len(sampled_symbols))), 4),
                 "samples": rows,
             }
-
             # lightweight recent outcome
             decision_health = {"sample_size": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "sum_pnl": 0.0, "expectancy": 0.0}
             ths = getattr(mc, "trade_history_service", None)

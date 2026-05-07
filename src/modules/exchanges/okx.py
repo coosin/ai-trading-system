@@ -527,7 +527,13 @@ class OKXExchange(ExchangeBase):
 
         time_probe = by_name.get("public_time", {})
         time_ok = bool(time_probe.get("ok"))
+        # Status policy:
+        # - If core time endpoint is reachable, network path is partially available.
+        #   Even with low composite score, classify as degraded (not unreachable) to reduce false P0.
+        # - Only classify unreachable when core_time itself is unavailable.
         status_text = "reachable" if score >= 0.67 else ("degraded" if score >= 0.34 else "unreachable")
+        if time_ok and status_text == "unreachable":
+            status_text = "degraded"
         overall_ok = time_ok and score >= 0.67
 
         return {

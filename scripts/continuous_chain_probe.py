@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-
 def _http_json(url: str, timeout: float = 20.0) -> Dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
@@ -56,6 +55,26 @@ class RoundRow:
     ai_trading_positions: int
     sltp_active_orders: int
     sltp_dynamic_adjustments: int
+    trend_coverage: float
+    trend_consistency: float
+    open_ok: int
+    open_fail: int
+    close_ok: int
+    close_fail: int
+    execution_top_reason: str
+    execution_top_severity: str
+    decision_trace_guard_rejected: int
+    decision_trace_execution_failed: int
+    position_consistency_healthy: bool
+    position_consistency_delta_exchange_vs_ai: int
+    position_consistency_delta_exchange_vs_sltp: int
+    position_consistency_exchange_non_zero: int
+    position_consistency_ai_tracked: int
+    position_consistency_sltp_tracked: int
+    strategy_coverage: float
+    trace_coverage: float
+    trade_30d_win_rate: float
+    trade_30d_sum_pnl: float
     guard_exchange_unreachable_rejected: int
     guard_exchange_degraded_risk_reduced: int
     reconciliation_healthy: bool
@@ -71,9 +90,15 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
     ai_core = (data.get("ai_core") or {}) if isinstance(data, dict) else {}
     ai_engine = (data.get("ai_trading_engine") or {}) if isinstance(data, dict) else {}
     sltp = (data.get("sltp") or {}) if isinstance(data, dict) else {}
+    exec_gw = (data.get("execution_gateway") or {}) if isinstance(data, dict) else {}
     rec = (data.get("execution_reconciliation") or {}) if isinstance(data, dict) else {}
     rec_sum = (rec.get("summary") or {}) if isinstance(rec, dict) else {}
     exch = (data.get("exchange_reachability") or {}) if isinstance(data, dict) else {}
+    attr = (data.get("execution_attribution") or {}) if isinstance(data, dict) else {}
+    dt_raw = (data.get("decision_traces") or {}) if isinstance(data, dict) else {}
+    pc = (data.get("position_consistency") or {}) if isinstance(data, dict) else {}
+    dci = (data.get("decision_contract_integrity") or {}) if isinstance(data, dict) else {}
+    th30 = (data.get("trade_history_30d") or {}) if isinstance(data, dict) else {}
     exch_st = str(exch.get("status") or "unknown").lower()
     try:
         exch_score = float(((exch.get("probe") or {}) if isinstance(exch.get("probe"), dict) else {}).get("score") or 0.0)
@@ -82,6 +107,40 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
 
     guards = (ai_core.get("execution_guards") or {}) if isinstance(ai_core, dict) else {}
     gstats = (guards.get("stats") or {}) if isinstance(guards, dict) else {}
+    top_reasons = attr.get("top_reasons") if isinstance(attr.get("top_reasons"), list) else []
+    top_reason = top_reasons[0] if top_reasons and isinstance(top_reasons[0], dict) else {}
+
+    policy = exec_gw.get("policy_metrics") if isinstance(exec_gw.get("policy_metrics"), dict) else {}
+    open_ok = _to_int(policy.get("open_ok"))
+    open_fail = _to_int(policy.get("open_fail"))
+    close_ok = _to_int(policy.get("close_ok"))
+    close_fail = _to_int(policy.get("close_fail"))
+
+    if isinstance(dt_raw, dict):
+        dt_summary = dt_raw.get("summary") if isinstance(dt_raw.get("summary"), dict) else {}
+    elif isinstance(dt_raw, list):
+        dt_summary = {
+            "sample_size": len(dt_raw),
+            "guard_rejected": 0,
+            "execution_failed": 0,
+        }
+    else:
+        dt_summary = {}
+
+    ma_samples = ma.get("samples") if isinstance(ma.get("samples"), list) else []
+    trend_values = [str((x or {}).get("trend") or "").strip().lower() for x in ma_samples if isinstance(x, dict)]
+    trend_values = [x for x in trend_values if x]
+    trend_non_unknown = [x for x in trend_values if x not in {"unknown", "none", "null"}]
+    trend_coverage = round(float(len(trend_non_unknown)) / float(max(1, len(ma_samples))), 4)
+    dominant = ""
+    if trend_non_unknown:
+        counts: Dict[str, int] = {}
+        for t in trend_non_unknown:
+            counts[t] = int(counts.get(t, 0)) + 1
+        dominant = max(counts.items(), key=lambda kv: kv[1])[0]
+        trend_consistency = round(float(counts.get(dominant, 0)) / float(max(1, len(trend_non_unknown))), 4)
+    else:
+        trend_consistency = 0.0
 
     sltp_dyn = _to_int(sltp.get("dynamic_adjustments"))
     rr_rej = _to_int(gstats.get("rr_rejected"))
@@ -99,8 +158,13 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
             alerts.append("diagnosis_warming_up")
         else:
             alerts.append("diagnosis_failed")
-    if _to_float(ma.get("degraded_ratio")) > 0.35:
+    degraded_ratio_now = _to_float(ma.get("degraded_ratio"))
+    degraded_ratio_prev = _to_float((prev or {}).get("degraded_ratio"), 0.0)
+    # Debounce transient one-off spikes; keep alert only when degradation persists.
+    if degraded_ratio_now > 0.35 and degraded_ratio_prev > 0.35:
         alerts.append("degraded_ratio_high")
+    if trend_coverage < 0.5:
+        alerts.append("trend_coverage_low")
     if exch_st == "unreachable":
         alerts.append("exchange_unreachable")
     elif exch_st == "degraded":
@@ -115,6 +179,19 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
         alerts.append("reconciliation_drift_present")
     if _to_int(ai_engine.get("positions")) > 0 and _to_int(sltp.get("active_orders")) <= 0:
         alerts.append("positions_without_sltp_tracking")
+    pc_deltas = pc.get("deltas") if isinstance(pc.get("deltas"), dict) else {}
+    pc_delta_ex_ai = _to_int(pc_deltas.get("exchange_vs_ai"))
+    pc_delta_ex_sltp = _to_int(pc_deltas.get("exchange_vs_sltp"))
+    pc_ex_non_zero = _to_int(pc.get("exchange_non_zero_positions"), -1)
+    pc_ai_tracked = _to_int(pc.get("ai_tracked_positions"), -1)
+    pc_sltp_tracked = _to_int(pc.get("sltp_live_tracked"), -1)
+
+    if bool(pc) and (pc.get("healthy") is False):
+        alerts.append("position_consistency_mismatch")
+    # Do not escalate this as an alert: SLTP tracked count >= exchange non-zero positions
+    # is often a benign supersets case (normalized keys / staged entries).
+    if bool(dci) and (_to_float(dci.get("strategy_coverage"), 1.0) < 0.95 or _to_float(dci.get("trace_coverage"), 1.0) < 0.95):
+        alerts.append("decision_contract_coverage_low")
 
     if prev:
         if rr_rej - _to_int(prev.get("rr_rej")) >= 2:
@@ -144,6 +221,26 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
         ai_trading_positions=_to_int(ai_engine.get("positions")),
         sltp_active_orders=_to_int(sltp.get("active_orders")),
         sltp_dynamic_adjustments=sltp_dyn,
+        trend_coverage=trend_coverage,
+        trend_consistency=trend_consistency,
+        open_ok=open_ok,
+        open_fail=open_fail,
+        close_ok=close_ok,
+        close_fail=close_fail,
+        execution_top_reason=str(top_reason.get("key") or ""),
+        execution_top_severity=str(top_reason.get("severity") or ""),
+        decision_trace_guard_rejected=_to_int(dt_summary.get("guard_rejected")),
+        decision_trace_execution_failed=_to_int(dt_summary.get("execution_failed")),
+        position_consistency_healthy=bool(pc.get("healthy")) if pc.get("healthy") is not None else True,
+        position_consistency_delta_exchange_vs_ai=pc_delta_ex_ai,
+        position_consistency_delta_exchange_vs_sltp=pc_delta_ex_sltp,
+        position_consistency_exchange_non_zero=pc_ex_non_zero,
+        position_consistency_ai_tracked=pc_ai_tracked,
+        position_consistency_sltp_tracked=pc_sltp_tracked,
+        strategy_coverage=_to_float(dci.get("strategy_coverage"), 1.0),
+        trace_coverage=_to_float(dci.get("trace_coverage"), 1.0),
+        trade_30d_win_rate=_to_float(th30.get("win_rate"), 0.0),
+        trade_30d_sum_pnl=_to_float(th30.get("total_pnl"), 0.0),
         guard_exchange_unreachable_rejected=ex_unreach_rej,
         guard_exchange_degraded_risk_reduced=ex_degraded_reduce,
         reconciliation_healthy=bool(rec.get("healthy", False)),
@@ -170,6 +267,14 @@ def _write_summary(rows: List[RoundRow], out_md: Path, duration_sec: int, interv
     exch_degraded = sum(1 for r in rows if r.exchange_reachability_status == "degraded")
     max_ex_unreach_rej = max((r.guard_exchange_unreachable_rejected for r in rows), default=0)
     max_ex_deg_reduce = max((r.guard_exchange_degraded_risk_reduced for r in rows), default=0)
+    avg_trend_coverage = round(sum(r.trend_coverage for r in rows) / max(1, total), 4)
+    avg_trend_consistency = round(sum(r.trend_consistency for r in rows) / max(1, total), 4)
+    open_fail_spike = max((r.open_fail for r in rows), default=0)
+    close_fail_spike = max((r.close_fail for r in rows), default=0)
+    contract_bad = sum(1 for r in rows if r.strategy_coverage < 0.95 or r.trace_coverage < 0.95)
+    pos_consistency_bad = sum(1 for r in rows if not r.position_consistency_healthy)
+    avg_win_rate = round(sum(r.trade_30d_win_rate for r in rows) / max(1, total), 4)
+    avg_30d_pnl = round(sum(r.trade_30d_sum_pnl for r in rows) / max(1, total), 4)
 
     alert_counter: Dict[str, int] = {}
     for r in rows:
@@ -205,6 +310,14 @@ def _write_summary(rows: List[RoundRow], out_md: Path, duration_sec: int, interv
         f"- SLTP动态调整峰值: {max_sltp_dyn}",
         f"- 不可达阻断开仓计数峰值: {max_ex_unreach_rej}",
         f"- 降级降风险计数峰值: {max_ex_deg_reduce}",
+        f"- 趋势识别覆盖均值: {avg_trend_coverage}",
+        f"- 趋势一致性均值: {avg_trend_consistency}",
+        f"- 开仓失败计数峰值: {open_fail_spike}",
+        f"- 平仓失败计数峰值: {close_fail_spike}",
+        f"- 决策合约覆盖异常轮次: {contract_bad}",
+        f"- 持仓一致性异常轮次: {pos_consistency_bad}",
+        f"- 30d胜率均值: {avg_win_rate}",
+        f"- 30dPnL均值: {avg_30d_pnl}",
         "",
         "## 告警分布",
     ]
@@ -217,8 +330,18 @@ def _write_summary(rows: List[RoundRow], out_md: Path, duration_sec: int, interv
     lines.extend(["- 数据分析链路: 以 diagnosis 可用率 + market_analysis 样本稳定性判断。"])
     lines.extend(["- 智能开平仓链路: 以 ai_core/ai_trading 运行状态 + guard 拒绝脉冲判断。"])
     lines.extend(["- 止盈止损链路: 以 `positions` 与 `sltp.active_orders/dynamic_adjustments` 联动判断是否在持续跟踪。"])
+    lines.extend(["- 开平仓执行质量: 以 `open_ok/open_fail/close_ok/close_fail` 和 top_reason/severity 识别瓶颈环节。"])
+    lines.extend(["- 决策可追溯性: 以 strategy_coverage/trace_coverage 与 decision_traces 的 rejected/failed 判断链路完整度。"])
+    lines.extend(["- 盈利结构: 以 trade_history_30d 的 win_rate/total_pnl 识别当前策略收益特征。"])
     lines.extend(["- 交易所链路: `exchange_unreachable` 视为 P0；`exchange_degraded` 视为 P1（系统会降杠杆/降仓）。"])
     lines.extend(["- 备注: 服务重启后的短时 `Connection refused` 将记为 `diagnosis_warming_up`，不再直接判定为 P0。"])
+    lines.extend(["", "## 优缺点自动归纳"])
+    lines.extend([
+        f"- 优点: 对账稳定性良好轮次 {total - rec_bad}/{total}，SLTP跟踪在位轮次 {sum(1 for r in rows if r.sltp_active_orders > 0 or r.ai_trading_positions == 0)}/{total}。"
+    ])
+    lines.extend([
+        f"- 不足: 交易所不可达/降级轮次 {exch_unreach + exch_degraded}，趋势覆盖不足轮次 {sum(1 for r in rows if r.trend_coverage < 0.5)}，决策可追溯性不足轮次 {contract_bad}。"
+    ])
 
     out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -260,7 +383,6 @@ def main() -> int:
         latency_ms = int((time.time() - t0) * 1000)
         row = _extract_row(diag, latency_ms, prev)
         rows.append(row)
-
         slim = {
             "ts": row.ts,
             "ok": row.ok,
@@ -275,6 +397,26 @@ def main() -> int:
             "ai_trading_positions": row.ai_trading_positions,
             "sltp_active_orders": row.sltp_active_orders,
             "sltp_dynamic_adjustments": row.sltp_dynamic_adjustments,
+            "trend_coverage": row.trend_coverage,
+            "trend_consistency": row.trend_consistency,
+            "open_ok": row.open_ok,
+            "open_fail": row.open_fail,
+            "close_ok": row.close_ok,
+            "close_fail": row.close_fail,
+            "execution_top_reason": row.execution_top_reason,
+            "execution_top_severity": row.execution_top_severity,
+            "decision_trace_guard_rejected": row.decision_trace_guard_rejected,
+            "decision_trace_execution_failed": row.decision_trace_execution_failed,
+            "position_consistency_healthy": row.position_consistency_healthy,
+            "position_consistency_delta_exchange_vs_ai": row.position_consistency_delta_exchange_vs_ai,
+            "position_consistency_delta_exchange_vs_sltp": row.position_consistency_delta_exchange_vs_sltp,
+            "position_consistency_exchange_non_zero": row.position_consistency_exchange_non_zero,
+            "position_consistency_ai_tracked": row.position_consistency_ai_tracked,
+            "position_consistency_sltp_tracked": row.position_consistency_sltp_tracked,
+            "strategy_coverage": row.strategy_coverage,
+            "trace_coverage": row.trace_coverage,
+            "trade_30d_win_rate": row.trade_30d_win_rate,
+            "trade_30d_sum_pnl": row.trade_30d_sum_pnl,
             "guard_exchange_unreachable_rejected": row.guard_exchange_unreachable_rejected,
             "guard_exchange_degraded_risk_reduced": row.guard_exchange_degraded_risk_reduced,
             "reconciliation_healthy": row.reconciliation_healthy,
@@ -286,6 +428,7 @@ def main() -> int:
             f.write(json.dumps(slim, ensure_ascii=False) + "\n")
 
         prev = {
+            "degraded_ratio": row.degraded_ratio,
             "rr_rej": (diag.get("data", {}).get("ai_core", {}).get("execution_guards", {}).get("stats", {}) or {}).get("rr_rejected", 0),
             "sp_rej": (diag.get("data", {}).get("ai_core", {}).get("execution_guards", {}).get("stats", {}) or {}).get("spread_rejected", 0),
             "dq_hold": (diag.get("data", {}).get("ai_core", {}).get("execution_guards", {}).get("stats", {}) or {}).get("data_quality_guard_hold", 0),
