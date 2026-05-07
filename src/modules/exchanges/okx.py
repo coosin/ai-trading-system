@@ -1465,6 +1465,41 @@ class OKXExchange(ExchangeBase):
         except Exception as e:
             logger.error(f"获取OKX订单信息失败: {e}")
         return None
+
+    async def get_swap_fills_for_order(self, symbol: str, ord_id: str) -> List[Dict[str, Any]]:
+        """
+        拉取某笔永续订单的成交明细（含 fillPnl / fee），用于平仓后与系统估算对账。
+
+        OKX: GET /api/v5/trade/fills?instType=SWAP&instId=...&ordId=...
+        """
+        oid = str(ord_id or "").strip()
+        if not oid:
+            return []
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+        endpoint = "/api/v5/trade/fills"
+        params: Dict[str, Any] = {"instType": "SWAP", "instId": okx_symbol, "ordId": oid}
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            return list(data or []) if isinstance(data, list) else []
+        except Exception as e:
+            logger.debug("get_swap_fills_for_order symbol=%s ordId=%s err=%s", symbol, oid, e)
+            return []
+
+    async def get_recent_fills(self, symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取某交易对最近成交明细，用于无 order_id 场景下的时间窗匹配。"""
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+        endpoint = "/api/v5/trade/fills"
+        params: Dict[str, Any] = {
+            "instType": "SWAP",
+            "instId": okx_symbol,
+            "limit": str(max(1, min(int(limit or 50), 100))),
+        }
+        try:
+            data = await self._make_request("GET", endpoint, params)
+            return list(data or []) if isinstance(data, list) else []
+        except Exception as e:
+            logger.debug("get_recent_fills symbol=%s err=%s", symbol, e)
+            return []
     
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
         """获取未成交订单"""
@@ -2199,11 +2234,13 @@ class OKXExchange(ExchangeBase):
             # 尝试 close-position 接口按方向强制减仓。
             if "All operations failed" in str(e):
                 try:
-                    fallback_body = {
+                    # net_mode 下 close-position 不得带 posSide（OKX 51000）；与 trade/order 分支一致。
+                    fallback_body: Dict[str, Any] = {
                         "instId": okx_symbol,
                         "mgnMode": "cross",
-                        "posSide": "short" if side == "short" else "long",
                     }
+                    if str(pos_side).strip().lower() != "net":
+                        fallback_body["posSide"] = str(pos_side)
                     fb = await self._make_request("POST", "/api/v5/trade/close-position", body=fallback_body)
                     logger.info(f"✅ 平仓成功(close-position兜底): {symbol}")
                     self.bust_positions_cache()

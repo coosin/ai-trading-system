@@ -333,6 +333,50 @@ class HistoricalDataStorage:
             except Exception as e:
                 logger.error(f"保存交易记录失败: {e}")
                 return False
+
+    async def update_trade_truth_by_order_id(
+        self,
+        order_id: str,
+        *,
+        symbol: Optional[str] = None,
+        price: Optional[float] = None,
+        pnl: Optional[float] = None,
+        fee: Optional[float] = None,
+        reasoning_append: str = "",
+    ) -> int:
+        """按 order_id 更新交易真值字段（价格/盈亏/手续费）。返回受影响行数。"""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return 0
+        async with self._lock:
+            try:
+                sets: List[str] = []
+                params: List[Any] = []
+                if price is not None:
+                    sets.append("price = ?")
+                    params.append(float(price))
+                if pnl is not None:
+                    sets.append("pnl = ?")
+                    params.append(float(pnl))
+                if fee is not None:
+                    sets.append("fee = ?")
+                    params.append(float(fee))
+                if reasoning_append:
+                    sets.append("reasoning = COALESCE(reasoning, '') || ?")
+                    params.append(str(reasoning_append))
+                if not sets:
+                    return 0
+                query = f"UPDATE trades SET {', '.join(sets)} WHERE order_id = ?"
+                params.append(oid)
+                if symbol:
+                    query += " AND symbol = ?"
+                    params.append(str(symbol))
+                cur = await self._db.execute(query, params)
+                await self._db.commit()
+                return int(getattr(cur, "rowcount", 0) or 0)
+            except Exception as e:
+                logger.error("update_trade_truth_by_order_id 失败: %s", e)
+                return 0
     
     async def get_trades(self, symbol: str = None, 
                          start_date: str = None, end_date: str = None,

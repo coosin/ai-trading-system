@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
 from src.modules.core.trading_limits import resolve_position_limits
 from src.modules.core.decision_trace_store import DecisionTraceStore
+from src.modules.core.ai_core_checkpoint_store import AICoreCheckpointStore
+from src.modules.core.decision_contract import (
+    build_envelope_from_decision,
+    validate_envelope,
+)
 
 from src.modules.core.timing_constants import (
     SLEEP_1S,
@@ -262,8 +267,9 @@ class AICoreDecisionEngine:
             "ai_autonomy_mtf_conflict_release_requires_mi_bias": True,
             # 冲突子类释放（更严格）：仅在“动量/波动证据充足”时放行。
             "ai_autonomy_conflict_subtype_release_enabled": True,
-            "ai_autonomy_conflict_release_min_rsi_1h_for_long": 56.0,
-            "ai_autonomy_conflict_release_max_rsi_1h_for_short": 44.0,
+            # RSI释放阈值对称化修复：原设置56/44过于偏向空头，调整为52/48使多空平衡
+            "ai_autonomy_conflict_release_min_rsi_1h_for_long": 52.0,
+            "ai_autonomy_conflict_release_max_rsi_1h_for_short": 48.0,
             "ai_autonomy_conflict_release_min_abs_change_24h": 0.006,
             "ai_autonomy_conflict_release_require_mi_confidence": True,
 
@@ -359,6 +365,8 @@ class AICoreDecisionEngine:
         # 主动性扫描器推送的机会（默认不自动开仓，仅进入本引擎决策上下文）
         self._scanner_hints: Dict[str, Dict[str, Any]] = {}
         self._scanner_hint_ttl_sec: float = 5400.0
+        self._checkpoint_store = AICoreCheckpointStore()
+        self._last_checkpoint_save_at: Optional[datetime] = None
 
         logger.info("🧠 AI核心决策引擎初始化（完整控制权版本）")
     
@@ -631,6 +639,7 @@ class AICoreDecisionEngine:
         """启动AI决策循环"""
         logger.info("🚀 启动AI核心决策引擎...")
         self._running = True
+        self._load_runtime_checkpoint()
         
         # 等待交易所连接完成
         logger.info("⏳ 等待交易所连接...")
@@ -744,7 +753,51 @@ class AICoreDecisionEngine:
     async def stop(self) -> None:
         """停止"""
         self._running = False
+        self._save_runtime_checkpoint(force=True)
         logger.info("🛑 AI核心决策引擎已停止")
+
+    def _checkpoint_payload(self) -> Dict[str, Any]:
+        return {
+            "preferred_strategy_id": self._preferred_strategy_id,
+            "last_research_at": self._last_research_at.isoformat() if self._last_research_at else None,
+            "loss_streak_cooldown_until": self._loss_streak_cooldown_until.isoformat() if self._loss_streak_cooldown_until else None,
+            "frequency_profile": self._frequency_profile,
+            "execution_guards_stats": dict(self._execution_guards_stats or {}),
+            "adaptive_guard_profile": dict(self._adaptive_guard_profile or {}),
+        }
+
+    def _save_runtime_checkpoint(self, force: bool = False) -> None:
+        try:
+            now = datetime.now()
+            if (not force) and self._last_checkpoint_save_at and (now - self._last_checkpoint_save_at).total_seconds() < 180:
+                return
+            if self._checkpoint_store.save(self._checkpoint_payload()):
+                self._last_checkpoint_save_at = now
+        except Exception:
+            pass
+
+    def _load_runtime_checkpoint(self) -> None:
+        try:
+            st = self._checkpoint_store.load()
+            if not isinstance(st, dict):
+                return
+            self._preferred_strategy_id = str(st.get("preferred_strategy_id") or "") or None
+            lr = st.get("last_research_at")
+            if isinstance(lr, str) and lr.strip():
+                self._last_research_at = datetime.fromisoformat(lr.replace("Z", "+00:00")).replace(tzinfo=None)
+            lc = st.get("loss_streak_cooldown_until")
+            if isinstance(lc, str) and lc.strip():
+                self._loss_streak_cooldown_until = datetime.fromisoformat(lc.replace("Z", "+00:00")).replace(tzinfo=None)
+            fp = str(st.get("frequency_profile") or "").strip()
+            if fp:
+                self._frequency_profile = fp
+            if isinstance(st.get("execution_guards_stats"), dict):
+                self._execution_guards_stats.update(st.get("execution_guards_stats") or {})
+            if isinstance(st.get("adaptive_guard_profile"), dict):
+                self._adaptive_guard_profile.update(st.get("adaptive_guard_profile") or {})
+            logger.info("✅ AI Core runtime checkpoint loaded")
+        except Exception as e:
+            logger.warning("AI Core runtime checkpoint load failed: %s", e)
     
     async def _main_decision_loop(self) -> None:
         """AI主决策循环 - 24小时不间断主动交易，自主选择币种"""
@@ -803,6 +856,8 @@ class AICoreDecisionEngine:
                             logger.info(f"📊 {symbol} 暂无机会，继续监控")
                     
                     await asyncio.sleep(SLEEP_2S)
+
+                self._save_runtime_checkpoint()
                 
                 await asyncio.sleep(SLEEP_30S)
                 
@@ -971,6 +1026,17 @@ class AICoreDecisionEngine:
 
                 # 自动切换频率档位（稳健/中频/积极），带冷却防抖
                 await self._auto_switch_frequency_profile()
+
+                # 成交结果反思闭环（pending -> realized -> reflection）
+                try:
+                    mc = getattr(self, "main_controller", None)
+                    ths = getattr(mc, "trade_history_service", None) if mc else None
+                    if ths and hasattr(ths, "run_outcome_reflection"):
+                        await ths.run_outcome_reflection(limit=120)
+                except Exception:
+                    pass
+
+                self._save_runtime_checkpoint()
                 
             except Exception as e:
                 logger.error(f"策略管理循环错误: {e}")
@@ -1957,9 +2023,13 @@ class AICoreDecisionEngine:
                 except Exception as e:
                     logger.error(f"保存交易分析失败: {e}")
             
-            # 3. 如果使用了策略，更新策略表现
-            if decision.strategy_used and self.strategy_manager:
-                await self._update_strategy_performance(decision.strategy_used, trade_analysis)
+            # 3. 更新策略表现（strategy_used 为空时仍入账到默认桶，避免胜率/反馈链断裂）
+            sid = (getattr(decision, "strategy_used", None) or "").strip()
+            if not sid:
+                sid = (str(getattr(self, "_preferred_strategy_id", "") or "").strip())
+            if not sid:
+                sid = "ai_core_default"
+            await self._update_strategy_performance(sid, trade_analysis)
             
             # 4. 学习并优化
             await self._learn_from_trade(trade_analysis)
@@ -2009,6 +2079,36 @@ class AICoreDecisionEngine:
         
         logger.info(f"📊 更新策略表现: {strategy_id} (总交易: {perf['total_trades']})")
 
+        # 简易指标：基于带 pnl 的平仓样本（非年化，仅供监控/反馈量级参考）
+        pnls: List[float] = []
+        for t in perf.get("trades") or []:
+            if not isinstance(t, dict):
+                continue
+            r = t.get("result")
+            if isinstance(r, dict) and r.get("pnl") is not None:
+                try:
+                    pnls.append(float(r.get("pnl")))
+                except (TypeError, ValueError):
+                    pass
+        max_dd = 0.0
+        peak = 0.0
+        cum = 0.0
+        for p in pnls:
+            cum += p
+            peak = max(peak, cum)
+            max_dd = max(max_dd, peak - cum)
+        sharpe = 0.0
+        if len(pnls) >= 2:
+            try:
+                import statistics as _statistics
+
+                m = _statistics.mean(pnls)
+                sd = _statistics.pstdev(pnls)
+                if sd > 1e-12:
+                    sharpe = float(m / sd)
+            except Exception:
+                sharpe = 0.0
+
         # 同步到 MainController → StrategyManager.apply_trade_feedback（生产闭环）
         mc = getattr(self, "main_controller", None)
         if mc and hasattr(mc, "update_strategy_performance"):
@@ -2024,8 +2124,8 @@ class AICoreDecisionEngine:
                     loss_trades=losses,
                     win_rate=wr,
                     total_pnl=float(perf.get("total_pnl", 0) or 0),
-                    max_drawdown=0.0,
-                    sharpe_ratio=0.0,
+                    max_drawdown=float(max_dd),
+                    sharpe_ratio=float(sharpe),
                 )
             except Exception as e:
                 logger.warning(f"同步策略表现到 StrategyManager 失败({strategy_id}): {e}")
@@ -3339,6 +3439,25 @@ class AICoreDecisionEngine:
                     )
                     bull_evidence = tech_bull or mi_bull or bias_bull or sentiment_bull
                     bear_evidence = tech_bear or mi_bear or bias_bear or sentiment_bear
+                    # 修复：引入证据强度评分，避免简单的if/elif导致空头优先
+                    # 计算多空证据强度（0-4分）
+                    bull_strength = sum([
+                        1.5 if tech_bull else 0.0,  # 技术趋势权重最高
+                        1.0 if mi_bull else 0.0,
+                        1.0 if bias_bull else 0.0,
+                        0.5 if sentiment_bull else 0.0  # 情绪权重最低
+                    ])
+                    bear_strength = sum([
+                        1.5 if tech_bear else 0.0,
+                        1.0 if mi_bear else 0.0,
+                        1.0 if bias_bear else 0.0,
+                        0.5 if sentiment_bear else 0.0
+                    ])
+                    # 只有一方明显强于另一方时才执行（差距>=0.5分）
+                    evidence_clear = abs(bull_strength - bear_strength) >= 0.5
+                    if not evidence_clear:
+                        bull_evidence = False
+                        bear_evidence = False
                     if autonomy_require_align:
                         bull_evidence = bull_evidence and (not mi_tr or tech_bull or mi_bull or bias_bull)
                         bear_evidence = bear_evidence and (not mi_tr or tech_bear or mi_bear or bias_bear)
@@ -3388,36 +3507,55 @@ class AICoreDecisionEngine:
                         if last and (now - last).total_seconds() < cooldown:
                             raise RuntimeError("hold_avoidance_override cooldown")
 
-                        if bear_evidence:
-                            if require_mi_align and str(mi_trend or "").lower() not in ("bearish", "down", "short"):
-                                raise RuntimeError("hold_avoidance_override mi trend mismatch")
-                            decision.action = "sell"
-                            decision.side = "short"
-                            decision.quantity = max(1, int(decision.quantity or 1))
-                            decision.leverage = int(self.config.get("default_leverage", 1) or 1)
-                            decision.confidence = float(max(decision.confidence or 0, min(1.0, max(fusion_conf, mi_conff))))
-                            decision.reasoning = (
-                                f"ai_autonomy_override: strict={strict_ready} autonomy={autonomy_ready} "
-                                f"fusion_conf={fusion_conf:.2f} mi_conf={mi_conff:.2f} mi_q={mi_qf:.2f} "
-                                f"t1={t1} t4={t4} t1d={t1d} mi_trend={mi_tr} mi_bias={mi_bi}"
-                            )
-                            decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
-                            self._last_hold_override_at[key] = now
-                        elif bull_evidence:
-                            if require_mi_align and str(mi_trend or "").lower() not in ("bullish", "up", "long"):
-                                raise RuntimeError("hold_avoidance_override mi trend mismatch")
-                            decision.action = "buy"
-                            decision.side = "long"
-                            decision.quantity = max(1, int(decision.quantity or 1))
-                            decision.leverage = int(self.config.get("default_leverage", 1) or 1)
-                            decision.confidence = float(max(decision.confidence or 0, min(1.0, max(fusion_conf, mi_conff))))
-                            decision.reasoning = (
-                                f"ai_autonomy_override: strict={strict_ready} autonomy={autonomy_ready} "
-                                f"fusion_conf={fusion_conf:.2f} mi_conf={mi_conff:.2f} mi_q={mi_qf:.2f} "
-                                f"t1={t1} t4={t4} t1d={t1d} mi_trend={mi_tr} mi_bias={mi_bi}"
-                            )
-                            decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
-                            self._last_hold_override_at[key] = now
+                        # 修复：使用证据强度比较替代简单的if/elif顺序
+                        # 避免空头逻辑优先于多头
+                        if bear_evidence or bull_evidence:
+                            # 重新计算证据强度用于比较
+                            bull_str = sum([
+                                1.5 if tech_bull else 0.0,
+                                1.0 if mi_bull else 0.0,
+                                1.0 if bias_bull else 0.0,
+                                0.5 if sentiment_bull else 0.0
+                            ])
+                            bear_str = sum([
+                                1.5 if tech_bear else 0.0,
+                                1.0 if mi_bear else 0.0,
+                                1.0 if bias_bear else 0.0,
+                                0.5 if sentiment_bear else 0.0
+                            ])
+
+                            if bear_str > bull_str:
+                                if require_mi_align and str(mi_trend or "").lower() not in ("bearish", "down", "short"):
+                                    raise RuntimeError("hold_avoidance_override mi trend mismatch")
+                                decision.action = "sell"
+                                decision.side = "short"
+                                decision.quantity = max(1, int(decision.quantity or 1))
+                                decision.leverage = int(self.config.get("default_leverage", 1) or 1)
+                                decision.confidence = float(max(decision.confidence or 0, min(1.0, max(fusion_conf, mi_conff))))
+                                decision.reasoning = (
+                                    f"ai_autonomy_override: strict={strict_ready} autonomy={autonomy_ready} "
+                                    f"fusion_conf={fusion_conf:.2f} mi_conf={mi_conff:.2f} mi_q={mi_qf:.2f} "
+                                    f"t1={t1} t4={t4} t1d={t1d} mi_trend={mi_tr} mi_bias={mi_bi} "
+                                    f"bear_str={bear_str:.1f} bull_str={bull_str:.1f}"
+                                )
+                                decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
+                                self._last_hold_override_at[key] = now
+                            elif bull_str > bear_str:
+                                if require_mi_align and str(mi_trend or "").lower() not in ("bullish", "up", "long"):
+                                    raise RuntimeError("hold_avoidance_override mi trend mismatch")
+                                decision.action = "buy"
+                                decision.side = "long"
+                                decision.quantity = max(1, int(decision.quantity or 1))
+                                decision.leverage = int(self.config.get("default_leverage", 1) or 1)
+                                decision.confidence = float(max(decision.confidence or 0, min(1.0, max(fusion_conf, mi_conff))))
+                                decision.reasoning = (
+                                    f"ai_autonomy_override: strict={strict_ready} autonomy={autonomy_ready} "
+                                    f"fusion_conf={fusion_conf:.2f} mi_conf={mi_conff:.2f} mi_q={mi_qf:.2f} "
+                                    f"t1={t1} t4={t4} t1d={t1d} mi_trend={mi_tr} mi_bias={mi_bi} "
+                                    f"bull_str={bull_str:.1f} bear_str={bear_str:.1f}"
+                                )
+                                decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
+                                self._last_hold_override_at[key] = now
                 except Exception as e:
                     logger.debug(f"hold override skipped: {e}")
             
@@ -3735,10 +3873,21 @@ class AICoreDecisionEngine:
             rsi_1h = calculate_rsi(closes_1h)
             rsi_4h = calculate_rsi(closes_4h)
             
-            # 趋势判断
-            trend_1h = "bullish" if ma5_1h > ma20_1h else "bearish"
-            trend_4h = "bullish" if ma5_4h > ma20_4h else "bearish"
-            trend_1d = "bullish" if closes_1d[-1] > ma20_1d else "bearish" if closes_1d[-1] < ma20_1d else "sideways"
+            # 趋势判断 - 增加缓冲区域避免频繁切换
+            # 修复：原代码使用二元判断，当价格在MA附近震荡时容易产生假信号
+            # 新逻辑：增加0.15%的缓冲区域，只有当偏离超过阈值时才确认趋势
+            def _trend_with_buffer(fast_val, slow_val, current_val=None, buffer_pct=0.0015):
+                """计算趋势，增加缓冲区域"""
+                if slow_val == 0:
+                    return "sideways"
+                deviation = (fast_val - slow_val) / slow_val
+                if abs(deviation) < buffer_pct:
+                    return "sideways"
+                return "bullish" if deviation > 0 else "bearish"
+
+            trend_1h = _trend_with_buffer(ma5_1h, ma20_1h)
+            trend_4h = _trend_with_buffer(ma5_4h, ma20_4h)
+            trend_1d = _trend_with_buffer(closes_1d[-1], ma20_1d) if closes_1d else "sideways"
 
             # 基于近端 1H K 线构建支撑/阻力，用于开仓择时门控。
             highs_1h = [float(k.get("high", 0) or 0) for k in klines_1h]
@@ -5484,6 +5633,15 @@ class AICoreDecisionEngine:
             except Exception:
                 pass
 
+            # 结构化决策契约：统一规范并校验执行层关键字段（action/side/qty/lev/strategy_id）。
+            decision_envelope = build_envelope_from_decision(decision, trace_id=trace_id).to_dict()
+            ok_env, why_env = validate_envelope(decision_envelope)
+            if not ok_env:
+                logger.error("AI决策契约校验失败: %s symbol=%s action=%s side=%s", why_env, decision.symbol, decision.action, decision.side)
+                _record_intent({"decision_contract": decision_envelope, "contract_error": why_env})
+                _record_guard("rejected", str(why_env), "decision_contract")
+                return False
+
             # 优先走主控制器执行验证网关，避免直接裸下单
             if self.main_controller and hasattr(self.main_controller, "execute_command"):
                 try:
@@ -5504,6 +5662,9 @@ class AICoreDecisionEngine:
                             "take_profit": decision.take_profit,
                             "write_source": "ai_core",
                             "trace_id": trace_id,
+                            "strategy_used": decision_envelope.get("strategy_id"),
+                            "strategy_id": decision_envelope.get("strategy_id"),
+                            "decision_envelope": decision_envelope,
                         },
                     )
                     if exec_result and getattr(exec_result, "status", None) and exec_result.status.value == "success":

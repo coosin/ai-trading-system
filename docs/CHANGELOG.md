@@ -1,5 +1,90 @@
 # 变更记录
 
+## 2026-05-06 — 交易真值自动同步、分账与对账报告（实盘口径对齐）
+
+- **交易所真值回填（自动化）：**
+  - 平仓成功后，`ExecutionGateway` 会基于订单 `ordId` 自动拉取 OKX `fills` 并回填真实字段（`pnl/fee/average price`），优先使用 `fillPnl/fee/fillPx/fillSz` 聚合结果，避免仅靠本地估算导致系统收益与交易所不一致。
+  - 新增 OKX 接口封装：
+    - `OKXExchange.get_swap_fills_for_order(symbol, ord_id)`：按订单拉取成交明细
+    - `OKXExchange.get_recent_fills(symbol, limit)`：按 symbol 拉取近期成交明细（用于无 `order_id` 场景的时间窗兜底）
+
+- **交易所事实账本（与运行日志分离）：**
+  - 新增 `src/modules/core/exchange_sync_ledger.py`，写入 `logs/exchange_sync/exchange_truth.jsonl`（JSON Lines，仅追加）。
+  - 用途：将“交易所侧事实”（回填结果、回填来源、是否估算、fills 数量）与 `app.log` 运行日志彻底分离，便于对账与排障。
+
+- **对账接口与一键差异报告：**
+  - 新增 `GET /api/v1/trades/reconcile`：对比系统平仓记录与交易所 `fills`，输出 `pnl_delta/fee_delta/price_delta`、`match_method` 等。
+  - 新增 `GET /api/v1/trades/reconcile/report`：输出摘要 + Top 偏差列表（按 `abs(pnl_delta)` / `abs(fee_delta)`）。
+  - `accurate_only`/`realized_only` 过滤口径修正：真实平仓但盈亏为 0 的记录不再被误排除（以 `action=close`/`status=filled` 判定为 realized）。
+
+- **全自动同步线程（默认启用）：**
+  - `MainController` 启动时自动启动后台同步线程：周期同步账户状态（余额/持仓）+ 周期回填近期平仓真值（pnl/fee/price）。
+  - 新增配置段 `exchange_auto_sync.*`（默认启用；可调 `interval_sec`、回填 lookback、每 N 轮回填一次等）。
+
+## 2026-05-06 — ai_core 开仓门控与低波动缓趋势适配（交易频率恢复）
+
+- **开仓门控修复：**
+  - 修复 `analysis_hard_gate` 与 `TradeDecision` 字段不对齐导致的“所有开仓被拒绝”（`quality_score/confidence` 为 none）。
+  - 统一将多源融合与市场情报载荷合并写入 `decision.market_analysis`，使 `analysis_hard_gate_for_open` 能正确读取 `quality_score/confidence/provenance/partial`。
+
+- **市况识别增强：**
+  - 新增/完善 `low_vol_grind`（低波动 + 缓趋势）识别与 profile overrides，避免“慢涨/慢跌”被误判为纯横盘从而过度收紧。
+
+## 2026-05-06 — SLTP 防回吐调优与诊断口径收敛
+
+- **执行归因与诊断可观测性：**
+  - `ExecutionGateway._classify_error_code` 新增 `ALREADY_CLOSED_NO_POSITION`（识别 OKX `sCode=51169` / 无可平仓位）。
+  - `GET /api/v1/modules/commander/trading-diagnosis` 的 `execution_attribution` 新增：
+    - `benign_failures_in_window`
+    - `benign_failure_codes`
+  - `ALREADY_CLOSED_NO_POSITION` 从可行动失败中分流，避免与真实失败混淆。
+
+- **SLTP 链路收敛：**
+  - `stop_loss_take_profit` 在 close context 中统一透传 `trace_id`、`strategy_id`、`strategy_used`。
+  - 对 `51169/no position` 类错误按终态处理：停止 pending-close 重试，回收本地索引，避免失败噪声膨胀。
+
+- **参数调优（防“浮盈回吐后亏损离场”）：**
+  - `stop_loss_take_profit.initial_trailing_offset`: `0.02 -> 0.016`
+  - `profit_tier2_pnl_threshold`: `0.06 -> 0.02`
+  - `tier2_trailing_offset`: `0.02 -> 0.012`
+  - `breakeven_trigger`: `0.02 -> 0.01`
+  - `profit_protect_trigger_1`: `0.02 -> 0.012`
+  - `profit_protect_lock_1`: `0.004 -> 0.002`
+  - `profit_protect_trigger_2`: `0.04 -> 0.025`
+  - `profit_protect_lock_2`: `0.012 -> 0.008`
+  - `profit_protect_tighten_factor`: `0.88 -> 0.82`
+  - `layered_trailing_tp_drawdown_levels`: `[0.03/0.06/0.10]` 对应回撤阈值收紧为 `[0.008/0.014/0.02]`
+
+- **分析口径说明：**
+  - 最近窗口交易诊断需显式区分 `metadata.source=db_bootstrap` 与真实执行记录，避免将补录/种子样本误判为实盘亏损离场。
+
+## 2026-05-05 — 决策契约化、可恢复与学习闭环升级（实盘链路收口）
+
+- **执行链路升级：**
+  - 新增 `src/modules/core/decision_contract.py`，引入 `DecisionEnvelope` 与统一校验（`symbol/action/side/quantity/leverage/strategy_id`）。
+  - `AICoreDecisionEngine` 在执行前强制构建并校验契约；校验失败 fail-closed。
+  - `ExecutionVerifier` open/close 路径接入契约校验并优先使用 envelope 字段。
+  - `AICommandExecutor` 手动开平仓优先走 `execute_command -> execution_verifier -> execution_gateway`，统一策略归因字段透传。
+
+- **稳定性升级：**
+  - 新增 `src/modules/core/ai_core_checkpoint_store.py`，支持 AI Core 运行态 checkpoint（重启恢复关键门控/档位状态）。
+  - `AICoreDecisionEngine` 启停与循环周期保存/加载 checkpoint。
+
+- **学习闭环升级：**
+  - `TradeHistoryService` 新增 `run_outcome_reflection()`，实现 pending->realized->reflection 自动闭环（去重索引持久化）。
+  - `AICoreDecisionEngine` 策略管理循环接入 outcome reflection 自动运行。
+
+- **统计与诊断升级：**
+  - `TradeHistoryService.get_statistics()` 新增 `strategy_distribution`（策略维度胜率/PnL）。
+  - `GET /api/v1/modules/commander/trading-diagnosis` 新增：
+    - `strategy_distribution_30d`
+    - `decision_contract_integrity`（含 coverage/by_source/samples/healthy）
+  - 契约完整性不健康时自动追加 `diagnosis_hints`。
+
+- **结构清理与工具：**
+  - strategy 字段解析统一收敛到 `normalize_strategy_field()`（减少 `strategy/strategy_used/strategy_id` 重复分支）。
+  - 新增 `scripts/migrate_strategy_ids.py`（安全模式：只生成回填计划，不直接重写历史记录）。
+
 ## 2026-05-02 — AI 维护交接文档与优化结果固化
 
 - **文档：** 新增 `docs/AI_HANDOFF_OPTIMIZATION_VERIFICATION_2026Q2.md`，汇总本轮系统测试与代码侧优化项、环境变量、验证命令（`health` / `trading-diagnosis` / `decision-traces`）、调参约束、`events.db` 裁剪脚本与重启注意点；`docs/README.md` 已索引。后续补充 **§4.2c**：监控数据源优先级（持仓 vs `recent_events`）、`GET /api/v1/positions` 的 `size`/`notional_value` 与 CCXT 别名字段说明。

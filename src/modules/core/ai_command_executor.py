@@ -2072,6 +2072,7 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                     side = "short"
 
                 reason = str(user_input or "user_trade_command")[:240]
+                strategy_id = "managed_manual_trade"
                 force_close = bool(merged.get("force_close"))
                 if force_close:
                     gw = getattr(mc, "execution_gateway", None)
@@ -2092,19 +2093,61 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                                         break
                         except Exception:
                             pass
-                    res = await gw.close_swap(
-                        symbol=symbol,
-                        side=side,
-                        size=qty if (qty is not None and qty > 0) else None,
-                        source="manual",
-                        reason=reason,
-                        force=False,
-                        context={
-                            "via": "ai_command_executor_force_close",
-                            "manual_approved": True,
-                            "user_input": str(user_input)[:240],
-                        },
-                    )
+                    res = None
+                    try:
+                        if hasattr(mc, "execute_command") and mc.execute_command:
+                            from src.modules.core.execution_verifier import CommandType
+                            from src.modules.core.decision_contract import DecisionEnvelope
+
+                            env = DecisionEnvelope(
+                                symbol=str(symbol),
+                                action="close",
+                                side=str(side),
+                                quantity=float(qty if (qty is not None and qty > 0) else 1.0),
+                                leverage=int(getattr(engine, "contract_config", {}).get("default_leverage", 20)),
+                                confidence=1.0,
+                                strategy_id=strategy_id,
+                                reasoning=reason,
+                                trace_id="",
+                            )
+                            er = await mc.execute_command(
+                                command_type=CommandType.CLOSE_POSITION,
+                                action=f"manual_close_{side}",
+                                symbol=symbol,
+                                params={
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "quantity": qty if (qty is not None and qty > 0) else None,
+                                    "write_source": "manual",
+                                    "trace_id": "",
+                                    "strategy_used": strategy_id,
+                                    "strategy_id": strategy_id,
+                                    "decision_envelope": env.to_dict(),
+                                },
+                            )
+                            if er and getattr(er, "status", None) and er.status.value == "success":
+                                res = {"success": True, "order_id": er.execution_id, "details": er.details}
+                            else:
+                                em = getattr(er, "error_message", None) if er else "unknown"
+                                res = {"success": False, "error": em}
+                    except Exception:
+                        res = None
+                    if not res:
+                        res = await gw.close_swap(
+                            symbol=symbol,
+                            side=side,
+                            size=qty if (qty is not None and qty > 0) else None,
+                            source="manual",
+                            reason=reason,
+                            force=False,
+                            context={
+                                "via": "ai_command_executor_force_close",
+                                "manual_approved": True,
+                                "user_input": str(user_input)[:240],
+                                "strategy_used": strategy_id,
+                                "strategy_id": strategy_id,
+                            },
+                        )
                     ok = bool((res or {}).get("success"))
                     return {
                         "success": ok,
@@ -2137,23 +2180,70 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                                 market_reasoning = " | ".join(pieces)[:180]
                     except Exception:
                         market_reasoning = ""
-                    res = await gw.open_swap(
-                        symbol=symbol,
-                        side=side,
-                        size=qty if (qty is not None and qty > 0) else 0.01,
-                        leverage=lev,
-                        source="manual",
-                        reason=reason,
-                        margin_mode="cross",
-                        price=None,
-                        context={
-                            "via": "ai_command_executor",
-                            "user_input": str(user_input)[:240],
-                            "manual_approved": True,
-                            "strategy": "managed_manual_trade",
-                            "decision_reasoning": market_reasoning or str(reason)[:180],
-                        },
-                    )
+                    res = None
+                    try:
+                        if hasattr(mc, "execute_command") and mc.execute_command:
+                            from src.modules.core.execution_verifier import CommandType
+                            from src.modules.core.decision_contract import DecisionEnvelope
+
+                            open_qty = float(qty if (qty is not None and qty > 0) else 0.01)
+                            env = DecisionEnvelope(
+                                symbol=str(symbol),
+                                action="open",
+                                side=str(side),
+                                quantity=open_qty,
+                                leverage=int(lev),
+                                confidence=1.0,
+                                strategy_id=strategy_id,
+                                reasoning=reason,
+                                trace_id="",
+                            )
+                            er = await mc.execute_command(
+                                command_type=CommandType.OPEN_POSITION,
+                                action=f"manual_open_{side}",
+                                symbol=symbol,
+                                params={
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "quantity": open_qty,
+                                    "leverage": int(lev),
+                                    "entry_price": None,
+                                    "stop_loss": None,
+                                    "take_profit": None,
+                                    "write_source": "manual",
+                                    "trace_id": "",
+                                    "strategy_used": strategy_id,
+                                    "strategy_id": strategy_id,
+                                    "decision_envelope": env.to_dict(),
+                                },
+                            )
+                            if er and getattr(er, "status", None) and er.status.value == "success":
+                                res = {"success": True, "order_id": er.execution_id, "details": er.details}
+                            else:
+                                em = getattr(er, "error_message", None) if er else "unknown"
+                                res = {"success": False, "error": em}
+                    except Exception:
+                        res = None
+                    if not res:
+                        res = await gw.open_swap(
+                            symbol=symbol,
+                            side=side,
+                            size=qty if (qty is not None and qty > 0) else 0.01,
+                            leverage=lev,
+                            source="manual",
+                            reason=reason,
+                            margin_mode="cross",
+                            price=None,
+                            context={
+                                "via": "ai_command_executor",
+                                "user_input": str(user_input)[:240],
+                                "manual_approved": True,
+                                "strategy": strategy_id,
+                                "strategy_used": strategy_id,
+                                "strategy_id": strategy_id,
+                                "decision_reasoning": market_reasoning or str(reason)[:180],
+                            },
+                        )
                 else:
                     res = await engine.execute_trade(
                         symbol=symbol,

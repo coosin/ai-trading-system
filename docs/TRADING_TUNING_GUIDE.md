@@ -16,7 +16,7 @@
 
 配置位置：`config/config.yaml` → `trading.position_limits`
 
-- `symbol_max_margin_ratio`：**每一笔开仓**（包括第2/3/4笔加仓）单笔最大保证金占用（口径=available），默认 `0.2`。
+- `symbol_max_margin_ratio`：**单币种总保证金占用上限**（已有仓位 + 新单，口径=available），默认 `0.2`。
 - `max_same_direction_positions`：同向持仓数上限（long/short 分别计数）。
 - `max_positions_oneway`：单向模式总持仓上限。
 - `max_positions_hedge`：双向对冲并存时总持仓上限。
@@ -54,6 +54,8 @@
 
 - `GET /api/v1/modules/ai/frequency-profile`：看当前档位与 `min_confidence_to_trade` 等核心门槛。
 - `GET /api/v1/modules/commander/trading-diagnosis`：看 `ai_core.execution_guards.config` + `stats`（被哪些门控拦截）。
+
+> 重要（2026-05-06）：`analysis_hard_gate` 依赖 `decision.market_analysis.quality_score/confidence`。当前版本已修复并确保多源融合/情报载荷会写入该字段；若看到日志反复 `q=none c=none`，优先排查是否有旧进程/旧代码仍在跑。
 
 ### 1.2.2 微结构开仓门控（ai_trading 兼容链路）
 
@@ -161,6 +163,19 @@
 - `profit_protect_*`：锁盈加速器
 - `profit_protect_regime_overrides.*`：高波动/低流动性时的倍率调整
 
+2026-05-06 防回吐推荐基线（已应用）：
+
+- `initial_trailing_offset: 0.016`
+- `profit_tier2_pnl_threshold: 0.02`
+- `tier2_trailing_offset: 0.012`
+- `breakeven_trigger: 0.01`
+- `profit_protect_trigger_1/2: 0.012 / 0.025`
+- `profit_protect_lock_1/2: 0.002 / 0.008`
+- `profit_protect_tighten_factor: 0.82`
+- `layered_trailing_tp_drawdown_levels`: `(0.03,0.008) (0.06,0.014) (0.10,0.02)`
+
+适用场景：出现“浮盈后回吐成亏损离场”时，优先用这一组参数先压回吐，再观察 24h/72h。
+
 验证：
 
 - `GET /api/v1/modules/commander/trading-diagnosis` → `data.sltp`
@@ -181,6 +196,13 @@
 - 统一做写入权限（single_write_owner）与审计
 - 统一做失败归因（error_code）、重试/冷却、post-check 等
 
+### 2.3 交易真值自动回填（pnl/fee/price）
+
+从 2026-05-06 起，平仓后会自动回拉 OKX `fills`，并将真值回填到交易记录（用于收益统计与复盘），并写入独立事实账本：
+
+- 账本：`logs/exchange_sync/exchange_truth.jsonl`
+- 相关接口：`/api/v1/trades?accurate_only=true`、`/api/v1/trades/reconcile`
+
 验证：
 
 - `trading-diagnosis.data.execution_gateway.recent_events`
@@ -188,6 +210,8 @@
 - `trading-diagnosis.data.execution_reconciliation`：本地/交易所持仓与挂单是否漂移
 - `trading-diagnosis.data.execution_reconciliation_protection`：对账保护是否正在阻断新开仓
 - `trading-diagnosis.data.execution_safe_recovery`：系统已自动执行了哪些安全恢复动作
+- `trading-diagnosis.data.decision_contract_integrity`：策略归因/trace 透传覆盖率与样本
+- `trading-diagnosis.data.strategy_distribution_30d`：近30天按策略聚合胜率/PnL
 - `GET /api/v1/modules/commander/decision-traces`：最近决策轨迹的聚合复盘（拒绝原因/执行失败/保护拦截）
 
 ### 2.1 开仓参数变更最小流程（标准化）
@@ -245,4 +269,13 @@
 注意：`seed-and-run` 是写接口，默认会返回 `401`（没有 token）或 `403`（角色不够），属于正常保护行为。
 
 若你只在本机/内网对接，可启用 `api.auth_bypass_cidrs`（默认放行 `127.0.0.1/32`、`::1/128`），使该写接口在白名单来源无需 token。
+
+---
+
+## 5) 交易分析口径提示（避免误判）
+
+- 做“最近 3 小时亏损离场”归因时，先区分 `metadata.source`：
+  - `db_bootstrap`：补录/种子样本，不应直接作为实盘离场质量结论；
+  - 非 `db_bootstrap`：真实执行样本（优先用于 SLTP 与开平仓逻辑判断）。
+- 若 `execution_attribution` 中存在 `ALREADY_CLOSED_NO_POSITION`，该类属于 benign failure（终态噪声），不应与真实失败混算。
 

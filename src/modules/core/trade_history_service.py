@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 import aiofiles
 import pandas as pd
+from src.modules.core.decision_contract import normalize_strategy_field
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +131,27 @@ class TradeHistoryService:
         
         # JSONL备份文件
         self.backup_file = self.base_path / "trades.jsonl"
+        self._reflection_index_file = self.base_path / "reflection_index.json"
+        self._reflection_seen: set[str] = set()
+        self._load_reflection_index()
         
         logger.info(f"统一交易历史服务初始化完成，路径: {self.base_path}")
+
+    def _load_reflection_index(self) -> None:
+        try:
+            if self._reflection_index_file.is_file():
+                data = json.loads(self._reflection_index_file.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self._reflection_seen = {str(x) for x in data if str(x).strip()}
+        except Exception:
+            self._reflection_seen = set()
+
+    def _save_reflection_index(self) -> None:
+        try:
+            arr = sorted(self._reflection_seen)[-5000:]
+            self._reflection_index_file.write_text(json.dumps(arr, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
     
     async def initialize(self) -> bool:
         """初始化服务"""
@@ -214,6 +234,17 @@ class TradeHistoryService:
         """从字典创建并记录交易"""
         side_raw = str(trade_dict.get("side", "buy") or "buy").strip().lower()
         side_norm = {"long": "buy", "short": "sell"}.get(side_raw, side_raw or "buy")
+        meta = dict(trade_dict.get("metadata") or {})
+        strat_s = normalize_strategy_field(trade_dict, metadata=meta, default="unknown")
+        if strat_s:
+            meta.setdefault("strategy_id", strat_s)
+        strategy_field = strat_s or "unknown"
+        reason_s = str(
+            trade_dict.get("reasoning")
+            or trade_dict.get("reason")
+            or meta.get("reason")
+            or ""
+        ).strip()
         trade = TradeRecord(
             trade_id=trade_dict.get("trade_id", f"trade_{datetime.now().timestamp()}"),
             order_id=trade_dict.get("order_id", ""),
@@ -227,15 +258,69 @@ class TradeHistoryService:
             pnl=_to_float(trade_dict.get("pnl"), 0.0),
             pnl_percent=_to_float(trade_dict.get("pnl_percent"), 0.0),
             status=trade_dict.get("status", "filled"),
-            strategy=trade_dict.get("strategy", ""),
-            reasoning=trade_dict.get("reasoning", ""),
+            strategy=strategy_field,
+            reasoning=reason_s,
             stop_loss=_to_float(trade_dict.get("stop_loss"), 0.0) if trade_dict.get("stop_loss") is not None else None,
             take_profit=_to_float(trade_dict.get("take_profit"), 0.0) if trade_dict.get("take_profit") is not None else None,
             leverage=_to_int(trade_dict.get("leverage"), 1),
             timestamp=trade_dict.get("timestamp", datetime.now().isoformat()),
-            metadata=trade_dict.get("metadata", {})
+            metadata=meta,
         )
         return await self.record_trade(trade)
+
+    async def apply_exchange_truth(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        exchange_pnl: Optional[float] = None,
+        exchange_fee: Optional[float] = None,
+        exchange_price: Optional[float] = None,
+        source: str = "exchange_auto_sync",
+    ) -> bool:
+        """
+        将交易所真值回填到本地交易记录（缓存 + SQLite）。
+        仅按 order_id(+symbol) 匹配，避免误改。
+        """
+        oid = str(order_id or "").strip()
+        sym = str(symbol or "").strip().upper()
+        if not oid or not sym:
+            return False
+        changed = False
+        async with self._lock:
+            for tr in self._cache:
+                if str(tr.order_id or "").strip() != oid:
+                    continue
+                if str(tr.symbol or "").strip().upper() != sym:
+                    continue
+                if exchange_pnl is not None:
+                    tr.pnl = _to_float(exchange_pnl, tr.pnl)
+                    changed = True
+                if exchange_fee is not None:
+                    tr.fee = _to_float(exchange_fee, tr.fee)
+                    changed = True
+                if exchange_price is not None and _to_float(exchange_price, 0.0) > 0:
+                    tr.price = _to_float(exchange_price, tr.price)
+                    changed = True
+                if changed:
+                    tr.metadata = dict(tr.metadata or {})
+                    tr.metadata["truth_synced"] = True
+                    tr.metadata["truth_source"] = str(source or "exchange_auto_sync")
+                    tr.metadata["truth_synced_at"] = datetime.now().isoformat()
+                    tr.metadata["pnl_estimated"] = False
+            if changed:
+                self._invalidate_stats_cache()
+        if self.db_storage:
+            suffix = f"\n[truth_sync:{datetime.now().isoformat()}]"
+            rows_updated = await self.db_storage.update_trade_truth_by_order_id(
+                oid,
+                symbol=sym,
+                price=exchange_price,
+                pnl=exchange_pnl,
+                fee=exchange_fee,
+                reasoning_append=suffix,
+            )
+        return changed
     
     # ==================== 核心查询操作 ====================
     
@@ -372,6 +457,7 @@ class TradeHistoryService:
             result.update({
                 "period_days": days,
                 "symbol_distribution": self._get_symbol_distribution(trades),
+                "strategy_distribution": self._get_strategy_distribution(trades),
                 "daily_pnl_trend": self._get_daily_pnl_trend(trades),
                 "analysis_time": datetime.now().isoformat()
             })
@@ -467,6 +553,33 @@ class TradeHistoryService:
             d["total_volume"] = round(d["total_volume"], 2)
             d["total_pnl"] = round(d["total_pnl"], 4)
         
+        return dict(sorted(distribution.items(), key=lambda x: x[1]["count"], reverse=True))
+
+    def _get_strategy_distribution(self, trades: List[Dict]) -> Dict[str, Dict]:
+        """按策略统计分布，供跨重启稳定查看策略表现。"""
+        distribution: Dict[str, Dict[str, Any]] = {}
+        for t in trades:
+            strategy = str(t.get("strategy") or "unknown").strip() or "unknown"
+            if strategy not in distribution:
+                distribution[strategy] = {
+                    "count": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "total_pnl": 0.0,
+                }
+            d = distribution[strategy]
+            d["count"] += 1
+            pnl = float(t.get("pnl", 0) or 0)
+            d["total_pnl"] += pnl
+            if pnl > 0:
+                d["wins"] += 1
+            elif pnl < 0:
+                d["losses"] += 1
+
+        for st, d in distribution.items():
+            total = int(d["wins"]) + int(d["losses"])
+            d["win_rate"] = round((d["wins"] / total * 100.0), 2) if total > 0 else 0.0
+            d["total_pnl"] = round(float(d["total_pnl"]), 4)
         return dict(sorted(distribution.items(), key=lambda x: x[1]["count"], reverse=True))
     
     def _get_daily_pnl_trend(self, trades: List[Dict]) -> List[Dict]:
@@ -673,6 +786,72 @@ class TradeHistoryService:
         except Exception as e:
             logger.error(f"生成复盘报告失败: {e}")
             return f"生成复盘报告失败: {e}"
+
+    async def run_outcome_reflection(self, limit: int = 120) -> Dict[str, Any]:
+        """
+        Resolve recently closed outcomes into lessons once (pending -> realized -> reflection).
+        """
+        rows = await self.get_recent_trades(limit=max(20, int(limit or 120)))
+        if not rows:
+            return {"processed": 0, "reflected": 0, "skipped": 0}
+
+        reflected = 0
+        skipped = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
+            action = str(row.get("action") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            if action not in {"close", "closed"} and status not in {"closed", "filled"}:
+                skipped += 1
+                continue
+
+            try:
+                pnl = float(row.get("pnl", 0) or 0)
+                pnl_pct = float(row.get("pnl_percent", 0) or 0)
+            except Exception:
+                skipped += 1
+                continue
+            if abs(pnl) <= 1e-12 and abs(pnl_pct) <= 1e-12:
+                skipped += 1
+                continue
+
+            rid = str(row.get("order_id") or row.get("trade_id") or "") or (
+                f"{row.get('symbol','')}|{row.get('timestamp','')}|{pnl:.8f}"
+            )
+            if rid in self._reflection_seen:
+                skipped += 1
+                continue
+
+            if self.memory_manager is not None:
+                try:
+                    symbol = str(row.get("symbol") or "")
+                    side = str(row.get("side") or "")
+                    strat = str(row.get("strategy") or "unknown")
+                    reason = str(row.get("reasoning") or "N/A")[:220]
+                    tone = "成功模式" if pnl > 0 else "失败教训"
+                    lesson = (
+                        f"{tone}: {symbol} {side} strategy={strat} pnl={pnl:.4f} "
+                        f"pnl_pct={pnl_pct:.4%}; reason={reason}"
+                    )
+                    await self.memory_manager.save_lesson_learned(
+                        lesson_type="successful_patterns" if pnl > 0 else "trading_mistakes",
+                        lesson=lesson,
+                        context=f"order={rid}",
+                    )
+                except Exception:
+                    pass
+
+            self._reflection_seen.add(rid)
+            reflected += 1
+
+        self._save_reflection_index()
+        return {
+            "processed": len(rows),
+            "reflected": reflected,
+            "skipped": skipped,
+        }
     
     # ==================== 内部方法 ====================
     
@@ -727,7 +906,8 @@ class TradeHistoryService:
                             status="filled",
                             reasoning=str(row.get("reasoning") or ""),
                             timestamp=str(row.get("timestamp") or datetime.now().isoformat()),
-                            metadata={"source": "db_bootstrap", "db_id": row.get("id")},
+                            # Rows loaded from persistent DB are real history, not synthetic bootstrap.
+                            metadata={"source": "historical_db", "db_id": row.get("id")},
                         )
                     )
 

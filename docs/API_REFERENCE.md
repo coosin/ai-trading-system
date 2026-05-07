@@ -47,6 +47,46 @@
 
 详见：`docs/TRADING_DEBUG_PLAYBOOK.md`
 
+---
+
+## 交易真值（交易所同步）与对账接口（2026-05-06 新增）
+
+### 1) 交易所事实账本（独立分账）
+
+为避免“系统运行日志”和“资金/成交事实”混杂，系统新增独立账本文件（JSON Lines，仅追加）：
+
+- **交易所事实账本**：`logs/exchange_sync/exchange_truth.jsonl`
+- 写入方：`src/modules/core/exchange_sync_ledger.py`（logger：`openclaw.exchange_sync`）
+- 典型事件：
+  - `trade_close_recorded`：平仓入账摘要（含 `pnl_estimated` / `fills_enriched`）
+  - `auto_truth_backfill`：后台自动回填真值摘要
+
+### 2) 对账接口（按 order_id + symbol）
+
+- `GET /api/v1/trades/reconcile`
+  - 用途：对比系统平仓记录与 OKX `fills` 聚合结果
+  - 关键返回：
+    - `summary.matched / missing_on_exchange / match_rate`
+    - `details[].pnl_delta / fee_delta / price_delta`
+    - `details[].match_method`：`order_id` / `time_window` / `none`
+  - 常用参数：
+    - `days`：时间范围
+    - `symbol`：只查单标的
+    - `exclude_bootstrap=true`：排除 `db_bootstrap`
+    - `exclude_estimated_pnl=true`：排除估算 PnL 样本（用于严格真实收益分析）
+    - `include_time_window_fallback=true`：允许无 order_id 的时间窗兜底匹配
+    - `fallback_time_window_sec`：时间窗大小
+
+- `GET /api/v1/trades/reconcile/report`
+  - 用途：一键差异报告（摘要 + Top 偏差列表）
+  - 适合：值守快速定位“哪几笔最不一致”
+
+### 3) 交易历史接口的“严格真实模式”
+
+- `GET /api/v1/trades?accurate_only=true`
+  - 等价于：`realized_only=true&exclude_bootstrap=true&exclude_estimated_pnl=true`
+  - 说明：真实平仓但盈亏为 0 的记录也视为 realized（按 `action=close` / `status=filled` 识别）
+
 ## 升级后实时链路（2026-04-13）
 
 以下为当前版本实测可用的“实时信息与通知”主链路，优先作为前端与司令部集成基线：
@@ -142,6 +182,9 @@
     - `max_positions_oneway`
     - `max_positions_hedge`
     - `hard_max_positions`
+  - 2026-05 升级补充字段：
+    - `data.strategy_distribution_30d`：近30天策略维度统计（count/win_rate/total_pnl）
+    - `data.decision_contract_integrity`：决策契约完整性（strategy/trace 覆盖率、按 source 分解、异常样本）
   - 2026-04-28 补充关键诊断块：
     - `data.execution_reconciliation`：本地/交易所状态对账摘要（仓位漂移、孤儿挂单、修复建议）
     - `data.execution_reconciliation_protection`：对账保护层状态（symbol/global 锁）

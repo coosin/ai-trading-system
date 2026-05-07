@@ -26,6 +26,7 @@ from enum import Enum
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+from src.modules.core.decision_contract import validate_envelope
 
 
 class CommandType(Enum):
@@ -396,14 +397,27 @@ class ExecutionVerifier:
             return result
 
         params = params or {}
-        sym = symbol or params.get("symbol")
+        env = params.get("decision_envelope") if isinstance(params.get("decision_envelope"), dict) else None
+        if env:
+            ok_env, why_env = validate_envelope(env)
+            if not ok_env:
+                result.status = ExecutionStatus.FAILED
+                result.error_message = str(why_env)
+                self._stats["failed"] += 1
+                return result
+            sym = env.get("symbol") or symbol or params.get("symbol")
+            side = self._normalize_swap_side(env.get("side") or params.get("side", "long")) or "long"
+            quantity = float(env.get("quantity", params.get("quantity", 0)) or 0)
+            leverage = int(env.get("leverage", params.get("leverage") or 20) or 20)
+        else:
+            sym = symbol or params.get("symbol")
+            side = self._normalize_swap_side(params.get("side", "long")) or "long"
+            quantity = float(params.get("quantity", 0) or 0)
+            leverage = int(params.get("leverage") or 20)
         # CRITICAL: 不允许“省略即特权”。write_source 缺失则视为 unknown，交由 S1 policy 决定是否放行。
         write_source = str(params.get("write_source") or params.get("source") or "unknown").strip().lower()
-        side = self._normalize_swap_side(params.get("side", "long")) or "long"
-        quantity = float(params.get("quantity", 0) or 0)
         price = params.get("price")
         order_type = params.get("order_type", "market")
-        leverage = int(params.get("leverage") or 20)
 
         gw = None
         if self._main_controller is not None:
@@ -435,6 +449,8 @@ class ExecutionVerifier:
                     "stop_loss": params.get("stop_loss"),
                     "take_profit": params.get("take_profit"),
                     "trace_id": params.get("trace_id"),
+                    "strategy_used": params.get("strategy_used") or params.get("strategy_id"),
+                    "strategy_id": params.get("strategy_id") or params.get("strategy_used"),
                 },
             )
         except Exception as e:
@@ -496,7 +512,19 @@ class ExecutionVerifier:
             return result
 
         params = params or {}
-        sym = symbol or params.get("symbol")
+        env = params.get("decision_envelope") if isinstance(params.get("decision_envelope"), dict) else None
+        if env:
+            ok_env, why_env = validate_envelope(env)
+            if not ok_env:
+                result.status = ExecutionStatus.FAILED
+                result.error_message = str(why_env)
+                self._stats["failed"] += 1
+                return result
+            sym = env.get("symbol") or symbol or params.get("symbol")
+            pos_side: Optional[str] = self._normalize_swap_side(env.get("side") or params.get("side"))
+        else:
+            sym = symbol or params.get("symbol")
+            pos_side: Optional[str] = self._normalize_swap_side(params.get("side"))
         # CRITICAL: 不允许“省略即特权”。write_source 缺失则视为 unknown，交由 S1 policy 决定是否放行。
         write_source = str(params.get("write_source") or params.get("source") or "unknown").strip().lower()
         quantity = params.get("quantity")
@@ -505,7 +533,6 @@ class ExecutionVerifier:
         if self._main_controller is not None:
             gw = getattr(self._main_controller, "execution_gateway", None)
 
-        pos_side: Optional[str] = self._normalize_swap_side(params.get("side"))
         if not pos_side and sym:
             try:
                 positions = await self._exchange.fetch_positions([sym])
@@ -555,6 +582,8 @@ class ExecutionVerifier:
                     "quantity": quantity,
                     "pnl": params.get("pnl", 0),
                     "trace_id": params.get("trace_id"),
+                    "strategy_used": params.get("strategy_used") or params.get("strategy_id"),
+                    "strategy_id": params.get("strategy_id") or params.get("strategy_used"),
                 },
             )
         except Exception as e:

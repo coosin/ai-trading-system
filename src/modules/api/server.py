@@ -494,12 +494,8 @@ class APIServer:
                         return s.connect_ex(('localhost', port)) == 0
                 
                 if is_port_in_use(self.port):
-                    logger.warning(f"端口 {self.port} 已被占用，尝试使用备用端口")
-                    for alt_port in range(self.port + 1, self.port + 10):
-                        if not is_port_in_use(alt_port):
-                            self.port = alt_port
-                            logger.info(f"使用备用端口: {self.port}")
-                            break
+                    logger.error(f"端口 {self.port} 已被占用，拒绝自动切换端口（避免前端/网关指向漂移）")
+                    return False
                 
                 config = uvicorn.Config(
                     self.app,
@@ -905,6 +901,15 @@ class APIServer:
         async def add_process_time_header(request: Request, call_next):
             """添加处理时间头"""
             start_time = datetime.now()
+            path = str(request.url.path or "")
+            method = str(request.method or "").upper()
+            watch_path = (
+                "/commander/dispatch" in path
+                or "/trade/" in path
+                or "/modules/execution" in path
+                or "/ai/chat" in path
+            )
+            broad_watch_path = path.startswith("/api") or path.startswith("/commander")
 
             if self.enforce_auth_on_writes and self._is_protected_write_path(request.url.path, request.method):
                 if not self._is_internal_auth_bypass(request):
@@ -2242,7 +2247,12 @@ class APIServer:
         def _is_realized_trade(row: Dict[str, Any]) -> bool:
             pnl = _to_float(row.get("pnl"))
             pnl_pct = _to_float(row.get("pnl_percent"))
-            return abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12
+            if abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12:
+                return True
+            # break-even close should still be treated as realized when confirmed by close action/status
+            action = str(row.get("action") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            return action in {"close", "closed"} or status in {"closed", "filled"}
 
         @api_v1_router.get("/trades", tags=["trades"])
         async def get_trades(
@@ -2250,7 +2260,11 @@ class APIServer:
             symbol: Optional[str] = None,
             side: Optional[str] = None,
             limit: int = 100,
-            offset: int = 0
+            offset: int = 0,
+            realized_only: bool = False,
+            exclude_bootstrap: bool = False,
+            exclude_estimated_pnl: bool = False,
+            accurate_only: bool = False,
         ):
             """
             获取交易历史（真实数据）
@@ -2261,9 +2275,14 @@ class APIServer:
             - side: 方向过滤 (buy/sell)
             - limit: 返回数量限制
             - offset: 分页偏移
+            - accurate_only: 仅返回可用于真实收益分析的记录（等价 realized_only+exclude_bootstrap）
             """
             try:
                 mc = self.main_controller
+                if accurate_only:
+                    realized_only = True
+                    exclude_bootstrap = True
+                    exclude_estimated_pnl = True
                 # 解析时间范围
                 now = datetime.now()
                 if range == "24h":
@@ -2284,29 +2303,53 @@ class APIServer:
                 
                 if trade_service:
                     # 使用真实的交易历史服务查询
+                    # Note: filtering after retrieval can empty a page if raw rows include many non-realized/bootstrap entries.
+                    # Over-fetch and paginate after filtering for stable operator-facing results.
+                    fetch_limit = max(int(limit or 100) * 20, 2000)
                     trades = await trade_service.get_trade_history(
                         start_date=start_date,
                         symbol=symbol,
                         side=side,
-                        limit=limit,
-                        offset=offset
+                        limit=fetch_limit,
+                        offset=0,
                     )
+                    clean_trades: List[Dict[str, Any]] = []
+                    for row in (trades or []):
+                        if not isinstance(row, dict):
+                            continue
+                        md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                        if exclude_bootstrap and _is_bootstrap_trade(row):
+                            continue
+                        if exclude_estimated_pnl and bool(md.get("pnl_estimated")):
+                            continue
+                        if realized_only and not _is_realized_trade(row):
+                            continue
+                        clean_trades.append(row)
+                    paged_trades = clean_trades[offset: offset + max(limit, 1)]
                     
-                    if not trades:
+                    if not paged_trades:
                         return {
                             "trades": [],
-                            "total": 0,
+                            "total": len(clean_trades),
                             "message": f"暂无{range}时间范围内的交易记录",
+                            "filters_applied": {
+                                "realized_only": bool(realized_only),
+                                "exclude_bootstrap": bool(exclude_bootstrap),
+                                "exclude_estimated_pnl": bool(exclude_estimated_pnl),
+                            },
                             "query_time": datetime.now().isoformat()
                         }
                     
                     return {
-                        "trades": trades,
-                        "total": len(trades),
+                        "trades": paged_trades,
+                        "total": len(clean_trades),
                         "range": range,
                         "filters": {
                             "symbol": symbol,
-                            "side": side
+                            "side": side,
+                            "realized_only": bool(realized_only),
+                            "exclude_bootstrap": bool(exclude_bootstrap),
+                            "exclude_estimated_pnl": bool(exclude_estimated_pnl),
                         },
                         "query_time": datetime.now().isoformat()
                     }
@@ -2329,12 +2372,28 @@ class APIServer:
                         if trades_db:
                             from dataclasses import asdict
                             trades_list = [asdict(t) for t in trades_db]
+                            clean_list: List[Dict[str, Any]] = []
+                            for row in trades_list:
+                                if not isinstance(row, dict):
+                                    continue
+                                if exclude_bootstrap and _is_bootstrap_trade(row):
+                                    continue
+                                if realized_only and not _is_realized_trade(row):
+                                    continue
+                                clean_list.append(row)
                             
                             return {
-                                "trades": trades_list,
-                                "total": len(trades_list),
+                                "trades": clean_list,
+                                "total": len(clean_list),
                                 "source": "database",
                                 "range": range,
+                                "filters": {
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "realized_only": bool(realized_only),
+                                    "exclude_bootstrap": bool(exclude_bootstrap),
+                                    "exclude_estimated_pnl": bool(exclude_estimated_pnl),
+                                },
                                 "query_time": datetime.now().isoformat()
                             }
                         else:
@@ -2369,11 +2428,25 @@ class APIServer:
                                     "error_message": row.get("error_message"),
                                 }
                             )
+                        clean_mapped: List[Dict[str, Any]] = []
+                        for row in mapped:
+                            if exclude_bootstrap and _is_bootstrap_trade(row):
+                                continue
+                            if realized_only and not _is_realized_trade(row):
+                                continue
+                            clean_mapped.append(row)
                         return {
-                            "trades": mapped,
-                            "total": len(mapped),
+                            "trades": clean_mapped,
+                            "total": len(clean_mapped),
                             "source": "fallback:execution_audit",
                             "note": "trade_history_service/database unavailable",
+                            "filters": {
+                                "symbol": symbol,
+                                "side": side,
+                                "realized_only": bool(realized_only),
+                                "exclude_bootstrap": bool(exclude_bootstrap),
+                                "exclude_estimated_pnl": bool(exclude_estimated_pnl),
+                            },
                             "query_time": datetime.now().isoformat(),
                         }
                         
@@ -2384,6 +2457,273 @@ class APIServer:
                     "details": str(e),
                     "suggestion": "请联系管理员检查系统状态"
                 }
+
+        @api_v1_router.get("/trades/reconcile", tags=["trades"])
+        async def reconcile_trades_with_exchange(
+            days: int = 7,
+            symbol: Optional[str] = None,
+            limit: int = 200,
+            max_exchange_checks: int = 120,
+            exclude_bootstrap: bool = True,
+            exclude_estimated_pnl: bool = True,
+            include_time_window_fallback: bool = True,
+            fallback_time_window_sec: int = 240,
+            max_fallback_candidates_per_symbol: int = 30,
+        ):
+            """
+            对账系统平仓记录与交易所成交事实（按 order_id + symbol）。
+            """
+            try:
+                mc = self.main_controller
+                trade_service = getattr(mc, "trade_history_service", None) if mc else None
+                if not trade_service:
+                    return {"success": False, "message": "trade_history_service unavailable"}
+                ex = mc.get_exchange() if (mc and hasattr(mc, "get_exchange")) else None
+                if not ex:
+                    ex = getattr(mc, "okx_exchange", None) if mc else None
+                if not ex:
+                    return {"success": False, "message": "exchange unavailable"}
+                get_fills = getattr(ex, "get_swap_fills_for_order", None)
+                if not callable(get_fills):
+                    return {"success": False, "message": "exchange does not support fills reconciliation"}
+                get_history_fills = getattr(ex, "get_recent_fills", None)
+
+                start_date = datetime.now() - timedelta(days=max(1, int(days or 7)))
+                fetch_limit = max(int(limit or 200) * 10, 1000)
+                rows = await trade_service.get_trade_history(
+                    start_date=start_date,
+                    symbol=symbol,
+                    limit=fetch_limit,
+                    offset=0,
+                )
+
+                candidates: List[Dict[str, Any]] = []
+                for row in (rows or []):
+                    if not isinstance(row, dict):
+                        continue
+                    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                    action = str(row.get("action") or "").strip().lower()
+                    status = str(row.get("status") or "").strip().lower()
+                    if action not in {"close", "closed"} and status not in {"filled", "closed"}:
+                        continue
+                    if exclude_bootstrap and _is_bootstrap_trade(row):
+                        continue
+                    if exclude_estimated_pnl and bool(md.get("pnl_estimated")):
+                        continue
+                    oid = str(row.get("order_id") or "").strip()
+                    sym = str(row.get("symbol") or "").strip()
+                    if not sym:
+                        continue
+                    candidates.append(row)
+
+                candidates = candidates[: max(1, int(max_exchange_checks or 120))]
+                details: List[Dict[str, Any]] = []
+                matched = 0
+                missing = 0
+                matched_by_order_id = 0
+                matched_by_time_window = 0
+                abs_pnl_delta_sum = 0.0
+                abs_fee_delta_sum = 0.0
+
+                def _parse_ts(ts: Any) -> Optional[datetime]:
+                    s = str(ts or "").strip()
+                    if not s:
+                        return None
+                    try:
+                        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                    except Exception:
+                        return None
+
+                def _aggregate_fills(fills: List[Dict[str, Any]]) -> Dict[str, float]:
+                    ex_pnl = 0.0
+                    ex_fee = 0.0
+                    ex_px_num = 0.0
+                    ex_px_den = 0.0
+                    for f in (fills or []):
+                        if not isinstance(f, dict):
+                            continue
+                        for k in ("fillPnl", "pnl", "realizedPnl"):
+                            if f.get(k) is None:
+                                continue
+                            ex_pnl += _to_float(f.get(k))
+                            break
+                        ex_fee += _to_float(f.get("fee"))
+                        fsz = _to_float(f.get("fillSz") if f.get("fillSz") is not None else f.get("sz"))
+                        fpx = _to_float(f.get("fillPx") if f.get("fillPx") is not None else f.get("px"))
+                        if fsz > 0 and fpx > 0:
+                            ex_px_num += fpx * fsz
+                            ex_px_den += fsz
+                    ex_price = (ex_px_num / ex_px_den) if ex_px_den > 1e-18 else 0.0
+                    return {"pnl": ex_pnl, "fee": ex_fee, "price": ex_price}
+
+                fallback_fills_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+
+                for row in candidates:
+                    oid = str(row.get("order_id") or "").strip()
+                    sym = str(row.get("symbol") or "").strip()
+                    match_method = "none"
+                    fills: List[Dict[str, Any]] = []
+                    if oid:
+                        try:
+                            fills = await get_fills(sym, oid)
+                        except Exception:
+                            fills = []
+                        if fills:
+                            match_method = "order_id"
+                            matched_by_order_id += 1
+                    if (
+                        not fills
+                        and include_time_window_fallback
+                        and callable(get_history_fills)
+                    ):
+                        ts = _parse_ts(row.get("timestamp"))
+                        if sym not in fallback_fills_by_symbol:
+                            try:
+                                got = await get_history_fills(
+                                    symbol=sym,
+                                    limit=max(5, int(max_fallback_candidates_per_symbol or 30)),
+                                )
+                                fallback_fills_by_symbol[sym] = list(got or []) if isinstance(got, list) else []
+                            except Exception:
+                                fallback_fills_by_symbol[sym] = []
+                        if ts is not None:
+                            delta_sec = max(10, int(fallback_time_window_sec or 240))
+                            time_bucket: List[Dict[str, Any]] = []
+                            for f in fallback_fills_by_symbol.get(sym, []):
+                                if not isinstance(f, dict):
+                                    continue
+                                fts = _parse_ts(f.get("ts") or f.get("fillTime") or f.get("cTime"))
+                                if fts is None:
+                                    continue
+                                if abs((fts - ts).total_seconds()) <= float(delta_sec):
+                                    time_bucket.append(f)
+                            if time_bucket:
+                                fills = time_bucket
+                                match_method = "time_window"
+                                matched_by_time_window += 1
+
+                    aggr = _aggregate_fills(fills)
+                    ex_pnl = _to_float(aggr.get("pnl"))
+                    ex_fee = _to_float(aggr.get("fee"))
+                    ex_price = _to_float(aggr.get("price"))
+
+                    sys_pnl = _to_float(row.get("pnl"))
+                    sys_fee = _to_float(row.get("fee"))
+                    sys_price = _to_float(row.get("price"))
+                    pnl_delta = sys_pnl - ex_pnl
+                    fee_delta = sys_fee - ex_fee
+                    price_delta = sys_price - ex_price if ex_price > 0 else 0.0
+                    is_match = bool(fills)
+                    if is_match:
+                        matched += 1
+                    else:
+                        missing += 1
+                    abs_pnl_delta_sum += abs(pnl_delta)
+                    abs_fee_delta_sum += abs(fee_delta)
+                    details.append(
+                        {
+                            "timestamp": row.get("timestamp"),
+                            "symbol": sym,
+                            "order_id": oid,
+                            "matched": is_match,
+                            "match_method": match_method,
+                            "exchange_fill_count": int(len(fills or [])),
+                            "system_pnl": round(sys_pnl, 8),
+                            "exchange_pnl": round(ex_pnl, 8),
+                            "pnl_delta": round(pnl_delta, 8),
+                            "system_fee": round(sys_fee, 8),
+                            "exchange_fee": round(ex_fee, 8),
+                            "fee_delta": round(fee_delta, 8),
+                            "system_price": round(sys_price, 8),
+                            "exchange_avg_fill_price": round(ex_price, 8),
+                            "price_delta": round(price_delta, 8),
+                        }
+                    )
+
+                details.sort(key=lambda x: abs(_to_float(x.get("pnl_delta"))), reverse=True)
+                output_rows = details[: max(1, int(limit or 200))]
+                return {
+                    "success": True,
+                    "period_days": int(days or 7),
+                    "filters": {
+                        "symbol": symbol,
+                        "exclude_bootstrap": bool(exclude_bootstrap),
+                        "exclude_estimated_pnl": bool(exclude_estimated_pnl),
+                        "max_exchange_checks": int(max_exchange_checks or 120),
+                        "include_time_window_fallback": bool(include_time_window_fallback),
+                        "fallback_time_window_sec": int(fallback_time_window_sec or 240),
+                    },
+                    "summary": {
+                        "input_rows": int(len(rows or [])),
+                        "candidate_rows": int(len(candidates)),
+                        "matched": int(matched),
+                        "missing_on_exchange": int(missing),
+                        "matched_by_order_id": int(matched_by_order_id),
+                        "matched_by_time_window": int(matched_by_time_window),
+                        "match_rate": round((matched / len(candidates)) if candidates else 0.0, 6),
+                        "sum_abs_pnl_delta": round(abs_pnl_delta_sum, 8),
+                        "sum_abs_fee_delta": round(abs_fee_delta_sum, 8),
+                    },
+                    "details": output_rows,
+                    "generated_at": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                logger.error(f"交易对账失败: {e}", exc_info=True)
+                return {
+                    "success": False,
+                    "message": "交易对账失败",
+                    "details": str(e),
+                }
+
+        @api_v1_router.get("/trades/reconcile/report", tags=["trades"])
+        async def reconcile_trades_report(
+            days: int = 7,
+            symbol: Optional[str] = None,
+            top_n: int = 20,
+        ):
+            """
+            一键差异报告（摘要 + TOP 偏差列表），便于快速人工排查。
+            """
+            raw = await reconcile_trades_with_exchange(
+                days=days,
+                symbol=symbol,
+                limit=max(20, int(top_n or 20)),
+                max_exchange_checks=max(50, int(top_n or 20) * 6),
+                exclude_bootstrap=True,
+                exclude_estimated_pnl=True,
+                include_time_window_fallback=True,
+                fallback_time_window_sec=240,
+                max_fallback_candidates_per_symbol=50,
+            )
+            if not isinstance(raw, dict) or not raw.get("success"):
+                return raw
+
+            detail_rows = list(raw.get("details") or [])
+            top_pnl = sorted(detail_rows, key=lambda x: abs(_to_float((x or {}).get("pnl_delta"))), reverse=True)[: max(1, int(top_n or 20))]
+            top_fee = sorted(detail_rows, key=lambda x: abs(_to_float((x or {}).get("fee_delta"))), reverse=True)[: max(1, int(top_n or 20))]
+            high_risk: List[Dict[str, Any]] = []
+            for r in detail_rows:
+                if not isinstance(r, dict):
+                    continue
+                if (not bool(r.get("matched"))) or abs(_to_float(r.get("pnl_delta"))) >= 0.5:
+                    high_risk.append(r)
+            return {
+                "success": True,
+                "report_type": "trade_reconcile_gap_report",
+                "period_days": int(days or 7),
+                "symbol": symbol,
+                "summary": raw.get("summary"),
+                "filters": raw.get("filters"),
+                "high_risk_count": int(len(high_risk)),
+                "top_pnl_delta": top_pnl,
+                "top_fee_delta": top_fee,
+                "recommendations": [
+                    "优先检查 missing_on_exchange 与 match_method=time_window 的记录。",
+                    "对 high_risk 记录逐笔回查交易所成交明细与本地 order_id 映射。",
+                    "若连续出现 time_window 匹配，建议补齐 order_id 持久化链路。"
+                ],
+                "generated_at": datetime.now().isoformat(),
+            }
 
         # 移除历史兼容别名：/trading/history 与 /trade/history（统一使用 /api/v1/trades）
 

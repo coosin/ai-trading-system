@@ -119,6 +119,7 @@ def _configure_root_logging() -> None:
 _configure_root_logging()
 
 logger = logging.getLogger(__name__)
+logging.getLogger("openclaw.exchange_sync").setLevel(logging.INFO)
 
 
 class TradingSystem:
@@ -192,7 +193,14 @@ class TradingSystem:
         try:
             # 先启动 API（避免 start_system 因外部依赖阻塞导致“端口未监听”）
             if self.api_server:
-                await self.api_server.start()
+                started = await self.api_server.start()
+                if not started:
+                    logger.error(
+                        "API服务器启动失败（host=%s port=%s），终止系统启动以避免进入“无API仅后台任务运行”状态",
+                        getattr(self.api_server, "host", "0.0.0.0"),
+                        getattr(self.api_server, "port", "unknown"),
+                    )
+                    raise RuntimeError("api_server_start_failed")
                 logger.info(f"API服务器已启动，访问 http://{self.api_server.host}:{self.api_server.port}/docs 查看文档")
 
             # 使用 MainController 的完整启动流程（包含依赖顺序、状态管理与健康检查链路）

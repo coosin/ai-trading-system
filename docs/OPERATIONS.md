@@ -99,6 +99,44 @@ curl -s 'http://localhost:8000/api/v1/modules/commander/account-diagnostics'
 - 若 `snapshot.data.account.positions` 为空，应检查 `snapshot.data.alerts` 是否含回退提示。
 - 若 `account-diagnostics` 返回 `degraded=true` 且 `hint=account_diagnostics_timeout`，属于超时降级，不等价于“交易所断连”。
 
+---
+
+## 2.5 交易所实时同步与真值回填（自动，2026-05 新增）
+
+### 2.5.1 分账原则（强制建议）
+
+为避免排障时混淆“系统行为”和“资金事实”，请分开看两类数据源：
+
+- **行为日志**：`logs/app.log`（决策、门控、执行、异常）
+- **交易所事实账本**：`logs/exchange_sync/exchange_truth.jsonl`（pnl/fee/均价回填、fills 数量、是否估算）
+
+### 2.5.2 自动同步线程（无需人工触发）
+
+系统启动后会自动运行“交易所同步线程”，周期执行：
+
+- 同步余额/持仓（用于接管与风控）
+- 回填近期平仓订单的交易所真值（用于收益统计与复盘口径）
+
+配置入口（主配置文件 `config/config.yaml`）：
+
+- `exchange_auto_sync.enabled`（默认 true）
+- `exchange_auto_sync.interval_sec`（默认 20）
+- `exchange_auto_sync.truth_backfill_every_n_cycles`（默认 3）
+- `exchange_auto_sync.truth_backfill_lookback_minutes`（默认 180）
+- `exchange_auto_sync.truth_backfill_max_rows`（默认 80）
+
+### 2.5.3 对账报告（值守快检）
+
+当你怀疑“系统记录与交易所不一致”时，优先跑一键报告：
+
+- `GET /api/v1/trades/reconcile/report?days=7&top_n=20`
+
+判读优先级：
+
+1. `missing_on_exchange` 高：可能是 order_id 不完整、fills 拉取失败、或记录口径混入非实盘来源
+2. `match_method=time_window` 多：说明历史链路缺少 order_id，建议优先补齐入账字段/持久化链路
+3. `abs(pnl_delta)` 最大的几笔：逐笔核对交易所成交明细与系统入账
+
 ### 2.1 实时通知链路巡检（升级后必做）
 
 > 目标：确认“行情判断、开平仓、止盈止损、告警”可同步到司令部、前端与 API 对接端。

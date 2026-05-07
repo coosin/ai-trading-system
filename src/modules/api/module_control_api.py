@@ -3037,6 +3037,9 @@ def init_module_control_api(app, main_controller):
                     ths.get_statistics(days=30, force_refresh=False),
                     timeout=2.5,
                 )
+                st = out.get("trade_history_30d") if isinstance(out.get("trade_history_30d"), dict) else {}
+                if isinstance(st, dict):
+                    out["strategy_distribution_30d"] = st.get("strategy_distribution") or {}
         except asyncio.TimeoutError:
             out["trade_history_30d"] = {"degraded": True, "message": "trade_history_stats_timeout"}
         except Exception as e:
@@ -3191,8 +3194,17 @@ def init_module_control_api(app, main_controller):
         try:
             eg = out.get("execution_gateway") if isinstance(out.get("execution_gateway"), dict) else {}
             events = (eg.get("recent_events") or []) if isinstance(eg.get("recent_events"), list) else []
-            # focus on failures only
-            fails = [e for e in events if isinstance(e, dict) and e.get("success") is False]
+            # focus on failures only; split benign terminal-close noise from actionable failures
+            fails_all = [e for e in events if isinstance(e, dict) and e.get("success") is False]
+            benign_codes = {"ALREADY_CLOSED_NO_POSITION"}
+            benign_fails = [
+                e for e in fails_all
+                if str(e.get("error_code") or "").upper() in benign_codes
+            ]
+            fails = [
+                e for e in fails_all
+                if str(e.get("error_code") or "").upper() not in benign_codes
+            ]
 
             def _key(e: Dict[str, Any]) -> str:
                 op = str(e.get("op") or "unknown")
@@ -3238,6 +3250,7 @@ def init_module_control_api(app, main_controller):
                     "INSUFFICIENT_FUNDS": "余额不足：检查资金与费用预留。",
                     "SIZE_TOO_SMALL": "下单张数过小：检查 minSz/lotSz，修正 size 计算与步进对齐。",
                     "INSTRUMENT_INVALID": "合约标的无效：检查 symbol 规范化与 instId。",
+                    "ALREADY_CLOSED_NO_POSITION": "终态噪声(已无可平仓位)：通常为并发/延迟导致的重复 close，可忽略并检查幂等收敛。",
                     "EXCHANGE_ALL_OPERATIONS_FAILED": "交易所拒单(All operations failed)：检查 reduceOnly/posSide/参数组合，必要时走 close-position fallback。",
                     "POST_CHECK_ANOMALY": "平仓后复核异常：检查 positions 刷新延迟/是否实际成交；必要时二次 close-position。",
                 }.get(code, "查看 detail/endpoint/trace_id 对照交易所返回，补齐映射或加更具体的重试/降级。")
@@ -3258,10 +3271,88 @@ def init_module_control_api(app, main_controller):
 
             out["execution_attribution"] = {
                 "failures_in_window": len(fails),
+                "benign_failures_in_window": len(benign_fails),
+                "benign_failure_codes": sorted(list(benign_codes)),
                 "top_reasons": top,
             }
         except Exception as e:
             out["execution_attribution_error"] = str(e)
+
+        # 8) Decision contract integrity snapshot (strategy/trace attribution health)
+        try:
+            eg = out.get("execution_gateway") if isinstance(out.get("execution_gateway"), dict) else {}
+            events = (eg.get("recent_events") or []) if isinstance(eg.get("recent_events"), list) else []
+            total = 0
+            miss_strategy = 0
+            miss_trace = 0
+            miss_both = 0
+            by_source: Dict[str, Dict[str, int]] = {}
+            samples: List[Dict[str, Any]] = []
+            for e in events:
+                if not isinstance(e, dict):
+                    continue
+                if str(e.get("op") or "").strip().lower() not in {"open", "close"}:
+                    continue
+                total += 1
+                src = str(e.get("source") or "unknown")
+                ctx = e.get("context") if isinstance(e.get("context"), dict) else {}
+                sid = str(
+                    ctx.get("strategy_used")
+                    or ctx.get("strategy_id")
+                    or ctx.get("strategy")
+                    or ""
+                ).strip()
+                tid = str(e.get("trace_id") or "").strip()
+                ms = int(not bool(sid))
+                mt = int(not bool(tid))
+                if ms:
+                    miss_strategy += 1
+                if mt:
+                    miss_trace += 1
+                if ms and mt:
+                    miss_both += 1
+                g = by_source.get(src)
+                if not g:
+                    g = {"total": 0, "missing_strategy": 0, "missing_trace": 0}
+                    by_source[src] = g
+                g["total"] += 1
+                g["missing_strategy"] += ms
+                g["missing_trace"] += mt
+                if (ms or mt) and len(samples) < 8:
+                    samples.append(
+                        {
+                            "ts": e.get("ts"),
+                            "op": e.get("op"),
+                            "symbol": e.get("symbol"),
+                            "source": src,
+                            "has_strategy": not ms,
+                            "has_trace": not mt,
+                            "detail": str(e.get("detail") or "")[:180],
+                        }
+                    )
+
+            coverage_strategy = (1.0 - float(miss_strategy) / float(total)) if total > 0 else 1.0
+            coverage_trace = (1.0 - float(miss_trace) / float(total)) if total > 0 else 1.0
+            out["decision_contract_integrity"] = {
+                "sample_size": int(total),
+                "missing_strategy": int(miss_strategy),
+                "missing_trace": int(miss_trace),
+                "missing_both": int(miss_both),
+                "strategy_coverage": round(float(coverage_strategy), 4),
+                "trace_coverage": round(float(coverage_trace), 4),
+                "by_source": by_source,
+                "samples": samples,
+                "healthy": bool(total == 0 or (coverage_strategy >= 0.95 and coverage_trace >= 0.95)),
+            }
+            if not bool(out["decision_contract_integrity"]["healthy"]):
+                hints = out.get("diagnosis_hints") if isinstance(out.get("diagnosis_hints"), list) else []
+                hints.append(
+                    "decision_contract_integrity unhealthy: strategy/trace coverage 低于阈值，"
+                    "请优先检查 open/close 调用链是否统一透传 decision_envelope + strategy_id + trace_id。"
+                )
+                out["diagnosis_hints"] = hints
+        except Exception as e:
+            out["decision_contract_integrity_error"] = str(e)
 
         return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
 

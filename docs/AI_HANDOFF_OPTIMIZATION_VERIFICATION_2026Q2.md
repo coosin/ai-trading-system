@@ -17,6 +17,11 @@
 | **第三方采集** | 全局最小请求间隔默认值收紧（仍可用 env 覆盖） |
 | **事件库** | `scripts/prune_events_db.py` 运维脚本；生产曾对 `data/events.db` 按保留天数删除并 `VACUUM` |
 | **环境模板** | `.env.example` 补充 TLS / LLM / 轨迹相关变量说明 |
+| **失败归因分流** | `ALREADY_CLOSED_NO_POSITION`（OKX `51169`）单独归类为 benign failure，避免污染 actionable 失败统计 |
+| **SLTP 收益保护** | 2026-05-06 收紧 trailing/profit_protect 参数，目标是降低“浮盈回吐后亏损离场” |
+| **交易真值同步** | 平仓后自动回拉 OKX `fills` 回填真实 `pnl/fee/均价`；新增独立事实账本 `logs/exchange_sync/exchange_truth.jsonl` |
+| **对账与报告** | 新增 `/api/v1/trades/reconcile` 与 `/api/v1/trades/reconcile/report`，用于系统记录 vs 交易所事实差异清单 |
+| **全自动同步线程** | `MainController` 启动时自动同步余额/持仓并周期回填真值（配置段：`exchange_auto_sync.*`） |
 
 ---
 
@@ -31,6 +36,10 @@
 | 第三方 HTTP 限速 | `src/modules/data/third_party_data_integrator.py`：`OPENCLAW_THIRD_PARTY_MIN_INTERVAL_SEC` |
 | 司令台诊断 / 门控 API | `src/modules/api/module_control_api.py`：`trading-diagnosis`、`/modules/ai/guards` |
 | 兼容持仓列表（含 CCXT 别名） | `src/modules/api/server.py`：`GET /api/v1/positions`（`contracts`/`notional` 见 §4.2c） |
+| 交易所事实账本（分账） | `src/modules/core/exchange_sync_ledger.py`（输出：`logs/exchange_sync/exchange_truth.jsonl`） |
+| 平仓后真值回填 | `src/modules/core/execution_gateway.py`：`_enrich_close_result_with_exchange_fills` |
+| OKX fills 拉取 | `src/modules/exchanges/okx.py`：`get_swap_fills_for_order`、`get_recent_fills` |
+| 自动同步线程 | `src/modules/main_controller.py`：`_auto_exchange_sync_worker`、`_auto_backfill_trade_truth_once` |
 
 ---
 
@@ -48,6 +57,7 @@
 | `SSL_CERT_FILE` | 显式系统 CA 包（如 Debian：`/etc/ssl/certs/ca-certificates.crt`） |
 | `OPENCLAW_SSL_CA_BUNDLE` | **额外** PEM，与 certifi **合并**后再校验（HTTPS 代理 MITM 根证书） |
 | `OPENCLAW_OKX_INSECURE_SSL` | `1` 关闭 TLS 校验（仅排障/受信环境） |
+| （配置）`exchange_auto_sync.*` | 交易所全自动同步线程的周期/回填窗口/回填频率（位于 `config/config.yaml`） |
 
 ---
 
@@ -218,6 +228,30 @@ cd /path/to/ai-trading-system && nohup env PYTHONUNBUFFERED=1 .venv/bin/python -
 | **mihomo 未配置 MITM** | 若无独立代理根证书，仅依赖系统 CA；若仍报 SSL，再配置 `OPENCLAW_SSL_CA_BUNDLE`。 |
 | **诊断字段语义** | `execution_gateway.last_order_*` 在重启后可能为空直至下一笔订单；属正常现象。 |
 | **策略层 hold** | `top_hold_reason_tags` 反映 AI/规则倾向；调阈值与提示词属于产品决策，需与风控目标一致。 |
+| **交易样本口径** | `db_bootstrap` 记录可能缺少 `trace_id/strategy/SLTP context`；做“最近亏损原因”分析时应先排除该来源。 |
+
+---
+
+## 7.1 2026-05-06 SLTP 防回吐参数快照（新增）
+
+以下为当前推荐运行值（`config/config.yaml -> stop_loss_take_profit`）：
+
+- `initial_trailing_offset: 0.016`
+- `profit_tier2_pnl_threshold: 0.02`
+- `tier2_trailing_offset: 0.012`
+- `breakeven_trigger: 0.01`
+- `profit_protect_trigger_1: 0.012`
+- `profit_protect_lock_1: 0.002`
+- `profit_protect_trigger_2: 0.025`
+- `profit_protect_lock_2: 0.008`
+- `profit_protect_tighten_factor: 0.82`
+- `layered_trailing_tp_drawdown_levels: [(0.03,0.008),(0.06,0.014),(0.10,0.02)]`
+
+验收建议（上线后 24h）：
+
+- `take_profit_triggered / stop_loss_triggered` 比值是否回升；
+- “浮盈后转亏离场”样本占比是否下降；
+- 单笔亏损尾部是否未被放大（防止过度收紧引发噪声出场）。
 
 ---
 

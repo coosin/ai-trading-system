@@ -27,6 +27,8 @@ from src.modules.core.execution_reconciler import ExecutionReconciler
 from src.modules.core.decision_trace_store import DecisionTraceStore
 from src.modules.core.reconciliation_protection_manager import ReconciliationProtectionManager
 from src.modules.core.trading_limits import resolve_position_limits
+from src.modules.core.decision_contract import normalize_strategy_field
+from src.modules.core.exchange_sync_ledger import append_exchange_truth
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +202,13 @@ class ExecutionGateway:
             return "NETWORK_ERROR"
 
         # Common exchange-side failures
+        if (
+            "scode=51169" in d
+            or "51169" in d
+            or "don't have any positions in this direction" in d
+            or "no positions in this direction" in d
+        ):
+            return "ALREADY_CLOSED_NO_POSITION"
         if "all operations failed" in d:
             return "EXCHANGE_ALL_OPERATIONS_FAILED"
         if "insufficient" in d and ("margin" in d or "balance" in d):
@@ -458,6 +467,11 @@ class ExecutionGateway:
             "effective_qty_factor": float(qty_factor),
         }
 
+    @staticmethod
+    def _extract_strategy_id(context: Optional[Dict[str, Any]], default: str = "") -> str:
+        ctx = context if isinstance(context, dict) else {}
+        return normalize_strategy_field(ctx, metadata=ctx, default=default)
+
     def _close_idempotent_key(self, symbol: str, side: str, size: Optional[float], context: Optional[Dict[str, Any]]) -> str:
         """
         close 幂等粒度：
@@ -480,6 +494,95 @@ class ExecutionGateway:
             if now - self._idempotent_recent[k] > 60.0:
                 del self._idempotent_recent[k]
         return False
+
+    async def _enrich_close_result_with_exchange_fills(
+        self, ex: Any, symbol: str, res: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        平仓回报里往往只有 ordId；用交易所 fills 回填 realizedPnl / fee / 均价，供入账与 accurate_only。
+        """
+        if not isinstance(res, dict) or not res.get("success"):
+            return res
+        oid = res.get("orderId") or res.get("order_id") or res.get("id")
+        getter = getattr(ex, "get_swap_fills_for_order", None)
+        if not oid or not callable(getter):
+            return res
+        fills: List[Dict[str, Any]] = []
+        for attempt in range(4):
+            try:
+                fills = await getter(symbol, str(oid))
+            except Exception:
+                fills = []
+            if fills:
+                break
+            await asyncio.sleep(0.2 * float(attempt + 1))
+        if not fills:
+            return res
+        out = dict(res)
+        total_pnl = 0.0
+        total_fee = 0.0
+        px_num = 0.0
+        px_den = 0.0
+        notional = 0.0
+        ct_val = 0.0
+        ct_is_base = False
+        try:
+            get_swap_info = getattr(ex, "get_swap_symbol_info", None)
+            if callable(get_swap_info):
+                info = await get_swap_info(symbol)
+                if isinstance(info, dict):
+                    ct_val = float(info.get("ctVal", 0) or 0)
+                    ct_ccy = str(info.get("ctValCcy") or "").upper()
+                    base_ccy = str(symbol).split("/")[0].upper()
+                    ct_is_base = bool(ct_val > 0 and ct_ccy and base_ccy and ct_ccy == base_ccy)
+        except Exception:
+            ct_val = 0.0
+            ct_is_base = False
+        for f in fills:
+            if not isinstance(f, dict):
+                continue
+            for k in ("fillPnl", "pnl", "realizedPnl"):
+                if f.get(k) is None:
+                    continue
+                try:
+                    total_pnl += float(f.get(k) or 0)
+                    break
+                except Exception:
+                    continue
+            try:
+                total_fee += float(f.get("fee") or 0)
+            except Exception:
+                pass
+            try:
+                fsz = float(f.get("fillSz") or f.get("sz") or 0)
+                fpx = float(f.get("fillPx") or f.get("px") or 0)
+            except Exception:
+                fsz, fpx = 0.0, 0.0
+            if fsz > 0 and fpx > 0:
+                px_num += fpx * fsz
+                px_den += fsz
+                if ct_val > 0:
+                    # For SWAP: ctVal can be base-coin or USDT; normalize into an approximate USDT notional.
+                    if ct_is_base:
+                        notional += fsz * ct_val * fpx
+                    else:
+                        notional += fsz * ct_val
+                else:
+                    notional += fsz * fpx
+        out["realizedPnl"] = total_pnl
+        out["pnl"] = total_pnl
+        out["fee"] = total_fee
+        if px_den > 1e-18:
+            out["average"] = px_num / px_den
+            out["price"] = out["average"]
+        out["fills_enriched"] = True
+        out["fill_count"] = len(fills)
+        out["notional_usdt_est"] = float(notional) if notional > 0 else None
+        try:
+            out["fee_rate_est"] = (abs(float(total_fee)) / float(notional)) if notional > 1e-18 else None
+        except Exception:
+            out["fee_rate_est"] = None
+        return out
 
     async def close_swap(
         self,
@@ -707,6 +810,10 @@ class ExecutionGateway:
                         source,
                         reason,
                     )
+                    try:
+                        res = await self._enrich_close_result_with_exchange_fills(ex, symbol, res)
+                    except Exception:
+                        pass
                     await self._notify_telegram(
                         f"✅ 平仓\n交易对: {symbol}\n方向: {side}\n来源: {source}\n原因: {reason}"
                     )
@@ -778,7 +885,32 @@ class ExecutionGateway:
 
                             pnl_val: float = 0.0
                             pnl_pct_val: float = 0.0
+                            pnl_estimated: bool = True
                             try:
+                                realized_candidates = []
+                                if isinstance(res, dict):
+                                    realized_candidates.extend(
+                                        [
+                                            res.get("pnl"),
+                                            res.get("realized_pnl"),
+                                            res.get("realizedPnl"),
+                                            res.get("fillPnl"),
+                                            (res.get("data") or {}).get("pnl") if isinstance(res.get("data"), dict) else None,
+                                            (res.get("data") or {}).get("realizedPnl") if isinstance(res.get("data"), dict) else None,
+                                        ]
+                                    )
+                                if ctx.get("realized_pnl") is not None:
+                                    realized_candidates.append(ctx.get("realized_pnl"))
+                                for cand in realized_candidates:
+                                    try:
+                                        if cand is None or cand == "":
+                                            continue
+                                        pnl_val = float(cand)
+                                        pnl_estimated = False
+                                        break
+                                    except Exception:
+                                        continue
+
                                 # 优先使用上游已计算的触发收益率（例如 SLTP 触发上下文），
                                 # 可避免由于价格/名义缺失导致的 pnl 长期为 0。
                                 if ctx.get("trigger_pnl_percent") is not None:
@@ -792,9 +924,9 @@ class ExecutionGateway:
                                             pnl_pct_val = (price_val - ep) / ep
                                         elif sd == "short":
                                             pnl_pct_val = (ep - price_val) / ep
-                                # 名义金额兜底：position_notional -> quantity * entry_price -> quantity * fill_price
-                                position_notional = float(ctx.get("position_notional") or 0.0)
-                                if position_notional <= 0:
+                                if pnl_estimated:
+                                    # 名义金额兜底：position_notional -> 合约 ctVal 估算 -> 数量*价格
+                                    position_notional = float(ctx.get("position_notional") or 0.0)
                                     try:
                                         qty = float(size or 0.0) if size is not None else float(ctx.get("quantity") or 0.0)
                                     except Exception:
@@ -803,16 +935,36 @@ class ExecutionGateway:
                                         ep = float(ctx.get("entry_price") or 0.0)
                                     except Exception:
                                         ep = 0.0
-                                    if qty > 0 and ep > 0:
-                                        position_notional = qty * ep
-                                    elif qty > 0 and price_val > 0:
-                                        position_notional = qty * price_val
-                                # 合约张数/币本位不一定等同名义数量，这里保留“估算 pnl”用于运营观测/学习闭环。
-                                pnl_val = float(pnl_pct_val) * max(1e-12, float(position_notional or 0.0))
+                                    ref_px = ep if ep > 0 else price_val
+                                    if position_notional <= 0 and qty > 0:
+                                        ct_val = 0.0
+                                        ct_is_base = False
+                                        try:
+                                            get_swap_info = getattr(ex, "get_swap_symbol_info", None)
+                                            if callable(get_swap_info):
+                                                info = await get_swap_info(sym)
+                                                if isinstance(info, dict):
+                                                    ct_val = float(info.get("ctVal", 0) or 0)
+                                                    ct_ccy = str(info.get("ctValCcy") or "").upper()
+                                                    base_ccy = str(sym).split("/")[0].upper()
+                                                    ct_is_base = bool(ct_val > 0 and ct_ccy and base_ccy and ct_ccy == base_ccy)
+                                        except Exception:
+                                            ct_val = 0.0
+                                            ct_is_base = False
+                                        if ct_val > 0:
+                                            if ct_is_base and ref_px > 0:
+                                                position_notional = qty * ct_val * ref_px
+                                            else:
+                                                position_notional = qty * ct_val
+                                        elif ref_px > 0:
+                                            position_notional = qty * ref_px
+                                    pnl_val = float(pnl_pct_val) * max(1e-12, float(position_notional or 0.0))
                             except Exception:
                                 pnl_val = 0.0
                                 pnl_pct_val = 0.0
+                                pnl_estimated = True
 
+                            _sid = self._extract_strategy_id(ctx, default=str(source or "gateway"))
                             await ths.record_trade_dict(
                                 {
                                     "timestamp": self._snapshot.last_order_at,
@@ -822,6 +974,7 @@ class ExecutionGateway:
                                     "source": str(source or "gateway"),
                                     "reason": str(reason or ""),
                                     "status": "filled",
+                                    "strategy": _sid,
                                     "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
                                     "price": float(price_val),
                                     "quantity": float(size) if size is not None else None,
@@ -839,10 +992,31 @@ class ExecutionGateway:
                                             "reason": str(reason or ""),
                                             "context": dict(ctx) if isinstance(ctx, dict) else {},
                                         },
+                                        "pnl_estimated": bool(pnl_estimated),
                                         "raw": dict(res) if isinstance(res, dict) else {"raw": str(res)},
                                     },
                                 }
                             )
+                            try:
+                                await append_exchange_truth(
+                                    {
+                                        "event": "trade_close_recorded",
+                                        "symbol": str(symbol),
+                                        "side": str(side),
+                                        "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
+                                        "price": float(price_val),
+                                        "quantity": float(size) if size is not None else None,
+                                        "pnl": float(pnl_val),
+                                        "fee": float(fee_val),
+                                        "notional_usdt_est": (res.get("notional_usdt_est") if isinstance(res, dict) else None),
+                                        "fee_rate_est": (res.get("fee_rate_est") if isinstance(res, dict) else None),
+                                        "pnl_estimated": bool(pnl_estimated),
+                                        "fills_enriched": bool((res or {}).get("fills_enriched")) if isinstance(res, dict) else False,
+                                        "source": str(source or "gateway"),
+                                    }
+                                )
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     # memory persistence (best-effort): feed AILearningEngine (trade_close memories)
@@ -1292,7 +1466,7 @@ class ExecutionGateway:
                     extra = ""
                     if context and isinstance(context, dict):
                         r = str(context.get("decision_reasoning") or context.get("reasoning") or "")[:160]
-                        st = str(context.get("strategy") or context.get("strategy_used") or "")[:80]
+                        st = str(self._extract_strategy_id(context, default=""))[:80]
                         parts = []
                         if st:
                             parts.append(f"策略: {st}")
@@ -1368,6 +1542,7 @@ class ExecutionGateway:
                             except Exception:
                                 fee_val = 0.0
 
+                            _sid = self._extract_strategy_id(ctx, default=str(source or "gateway"))
                             await ths.record_trade_dict(
                                 {
                                     "timestamp": self._snapshot.last_order_at,
@@ -1377,6 +1552,7 @@ class ExecutionGateway:
                                     "source": str(source or "gateway"),
                                     "reason": str(reason or ""),
                                     "status": "filled",
+                                    "strategy": _sid,
                                     "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
                                     "price": float(price_val),
                                     "quantity": float(size) if size is not None else None,

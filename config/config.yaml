@@ -10,8 +10,8 @@ system:
   log_level: INFO
   environment: production
 llm:
-  # 主模型：Volces Ark (北京) + 备用：百度千帆
-  default_model: ark-code-latest
+  # 主模型：小米MiMo + 备用：百度千帆
+  default_model: mimo-v2.5
   models:
   - provider: openai
     model_id: qianfan-code-latest
@@ -30,19 +30,19 @@ llm:
     enabled: true
     priority: 20
     fallback_models:
-    - ark-code-latest
+    - mimo-v2.5-pro
   - provider: openai
-    model_id: ark-code-latest
-    display_name: Volcengine Ark Code Latest
-    api_key: ark-dd309044-fbb7-4028-90b4-12aca1c542c8-ae933
-    base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+    model_id: mimo-v2.5
+    display_name: MiMo V2.5
+    api_key_env: MIMO_API_KEY
+    base_url: https://token-plan-cn.xiaomimimo.com/v1
     temperature: 0.6
     max_tokens: 8000
     timeout: 30.0
     max_retries: 2
     cost_per_input_token: 0.0
     cost_per_output_token: 0.0
-    context_window: 200000
+    context_window: 128000
     supports_vision: true
     supports_reasoning: false
     enabled: true
@@ -51,28 +51,28 @@ llm:
     - qianfan-code-latest
   task_model_mapping:
     general:
-    - ark-code-latest
+    - mimo-v2.5
     - qianfan-code-latest
     market_analysis:
-    - ark-code-latest
+    - mimo-v2.5
     - qianfan-code-latest
     strategy_generation:
-    - ark-code-latest
+    - mimo-v2.5
     - qianfan-code-latest
     signal_generation:
-    - ark-code-latest
+    - mimo-v2.5
     - qianfan-code-latest
     risk_assessment:
-    - ark-code-latest
+    - mimo-v2.5
     - qianfan-code-latest
     news_analysis:
-    - ark-code-latest
+    - mimo-v2.5
     - qianfan-code-latest
     code_generation:
-    - ark-code-latest
+    - mimo-v2.5
     - qianfan-code-latest
     natural_language:
-    - ark-code-latest
+    - mimo-v2.5
     - qianfan-code-latest
 trading:
   # 默认关注列表（动态选币开启时仍作 always_include 候选）
@@ -739,9 +739,9 @@ stop_loss_take_profit:
   trailing_only_mode: true
   trailing_only_coerce_inputs: true
   trailing_active_on_open: true
-  initial_trailing_offset: 0.02
-  profit_tier2_pnl_threshold: 0.06
-  tier2_trailing_offset: 0.02
+  initial_trailing_offset: 0.016
+  profit_tier2_pnl_threshold: 0.02
+  tier2_trailing_offset: 0.012
   trailing_momentum_adjust_enable: true
   default_stop_loss_percent: 0.04
   default_take_profit_percent: 0.08
@@ -750,13 +750,13 @@ stop_loss_take_profit:
   trailing_stop_offset: 0.02
   trailing_stop_trigger: 0.01
   enable_breakeven: true
-  breakeven_trigger: 0.02
+  breakeven_trigger: 0.01
   profit_protect_accelerator_enable: true
-  profit_protect_trigger_1: 0.02
-  profit_protect_lock_1: 0.004
-  profit_protect_trigger_2: 0.04
-  profit_protect_lock_2: 0.012
-  profit_protect_tighten_factor: 0.88
+  profit_protect_trigger_1: 0.012
+  profit_protect_lock_1: 0.002
+  profit_protect_trigger_2: 0.025
+  profit_protect_lock_2: 0.008
+  profit_protect_tighten_factor: 0.82
   profit_protect_regime_overrides:
     high_vol:
       trigger_mult: 0.8
@@ -786,11 +786,11 @@ stop_loss_take_profit:
   layered_trailing_tp_enable: true
   layered_trailing_tp_drawdown_levels:
   - - 0.03
-    - 0.01
+    - 0.008
   - - 0.06
-    - 0.02
+    - 0.014
   - - 0.1
-    - 0.03
+    - 0.02
   min_trailing_offset: 0.005
   max_trailing_offset: 0.2
   check_interval: 5

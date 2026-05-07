@@ -57,6 +57,20 @@ curl -s http://127.0.0.1:8000/api/v1/system/health
 
 **AI 维护交接（2026 Q2 优化与验证）**：[docs/AI_HANDOFF_OPTIMIZATION_VERIFICATION_2026Q2.md](./docs/AI_HANDOFF_OPTIMIZATION_VERIFICATION_2026Q2.md) — 测试结论、环境变量、验收命令与调参流程的单一入口。
 
+## 交易所实时同步与“真值记账”（2026-05 更新）
+
+为确保**钱包/持仓/成交数据与交易所实时一致**，系统已收敛为“自动同步 + 真值回填 + 分账账本”的默认行为：
+
+- **全自动同步线程**：启动后自动周期同步余额/持仓，并自动回填近期平仓记录的真实 `pnl/fee/均价`
+- **事实账本（与 app.log 分离）**：`logs/exchange_sync/exchange_truth.jsonl`（JSON Lines，仅追加）
+- **对账接口**：`GET /api/v1/trades/reconcile`、`GET /api/v1/trades/reconcile/report`
+
+详见：
+
+- 运维：[`docs/OPERATIONS.md`](./docs/OPERATIONS.md)
+- API：[`docs/API_REFERENCE.md`](./docs/API_REFERENCE.md)
+- 排障：[`docs/TRADING_DEBUG_PLAYBOOK.md`](./docs/TRADING_DEBUG_PLAYBOOK.md)
+
 ## 说明
 
 - 架构一页跳转：[ARCHITECTURE.md](./ARCHITECTURE.md)  

@@ -574,6 +574,16 @@ class StopLossTakeProfitManager:
         except Exception:
             pass
 
+    @staticmethod
+    def _is_no_position_close_error(err: Any) -> bool:
+        s = str(err or "").lower()
+        return (
+            "scode=51169" in s
+            or "51169" in s
+            or "don't have any positions in this direction" in s
+            or "no positions in this direction" in s
+        )
+
     async def _quantize_partial_close_size(
         self,
         symbol: str,
@@ -781,6 +791,17 @@ class StopLossTakeProfitManager:
             if gw:
                 used_gateway = True
                 meta_ctx = order.metadata or {}
+                trace_id = (
+                    meta_ctx.get("trace_id")
+                    or meta_ctx.get("traceId")
+                    or f"sltp:{getattr(order, 'order_id', '') or order.symbol}:{order.side}:{reason}"
+                )
+                strategy_id = (
+                    meta_ctx.get("strategy_id")
+                    or meta_ctx.get("strategy_used")
+                    or meta_ctx.get("strategy")
+                    or "sltp_auto_exit"
+                )
                 res = await gw.close_swap(
                     symbol=order.symbol,
                     side=order.side,
@@ -788,7 +809,9 @@ class StopLossTakeProfitManager:
                     source="stop_loss_take_profit",
                     reason=reason,
                     context={
-                        "trace_id": meta_ctx.get("trace_id") or meta_ctx.get("traceId"),
+                        "trace_id": trace_id,
+                        "strategy_id": strategy_id,
+                        "strategy_used": strategy_id,
                         "index_key": meta_ctx.get("index_key"),
                         "position_key": meta_ctx.get("position_key"),
                         "sltp_reason": reason,
@@ -834,6 +857,17 @@ class StopLossTakeProfitManager:
                                 )
                                 if gw:
                                     meta_ctx = order.metadata or {}
+                                    trace_id = (
+                                        meta_ctx.get("trace_id")
+                                        or meta_ctx.get("traceId")
+                                        or f"sltp:{getattr(order, 'order_id', '') or order.symbol}:{order.side}:{reason}"
+                                    )
+                                    strategy_id = (
+                                        meta_ctx.get("strategy_id")
+                                        or meta_ctx.get("strategy_used")
+                                        or meta_ctx.get("strategy")
+                                        or "sltp_auto_exit"
+                                    )
                                     res = await gw.close_swap(
                                         symbol=order.symbol,
                                         side=order.side,
@@ -841,7 +875,9 @@ class StopLossTakeProfitManager:
                                         source="stop_loss_take_profit",
                                         reason=reason,
                                         context={
-                                            "trace_id": meta_ctx.get("trace_id") or meta_ctx.get("traceId"),
+                                            "trace_id": trace_id,
+                                            "strategy_id": strategy_id,
+                                            "strategy_used": strategy_id,
                                             "index_key": meta_ctx.get("index_key"),
                                             "position_key": meta_ctx.get("position_key"),
                                             "sltp_reason": reason,
@@ -881,6 +917,47 @@ class StopLossTakeProfitManager:
                 return True
             else:
                 err = res.get("error", res) if isinstance(res, dict) else res
+                if self._is_no_position_close_error(err):
+                    # Exchange confirms there is no reducible position on this side.
+                    # Treat as terminal "already closed" to stop pending-close retry noise.
+                    logger.warning(
+                        "SLTP close treated as terminal(no-position): %s reason=%s err=%s",
+                        order.symbol,
+                        reason,
+                        err,
+                    )
+                    try:
+                        order.remaining_quantity = 0.0
+                        order.status = StopLossTakeProfitStatus.TRIGGERED
+                        if not order.triggered_at:
+                            order.triggered_at = datetime.now()
+                        if not order.trigger_reason:
+                            order.trigger_reason = str(reason or "already_closed_no_position")
+                        meta = dict(order.metadata or {})
+                        meta["terminal_close_no_position"] = True
+                        meta["terminal_close_no_position_at"] = datetime.now().isoformat()
+                        meta["terminal_close_error"] = str(err)[:500]
+                        order.metadata = meta
+                        for k in self._order_index_keys_to_clear(order):
+                            if self.order_index.get(k) == order.order_id:
+                                del self.order_index[k]
+                        await self._save_orders()
+                    except Exception:
+                        pass
+                    await self._emit_close_execution_audit(
+                        order,
+                        reason,
+                        close_sz,
+                        True,
+                        {
+                            "success": True,
+                            "status": "assumed_closed_no_position",
+                            "assumed_closed": True,
+                            "error": str(err),
+                        },
+                        gw_used=used_gateway,
+                    )
+                    return True
                 logger.error("❌ 止盈止损实盘平仓失败: %s err=%s", order.symbol, err)
                 self._note_close_failure_meta(order, err, reason)
                 await self._emit_close_execution_audit(
@@ -1076,6 +1153,46 @@ class StopLossTakeProfitManager:
         if up.endswith("/SWAP"):
             return s[: -len("/SWAP")]
         return s
+
+    def _normalize_coord_key(self, order: StopLossTakeProfitOrder) -> str:
+        """同一永续仓位可能被多条 SLTP 索引（如 AVAX/USDT 与 AVAX/USDT/SWAP）；用核心标的+方向对齐。"""
+        core = self._strip_swap_market_suffix(str(getattr(order, "symbol", "") or ""))
+        side = str(getattr(order, "side", "") or "").strip().lower()
+        return f"{core}|{side}"
+
+    async def _coord_duplicate_suppress_if_needed(
+        self, order: StopLossTakeProfitOrder, *, trigger_kind: str
+    ) -> bool:
+        """若同 coord 已有兄弟单正在平仓或已触发，则抑制本条影子单，避免二次 close_swap（51169）。"""
+        ck = self._normalize_coord_key(order)
+        for o in list((self.orders or {}).values()):
+            if getattr(o, "order_id", None) == getattr(order, "order_id", None):
+                continue
+            if self._normalize_coord_key(o) != ck:
+                continue
+            if o.status not in (
+                StopLossTakeProfitStatus.PENDING_CLOSE,
+                StopLossTakeProfitStatus.TRIGGERED,
+            ):
+                continue
+            order.status = StopLossTakeProfitStatus.CANCELLED
+            order.updated_at = datetime.now()
+            meta = dict(order.metadata or {})
+            meta["suppressed_as_coord_duplicate"] = True
+            meta["suppressed_coord_key"] = ck
+            meta["suppressed_sibling_order_id"] = str(getattr(o, "order_id", "") or "")
+            meta["suppressed_trigger_kind"] = str(trigger_kind)
+            order.metadata = meta
+            logger.info(
+                "SLTP: 抑制影子重复单（同 coord 已有平仓中/已触发）coord=%s suppressed=%s sibling=%s sibling_status=%s",
+                ck,
+                getattr(order, "order_id", None),
+                getattr(o, "order_id", None),
+                getattr(o, "status", None),
+            )
+            await self._save_orders()
+            return True
+        return False
 
     def _expand_live_position_key_set(self, positions: Any) -> set[str]:
         """
@@ -2503,6 +2620,10 @@ class StopLossTakeProfitManager:
         current_price: float
     ) -> StopLossTakeProfitOrder:
         """触发止损"""
+        if order.status in (StopLossTakeProfitStatus.PENDING_CLOSE, StopLossTakeProfitStatus.TRIGGERED):
+            return order
+        if await self._coord_duplicate_suppress_if_needed(order, trigger_kind="stop_loss"):
+            return order
         order.status = StopLossTakeProfitStatus.PENDING_CLOSE
         order.triggered_at = datetime.now()
         
@@ -2538,7 +2659,7 @@ class StopLossTakeProfitManager:
             logger.warning(f"   止损价: {order.stop_loss_price:.4f}")
             logger.warning(f"   当前价: {current_price:.4f}")
             logger.warning(f"   亏损: {pnl_percent*100:.2f}%")
-        
+
         if self._audit_logger:
             from .audit_logger import AuditEventType, AuditSeverity
             await self._audit_logger.log_trade(
@@ -2656,6 +2777,8 @@ class StopLossTakeProfitManager:
     ) -> StopLossTakeProfitOrder:
         """触发止盈"""
         pnl_percent = self._calculate_pnl_percent(order, current_price)
+        if await self._coord_duplicate_suppress_if_needed(order, trigger_kind="take_profit"):
+            return order
         try:
             meta = dict(order.metadata or {})
             meta["trigger_price"] = float(current_price or 0)
@@ -2835,6 +2958,8 @@ class StopLossTakeProfitManager:
             return
 
         if now >= effective_time_limit:
+            if await self._coord_duplicate_suppress_if_needed(order, trigger_kind="time_stop"):
+                return
             order.status = StopLossTakeProfitStatus.PENDING_CLOSE
             order.triggered_at = now
             order.trigger_reason = "time_stop"
@@ -3001,7 +3126,7 @@ class StopLossTakeProfitManager:
     async def _monitor_loop(self) -> None:
         """监控循环"""
         logger.info("止盈止损监控循环启动")
-        
+
         while self._running:
             try:
                 if not self._exchange:

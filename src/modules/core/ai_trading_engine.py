@@ -2259,6 +2259,12 @@ class AITradingEngine:
                 if hasattr(self, 'trade_history_service') and self.trade_history_service:
                     try:
                         side = "buy" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "sell"
+                        _st = (
+                            decision.metadata.get("strategy_used")
+                            or decision.metadata.get("strategy_id")
+                            or decision.metadata.get("strategy")
+                            or "AI智能决策"
+                        )
                         await self.trade_history_service.record_trade_dict({
                             "order_id": result.get("order_id", ""),
                             "symbol": decision.symbol,
@@ -2268,7 +2274,7 @@ class AITradingEngine:
                             "price": decision.price,
                             "cost": decision.quantity * decision.price,
                             "reasoning": decision.reasoning,
-                            "strategy": decision.metadata.get("strategy", "AI智能决策"),
+                            "strategy": str(_st),
                             "stop_loss": decision.stop_loss,
                             "take_profit": decision.take_profit,
                             "leverage": self.contract_config.get("default_leverage", 1),
@@ -2574,8 +2580,16 @@ class AITradingEngine:
             )
             
             logger.info(f"✅ 止损止盈订单已创建: {decision.symbol}")
-            logger.info(f"   止损价: {order.stop_loss_price:.4f}")
-            logger.info(f"   止盈价: {order.take_profit_price:.4f}")
+            _sl = order.stop_loss_price
+            _tp = order.take_profit_price
+            logger.info(
+                "   止损价: %s",
+                f"{float(_sl):.4f}" if _sl is not None else "N/A",
+            )
+            logger.info(
+                "   止盈价: %s",
+                f"{float(_tp):.4f}" if _tp is not None else "N/A",
+            )
             
             return True
             
@@ -2933,7 +2947,16 @@ class AITradingEngine:
             if self.positions:
                 logger.info(f"📊 当前监控 {len(self.positions)} 个持仓")
                 for sym, pos in self.positions.items():
-                    logger.info(f"   - {sym}: {pos.side} {pos.quantity} | 止损={pos.stop_loss:.4f} | 止盈={pos.take_profit:.4f}")
+                    _psl = pos.stop_loss
+                    _ptp = pos.take_profit
+                    logger.info(
+                        "   - %s: %s %s | 止损=%s | 止盈=%s",
+                        sym,
+                        pos.side,
+                        pos.quantity,
+                        f"{float(_psl):.4f}" if _psl is not None else "N/A",
+                        f"{float(_ptp):.4f}" if _ptp is not None else "N/A",
+                    )
             await self._sync_wallet_snapshot()
             await self._ensure_sltp_binding_for_positions()
             

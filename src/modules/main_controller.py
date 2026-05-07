@@ -55,6 +55,7 @@ from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 # 导入新增的升级模块
 from src.modules.core.dynamic_position_manager import DynamicPositionManager, DynamicPositionConfig
 from src.modules.core.trading_limits import resolve_position_limits
+from src.modules.core.exchange_sync_ledger import append_exchange_truth
 
 
 def _snapshot_pid_bookkeeping(process_pid: int) -> Dict[str, Any]:
@@ -1818,12 +1819,17 @@ class MainController:
                 if self.telegram_bot:
                     pnl_percent = (current_price - order.entry_price) / order.entry_price if order.side == "long" \
                                   else (order.entry_price - current_price) / order.entry_price
+                    sl_s = (
+                        f"{float(order.stop_loss_price):.4f}"
+                        if getattr(order, "stop_loss_price", None) is not None
+                        else "N/A"
+                    )
                     await self.telegram_bot.send_message(
                         f"🚨 止损触发\n\n"
                         f"交易对: {order.symbol}\n"
                         f"方向: {order.side}\n"
                         f"入场价: {order.entry_price:.4f}\n"
-                        f"止损价: {order.stop_loss_price:.4f}\n"
+                        f"止损价: {sl_s}\n"
                         f"当前价: {current_price:.4f}\n"
                         f"亏损: {pnl_percent*100:.2f}%"
                     )
@@ -1833,12 +1839,17 @@ class MainController:
                 if self.telegram_bot:
                     pnl_percent = (current_price - order.entry_price) / order.entry_price if order.side == "long" \
                                   else (order.entry_price - current_price) / order.entry_price
+                    tp_s = (
+                        f"{float(order.take_profit_price):.4f}"
+                        if getattr(order, "take_profit_price", None) is not None
+                        else "N/A"
+                    )
                     await self.telegram_bot.send_message(
                         f"🎯 止盈触发\n\n"
                         f"交易对: {order.symbol}\n"
                         f"方向: {order.side}\n"
                         f"入场价: {order.entry_price:.4f}\n"
-                        f"止盈价: {order.take_profit_price:.4f}\n"
+                        f"止盈价: {tp_s}\n"
                         f"当前价: {current_price:.4f}\n"
                         f"盈利: {pnl_percent*100:.2f}%"
                     )
@@ -2353,6 +2364,14 @@ class MainController:
                 logger.info("🛡️ 托管守护器已启动")
             except Exception as e:
                 logger.error(f"托管守护器启动失败: {e}")
+
+            # 启动交易所全自动同步线程（自动拉取、自动对账、自动回填）
+            try:
+                auto_sync_task = asyncio.create_task(self._auto_exchange_sync_worker())
+                self._tasks.append(auto_sync_task)
+                logger.info("🔄 交易所全自动同步线程已启动")
+            except Exception as e:
+                logger.error(f"交易所全自动同步线程启动失败: {e}")
 
             # 发送心跳事件
             await self.emit_event(
@@ -4914,6 +4933,158 @@ class MainController:
                 logger.error(f"自动策略研发线程异常: {e}")
                 await asyncio.sleep(30)
         logger.info("自动策略研发工作线程停止")
+
+    async def _auto_backfill_trade_truth_once(self, lookback_minutes: int = 180, max_rows: int = 80) -> Dict[str, Any]:
+        """
+        自动回填近期平仓记录的交易所真值（pnl/fee/price）。
+        """
+        out: Dict[str, Any] = {
+            "checked": 0,
+            "matched": 0,
+            "updated": 0,
+            "missing": 0,
+        }
+        trade_service = getattr(self, "trade_history_service", None)
+        if not trade_service:
+            out["error"] = "trade_history_service_missing"
+            return out
+        ex = self.get_exchange() if hasattr(self, "get_exchange") else None
+        ex = ex or getattr(self, "okx_exchange", None)
+        if not ex:
+            out["error"] = "exchange_missing"
+            return out
+        get_fills = getattr(ex, "get_swap_fills_for_order", None)
+        if not callable(get_fills):
+            out["error"] = "get_swap_fills_for_order_missing"
+            return out
+
+        start_date = datetime.now() - timedelta(minutes=max(10, int(lookback_minutes or 180)))
+        rows = await trade_service.get_trade_history(start_date=start_date, limit=max(20, int(max_rows or 80) * 8))
+        candidates: List[Dict[str, Any]] = []
+        for row in (rows or []):
+            if not isinstance(row, dict):
+                continue
+            action = str(row.get("action") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            if action not in {"close", "closed"} and status not in {"filled", "closed"}:
+                continue
+            oid = str(row.get("order_id") or "").strip()
+            sym = str(row.get("symbol") or "").strip()
+            if not oid or not sym:
+                continue
+            candidates.append(row)
+        candidates = candidates[: max(10, int(max_rows or 80))]
+
+        for row in candidates:
+            out["checked"] += 1
+            oid = str(row.get("order_id") or "").strip()
+            sym = str(row.get("symbol") or "").strip()
+            try:
+                fills = await get_fills(sym, oid)
+            except Exception:
+                fills = []
+            if not fills:
+                out["missing"] += 1
+                continue
+            out["matched"] += 1
+            ex_pnl = 0.0
+            ex_fee = 0.0
+            ex_px_num = 0.0
+            ex_px_den = 0.0
+            for f in fills:
+                if not isinstance(f, dict):
+                    continue
+                for k in ("fillPnl", "pnl", "realizedPnl"):
+                    if f.get(k) is None:
+                        continue
+                    try:
+                        ex_pnl += float(f.get(k) or 0.0)
+                    except Exception:
+                        pass
+                    break
+                try:
+                    ex_fee += float(f.get("fee") or 0.0)
+                except Exception:
+                    pass
+                try:
+                    fsz = float(f.get("fillSz") or f.get("sz") or 0.0)
+                    fpx = float(f.get("fillPx") or f.get("px") or 0.0)
+                except Exception:
+                    fsz = 0.0
+                    fpx = 0.0
+                if fsz > 0 and fpx > 0:
+                    ex_px_num += fpx * fsz
+                    ex_px_den += fsz
+            ex_price = (ex_px_num / ex_px_den) if ex_px_den > 1e-18 else None
+            changed = await trade_service.apply_exchange_truth(
+                order_id=oid,
+                symbol=sym,
+                exchange_pnl=ex_pnl,
+                exchange_fee=ex_fee,
+                exchange_price=ex_price,
+                source="auto_exchange_sync",
+            )
+            if changed:
+                out["updated"] += 1
+                try:
+                    await append_exchange_truth(
+                        {
+                            "event": "auto_truth_backfill",
+                            "symbol": sym,
+                            "order_id": oid,
+                            "exchange_fill_count": int(len(fills or [])),
+                            "exchange_pnl": float(ex_pnl),
+                            "exchange_fee": float(ex_fee),
+                            "exchange_price": float(ex_price or 0.0),
+                        }
+                    )
+                except Exception:
+                    pass
+        return out
+
+    async def _auto_exchange_sync_worker(self) -> None:
+        """
+        全自动交易所同步线程：
+        - 周期同步账户状态（余额/持仓）
+        - 周期回填成交真值（pnl/fee/price）
+        """
+        logger.info("全自动交易所同步线程启动")
+        while self._running:
+            try:
+                cfg = await self.config_manager.get_config("exchange_auto_sync", {}) if self.config_manager else {}
+                cfg = cfg if isinstance(cfg, dict) else {}
+                enabled = bool(cfg.get("enabled", True))
+                interval_sec = max(5, int(cfg.get("interval_sec", 20) or 20))
+                truth_every_n = max(1, int(cfg.get("truth_backfill_every_n_cycles", 3) or 3))
+                lookback_minutes = max(30, int(cfg.get("truth_backfill_lookback_minutes", 180) or 180))
+                max_rows = max(20, int(cfg.get("truth_backfill_max_rows", 80) or 80))
+
+                if not enabled:
+                    await asyncio.sleep(interval_sec)
+                    continue
+
+                sync_res = await self.force_sync_account_state(reason="auto_periodic")
+                self._auto_exchange_sync_cycle = int(getattr(self, "_auto_exchange_sync_cycle", 0) or 0) + 1
+                cycle = int(self._auto_exchange_sync_cycle)
+                truth_res: Dict[str, Any] = {"skipped": True}
+                if cycle % truth_every_n == 0:
+                    truth_res = await self._auto_backfill_trade_truth_once(
+                        lookback_minutes=lookback_minutes,
+                        max_rows=max_rows,
+                    )
+                logger.info(
+                    "🔄 自动同步完成 cycle=%s nonzero=%s truth=%s",
+                    cycle,
+                    sync_res.get("nonzero_position_count"),
+                    truth_res,
+                )
+                await asyncio.sleep(interval_sec)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("全自动交易所同步线程异常: %s", e)
+                await asyncio.sleep(10)
+        logger.info("全自动交易所同步线程停止")
 
     async def _send_notification_direct(self, title: str, message: str, priority: str = "medium"):
         """直接发送通知到底层渠道（不做智能去重/节流）。"""
