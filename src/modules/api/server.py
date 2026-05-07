@@ -1034,12 +1034,46 @@ class APIServer:
         @api_v1_router.get("/system/health", tags=["health"])
         async def health_check():
             """健康检查"""
+            reachability: Dict[str, Any] = {"ok": None, "status": "unknown"}
+            status = "healthy"
+            mc = self.main_controller or main_controller
+            ex = None
+            try:
+                if mc and hasattr(mc, "get_exchange"):
+                    ex = mc.get_exchange()
+                if not ex and mc is not None:
+                    ex = getattr(mc, "okx_exchange", None)
+                probe = getattr(ex, "probe_public_api", None) if ex is not None else None
+                if callable(probe):
+                    try:
+                        pr = await asyncio.wait_for(probe(timeout_sec=1.5), timeout=1.8)
+                    except Exception as _e:
+                        pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
+                    ok = bool((pr or {}).get("ok"))
+                    reachability = {
+                        "ok": ok,
+                        "status": "reachable" if ok else "unreachable",
+                        "probe": pr,
+                    }
+                    if not ok:
+                        status = "degraded"
+                        reachability["hint"] = (
+                            "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network."
+                        )
+                elif ex is None:
+                    reachability = {"ok": None, "status": "unknown", "message": "exchange_unavailable"}
+                else:
+                    reachability = {"ok": None, "status": "unknown", "message": "probe_not_supported"}
+            except Exception as e:
+                status = "degraded"
+                reachability = {"ok": False, "status": "unreachable", "reason": "health_probe_error", "error": str(e)[:220]}
             return {
                 "success": True,
                 "data": {
-                    "status": "healthy",
+                    "status": status,
                     "timestamp": datetime.now().isoformat(),
                     "uptime": self._get_uptime(),
+                    "exchange_reachability": reachability,
                 },
             }
 

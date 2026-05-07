@@ -6,6 +6,15 @@
 
 **机器可读规范（与线上一致，由运行中服务导出）:** 同目录下 [`API_OPENAPI_FULL.json`](./API_OPENAPI_FULL.json)（OpenAPI 3.1，当前约 181 条路径；含请求体、查询参数、422 校验模型等）。
 
+## 健康检查（2026-05-07 更新）
+
+- `GET /api/v1/system/health`
+  - 返回 `data.status`：`healthy` / `degraded`
+  - 新增 `data.exchange_reachability`：
+    - `status`: `reachable` / `unreachable` / `unknown`
+    - `probe`: 交易所公共时间探针结果（用于快速识别 TLS/代理/网络故障）
+  - 说明：当交易所不可达时，健康接口会降级为 `degraded`，便于监控系统直接告警。
+
 ## 开平仓 API 与调试总览（2026-04 收口版）
 
 ### 1) 推荐读写入口

@@ -23,6 +23,7 @@
 | **对账与报告** | 新增 `/api/v1/trades/reconcile` 与 `/api/v1/trades/reconcile/report`，用于系统记录 vs 交易所事实差异清单 |
 | **全自动同步线程** | `MainController` 启动时自动同步余额/持仓并周期回填真值（配置段：`exchange_auto_sync.*`） |
 | **交易所可达性快探针** | `trading-diagnosis` 新增 `exchange_reachability`；对账接口不可达时优先返回 `exchange_unreachable`（不再长时间卡住） |
+| **健康检查可达性上浮** | `/api/v1/system/health` 新增 `exchange_reachability`，交易所不可达时 `status=degraded`，便于监控直接告警 |
 
 ---
 
@@ -43,6 +44,7 @@
 | 自动同步线程 | `src/modules/main_controller.py`：`_auto_exchange_sync_worker`、`_auto_backfill_trade_truth_once` |
 | 交易所可达性探针 | `src/modules/exchanges/okx.py`：`probe_public_api`（`/api/v5/public/time`） |
 | 诊断可达性输出 | `src/modules/api/module_control_api.py`：`trading-diagnosis` → `exchange_reachability` |
+| 健康可达性输出 | `src/modules/api/server.py`：`GET /api/v1/system/health` → `data.exchange_reachability` |
 
 ---
 
