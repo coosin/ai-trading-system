@@ -3019,6 +3019,38 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             out["position_consistency_error"] = str(e)
 
+        # 3.2) Exchange reachability quick probe (surface TLS/proxy/network issues in diagnosis)
+        try:
+            exch_diag: Dict[str, Any] = {"ok": None}
+            ex_probe = mc.get_exchange() if hasattr(mc, "get_exchange") else None
+            if not ex_probe:
+                ex_probe = getattr(mc, "okx_exchange", None)
+            if ex_probe is None:
+                exch_diag = {"ok": False, "status": "missing", "message": "exchange_unavailable"}
+            else:
+                probe = getattr(ex_probe, "probe_public_api", None)
+                if callable(probe):
+                    try:
+                        pr = await asyncio.wait_for(probe(timeout_sec=1.8), timeout=_remaining(2.2))
+                    except Exception as _e:
+                        pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
+                    exch_diag = {
+                        "ok": bool((pr or {}).get("ok")),
+                        "status": "reachable" if bool((pr or {}).get("ok")) else "unreachable",
+                        "probe": pr,
+                    }
+                    if not bool((pr or {}).get("ok")):
+                        exch_diag["hint"] = (
+                            "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network."
+                        )
+                else:
+                    exch_diag = {"ok": None, "status": "unknown", "message": "probe_not_supported"}
+            out["exchange_reachability"] = exch_diag
+        except asyncio.TimeoutError:
+            out["exchange_reachability"] = {"ok": None, "status": "unknown", "message": "probe_timeout"}
+        except Exception as e:
+            out["exchange_reachability_error"] = str(e)
+
         # 4) AI 学习引擎（经验教训/优化循环）
         try:
             le = getattr(mc, "ai_learning_engine", None)

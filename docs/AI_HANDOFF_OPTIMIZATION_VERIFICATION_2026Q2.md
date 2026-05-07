@@ -22,6 +22,7 @@
 | **交易真值同步** | 平仓后自动回拉 OKX `fills` 回填真实 `pnl/fee/均价`；新增独立事实账本 `logs/exchange_sync/exchange_truth.jsonl` |
 | **对账与报告** | 新增 `/api/v1/trades/reconcile` 与 `/api/v1/trades/reconcile/report`，用于系统记录 vs 交易所事实差异清单 |
 | **全自动同步线程** | `MainController` 启动时自动同步余额/持仓并周期回填真值（配置段：`exchange_auto_sync.*`） |
+| **交易所可达性快探针** | `trading-diagnosis` 新增 `exchange_reachability`；对账接口不可达时优先返回 `exchange_unreachable`（不再长时间卡住） |
 
 ---
 
@@ -40,6 +41,8 @@
 | 平仓后真值回填 | `src/modules/core/execution_gateway.py`：`_enrich_close_result_with_exchange_fills` |
 | OKX fills 拉取 | `src/modules/exchanges/okx.py`：`get_swap_fills_for_order`、`get_recent_fills` |
 | 自动同步线程 | `src/modules/main_controller.py`：`_auto_exchange_sync_worker`、`_auto_backfill_trade_truth_once` |
+| 交易所可达性探针 | `src/modules/exchanges/okx.py`：`probe_public_api`（`/api/v5/public/time`） |
+| 诊断可达性输出 | `src/modules/api/module_control_api.py`：`trading-diagnosis` → `exchange_reachability` |
 
 ---
 
@@ -84,6 +87,7 @@ curl -sS --max-time 60 'http://127.0.0.1:8000/api/v1/modules/commander/trading-d
   **说明**：历史字段 `total_trades` 表示 **ai_core 内存环形记录条数**，不是交易所终身成交笔数。
 - `data.execution_gateway`：`policy_metrics`、`reconciliation`；重启后短期内 `last_order_*` 可能为空，直至下一笔经网关的下单。
 - `data.analysis_pipeline_assessment`：数据质量与决策结果健康度摘要。
+- `data.exchange_reachability`：交易所可达性快探针（`reachable/unreachable/unknown`），不可达时附带 `probe.error` 与 TLS/代理修复提示。
 
 ### 4.2b PnL 健康与门控热更新（OpenAPI 一致示例）
 
@@ -229,6 +233,7 @@ cd /path/to/ai-trading-system && nohup env PYTHONUNBUFFERED=1 .venv/bin/python -
 | **诊断字段语义** | `execution_gateway.last_order_*` 在重启后可能为空直至下一笔订单；属正常现象。 |
 | **策略层 hold** | `top_hold_reason_tags` 反映 AI/规则倾向；调阈值与提示词属于产品决策，需与风控目标一致。 |
 | **交易样本口径** | `db_bootstrap` 记录可能缺少 `trace_id/strategy/SLTP context`；做“最近亏损原因”分析时应先排除该来源。 |
+| **对账接口卡顿** | 已支持超时与快失败：`trade_reconcile_report_timeout`（总超时）或 `exchange_unreachable`（探针不可达）。优先修复 TLS/代理链路后再核对收益口径。 |
 
 ---
 
