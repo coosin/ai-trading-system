@@ -450,6 +450,38 @@ class OKXExchange(ExchangeBase):
             logger.warning("OKX 时间同步失败: %s", e)
             return False
 
+    async def probe_public_api(self, proxy: Optional[str] = None, timeout_sec: float = 2.0) -> Dict[str, Any]:
+        """
+        Fast reachability probe for operators / API endpoints.
+
+        Returns a structured result instead of raising, so callers can degrade gracefully.
+        This does NOT mutate state other than optionally touching the underlying session.
+        """
+        url = self.api_url + "/api/v5/public/time"
+        try:
+            timeout = aiohttp.ClientTimeout(
+                total=float(timeout_sec or 2.0),
+                connect=min(3.0, float(timeout_sec or 2.0)),
+                sock_read=min(3.0, float(timeout_sec or 2.0)),
+            )
+            async with self._session.get(url, timeout=timeout, proxy=proxy) as resp:
+                status = int(getattr(resp, "status", 0) or 0)
+                payload = await resp.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            row = data[0] if isinstance(data, list) and data else {}
+            ts = float((row or {}).get("ts") or 0.0)
+            if status >= 400 or ts <= 0:
+                return {
+                    "ok": False,
+                    "status": status,
+                    "url": url,
+                    "reason": "bad_response",
+                    "ts": ts,
+                }
+            return {"ok": True, "status": status, "url": url, "ts": ts}
+        except Exception as e:
+            return {"ok": False, "status": 0, "url": url, "reason": "exception", "error": str(e)[:240]}
+
     def _build_request_path(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> str:
         """
         OKX 签名的 requestPath 对 GET 需要包含 query string。

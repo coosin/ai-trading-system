@@ -149,6 +149,7 @@
 - `reconcile/report` 支持 `timeout_sec`（默认 8 秒），建议值守脚本显式设置：
   - `GET /api/v1/trades/reconcile/report?days=7&top_n=20&timeout_sec=6`
 - 若触发超时会返回 `message=trade_reconcile_report_timeout`，此时应优先修复网络/TLS，再做收益口径核对。
+- 若交易所不可达（探针失败）会优先返回 `message=exchange_unreachable` + `details`（常见：TLS 证书链/代理 MITM 根证书缺失）。
 
 ---
 

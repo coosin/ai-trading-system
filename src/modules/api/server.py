@@ -2484,6 +2484,21 @@ class APIServer:
                     ex = getattr(mc, "okx_exchange", None) if mc else None
                 if not ex:
                     return {"success": False, "message": "exchange unavailable"}
+                # Fast reachability probe: avoid long tail latency when OKX is unreachable (TLS/proxy/network).
+                probe = getattr(ex, "probe_public_api", None)
+                if callable(probe):
+                    try:
+                        pr = await asyncio.wait_for(probe(timeout_sec=1.8), timeout=2.2)
+                    except Exception as _e:
+                        pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:200]}
+                    if not bool((pr or {}).get("ok")):
+                        return {
+                            "success": False,
+                            "message": "exchange_unreachable",
+                            "details": pr,
+                            "hint": "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network.",
+                            "timestamp": datetime.now().isoformat(),
+                        }
                 get_fills = getattr(ex, "get_swap_fills_for_order", None)
                 if not callable(get_fills):
                     return {"success": False, "message": "exchange does not support fills reconciliation"}

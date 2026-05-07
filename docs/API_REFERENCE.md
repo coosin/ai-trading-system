@@ -85,6 +85,12 @@
     - `timeout_sec`：**整条报告最大执行时间**（默认 8 秒）
     - 若交易所不可达（如 TLS 校验失败）会返回 `message=trade_reconcile_report_timeout`，用于脚本与前端友好降级展示
 
+  - 交易所不可达快失败（2026-05-07 更新）：
+    - 对账接口会先进行一次 **OKX public time 探针**；若不可达则直接返回：
+      - `message=exchange_unreachable`
+      - `details`：包含 `SSLCertVerificationError` 等底层原因片段
+    - 用途：避免在 TLS/代理问题时长时间等待 fills 重试
+
 ### 3) 交易历史接口的“严格真实模式”
 
 - `GET /api/v1/trades?accurate_only=true`
