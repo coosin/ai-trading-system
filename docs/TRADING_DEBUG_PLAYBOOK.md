@@ -150,6 +150,23 @@
   - `GET /api/v1/trades/reconcile/report?days=7&top_n=20&timeout_sec=6`
 - 若触发超时会返回 `message=trade_reconcile_report_timeout`，此时应优先修复网络/TLS，再做收益口径核对。
 - 若交易所不可达（探针失败）会优先返回 `message=exchange_unreachable` + `details`（常见：TLS 证书链/代理 MITM 根证书缺失）。
+- `trading-diagnosis.data.execution_attribution.top_reasons` 现会合并 `ai_core` 执行门控计数（不仅是交易所失败）：
+  - `AI_CORE_GUARD:EXCHANGE_UNREACHABLE_OPEN_REJECTED`：不可达阻断开仓（资金安全优先）
+  - `AI_CORE_GUARD:EXCHANGE_DEGRADED_RISK_REDUCED`：降级可达时已自动降杠杆/降仓
+  - `AI_CORE_GUARD:ANALYSIS_HARD_REJECTED` / `...CONFIDENCE_OPEN_REJECTED` / `...OPEN_EVIDENCE_REJECTED`
+- 每个 `top_reasons[]` 项新增：
+  - `severity`: `block`（阻断）/ `reduce`（降风险）/ `warn`（告警）
+  - `category`: `exchange_failure` 或 `ai_core_guard`
+- 可直接读取 `trading-diagnosis.data.execution_attribution.summary` 获取一句话主因结论。
+
+### 4.1 市场状态(regime) → 参数治理矩阵（可回滚，2026-05-07）
+
+系统会识别 `regime`（如 `trend/range/low_vol_grind/high_vol/low_liquidity`），并通过两层配置影响“能不能开仓/开多大/用多大杠杆”：
+
+- `regime_profile_overrides`：影响门控阈值（RR/点差）与最低置信度加成/仓位缩放
+- `regime_policy_matrix`：影响执行层 sizing（`qty_mult/leverage_mult`），并可通过 `ai_core_runtime` 做运行时覆盖（用于小步试错、可回滚）
+
+这两层会写入 `guard_profile`，并随执行审计入账（trade_history metadata），用于后续按 regime 的真实PnL归因与参数回滚验证。
 
 ---
 

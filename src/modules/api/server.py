@@ -1049,17 +1049,21 @@ class APIServer:
                         pr = await asyncio.wait_for(probe(timeout_sec=1.5), timeout=1.8)
                     except Exception as _e:
                         pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
+                    probe_status = str((pr or {}).get("status_text") or "").strip().lower()
                     ok = bool((pr or {}).get("ok"))
+                    if probe_status not in {"reachable", "degraded", "unreachable"}:
+                        probe_status = "reachable" if ok else "unreachable"
                     reachability = {
                         "ok": ok,
-                        "status": "reachable" if ok else "unreachable",
+                        "status": probe_status,
                         "probe": pr,
                     }
-                    if not ok:
+                    if probe_status != "reachable":
                         status = "degraded"
-                        reachability["hint"] = (
-                            "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network."
-                        )
+                        if probe_status == "unreachable":
+                            reachability["hint"] = (
+                                "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network."
+                            )
                 elif ex is None:
                     reachability = {"ok": None, "status": "unknown", "message": "exchange_unavailable"}
                 else:
@@ -2525,7 +2529,10 @@ class APIServer:
                         pr = await asyncio.wait_for(probe(timeout_sec=1.8), timeout=2.2)
                     except Exception as _e:
                         pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:200]}
-                    if not bool((pr or {}).get("ok")):
+                    probe_status = str((pr or {}).get("status_text") or "").strip().lower()
+                    if probe_status not in {"reachable", "degraded", "unreachable"}:
+                        probe_status = "reachable" if bool((pr or {}).get("ok")) else "unreachable"
+                    if probe_status == "unreachable":
                         return {
                             "success": False,
                             "message": "exchange_unreachable",
@@ -2774,19 +2781,43 @@ class APIServer:
             top_pnl = sorted(detail_rows, key=lambda x: abs(_to_float((x or {}).get("pnl_delta"))), reverse=True)[: max(1, int(top_n or 20))]
             top_fee = sorted(detail_rows, key=lambda x: abs(_to_float((x or {}).get("fee_delta"))), reverse=True)[: max(1, int(top_n or 20))]
             high_risk: List[Dict[str, Any]] = []
+            missing_rows: List[Dict[str, Any]] = []
+            time_window_rows: List[Dict[str, Any]] = []
+            by_method: Dict[str, int] = {}
+            pnl_ge_05 = 0
+            fee_ge_05 = 0
             for r in detail_rows:
                 if not isinstance(r, dict):
                     continue
+                mm = str(r.get("match_method") or "").strip() or "unknown"
+                by_method[mm] = int(by_method.get(mm, 0) or 0) + 1
+                if abs(_to_float(r.get("pnl_delta"))) >= 0.5:
+                    pnl_ge_05 += 1
+                if abs(_to_float(r.get("fee_delta"))) >= 0.5:
+                    fee_ge_05 += 1
+                if not bool(r.get("matched")):
+                    missing_rows.append(r)
+                if str(r.get("match_method") or "") == "time_window":
+                    time_window_rows.append(r)
                 if (not bool(r.get("matched"))) or abs(_to_float(r.get("pnl_delta"))) >= 0.5:
                     high_risk.append(r)
+            missing_rows = missing_rows[: max(1, int(top_n or 20))]
+            time_window_rows = time_window_rows[: max(1, int(top_n or 20))]
             return {
                 "success": True,
                 "report_type": "trade_reconcile_gap_report",
                 "period_days": int(days or 7),
                 "symbol": symbol,
-                "summary": raw.get("summary"),
+                "summary": {
+                    **((raw.get("summary") or {}) if isinstance(raw.get("summary"), dict) else {}),
+                    "match_method_distribution": by_method,
+                    "pnl_delta_abs_ge_0_5_count": int(pnl_ge_05),
+                    "fee_delta_abs_ge_0_5_count": int(fee_ge_05),
+                },
                 "filters": raw.get("filters"),
                 "high_risk_count": int(len(high_risk)),
+                "top_missing_on_exchange": missing_rows,
+                "top_time_window_matches": time_window_rows,
                 "top_pnl_delta": top_pnl,
                 "top_fee_delta": top_fee,
                 "recommendations": [
@@ -3011,6 +3042,164 @@ class APIServer:
                     "error": "获取交易统计失败",
                     "details": str(e)
                 }
+
+        @api_v1_router.get("/trades/analytics/summary", tags=["trades"])
+        async def trades_analytics_summary(
+            days: int = 30,
+            symbol: Optional[str] = None,
+            exclude_bootstrap: bool = True,
+            accurate_only: bool = True,
+            group_top_n: int = 12,
+        ):
+            """
+            盈利分析摘要（真实PnL优先）：按策略/按市场状态(regime)/按时段等聚合。
+            用于回答“盈利来自哪里、亏损来自哪里、下一步怎么最大化收益”。
+            """
+            try:
+                mc = self.main_controller
+                ths = getattr(mc, "trade_history_service", None) if mc else None
+                if not ths or not hasattr(ths, "get_trade_history"):
+                    return {"success": False, "message": "trade_history_service unavailable"}
+
+                start_date = datetime.now() - timedelta(days=max(1, int(days or 30)))
+                rows = await ths.get_trade_history(
+                    start_date=start_date,
+                    symbol=symbol,
+                    limit=20000,
+                    offset=0,
+                )
+
+                trades: List[Dict[str, Any]] = []
+                for r in (rows or []):
+                    if not isinstance(r, dict):
+                        continue
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    src = str((md.get("source") or r.get("source") or "")).strip().lower()
+                    if exclude_bootstrap and src == "db_bootstrap":
+                        continue
+                    if accurate_only and bool(md.get("pnl_estimated")):
+                        continue
+                    trades.append(r)
+
+                def _bucket_strategy(r: Dict[str, Any]) -> str:
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    s = (
+                        md.get("strategy_id")
+                        or md.get("strategy_used")
+                        or r.get("strategy")
+                        or r.get("strategy_used")
+                        or ""
+                    )
+                    return str(s or "").strip() or "unknown"
+
+                def _bucket_regime(r: Dict[str, Any]) -> str:
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    reg = md.get("regime") or md.get("market_regime") or r.get("market_regime") or ""
+                    return str(reg or "").strip().lower() or "unknown"
+
+                def _bucket_hour(r: Dict[str, Any]) -> str:
+                    ts = str(r.get("timestamp") or "").strip()
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        return f"{dt.hour:02d}"
+                    except Exception:
+                        return "unknown"
+
+                def _to_float_local(v: Any) -> float:
+                    try:
+                        return float(v or 0.0)
+                    except Exception:
+                        return 0.0
+
+                def _agg(rows2: List[Dict[str, Any]]) -> Dict[str, Any]:
+                    pnls = [_to_float_local(x.get("pnl")) for x in rows2]
+                    fees = [_to_float_local(x.get("fee")) for x in rows2]
+                    total = len(rows2)
+                    wins = sum(1 for p in pnls if p > 0)
+                    losses = sum(1 for p in pnls if p < 0)
+                    gross_profit = sum(p for p in pnls if p > 0)
+                    gross_loss = abs(sum(p for p in pnls if p < 0))
+                    total_pnl = sum(pnls)
+                    total_fee = sum(fees)
+                    win_rate = (wins / total) if total else 0.0
+                    pf = (gross_profit / gross_loss) if gross_loss > 1e-18 else (9999.0 if gross_profit > 0 else 0.0)
+                    expectancy = (total_pnl / total) if total else 0.0
+                    return {
+                        "trades": int(total),
+                        "wins": int(wins),
+                        "losses": int(losses),
+                        "win_rate": round(win_rate, 6),
+                        "total_pnl": round(total_pnl, 8),
+                        "total_fees": round(total_fee, 8),
+                        "profit_factor": round(pf, 6),
+                        "expectancy": round(expectancy, 8),
+                    }
+
+                # overall equity curve drawdown (PnL-based)
+                curve = []
+                for r in sorted(trades, key=lambda x: str(x.get("timestamp") or "")):
+                    curve.append(_to_float_local(r.get("pnl")))
+                cum = 0.0
+                peak = 0.0
+                max_dd = 0.0
+                for p in curve:
+                    cum += p
+                    peak = max(peak, cum)
+                    max_dd = max(max_dd, peak - cum)
+
+                overall = _agg(trades)
+                overall["max_drawdown_pnl"] = round(max_dd, 8)
+
+                def _top_by(bucket_fn) -> List[Dict[str, Any]]:
+                    groups: Dict[str, List[Dict[str, Any]]] = {}
+                    for r in trades:
+                        k = bucket_fn(r)
+                        groups.setdefault(k, []).append(r)
+                    out = []
+                    for k, g in groups.items():
+                        s = _agg(g)
+                        s["key"] = k
+                        out.append(s)
+                    out.sort(key=lambda x: float(x.get("total_pnl", 0.0)), reverse=True)
+                    return out[: max(1, int(group_top_n or 12))]
+
+                by_strategy = _top_by(_bucket_strategy)
+                by_regime = _top_by(_bucket_regime)
+                by_hour = _top_by(_bucket_hour)
+
+                recs: List[str] = []
+                if overall.get("trades", 0) <= 0:
+                    recs.append("暂无可用于真实PnL分析的交易记录（可能都被 accurate_only/exclude_bootstrap 过滤）。")
+                else:
+                    pnl = float(overall.get("total_pnl", 0.0) or 0.0)
+                    fee = float(overall.get("total_fees", 0.0) or 0.0)
+                    if abs(fee) > abs(pnl) * 0.6 and abs(fee) > 0.5:
+                        recs.append("手续费占比偏高：建议减少低流动性/高点差时段交易，并降低频繁进出。")
+                    worst_reg = None
+                    for r in sorted(by_regime, key=lambda x: float(x.get("total_pnl", 0.0))):
+                        if str(r.get("key")) != "unknown" and int(r.get("trades", 0) or 0) >= 5:
+                            worst_reg = r
+                            break
+                    if worst_reg and float(worst_reg.get("total_pnl", 0.0)) < 0:
+                        recs.append(f"某些市场状态下亏损明显：regime={worst_reg.get('key')}，建议提高门槛或降低 qty/leverage。")
+                    if not recs:
+                        recs.append("整体表现稳定：建议继续按策略/市场状态分组跟踪，并用学习引擎做小步可回滚调参。")
+
+                return {
+                    "success": True,
+                    "period_days": int(days or 30),
+                    "symbol": symbol,
+                    "filters": {"exclude_bootstrap": bool(exclude_bootstrap), "accurate_only": bool(accurate_only)},
+                    "overall": overall,
+                    "by_strategy_top": by_strategy,
+                    "by_regime_top": by_regime,
+                    "by_hour_top": by_hour,
+                    "recommendations": recs,
+                    "generated_at": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                logger.error("trades_analytics_summary failed: %s", e, exc_info=True)
+                return {"success": False, "message": "trades_analytics_summary_failed", "error": str(e)[:240]}
 
         @api_v1_router.get("/trades/review", tags=["trades"])
         async def get_trade_review(days: int = 7):

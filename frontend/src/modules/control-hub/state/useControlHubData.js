@@ -92,6 +92,7 @@ export function useControlHubData() {
     dataIntegrationHealth: null,
     pluginsStatus: null,
     opportunities: [],
+    profitAnalytics: null,
   });
 
   const showNotice = useCallback((message, type = 'success') => {
@@ -219,7 +220,7 @@ export function useControlHubData() {
     markLoading('slow', true);
     markError('slow', null);
     try {
-      const [acceptance, accountDiagnostics, executionSpine, tradeHistory, strategies, strategyOpt, researchJobs, productionAudit, memorySummary, commanderSnapshot, commanderAudit, commanderCapabilities, hostingMode, hostingGuard, automationProfile, riskRedlines, toolContract, governanceAudit, aiGuards, stopLossStats, tradeEvents, surfaceRegistry, dataIntegrationHealth, pluginsStatus, opportunities] =
+      const [acceptance, accountDiagnostics, executionSpine, tradeHistory, strategies, strategyOpt, researchJobs, productionAudit, memorySummary, commanderSnapshot, commanderAudit, commanderCapabilities, hostingMode, hostingGuard, automationProfile, riskRedlines, toolContract, governanceAudit, aiGuards, stopLossStats, tradeEvents, surfaceRegistry, dataIntegrationHealth, pluginsStatus, opportunities, profitAnalytics] =
         await Promise.all([
           api.system.getAcceptance().catch(() => null),
           api.modules.getAccountDiagnostics().catch(() => null),
@@ -246,6 +247,7 @@ export function useControlHubData() {
           api.modules.getDataIntegrationHealth().catch(() => null),
           api.modules.getPluginsStatus().catch(() => null),
           api.request('/monitoring/proactive-ai/opportunities').catch(() => null),
+          api.trading.getAnalyticsSummary({ days: 30, accurate_only: true, exclude_bootstrap: true }).catch(() => null),
         ]);
       updateSlice({
         acceptance: unwrap(acceptance),
@@ -277,6 +279,7 @@ export function useControlHubData() {
           : Array.isArray(opportunities?.data)
             ? opportunities.data
             : [],
+        profitAnalytics: unwrap(profitAnalytics),
       });
       markUpdated('slow');
     } catch (error) {

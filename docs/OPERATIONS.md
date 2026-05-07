@@ -387,6 +387,29 @@ docker logs openclaw-trading --tail 200
 ./scripts/cleanup_trading_workspace.sh   # 按需；见脚本内环境变量
 ```
 
+### 4.1.1 持续巡检 + 日报（含盈利归因）
+
+```bash
+# 1) 连续巡检（建议 10~30 分钟）
+python3 scripts/continuous_chain_probe.py --base-url http://127.0.0.1:8000 --duration-sec 1200 --interval-sec 20
+
+# 2) 系统巡检日报（告警峰值 + 高频时段）
+python3 scripts/system_probe_daily_summary.py \
+  --input logs/system_probe_report.jsonl \
+  --output logs/system_probe_daily_summary.md
+
+# 3) 日报附加真实PnL归因（按策略/按regime + recommendations）
+python3 scripts/system_probe_daily_summary.py \
+  --base-url http://127.0.0.1:8000 \
+  --analytics-days 30 \
+  --analytics-timeout-sec 8
+```
+
+说明：
+
+- 若交易所/API 暂时不可达，日报仍会生成，并在“盈利归因摘要”标注抓取失败原因。
+- 生产建议保持 `accurate_only=true`（真实PnL优先，过滤估算样本）作为默认口径。
+
 ### 4.2 宿主机内核（可选）
 
 降低 swap 抖动可参考仓库 `config/trading-host-sysctl.conf`（需 root 写入 `/etc/sysctl.d/` 后 `sysctl --system`）。

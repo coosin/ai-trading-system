@@ -15,6 +15,8 @@ function viewAutoGuard(view) {
   };
 }
 
+const SEVERITY_LABEL = { block: '阻断', reduce: '降风险', warn: '告警' };
+
 export default function OverviewSection({ state, view, flowRows, updatedAt, actions, loading }) {
   const missingRows = flowRows.filter((r) => !r.ok);
   const hosting = state.hostingMode?.data || {};
@@ -26,7 +28,99 @@ export default function OverviewSection({ state, view, flowRows, updatedAt, acti
       ? '半自动托管：策略开仓需人工确认，平仓风控仍自动执行'
       : '全自动托管：AI自主开平仓并自动执行风控');
   const autoGuard = viewAutoGuard(view);
+  const commanderSnapshot = state.commanderSnapshot?.data || state.commanderSnapshot || {};
+  const executionAttribution =
+    commanderSnapshot.execution_attribution ||
+    commanderSnapshot.data?.execution_attribution ||
+    {};
+  const executionSummary = String(executionAttribution.summary || '').trim();
+  const executionTop = (Array.isArray(executionAttribution.top_reasons) ? executionAttribution.top_reasons : [])
+    .slice(0, 3)
+    .map((x) => {
+      const sev = String(x?.severity || 'warn').toLowerCase();
+      return `${SEVERITY_LABEL[sev] || '告警'} · ${String(x?.key || '-')}（${Number(x?.count || 0)}）`;
+    });
   const automationProfile = state.automationProfile?.data?.profile || state.systemStatus?.automation_profile || 'semi_auto';
+  const profit = state.profitAnalytics?.data || state.profitAnalytics || {};
+  const overall = profit?.overall || {};
+  const byStrategy = Array.isArray(profit?.by_strategy_top) ? profit.by_strategy_top : [];
+  const byRegime = Array.isArray(profit?.by_regime_top) ? profit.by_regime_top : [];
+  const byHour = Array.isArray(profit?.by_hour_top) ? profit.by_hour_top : [];
+  const profitRecommendations = Array.isArray(profit?.recommendations) ? profit.recommendations : [];
+  const pnlText =
+    overall && typeof overall === 'object' && Object.keys(overall).length
+      ? `30天真实PnL：${overall.total_pnl ?? '-'}；手续费：${overall.total_fees ?? '-'}；胜率：${overall.win_rate != null ? `${(Number(overall.win_rate) * 100).toFixed(2)}%` : '-'}；PF：${overall.profit_factor ?? '-'}；最大回撤(PnL)：${overall.max_drawdown_pnl ?? '-'}。`
+      : '暂无盈利分析数据（可能还没有真实PnL样本，或被 accurate_only 过滤）。';
+  const topStr = byStrategy.slice(0, 3).map((x) => `${x.key || 'unknown'}:${x.total_pnl}`).join('；');
+  const topReg = byRegime.slice(0, 3).map((x) => `${x.key || 'unknown'}:${x.total_pnl}`).join('；');
+  const strategyRows = byStrategy.slice(0, 8).map((x, idx) => ({
+    id: `s-${idx}`,
+    key: x?.key || 'unknown',
+    trades: Number(x?.trades || 0),
+    win_rate: x?.win_rate != null ? `${(Number(x.win_rate) * 100).toFixed(2)}%` : '-',
+    total_pnl: x?.total_pnl ?? '-',
+    expectancy: x?.expectancy ?? '-',
+  }));
+  const regimeRows = byRegime.slice(0, 8).map((x, idx) => ({
+    id: `r-${idx}`,
+    key: x?.key || 'unknown',
+    trades: Number(x?.trades || 0),
+    win_rate: x?.win_rate != null ? `${(Number(x.win_rate) * 100).toFixed(2)}%` : '-',
+    total_pnl: x?.total_pnl ?? '-',
+    expectancy: x?.expectancy ?? '-',
+  }));
+  const hourRows = byHour.slice(0, 8).map((x, idx) => ({
+    id: `h-${idx}`,
+    key: x?.key || 'unknown',
+    trades: Number(x?.trades || 0),
+    win_rate: x?.win_rate != null ? `${(Number(x.win_rate) * 100).toFixed(2)}%` : '-',
+    total_pnl: x?.total_pnl ?? '-',
+    expectancy: x?.expectancy ?? '-',
+  }));
+  const runtimePatch = { regime_policy_matrix: {} };
+  const adaptiveTips = [];
+  byRegime.slice(0, 8).forEach((x) => {
+    const key = String(x?.key || 'unknown');
+    const trades = Number(x?.trades || 0);
+    const pnl = Number(x?.total_pnl || 0);
+    const exp = Number(x?.expectancy || 0);
+    if (!key || key === 'unknown' || trades < 5) return;
+    if (pnl < 0 || exp < 0) {
+      runtimePatch.regime_policy_matrix[key] = { qty_mult: 0.9, leverage_mult: 0.9 };
+      adaptiveTips.push(`Regime=${key} 样本${trades}且收益偏弱，建议先降仓降杠杆（qty/leverage ×0.9）观察 1-3 天。`);
+    }
+  });
+  byStrategy.slice(0, 8).forEach((x) => {
+    const key = String(x?.key || 'unknown');
+    const trades = Number(x?.trades || 0);
+    const exp = Number(x?.expectancy || 0);
+    if (key !== 'unknown' && trades >= 8 && exp < 0) {
+      adaptiveTips.push(`策略=${key} 期望为负，建议提高开仓阈值（min_rr 或 min_conf）并降低该策略在弱势 regime 的参与度。`);
+    }
+  });
+  const weakHours = byHour
+    .filter((x) => Number(x?.trades || 0) >= 5 && Number(x?.total_pnl || 0) < 0)
+    .slice(0, 3)
+    .map((x) => String(x?.key || 'unknown'))
+    .filter((x) => x !== 'unknown');
+  if (weakHours.length) {
+    adaptiveTips.push(`时段 ${weakHours.join(', ')} 表现偏弱，建议降低这些时段开仓频率或提升点差门槛。`);
+  }
+  if (!adaptiveTips.length) {
+    adaptiveTips.push('当前分组表现未见明显劣势段，建议保持参数并继续滚动观察。');
+  }
+  const runtimePatchText =
+    Object.keys(runtimePatch.regime_policy_matrix).length > 0
+      ? JSON.stringify(runtimePatch, null, 2)
+      : JSON.stringify(
+          {
+            regime_policy_matrix: {
+              low_vol_grind: { qty_mult: 0.9, leverage_mult: 0.9 },
+            },
+          },
+          null,
+          2
+        );
   const red = state.riskRedlines?.data || state.systemStatus?.risk_redlines || {};
   const [redlineDraft, setRedlineDraft] = React.useState({
     max_positions: Number(red.max_positions || 5),
@@ -184,6 +278,82 @@ export default function OverviewSection({ state, view, flowRows, updatedAt, acti
           content={`系统健康：${state.health?.overall || state.health?.status || '-'}；账户同步：${statusText(!state.accountDiagnostics?.degraded)}；活跃告警：${state.monitoringSummary?.active_alerts ?? 0}。`}
           tone="info"
         />
+        <InsightCard
+          title="执行归因主结论"
+          content={
+            executionSummary ||
+            (executionTop.length
+              ? `当前主要执行归因为：${executionTop.join('；')}`
+              : '暂无执行归因数据，建议检查 commander snapshot 与 trading-diagnosis 数据链路。')
+          }
+          tone={executionTop.some((x) => x.startsWith('阻断')) ? 'warn' : 'info'}
+        />
+        <InsightCard
+          title="盈利概览（真实PnL）"
+          content={`${pnlText}${topStr ? ` 策略Top: ${topStr}。` : ''}${topReg ? ` RegimeTop: ${topReg}。` : ''}`}
+          tone={Number(overall?.total_pnl || 0) < 0 ? 'warn' : 'info'}
+        />
+        <ActionList
+          items={
+            profitRecommendations.length
+              ? profitRecommendations.slice(0, 5)
+              : ['暂无后端盈利优化建议，建议继续观察 30 天真实PnL后再调参。']
+          }
+        />
+        <div className="sub-title" style={{ marginTop: 12 }}>盈利归因下钻（真实PnL）</div>
+        <div className="table-grid-two">
+          <div>
+            <div className="sub-title">策略 Top</div>
+            <DataTable
+              columns={[
+                { key: 'key', title: '策略' },
+                { key: 'trades', title: '样本' },
+                { key: 'win_rate', title: '胜率' },
+                { key: 'total_pnl', title: '总PnL' },
+                { key: 'expectancy', title: '期望' },
+              ]}
+              rows={strategyRows}
+              emptyText="暂无策略归因数据"
+            />
+          </div>
+          <div>
+            <div className="sub-title">Regime Top</div>
+            <DataTable
+              columns={[
+                { key: 'key', title: 'Regime' },
+                { key: 'trades', title: '样本' },
+                { key: 'win_rate', title: '胜率' },
+                { key: 'total_pnl', title: '总PnL' },
+                { key: 'expectancy', title: '期望' },
+              ]}
+              rows={regimeRows}
+              emptyText="暂无 regime 归因数据"
+            />
+          </div>
+        </div>
+        <div style={{ marginTop: 10 }}>
+          <div className="sub-title">时段 Top（00-23）</div>
+          <DataTable
+            columns={[
+              { key: 'key', title: '小时' },
+              { key: 'trades', title: '样本' },
+              { key: 'win_rate', title: '胜率' },
+              { key: 'total_pnl', title: '总PnL' },
+              { key: 'expectancy', title: '期望' },
+            ]}
+            rows={hourRows}
+            emptyText="暂无时段归因数据"
+          />
+        </div>
+        <InsightCard
+          title="自动调参建议（草案）"
+          content={adaptiveTips.join('；')}
+          tone="info"
+        />
+        <div style={{ marginTop: 8, fontWeight: 700 }}>运行时覆盖建议（可回滚）</div>
+        <pre style={{ marginTop: 6, padding: 10, background: 'var(--bg-tertiary)', borderRadius: 8, overflow: 'auto', fontSize: 12 }}>
+          {runtimePatchText}
+        </pre>
         <ActionList
           items={[
             '先看“端到端链路状态”，有异常项先处理异常',

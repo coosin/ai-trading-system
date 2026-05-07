@@ -452,35 +452,99 @@ class OKXExchange(ExchangeBase):
 
     async def probe_public_api(self, proxy: Optional[str] = None, timeout_sec: float = 2.0) -> Dict[str, Any]:
         """
-        Fast reachability probe for operators / API endpoints.
+        Fast multi-endpoint reachability probe for operators / API endpoints.
 
-        Returns a structured result instead of raising, so callers can degrade gracefully.
-        This does NOT mutate state other than optionally touching the underlying session.
+        Backward compatible fields:
+        - ok/status/url/reason/ts are preserved so existing callers continue to work.
         """
-        url = self.api_url + "/api/v5/public/time"
-        try:
-            timeout = aiohttp.ClientTimeout(
-                total=float(timeout_sec or 2.0),
-                connect=min(3.0, float(timeout_sec or 2.0)),
-                sock_read=min(3.0, float(timeout_sec or 2.0)),
-            )
-            async with self._session.get(url, timeout=timeout, proxy=proxy) as resp:
-                status = int(getattr(resp, "status", 0) or 0)
-                payload = await resp.json()
-            data = payload.get("data") if isinstance(payload, dict) else None
-            row = data[0] if isinstance(data, list) and data else {}
-            ts = float((row or {}).get("ts") or 0.0)
-            if status >= 400 or ts <= 0:
+        timeout_val = float(timeout_sec or 2.0)
+        # Keep probe path consistent with normal request path:
+        # if caller doesn't pass proxy explicitly, inherit configured proxy.
+        if proxy is None:
+            proxy = getattr(self, "_proxy_url", None)
+        timeout = aiohttp.ClientTimeout(
+            total=timeout_val,
+            connect=min(3.0, timeout_val),
+            sock_read=min(3.0, timeout_val),
+        )
+
+        checks = [
+            {
+                "name": "public_time",
+                "path": "/api/v5/public/time",
+                "validator": lambda p: float((((p or {}).get("data") or [{}])[0] or {}).get("ts") or 0.0) > 0.0,
+            },
+            {
+                "name": "public_instruments_swap",
+                "path": "/api/v5/public/instruments?instType=SWAP",
+                "validator": lambda p: isinstance((p or {}).get("data"), list) and len((p or {}).get("data") or []) > 0,
+            },
+            {
+                "name": "market_ticker_btc_swap",
+                "path": "/api/v5/market/ticker?instId=BTC-USDT-SWAP",
+                "validator": lambda p: isinstance((p or {}).get("data"), list) and len((p or {}).get("data") or []) > 0,
+            },
+        ]
+
+        async def _run_one(item: Dict[str, Any]) -> Dict[str, Any]:
+            url = self.api_url + str(item.get("path") or "")
+            try:
+                async with self._session.get(url, timeout=timeout, proxy=proxy) as resp:
+                    status = int(getattr(resp, "status", 0) or 0)
+                    payload = await resp.json()
+                data = payload.get("data") if isinstance(payload, dict) else None
+                row0 = data[0] if isinstance(data, list) and data else {}
+                is_ok = bool(status < 400 and item["validator"](payload))
                 return {
-                    "ok": False,
+                    "name": item["name"],
+                    "ok": is_ok,
                     "status": status,
                     "url": url,
-                    "reason": "bad_response",
-                    "ts": ts,
+                    "reason": None if is_ok else "bad_response",
+                    "payload_code": (payload or {}).get("code") if isinstance(payload, dict) else None,
+                    "ts": float((row0 or {}).get("ts") or 0.0),
                 }
-            return {"ok": True, "status": status, "url": url, "ts": ts}
-        except Exception as e:
-            return {"ok": False, "status": 0, "url": url, "reason": "exception", "error": str(e)[:240]}
+            except Exception as e:
+                err_type = type(e).__name__
+                err_msg = str(e).strip()
+                err_repr = repr(e)
+                detail = err_msg or err_repr or err_type
+                return {
+                    "name": item["name"],
+                    "ok": False,
+                    "status": 0,
+                    "url": url,
+                    "reason": "exception",
+                    "error": detail[:240],
+                    "error_type": err_type,
+                }
+
+        results = await asyncio.gather(*[_run_one(c) for c in checks], return_exceptions=False)
+        by_name = {str(r.get("name")): r for r in results if isinstance(r, dict)}
+        ok_count = sum(1 for r in results if bool((r or {}).get("ok")))
+        total = max(1, len(results))
+        score = round(ok_count / total, 4)
+
+        time_probe = by_name.get("public_time", {})
+        time_ok = bool(time_probe.get("ok"))
+        status_text = "reachable" if score >= 0.67 else ("degraded" if score >= 0.34 else "unreachable")
+        overall_ok = time_ok and score >= 0.67
+
+        return {
+            # backward-compatible keys
+            "ok": overall_ok,
+            "status": int(time_probe.get("status", 0) or 0),
+            "url": str(time_probe.get("url") or (self.api_url + "/api/v5/public/time")),
+            "reason": time_probe.get("reason") if not overall_ok else None,
+            "ts": float(time_probe.get("ts") or 0.0),
+            # extended diagnostics
+            "status_text": status_text,
+            "score": score,
+            "ok_count": ok_count,
+            "total_checks": total,
+            "checks": results,
+            "core_time_ok": time_ok,
+        }
 
     def _build_request_path(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> str:
         """

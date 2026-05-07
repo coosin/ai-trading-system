@@ -462,9 +462,16 @@ class ExecutionGateway:
             )
         except Exception:
             qty_factor = 1.0
+        try:
+            lev_mult = float(gp.get("regime_leverage_mult", 1.0) or 1.0)
+        except Exception:
+            lev_mult = 1.0
+        sltp_profile = str(gp.get("sltp_profile") or "").strip()
         return {
             "regime": str(regime or "unknown"),
             "effective_qty_factor": float(qty_factor),
+            "regime_leverage_mult": float(lev_mult),
+            "sltp_profile": sltp_profile,
         }
 
     @staticmethod

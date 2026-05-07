@@ -35,6 +35,7 @@ help:
 	@echo "  $(GREEN)make coverage$(NC)    - 生成测试覆盖率报告"
 	@echo "  $(GREEN)make verify-trading$(NC) - 一键运行交易验收(fullcheck)"
 	@echo "  $(GREEN)make verify-trading-gates$(NC) - 运行微结构门控回归测试"
+	@echo "  $(GREEN)make verify-prod$(NC)    - 生产级稳定性验收(P0)"
 	@echo ""
 
 # 安装依赖
@@ -162,6 +163,10 @@ verify-trading:
 verify-trading-gates:
 	@echo "$(BLUE)运行微结构门控回归测试...$(NC)"
 	python3 scripts/verify.py trading-gates --kexpr microstructure
+
+verify-prod:
+	@echo "$(BLUE)运行生产级稳定性验收...$(NC)"
+	python3 scripts/prod_stability_check.py
 
 # 预提交检查
 pre-commit:

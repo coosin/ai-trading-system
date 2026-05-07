@@ -76,6 +76,10 @@ export const api = {
       );
     },
     getExecutionSpine: () => request('/trade/execution_spine'),
+    getAnalyticsSummary: (params = {}) => {
+      const q = new URLSearchParams(params).toString();
+      return request(`/trades/analytics/summary${q ? `?${q}` : ''}`);
+    },
     simulateOrder: (data) =>
       request('/modules/execution/simulate-order', { method: 'POST', body: JSON.stringify(data || {}) }),
     getEvents: (params = {}) => {

@@ -46,6 +46,8 @@ class RoundRow:
     ts: str
     ok: bool
     latency_ms: int
+    exchange_reachability_status: str
+    exchange_reachability_score: float
     degraded_ratio: float
     quality_coverage: float
     sample_count: int
@@ -54,6 +56,8 @@ class RoundRow:
     ai_trading_positions: int
     sltp_active_orders: int
     sltp_dynamic_adjustments: int
+    guard_exchange_unreachable_rejected: int
+    guard_exchange_degraded_risk_reduced: int
     reconciliation_healthy: bool
     reconciliation_drift_total: int
     reconciliation_stale_open_orders: int
@@ -69,6 +73,12 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
     sltp = (data.get("sltp") or {}) if isinstance(data, dict) else {}
     rec = (data.get("execution_reconciliation") or {}) if isinstance(data, dict) else {}
     rec_sum = (rec.get("summary") or {}) if isinstance(rec, dict) else {}
+    exch = (data.get("exchange_reachability") or {}) if isinstance(data, dict) else {}
+    exch_st = str(exch.get("status") or "unknown").lower()
+    try:
+        exch_score = float(((exch.get("probe") or {}) if isinstance(exch.get("probe"), dict) else {}).get("score") or 0.0)
+    except Exception:
+        exch_score = 0.0
 
     guards = (ai_core.get("execution_guards") or {}) if isinstance(ai_core, dict) else {}
     gstats = (guards.get("stats") or {}) if isinstance(guards, dict) else {}
@@ -77,6 +87,8 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
     rr_rej = _to_int(gstats.get("rr_rejected"))
     sp_rej = _to_int(gstats.get("spread_rejected"))
     dq_hold = _to_int(gstats.get("data_quality_guard_hold"))
+    ex_unreach_rej = _to_int(gstats.get("exchange_unreachable_rejected"))
+    ex_degraded_reduce = _to_int(gstats.get("exchange_degraded_risk_reduced"))
 
     alerts: List[str] = []
     err_text = str(diag.get("error") or "")
@@ -89,6 +101,10 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
             alerts.append("diagnosis_failed")
     if _to_float(ma.get("degraded_ratio")) > 0.35:
         alerts.append("degraded_ratio_high")
+    if exch_st == "unreachable":
+        alerts.append("exchange_unreachable")
+    elif exch_st == "degraded":
+        alerts.append("exchange_degraded")
     if not bool(ai_core.get("running")):
         alerts.append("ai_core_not_running")
     if not bool(ai_engine.get("running")):
@@ -107,6 +123,10 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
             alerts.append("spread_rejected_spike")
         if dq_hold - _to_int(prev.get("dq_hold")) >= 2:
             alerts.append("data_quality_hold_spike")
+        if ex_unreach_rej - _to_int(prev.get("ex_unreach_rej")) >= 1:
+            alerts.append("exchange_unreachable_rejected_spike")
+        if ex_degraded_reduce - _to_int(prev.get("ex_degraded_reduce")) >= 1:
+            alerts.append("exchange_degraded_risk_reduced_spike")
         if sltp_dyn - _to_int(prev.get("sltp_dyn")) >= 60:
             alerts.append("sltp_adjustments_spike")
 
@@ -114,6 +134,8 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
         ts=datetime.now().isoformat(),
         ok=bool(diag.get("success")),
         latency_ms=latency_ms,
+        exchange_reachability_status=exch_st,
+        exchange_reachability_score=float(exch_score),
         degraded_ratio=_to_float(ma.get("degraded_ratio")),
         quality_coverage=_to_float(ma.get("quality_coverage")),
         sample_count=len(ma.get("samples") or []) if isinstance(ma.get("samples"), list) else 0,
@@ -122,6 +144,8 @@ def _extract_row(diag: Dict[str, Any], latency_ms: int, prev: Dict[str, Any] | N
         ai_trading_positions=_to_int(ai_engine.get("positions")),
         sltp_active_orders=_to_int(sltp.get("active_orders")),
         sltp_dynamic_adjustments=sltp_dyn,
+        guard_exchange_unreachable_rejected=ex_unreach_rej,
+        guard_exchange_degraded_risk_reduced=ex_degraded_reduce,
         reconciliation_healthy=bool(rec.get("healthy", False)),
         reconciliation_drift_total=_to_int(rec_sum.get("drift_total")),
         reconciliation_stale_open_orders=_to_int(rec_sum.get("stale_open_orders")),
@@ -142,6 +166,10 @@ def _write_summary(rows: List[RoundRow], out_md: Path, duration_sec: int, interv
     max_sltp_dyn = max((r.sltp_dynamic_adjustments for r in rows), default=0)
     max_positions = max((r.ai_trading_positions for r in rows), default=0)
     max_drift = max((r.reconciliation_drift_total for r in rows), default=0)
+    exch_unreach = sum(1 for r in rows if r.exchange_reachability_status == "unreachable")
+    exch_degraded = sum(1 for r in rows if r.exchange_reachability_status == "degraded")
+    max_ex_unreach_rej = max((r.guard_exchange_unreachable_rejected for r in rows), default=0)
+    max_ex_deg_reduce = max((r.guard_exchange_degraded_risk_reduced for r in rows), default=0)
 
     alert_counter: Dict[str, int] = {}
     for r in rows:
@@ -150,7 +178,7 @@ def _write_summary(rows: List[RoundRow], out_md: Path, duration_sec: int, interv
     top_alerts = sorted(alert_counter.items(), key=lambda x: x[1], reverse=True)[:8]
 
     verdict = "整体正常"
-    if ai_down > 0 or rec_bad > 0:
+    if ai_down > 0 or rec_bad > 0 or exch_unreach > 0:
         verdict = "存在关键异常"
     elif degraded_bad > max(1, total // 4):
         verdict = "数据链路波动偏高"
@@ -168,12 +196,15 @@ def _write_summary(rows: List[RoundRow], out_md: Path, duration_sec: int, interv
         "",
         "## 核心健康指标",
         f"- 诊断接口延迟: 平均 {avg_latency}ms, 峰值 {max_latency}ms",
+        f"- 交易所可达性: unreachable={exch_unreach} degraded={exch_degraded} (窗口轮次)",
         f"- 数据退化比例>0.35 轮次: {degraded_bad}",
         f"- 对账异常轮次: {rec_bad}",
         f"- AI主链路非运行轮次: {ai_down}",
         f"- 持仓峰值: {max_positions}",
         f"- 对账漂移峰值: {max_drift}",
         f"- SLTP动态调整峰值: {max_sltp_dyn}",
+        f"- 不可达阻断开仓计数峰值: {max_ex_unreach_rej}",
+        f"- 降级降风险计数峰值: {max_ex_deg_reduce}",
         "",
         "## 告警分布",
     ]
@@ -186,6 +217,7 @@ def _write_summary(rows: List[RoundRow], out_md: Path, duration_sec: int, interv
     lines.extend(["- 数据分析链路: 以 diagnosis 可用率 + market_analysis 样本稳定性判断。"])
     lines.extend(["- 智能开平仓链路: 以 ai_core/ai_trading 运行状态 + guard 拒绝脉冲判断。"])
     lines.extend(["- 止盈止损链路: 以 `positions` 与 `sltp.active_orders/dynamic_adjustments` 联动判断是否在持续跟踪。"])
+    lines.extend(["- 交易所链路: `exchange_unreachable` 视为 P0；`exchange_degraded` 视为 P1（系统会降杠杆/降仓）。"])
     lines.extend(["- 备注: 服务重启后的短时 `Connection refused` 将记为 `diagnosis_warming_up`，不再直接判定为 P0。"])
 
     out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -233,6 +265,8 @@ def main() -> int:
             "ts": row.ts,
             "ok": row.ok,
             "latency_ms": row.latency_ms,
+            "exchange_reachability_status": row.exchange_reachability_status,
+            "exchange_reachability_score": row.exchange_reachability_score,
             "degraded_ratio": row.degraded_ratio,
             "quality_coverage": row.quality_coverage,
             "sample_count": row.sample_count,
@@ -241,6 +275,8 @@ def main() -> int:
             "ai_trading_positions": row.ai_trading_positions,
             "sltp_active_orders": row.sltp_active_orders,
             "sltp_dynamic_adjustments": row.sltp_dynamic_adjustments,
+            "guard_exchange_unreachable_rejected": row.guard_exchange_unreachable_rejected,
+            "guard_exchange_degraded_risk_reduced": row.guard_exchange_degraded_risk_reduced,
             "reconciliation_healthy": row.reconciliation_healthy,
             "reconciliation_drift_total": row.reconciliation_drift_total,
             "reconciliation_stale_open_orders": row.reconciliation_stale_open_orders,
@@ -253,6 +289,12 @@ def main() -> int:
             "rr_rej": (diag.get("data", {}).get("ai_core", {}).get("execution_guards", {}).get("stats", {}) or {}).get("rr_rejected", 0),
             "sp_rej": (diag.get("data", {}).get("ai_core", {}).get("execution_guards", {}).get("stats", {}) or {}).get("spread_rejected", 0),
             "dq_hold": (diag.get("data", {}).get("ai_core", {}).get("execution_guards", {}).get("stats", {}) or {}).get("data_quality_guard_hold", 0),
+            "ex_unreach_rej": (diag.get("data", {}).get("ai_core", {}).get("execution_guards", {}).get("stats", {}) or {}).get(
+                "exchange_unreachable_rejected", 0
+            ),
+            "ex_degraded_reduce": (diag.get("data", {}).get("ai_core", {}).get("execution_guards", {}).get("stats", {}) or {}).get(
+                "exchange_degraded_risk_reduced", 0
+            ),
             "sltp_dyn": (diag.get("data", {}).get("sltp", {}) or {}).get("dynamic_adjustments", 0),
         }
 

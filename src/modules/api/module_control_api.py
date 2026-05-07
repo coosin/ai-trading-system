@@ -3034,12 +3034,15 @@ def init_module_control_api(app, main_controller):
                         pr = await asyncio.wait_for(probe(timeout_sec=1.8), timeout=_remaining(2.2))
                     except Exception as _e:
                         pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
+                    probe_status = str((pr or {}).get("status_text") or "").strip().lower()
+                    if probe_status not in {"reachable", "degraded", "unreachable"}:
+                        probe_status = "reachable" if bool((pr or {}).get("ok")) else "unreachable"
                     exch_diag = {
                         "ok": bool((pr or {}).get("ok")),
-                        "status": "reachable" if bool((pr or {}).get("ok")) else "unreachable",
+                        "status": probe_status,
                         "probe": pr,
                     }
-                    if not bool((pr or {}).get("ok")):
+                    if probe_status == "unreachable":
                         exch_diag["hint"] = (
                             "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network."
                         )
@@ -3287,6 +3290,22 @@ def init_module_control_api(app, main_controller):
                     "POST_CHECK_ANOMALY": "平仓后复核异常：检查 positions 刷新延迟/是否实际成交；必要时二次 close-position。",
                 }.get(code, "查看 detail/endpoint/trace_id 对照交易所返回，补齐映射或加更具体的重试/降级。")
 
+            def _severity_from_exchange_code(code: str) -> str:
+                c = str(code or "").upper()
+                if c in {
+                    "NO_EXCHANGE",
+                    "TIMEOUT",
+                    "CONNECTION_ERROR",
+                    "NETWORK_ERROR",
+                    "POLICY_DENIED",
+                    "HOSTING_MODE_DENIED",
+                    "RISK_REDLINE_DENIED",
+                }:
+                    return "block"
+                if c in {"ALREADY_CLOSED_NO_POSITION", "POST_CHECK_ANOMALY"}:
+                    return "warn"
+                return "warn"
+
             top: List[Dict[str, Any]] = []
             for k, v in top_keys:
                 # k = op:code:phase
@@ -3296,16 +3315,82 @@ def init_module_control_api(app, main_controller):
                     {
                         "key": k,
                         "count": int(v),
+                        "severity": _severity_from_exchange_code(code),
+                        "category": "exchange_failure",
                         "action_hint": _action_hint(code),
                         "samples": samples.get(k, [])[:3],
                     }
                 )
+
+            # Merge ai_core execution guard counters to make "no-open" reasons visible
+            # even when rejection happened before exchange API calls.
+            guard_map = {
+                "exchange_unreachable_rejected": "AI_CORE_GUARD:EXCHANGE_UNREACHABLE_OPEN_REJECTED",
+                "exchange_degraded_risk_reduced": "AI_CORE_GUARD:EXCHANGE_DEGRADED_RISK_REDUCED",
+                "analysis_hard_rejected": "AI_CORE_GUARD:ANALYSIS_HARD_REJECTED",
+                "confidence_open_rejected": "AI_CORE_GUARD:CONFIDENCE_OPEN_REJECTED",
+                "open_evidence_rejected": "AI_CORE_GUARD:OPEN_EVIDENCE_REJECTED",
+                "rr_rejected": "AI_CORE_GUARD:RR_REJECTED",
+                "spread_rejected": "AI_CORE_GUARD:SPREAD_REJECTED",
+                "depth_imbalance_rejected": "AI_CORE_GUARD:DEPTH_IMBALANCE_REJECTED",
+            }
+            guard_hints = {
+                "exchange_unreachable_rejected": "交易所不可达，已阻断开仓；优先修复 TLS/代理/网络后再恢复自动开仓。",
+                "exchange_degraded_risk_reduced": "交易所降级可达，系统已自动降杠杆/降仓位；关注连接质量恢复。",
+                "analysis_hard_rejected": "分析硬门控拒绝：检查 quality/confidence/degraded 与 analysis_hard_gate 配置。",
+                "confidence_open_rejected": "置信度不足拒绝开仓：检查 ai_core_min_confidence_to_open 与 regime 加成。",
+                "open_evidence_rejected": "证据不足拒绝开仓：检查快照/K线是否缺失与超时。",
+                "rr_rejected": "盈亏比不足拒绝开仓：检查 SLTP 参数与 min_rr_to_trade。",
+                "spread_rejected": "点差过大拒绝开仓：检查流动性、交易时段与 max_spread_bps_to_trade。",
+                "depth_imbalance_rejected": "盘口深度失衡拒绝开仓：检查 max_abs_depth_imbalance_to_trade。",
+            }
+            guard_severity = {
+                "exchange_unreachable_rejected": "block",
+                "exchange_degraded_risk_reduced": "reduce",
+                "analysis_hard_rejected": "block",
+                "confidence_open_rejected": "block",
+                "open_evidence_rejected": "block",
+                "rr_rejected": "block",
+                "spread_rejected": "block",
+                "depth_imbalance_rejected": "block",
+            }
+            ai_core_diag = out.get("ai_core") if isinstance(out.get("ai_core"), dict) else {}
+            eg_cfg = ai_core_diag.get("execution_guards") if isinstance(ai_core_diag.get("execution_guards"), dict) else {}
+            eg_stats = eg_cfg.get("stats") if isinstance(eg_cfg.get("stats"), dict) else {}
+            for stat_key, reason_key in guard_map.items():
+                cnt = int(eg_stats.get(stat_key, 0) or 0)
+                if cnt <= 0:
+                    continue
+                top.append(
+                    {
+                        "key": reason_key,
+                        "count": cnt,
+                        "severity": guard_severity.get(stat_key, "warn"),
+                        "category": "ai_core_guard",
+                        "action_hint": guard_hints.get(stat_key, "检查 ai_core 执行门控配置与实时诊断。"),
+                        "samples": [],
+                    }
+                )
+            top = sorted(top, key=lambda x: int(x.get("count", 0)), reverse=True)[:12]
+            lead = top[0] if top else None
+            summary = "最近窗口未发现显著拒单/降级主因。"
+            if isinstance(lead, dict):
+                sev = str(lead.get("severity") or "warn")
+                key = str(lead.get("key") or "")
+                cnt = int(lead.get("count", 0) or 0)
+                if sev == "block":
+                    summary = f"当前主阻塞原因为 {key}（{cnt} 次），已触发阻断策略。"
+                elif sev == "reduce":
+                    summary = f"当前主降风险原因为 {key}（{cnt} 次），系统在降杠杆/降仓运行。"
+                else:
+                    summary = f"当前主要告警原因为 {key}（{cnt} 次），建议结合样本继续排查。"
 
             out["execution_attribution"] = {
                 "failures_in_window": len(fails),
                 "benign_failures_in_window": len(benign_fails),
                 "benign_failure_codes": sorted(list(benign_codes)),
                 "top_reasons": top,
+                "summary": summary,
             }
         except Exception as e:
             out["execution_attribution_error"] = str(e)

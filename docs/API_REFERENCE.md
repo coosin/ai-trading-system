@@ -11,9 +11,20 @@
 - `GET /api/v1/system/health`
   - 返回 `data.status`：`healthy` / `degraded`
   - 新增 `data.exchange_reachability`：
-    - `status`: `reachable` / `unreachable` / `unknown`
-    - `probe`: 交易所公共时间探针结果（用于快速识别 TLS/代理/网络故障）
-  - 说明：当交易所不可达时，健康接口会降级为 `degraded`，便于监控系统直接告警。
+    - `status`: `reachable` / `degraded` / `unreachable` / `unknown`
+    - `probe.score`: 多端点可达性评分（0~1）
+    - `probe.checks[]`: 分端点检查结果（`public_time` / `public_instruments_swap` / `market_ticker_btc_swap`）
+  - 说明：当交易所处于 `degraded` 或 `unreachable` 时，健康接口会降级为 `degraded`，便于监控系统直接告警。
+
+- `GET /api/v1/modules/commander/trading-diagnosis`
+  - `data.execution_attribution.top_reasons` 除交易所失败外，还会合并 `ai_core` 执行门控统计（`AI_CORE_GUARD:*`）。
+  - `top_reasons[]` 新增：
+    - `severity`: `block` / `reduce` / `warn`
+    - `category`: `exchange_failure` / `ai_core_guard`
+  - 新增 `data.execution_attribution.summary`：一句话主因总结（用于值守面板快速判断）。
+  - 典型键：
+    - `AI_CORE_GUARD:EXCHANGE_UNREACHABLE_OPEN_REJECTED`
+    - `AI_CORE_GUARD:EXCHANGE_DEGRADED_RISK_REDUCED`
 
 ## 开平仓 API 与调试总览（2026-04 收口版）
 
@@ -57,6 +68,22 @@
 详见：`docs/TRADING_DEBUG_PLAYBOOK.md`
 
 ---
+
+## 盈利分析摘要（真实PnL，2026-05-07 新增）
+
+- `GET /api/v1/trades/analytics/summary`
+  - 参数：
+    - `days`：默认 30
+    - `symbol`：可选
+    - `accurate_only`：默认 true（过滤 `metadata.pnl_estimated=true`）
+    - `exclude_bootstrap`：默认 true
+    - `group_top_n`：默认 12（分组 TOPN 大小）
+  - 返回：
+    - `overall`：胜率、总PnL、总手续费、profit_factor、expectancy、max_drawdown_pnl
+    - `by_strategy_top`：按策略聚合 TOPN（key = `metadata.strategy_id` 优先）
+    - `by_regime_top`：按市场状态（key = `metadata.regime`）聚合 TOPN
+    - `by_hour_top`：按小时（00~23）聚合 TOPN
+    - `recommendations`：基于聚合结果生成的可操作建议（手续费占比、亏损 regime 等）
 
 ## 交易真值（交易所同步）与对账接口（2026-05-06 新增）
 

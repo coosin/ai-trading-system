@@ -134,6 +134,12 @@ class AICoreDecisionEngine:
             "analysis_hard_gate_for_open": True,
             "analysis_min_confidence_for_open": 0.55,
             "analysis_require_not_degraded_for_open": True,
+            "exchange_reachability_gate_enabled": True,
+            "analysis_require_exchange_reachable_for_open": True,
+            "exchange_reachability_probe_timeout_sec": 1.2,
+            "exchange_reachability_cache_ttl_sec": 12.0,
+            "exchange_reachability_degraded_quantity_factor": 0.70,
+            "exchange_reachability_degraded_leverage_factor": 0.82,
             "min_rr_to_trade": 1.15,
             "max_spread_bps_to_trade": 40.0,
             "max_abs_depth_imbalance_to_trade": 0.92,
@@ -166,6 +172,16 @@ class AICoreDecisionEngine:
                 "low_liquidity": {"min_rr_mult": 1.12, "spread_mult": 0.82, "qty_mult": 0.68, "min_conf_add": 0.03},
                 # 低波动 + 有方向但未到「强趋势」阈值：典型「慢涨/慢磨」
                 "low_vol_grind": {"min_rr_mult": 0.96, "spread_mult": 1.07, "qty_mult": 0.88, "min_conf_add": -0.012},
+            },
+            # 生产级治理矩阵：regime -> 执行层仓位/杠杆/（预留）SLTP 策略路由
+            # 注意：这是“可回滚的运行时覆盖”层，默认只做轻度缩放；策略大改需配合验收脚本与巡检阈值。
+            "regime_policy_matrix": {
+                "trend": {"leverage_mult": 1.00, "qty_mult": 1.00},
+                "range": {"leverage_mult": 0.95, "qty_mult": 0.95},
+                "low_vol_grind": {"leverage_mult": 0.90, "qty_mult": 0.92, "sltp_profile": "grind_tight"},
+                "high_vol": {"leverage_mult": 0.85, "qty_mult": 0.90, "sltp_profile": "high_vol_wide"},
+                "low_liquidity": {"leverage_mult": 0.80, "qty_mult": 0.85},
+                "normal": {"leverage_mult": 1.00, "qty_mult": 1.00},
             },
             # MA5-MA20 价差占价比低于强趋势阈值、但超过此值时视为「缓趋势」而非无方向震荡
             "regime_grind_min_trend_abs": 0.00035,
@@ -327,7 +343,11 @@ class AICoreDecisionEngine:
             "discretionary_close_suppressed": 0,
             "open_evidence_rejected": 0,
             "open_evidence_error": 0,
+            "exchange_unreachable_rejected": 0,
+            "exchange_degraded_risk_reduced": 0,
         }
+        self._exchange_reachability_cache: Dict[str, Any] = {"status": "unknown", "ok": None}
+        self._exchange_reachability_cache_at: Optional[datetime] = None
         self._adaptive_guard_profile: Dict[str, Any] = {
             "profile": "normal",
             "symbol_group": "DEFAULT",
@@ -4769,6 +4789,81 @@ class AICoreDecisionEngine:
 
             is_close = decision.action == "close"
             is_open = decision.action in ("buy", "sell")
+            exchange_reachability: Dict[str, Any] = {"status": "unknown", "ok": None}
+            ex_reach_qty_factor = 1.0
+            ex_reach_lev_factor = 1.0
+
+            # Exchange reachability hard/soft gate for open actions:
+            # - unreachable: reject open (capital safety first)
+            # - degraded: keep open path but reduce risk budget (qty/leverage).
+            if is_open and bool(self.config.get("exchange_reachability_gate_enabled", True)):
+                try:
+                    probe_timeout = float(self.config.get("exchange_reachability_probe_timeout_sec", 1.2) or 1.2)
+                    cache_ttl = float(self.config.get("exchange_reachability_cache_ttl_sec", 12.0) or 12.0)
+                    now_ts = datetime.utcnow()
+                    cache_age = (
+                        (now_ts - self._exchange_reachability_cache_at).total_seconds()
+                        if self._exchange_reachability_cache_at
+                        else 10e9
+                    )
+                    if cache_age <= max(1.0, cache_ttl):
+                        exchange_reachability = dict(self._exchange_reachability_cache or {})
+                    else:
+                        probe = getattr(self.exchange, "probe_public_api", None)
+                        if callable(probe):
+                            try:
+                                pr = await asyncio.wait_for(
+                                    probe(timeout_sec=probe_timeout),
+                                    timeout=max(1.0, probe_timeout + 0.5),
+                                )
+                            except Exception as _e:
+                                pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
+                            st = str((pr or {}).get("status_text") or "").strip().lower()
+                            if st not in {"reachable", "degraded", "unreachable"}:
+                                st = "reachable" if bool((pr or {}).get("ok")) else "unreachable"
+                            exchange_reachability = {
+                                "status": st,
+                                "ok": bool((pr or {}).get("ok")),
+                                "score": float((pr or {}).get("score") or 0.0),
+                            }
+                        else:
+                            exchange_reachability = {"status": "unknown", "ok": None}
+                        self._exchange_reachability_cache = dict(exchange_reachability)
+                        self._exchange_reachability_cache_at = now_ts
+
+                    ex_status = str(exchange_reachability.get("status") or "unknown").lower()
+                    if ex_status == "unreachable" and bool(
+                        self.config.get("analysis_require_exchange_reachable_for_open", True)
+                    ):
+                        self._execution_guards_stats["exchange_unreachable_rejected"] = int(
+                            self._execution_guards_stats.get("exchange_unreachable_rejected", 0)
+                        ) + 1
+                        logger.warning(
+                            "⛔ 交易所不可达，拒绝开仓: symbol=%s status=%s score=%s",
+                            decision.symbol,
+                            ex_status,
+                            exchange_reachability.get("score"),
+                        )
+                        _record_intent({"exchange_reachability": exchange_reachability})
+                        _record_guard(
+                            "rejected",
+                            "exchange_unreachable_open_rejected",
+                            "exchange_reachability",
+                            {"exchange_reachability": exchange_reachability},
+                        )
+                        return False
+                    if ex_status == "degraded":
+                        ex_reach_qty_factor = float(
+                            self.config.get("exchange_reachability_degraded_quantity_factor", 0.70) or 0.70
+                        )
+                        ex_reach_lev_factor = float(
+                            self.config.get("exchange_reachability_degraded_leverage_factor", 0.82) or 0.82
+                        )
+                        self._execution_guards_stats["exchange_degraded_risk_reduced"] = int(
+                            self._execution_guards_stats.get("exchange_degraded_risk_reduced", 0)
+                        ) + 1
+                except Exception as e:
+                    logger.debug(f"exchange reachability gate failed: {e}")
 
             if is_close and not bypass_discretionary_close_gates:
                 ok_dc, why_dc = await self._discretionary_close_passes(decision)
@@ -4986,6 +5081,20 @@ class AICoreDecisionEngine:
             lev_max = float(self.config.get("leverage_max", 100) or 100)
             leverage = float(decision.leverage or self.config.get("default_leverage", 20))
             leverage = min(max(leverage, lev_min), lev_max)
+            if is_open and ex_reach_lev_factor < 0.999:
+                leverage = min(
+                    lev_max,
+                    max(
+                        lev_min,
+                        leverage * max(0.20, min(1.0, float(ex_reach_lev_factor))),
+                    ),
+                )
+                logger.info(
+                    "📉 交易所降级降杠杆: symbol=%s lev_factor=%.3f -> leverage=%.2f",
+                    decision.symbol,
+                    float(ex_reach_lev_factor),
+                    float(leverage),
+                )
             low_thr = float(self.config.get("low_balance_usdt_threshold") or 25.0)
             symbol_info: Dict[str, Any] = {}
             ct_val_num: Optional[float] = None
@@ -5068,6 +5177,17 @@ class AICoreDecisionEngine:
                     logger.info(f"📊 调整数量: {decision.quantity} -> {capped} (根据余额)")
                     decision.quantity = capped
                 decision.quantity = max(1, int(decision.quantity or 1))
+                if ex_reach_qty_factor < 0.999:
+                    q2 = max(1, int(float(decision.quantity) * max(0.20, min(1.0, float(ex_reach_qty_factor)))))
+                    if q2 < int(decision.quantity):
+                        logger.info(
+                            "📉 交易所降级降仓: symbol=%s qty=%s->%s qty_factor=%.3f",
+                            decision.symbol,
+                            decision.quantity,
+                            q2,
+                            float(ex_reach_qty_factor),
+                        )
+                        decision.quantity = q2
 
             # 3.1 动态仓位/组合风险预算（波动率/相关性/总仓位比例）— 仅开仓
             try:
@@ -5274,10 +5394,22 @@ class AICoreDecisionEngine:
                             regime = "normal"
                         reg_over = self.config.get("regime_profile_overrides", {}) or {}
                         ro = reg_over.get(regime, {}) if isinstance(reg_over, dict) else {}
+                        rpm = self.config.get("regime_policy_matrix", {}) or {}
+                        rp = rpm.get(regime, {}) if isinstance(rpm, dict) else {}
                         min_rr *= float(ro.get("min_rr_mult", 1.0) or 1.0)
                         max_spread_bps *= float(ro.get("spread_mult", 1.0) or 1.0)
                         regime_qty_mult = float(ro.get("qty_mult", 1.0) or 1.0)
                         regime_conf_add = float(ro.get("min_conf_add", 0.0) or 0.0)
+                        try:
+                            # policy matrix can further scale sizing (runtime-overridable governance layer)
+                            regime_qty_mult *= float(rp.get("qty_mult", 1.0) or 1.0)
+                        except Exception:
+                            pass
+                        try:
+                            regime_leverage_mult = float(rp.get("leverage_mult", 1.0) or 1.0)
+                        except Exception:
+                            regime_leverage_mult = 1.0
+                        sltp_profile = str(rp.get("sltp_profile") or "").strip()
 
                     # 在低风险状态下做轻度放宽以提高开单率；高风险时反向收紧。
                     if bool(self.config.get("boost_on_low_risk", True)):
@@ -5311,6 +5443,8 @@ class AICoreDecisionEngine:
                         "effective_max_abs_depth_imbalance": float(max_abs_imb),
                         "regime_qty_mult": float(regime_qty_mult),
                         "regime_min_conf_add": float(regime_conf_add),
+                        "regime_leverage_mult": float(regime_leverage_mult) if "regime_leverage_mult" in locals() else 1.0,
+                        "sltp_profile": str(sltp_profile) if "sltp_profile" in locals() else "",
                     }
                 except Exception as e:
                     logger.debug(f"自适应门控计算失败: {e}")
@@ -5576,6 +5710,26 @@ class AICoreDecisionEngine:
                         )
                         decision.quantity = new_qty
                     self._adaptive_guard_profile["effective_qty_factor"] = float(qty_factor)
+                except Exception:
+                    pass
+                try:
+                    lev_mult = float((self._adaptive_guard_profile or {}).get("regime_leverage_mult", 1.0) or 1.0)
+                    lev_mult = min(1.25, max(0.6, float(lev_mult)))
+                    if getattr(decision, "leverage", None) is not None:
+                        lev0 = int(decision.leverage or 1)
+                        lev1 = max(1, int(round(float(lev0) * lev_mult)))
+                        if lev1 != lev0:
+                            logger.info(
+                                "🧮 杠杆缩放: %s -> %s (mult=%.3f regime=%s)",
+                                lev0,
+                                lev1,
+                                lev_mult,
+                                (self._adaptive_guard_profile or {}).get("regime"),
+                            )
+                            decision.leverage = lev1
+                            self._execution_guards_stats["regime_leverage_adjusted"] = int(
+                                self._execution_guards_stats.get("regime_leverage_adjusted", 0) or 0
+                            ) + 1
                 except Exception:
                     pass
 
@@ -6079,6 +6233,12 @@ class AICoreDecisionEngine:
                     "analysis_hard_gate_for_open": self.config.get("analysis_hard_gate_for_open"),
                     "analysis_min_confidence_for_open": self.config.get("analysis_min_confidence_for_open"),
                     "analysis_require_not_degraded_for_open": self.config.get("analysis_require_not_degraded_for_open"),
+                    "exchange_reachability_gate_enabled": self.config.get("exchange_reachability_gate_enabled"),
+                    "analysis_require_exchange_reachable_for_open": self.config.get("analysis_require_exchange_reachable_for_open"),
+                    "exchange_reachability_probe_timeout_sec": self.config.get("exchange_reachability_probe_timeout_sec"),
+                    "exchange_reachability_cache_ttl_sec": self.config.get("exchange_reachability_cache_ttl_sec"),
+                    "exchange_reachability_degraded_quantity_factor": self.config.get("exchange_reachability_degraded_quantity_factor"),
+                    "exchange_reachability_degraded_leverage_factor": self.config.get("exchange_reachability_degraded_leverage_factor"),
                     "min_rr_to_trade": self.config.get("min_rr_to_trade"),
                     "max_spread_bps_to_trade": self.config.get("max_spread_bps_to_trade"),
                     "max_abs_depth_imbalance_to_trade": self.config.get("max_abs_depth_imbalance_to_trade"),
@@ -6237,6 +6397,12 @@ class AICoreDecisionEngine:
                 "analysis_hard_gate_for_open",
                 "analysis_min_confidence_for_open",
                 "analysis_require_not_degraded_for_open",
+                "exchange_reachability_gate_enabled",
+                "analysis_require_exchange_reachable_for_open",
+                "exchange_reachability_probe_timeout_sec",
+                "exchange_reachability_cache_ttl_sec",
+                "exchange_reachability_degraded_quantity_factor",
+                "exchange_reachability_degraded_leverage_factor",
                 "min_rr_to_trade",
                 "max_spread_bps_to_trade",
                 "max_abs_depth_imbalance_to_trade",
@@ -6259,6 +6425,7 @@ class AICoreDecisionEngine:
                 "low_vol_grind_profile_min_rr_mult",
                 "low_vol_grind_profile_spread_mult",
                 "regime_profile_overrides",
+                "regime_policy_matrix",
                 "pnl_health_sizing_enable",
                 "pnl_health_lookback_trades",
                 "pnl_health_bad_expectancy",
@@ -6388,6 +6555,7 @@ class AICoreDecisionEngine:
             }
             passthrough_keys = {
                 "regime_profile_overrides",
+                "regime_policy_matrix",
                 "auto_tune_rr_bounds",
                 "auto_tune_spread_bounds",
                 "auto_tune_sltp_tighten_bounds",

@@ -70,6 +70,10 @@ function diagnoseMissing(row, errors, value) {
   return err;
 }
 
+const SEVERITY_RANK = { block: 0, reduce: 1, warn: 2 };
+const SEVERITY_LABEL = { block: '阻断', reduce: '降风险', warn: '告警' };
+const SEVERITY_COLOR = { block: '#dc2626', reduce: '#d97706', warn: '#64748b' };
+
 export default function CommandDocsSection({ commandInput, setCommandInput, commandReply, actions, state, errors }) {
   const [docId, setDocId] = useState('readme');
   const [content, setContent] = useState('');
@@ -107,6 +111,49 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
     event: x.event || '-',
     detail: JSON.stringify(x.detail || {}, null, 0),
   }));
+  const commanderSnapshot = state.commanderSnapshot?.data || state.commanderSnapshot || {};
+  const executionAttribution =
+    commanderSnapshot.execution_attribution ||
+    commanderSnapshot.data?.execution_attribution ||
+    {};
+  const attributionSummary = String(executionAttribution.summary || '').trim();
+  const attributionTop = Array.isArray(executionAttribution.top_reasons)
+    ? executionAttribution.top_reasons
+    : [];
+  const attributionRows = attributionTop
+    .map((x, i) => {
+      const sev = String(x?.severity || 'warn').toLowerCase();
+      return {
+        id: `${x?.key || 'unknown'}-${i}`,
+        reason: String(x?.key || '-'),
+        severity: (
+          <span
+            style={{
+              display: 'inline-block',
+              padding: '2px 8px',
+              borderRadius: 999,
+              color: '#fff',
+              background: SEVERITY_COLOR[sev] || SEVERITY_COLOR.warn,
+              fontSize: 12,
+              fontWeight: 700,
+            }}
+          >
+            {SEVERITY_LABEL[sev] || SEVERITY_LABEL.warn}
+          </span>
+        ),
+        category: String(x?.category || '-'),
+        count: Number(x?.count || 0),
+        hint: String(x?.action_hint || '-'),
+        severity_raw: sev,
+      };
+    })
+    .sort((a, b) => {
+      const sa = SEVERITY_RANK[a.severity_raw] ?? 9;
+      const sb = SEVERITY_RANK[b.severity_raw] ?? 9;
+      if (sa !== sb) return sa - sb;
+      return Number(b.count || 0) - Number(a.count || 0);
+    })
+    .slice(0, 10);
 
   const loadDoc = async () => {
     const loader = resolve(selected.path);
@@ -137,6 +184,11 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
             title="傻瓜式使用建议"
             content="先看覆盖率与联调结果；如果有“缺数据”，按诊断提示处理即可。不会代码也能排查问题。"
             tone="info"
+          />
+          <InsightCard
+            title="执行归因一句话结论"
+            content={attributionSummary || '暂无执行归因总结，先点击“刷新覆盖状态”或检查司令部快照是否可用。'}
+            tone="normal"
           />
           <ActionList
             items={[
@@ -188,6 +240,18 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
             ]}
             rows={govAuditRows}
             emptyText="暂无治理审计记录"
+          />
+          <div className="sub-title" style={{ marginTop: 12 }}>执行归因（按严重级别排序）</div>
+          <DataTable
+            columns={[
+              { key: 'severity', title: '级别' },
+              { key: 'reason', title: '主因' },
+              { key: 'category', title: '分类' },
+              { key: 'count', title: '次数' },
+              { key: 'hint', title: '处理建议' },
+            ]}
+            rows={attributionRows}
+            emptyText="暂无执行归因数据"
           />
           <input className="form-input" value={commandInput} onChange={(e) => setCommandInput(e.target.value)} placeholder="发送司令部指令" />
           <button type="button" className="btn btn-sm btn-primary" style={{ marginTop: 8 }} onClick={actions.sendCommanderMessage}>
