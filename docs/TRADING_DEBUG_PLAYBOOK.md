@@ -186,6 +186,10 @@
 
 - **问题：开仓明显变少**
   - 排查：`min_confidence`、`min_rr`、`max_spread`、`funding/OI` 门控是否过严
+- **问题：风险已是 critical，但“建议平仓”在界面偶发看不到**
+  - 先看事件分发链路：是否有 `kind=risk.close_recommendation`（TradeEventHub/system.alert）
+  - 再看记忆事件链路：`close_recommendation_*` 是否持续入库
+  - 口径说明：`close_recommendation` 已独立于普通风险冷却（不再受 300s 去重影响），若仍不可见优先排查前端订阅/过滤条件
 - **问题：最近 3 小时“看起来大量亏损离场”**
   - 先排查：`/api/v1/trades` 中是否混入 `metadata.source=db_bootstrap`（补录/种子样本）；该来源不应用于实盘离场归因
   - 再排查：真实执行样本（`trade.fill`/`trade.position`）中的 `trace_id + strategy_id + sltp_reason`

@@ -3470,6 +3470,27 @@ class AITradingEngine:
                 await mc._send_notification_handler("风险：建议平仓（未自动下单）", text, priority="high")
         except Exception as e:
             logger.debug("recommend_close notify: %s", e)
+
+        # Also mirror directly to TradeEventHub (bypass messaging.instant off / filters).
+        try:
+            hub = getattr(mc, "trade_event_hub", None) if mc else None
+            if hub and hasattr(hub, "publish_system_alert"):
+                await hub.publish_system_alert(
+                    source="ai_trading_engine",
+                    title="风险：建议平仓（未自动下单）",
+                    message=text,
+                    priority="high",
+                    kind="risk.close_recommendation",
+                    data={
+                        "symbol": str(symbol or ""),
+                        "reason": str(reason or ""),
+                        "liq_dist": float(liq_dist or 0.0),
+                        "loss_pct": float(loss_pct or 0.0),
+                        "margin_ratio": float(margin_ratio or 0.0),
+                    },
+                )
+        except Exception as e:
+            logger.debug("recommend_close trade_event_hub: %s", e)
         try:
             from src.modules.core.event_system import EventPriority, EventType
 
@@ -3508,10 +3529,16 @@ class AITradingEngine:
             
             event_key = f"{event_type}_{symbol}"
             current_time = time.time()
+
+            # For close recommendations, we want repeated visibility in memory/UI.
+            # Keep global cooldown for noisy risk events, but bypass it for close_recommendation.
+            effective_cooldown = float(self._risk_event_cooldown or 0)
+            if str(event_type or "") == "close_recommendation":
+                effective_cooldown = 0.0
             
             if event_key in self._last_risk_events:
                 last_time = self._last_risk_events[event_key]
-                if current_time - last_time < self._risk_event_cooldown:
+                if effective_cooldown > 0 and (current_time - last_time) < effective_cooldown:
                     logger.debug(f"风险事件 {event_key} 在冷却期内，跳过记录")
                     return
             

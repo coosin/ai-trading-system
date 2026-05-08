@@ -1,5 +1,27 @@
 # 变更记录
 
+## 2026-05-08 — 临界风险建议平仓可见性修复（close_recommendation）
+
+- **问题现象：**
+  - `critical_risk_auto_close=true` 场景下，系统已触发“建议平仓”，但在部分观察面（记忆事件/前端订阅）出现“偶发看不到”的感知。
+
+- **根因确认（基于运行日志）：**
+  - 建议事件主链路本身可达（`_on_risk_warning` -> `_recommend_close_to_main_lane`）；
+  - 但 `close_recommendation_*` 与常规风险事件共用冷却去重，导致 300 秒窗口内事件写入记忆被跳过，影响可见性与复盘连续性。
+
+- **修复内容：**
+  - `AITradingEngine._save_risk_event_to_memory` 引入 `effective_cooldown`：
+    - 对 `event_type == "close_recommendation"` 设为 `0`（绕过冷却）；
+    - 其他风险事件保持原有冷却机制，避免噪声膨胀。
+  - `AITradingEngine._recommend_close_to_main_lane` 增加直接镜像到 `TradeEventHub.publish_system_alert`：
+    - `kind="risk.close_recommendation"`，
+    - 保障在即时消息开关/过滤开启时，前端与事件订阅侧仍可稳定观测。
+
+- **验证结论：**
+  - `close_recommendation` 连续触发场景下，记忆事件可持续写入；
+  - 事件总线与 TradeEventHub 通道均稳定分发；
+  - 调试埋点已清理，仅保留功能修复逻辑。
+
 ## 2026-05-06 — 交易真值自动同步、分账与对账报告（实盘口径对齐）
 
 - **交易所真值回填（自动化）：**
