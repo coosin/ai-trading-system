@@ -27,6 +27,7 @@ _process_lock: Optional[ProcessLock] = None
 
 _config_manager = None
 
+
 async def get_config_manager() -> ConfigManager:
     """获取配置管理器实例"""
     global _config_manager
@@ -254,7 +255,7 @@ class TradingSystem:
 
             logger.debug("信号处理器已设置")
         except Exception as e:
-            logger.warning(f"设置信号处理器失败（可能在某些环境中不支持）: {e}")
+            logger.warning(f"设置信号处理器失败（在某些环境中可能不支持）: {e}")
 
     async def _handle_shutdown_signal(self, sig: signal.Signals) -> None:
         """处理关闭信号"""
@@ -270,11 +271,18 @@ async def main() -> None:
     _process_lock = ProcessLock(APP_NAME)
     
     if not _process_lock.acquire():
+        lock_info = None
+        try:
+            lock_info = _process_lock.get_lock_info()
+        except Exception:
+            lock_info = None
         logger.error("❌ 另一个实例已在运行中，请先停止现有实例")
         logger.info("❌ 另一个实例已在运行中，请先停止现有实例")
         logger.info(f"   提示: 如果确认没有其他实例，请删除 /tmp/{APP_NAME}.lock 文件后重试")
-        return
-    
+        if lock_info:
+            logger.debug("Lock info: %s", lock_info)
+        raise SystemExit(2)
+
     system = TradingSystem()
 
     try:

@@ -44,6 +44,12 @@ class TradeRecord:
     pnl: float = 0.0
     fee: float = 0.0
     reasoning: str = ""
+    pnl_percent: float = 0.0
+    strategy: str = ""
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    leverage: int = 1
+    metadata_json: str = ""
 
 
 @dataclass
@@ -138,6 +144,12 @@ class HistoricalDataStorage:
                 pnl REAL DEFAULT 0,
                 fee REAL DEFAULT 0,
                 reasoning TEXT,
+                pnl_percent REAL DEFAULT 0,
+                strategy TEXT DEFAULT '',
+                stop_loss REAL,
+                take_profit REAL,
+                leverage INTEGER DEFAULT 1,
+                metadata_json TEXT DEFAULT '',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             
@@ -181,8 +193,28 @@ class HistoricalDataStorage:
             CREATE INDEX IF NOT EXISTS idx_indicators_symbol ON indicators(symbol);
             CREATE INDEX IF NOT EXISTS idx_indicators_timestamp ON indicators(timestamp);
         """)
+        await self._ensure_trade_columns()
         
         await self._db.commit()
+
+    async def _ensure_trade_columns(self) -> None:
+        """为旧数据库补齐新字段（幂等迁移）。"""
+        required_columns = {
+            "pnl_percent": "REAL DEFAULT 0",
+            "strategy": "TEXT DEFAULT ''",
+            "stop_loss": "REAL",
+            "take_profit": "REAL",
+            "leverage": "INTEGER DEFAULT 1",
+            "metadata_json": "TEXT DEFAULT ''",
+        }
+        async with self._db.execute("PRAGMA table_info(trades)") as cursor:
+            rows = await cursor.fetchall()
+        existing = {str(r[1]) for r in rows}
+        for col, ddl in required_columns.items():
+            if col in existing:
+                continue
+            await self._db.execute(f"ALTER TABLE trades ADD COLUMN {col} {ddl}")
+            logger.info("trades 表补充字段: %s %s", col, ddl)
     
     async def save_klines(self, symbol: str, timeframe: str, klines: List[Dict]) -> int:
         """
@@ -290,12 +322,14 @@ class HistoricalDataStorage:
         """保存交易记录"""
         async with self._lock:
             try:
+                metadata_json = str(getattr(trade, "metadata_json", "") or "")
                 has_order_id = bool(str(getattr(trade, "order_id", "") or "").strip())
                 if has_order_id:
                     await self._db.execute("""
                         INSERT OR IGNORE INTO trades 
-                        (symbol, side, order_type, quantity, price, timestamp, order_id, pnl, fee, reasoning)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (symbol, side, order_type, quantity, price, timestamp, order_id, pnl, fee, reasoning,
+                         pnl_percent, strategy, stop_loss, take_profit, leverage, metadata_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         trade.symbol,
                         trade.side,
@@ -306,13 +340,20 @@ class HistoricalDataStorage:
                         trade.order_id,
                         trade.pnl,
                         trade.fee,
-                        trade.reasoning
+                        trade.reasoning,
+                        float(getattr(trade, "pnl_percent", 0.0) or 0.0),
+                        str(getattr(trade, "strategy", "") or ""),
+                        getattr(trade, "stop_loss", None),
+                        getattr(trade, "take_profit", None),
+                        int(getattr(trade, "leverage", 1) or 1),
+                        metadata_json,
                     ))
                 else:
                     await self._db.execute("""
                         INSERT INTO trades 
-                        (symbol, side, order_type, quantity, price, timestamp, order_id, pnl, fee, reasoning)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (symbol, side, order_type, quantity, price, timestamp, order_id, pnl, fee, reasoning,
+                         pnl_percent, strategy, stop_loss, take_profit, leverage, metadata_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         trade.symbol,
                         trade.side,
@@ -323,7 +364,13 @@ class HistoricalDataStorage:
                         trade.order_id,
                         trade.pnl,
                         trade.fee,
-                        trade.reasoning
+                        trade.reasoning,
+                        float(getattr(trade, "pnl_percent", 0.0) or 0.0),
+                        str(getattr(trade, "strategy", "") or ""),
+                        getattr(trade, "stop_loss", None),
+                        getattr(trade, "take_profit", None),
+                        int(getattr(trade, "leverage", 1) or 1),
+                        metadata_json,
                     ))
                 
                 await self._db.commit()
@@ -403,20 +450,12 @@ class HistoricalDataStorage:
             
             async with self._db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
-                
-                return [{
-                    "id": row[0],
-                    "symbol": row[1],
-                    "side": row[2],
-                    "order_type": row[3],
-                    "quantity": row[4],
-                    "price": row[5],
-                    "timestamp": row[6],
-                    "order_id": row[7],
-                    "pnl": row[8],
-                    "fee": row[9],
-                    "reasoning": row[10]
-                } for row in rows]
+                columns = [d[0] for d in (cursor.description or [])]
+                out: List[Dict[str, Any]] = []
+                for row in rows:
+                    item = dict(zip(columns, row))
+                    out.append(item)
+                return out
                 
         except Exception as e:
             logger.error(f"查询交易记录失败: {e}")

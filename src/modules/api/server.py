@@ -488,7 +488,7 @@ class APIServer:
                 import uvicorn
                 import threading
                 import socket
-                
+
                 def is_port_in_use(port: int) -> bool:
                     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                         return s.connect_ex(('localhost', port)) == 0
@@ -521,7 +521,7 @@ class APIServer:
                 
                 server_task = asyncio.create_task(run_server())
                 self._tasks.append(server_task)
-                
+
                 # 轮询等待服务就绪，避免固定 1s 导致慢机/CI 偶发失败
                 for _ in range(20):
                     await asyncio.sleep(0.2)
@@ -1046,7 +1046,8 @@ class APIServer:
                 probe = getattr(ex, "probe_public_api", None) if ex is not None else None
                 if callable(probe):
                     try:
-                        pr = await asyncio.wait_for(probe(timeout_sec=1.5), timeout=1.8)
+                        # Keep health endpoint responsive under degraded exchange network.
+                        pr = await asyncio.wait_for(probe(timeout_sec=0.9), timeout=1.1)
                     except Exception as _e:
                         pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
                     probe_status = str((pr or {}).get("status_text") or "").strip().lower()
@@ -2496,6 +2497,61 @@ class APIServer:
                     "suggestion": "请联系管理员检查系统状态"
                 }
 
+        # ---------------------------------------------------------------------
+        # Compatibility aliases:
+        # Some clients/UI call:
+        #   - /api/v1/trades/recent
+        #   - /api/v1/trades/history
+        # But this service historically only exposed /api/v1/trades.
+        # ---------------------------------------------------------------------
+
+        @api_v1_router.get("/trades/recent", tags=["trades"])
+        async def get_trades_recent(
+            symbol: Optional[str] = None,
+            side: Optional[str] = None,
+            limit: int = 100,
+            offset: int = 0,
+            realized_only: bool = False,
+            exclude_bootstrap: bool = False,
+            exclude_estimated_pnl: bool = False,
+            accurate_only: bool = False,
+        ):
+            return await get_trades(
+                range="7d",
+                symbol=symbol,
+                side=side,
+                limit=limit,
+                offset=offset,
+                realized_only=realized_only,
+                exclude_bootstrap=exclude_bootstrap,
+                exclude_estimated_pnl=exclude_estimated_pnl,
+                accurate_only=accurate_only,
+            )
+
+        @api_v1_router.get("/trades/history", tags=["trades"])
+        async def get_trades_history(
+            range: str = "30d",
+            symbol: Optional[str] = None,
+            side: Optional[str] = None,
+            limit: int = 100,
+            offset: int = 0,
+            realized_only: bool = False,
+            exclude_bootstrap: bool = False,
+            exclude_estimated_pnl: bool = False,
+            accurate_only: bool = False,
+        ):
+            return await get_trades(
+                range=range or "30d",
+                symbol=symbol,
+                side=side,
+                limit=limit,
+                offset=offset,
+                realized_only=realized_only,
+                exclude_bootstrap=exclude_bootstrap,
+                exclude_estimated_pnl=exclude_estimated_pnl,
+                accurate_only=accurate_only,
+            )
+
         @api_v1_router.get("/trades/reconcile", tags=["trades"])
         async def reconcile_trades_with_exchange(
             days: int = 7,
@@ -3049,6 +3105,7 @@ class APIServer:
             symbol: Optional[str] = None,
             exclude_bootstrap: bool = True,
             accurate_only: bool = True,
+            exclude_low_fidelity: bool = True,
             group_top_n: int = 12,
         ):
             """
@@ -3079,7 +3136,50 @@ class APIServer:
                         continue
                     if accurate_only and bool(md.get("pnl_estimated")):
                         continue
+                    # Historical bootstrap-like rows with only db_id/source carry
+                    # little attribution value and can dominate analytics with "unknown".
+                    if exclude_low_fidelity:
+                        strategy_hint = (
+                            md.get("strategy_id")
+                            or md.get("strategy_used")
+                            or r.get("strategy")
+                            or r.get("strategy_used")
+                            or ""
+                        )
+                        has_min_context = bool(md.get("market_context")) or bool(md.get("open_timestamp")) or bool(md.get("close_timestamp"))
+                        if (src in {"historical_db", "legacy"}) and (not strategy_hint) and (not has_min_context):
+                            continue
                     trades.append(r)
+
+                def _infer_regime_from_trade(r: Dict[str, Any]) -> Dict[str, Any]:
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+                    direct = (
+                        mkt.get("regime")
+                        or md.get("regime")
+                        or md.get("market_regime")
+                        or r.get("market_regime")
+                        or ""
+                    )
+                    direct_s = str(direct or "").strip().lower()
+                    if direct_s:
+                        return {"regime": direct_s, "inferred": False}
+
+                    strategy = str(
+                        md.get("strategy_id")
+                        or md.get("strategy_used")
+                        or r.get("strategy")
+                        or ""
+                    ).strip().lower()
+                    reasoning = str(r.get("reasoning") or "").strip().lower()
+                    text = f"{strategy} {reasoning}"
+                    if any(k in text for k in ("trend", "breakout", "momentum", "bull", "bear")):
+                        return {"regime": "trend", "inferred": True}
+                    if any(k in text for k in ("support", "resistance", "mean_reversion", "sr_near")):
+                        return {"regime": "range", "inferred": True}
+                    if any(k in text for k in ("stop_loss", "volatility", "spike")):
+                        return {"regime": "volatile", "inferred": True}
+                    return {"regime": "unknown", "inferred": False}
 
                 def _bucket_strategy(r: Dict[str, Any]) -> str:
                     md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
@@ -3093,9 +3193,7 @@ class APIServer:
                     return str(s or "").strip() or "unknown"
 
                 def _bucket_regime(r: Dict[str, Any]) -> str:
-                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
-                    reg = md.get("regime") or md.get("market_regime") or r.get("market_regime") or ""
-                    return str(reg or "").strip().lower() or "unknown"
+                    return str((_infer_regime_from_trade(r) or {}).get("regime") or "unknown").strip().lower() or "unknown"
 
                 def _bucket_hour(r: Dict[str, Any]) -> str:
                     ts = str(r.get("timestamp") or "").strip()
@@ -3189,7 +3287,11 @@ class APIServer:
                     "success": True,
                     "period_days": int(days or 30),
                     "symbol": symbol,
-                    "filters": {"exclude_bootstrap": bool(exclude_bootstrap), "accurate_only": bool(accurate_only)},
+                    "filters": {
+                        "exclude_bootstrap": bool(exclude_bootstrap),
+                        "accurate_only": bool(accurate_only),
+                        "exclude_low_fidelity": bool(exclude_low_fidelity),
+                    },
                     "overall": overall,
                     "by_strategy_top": by_strategy,
                     "by_regime_top": by_regime,
@@ -3268,11 +3370,42 @@ class APIServer:
                         continue
                     clean_rows.append(r)
 
-                groups: Dict[str, Dict[str, Any]] = {}
-                for r in clean_rows:
+                def _infer_regime_from_trade(r: Dict[str, Any]) -> Dict[str, Any]:
                     md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
                     mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
-                    regime = str(mkt.get("regime") or "unknown").strip().lower() or "unknown"
+                    direct = (
+                        mkt.get("regime")
+                        or md.get("regime")
+                        or md.get("market_regime")
+                        or r.get("market_regime")
+                        or ""
+                    )
+                    direct_s = str(direct or "").strip().lower()
+                    if direct_s:
+                        return {"regime": direct_s, "inferred": False}
+                    strategy = str(
+                        md.get("strategy_id")
+                        or md.get("strategy_used")
+                        or r.get("strategy")
+                        or ""
+                    ).strip().lower()
+                    reasoning = str(r.get("reasoning") or "").strip().lower()
+                    text = f"{strategy} {reasoning}"
+                    if any(k in text for k in ("trend", "breakout", "momentum", "bull", "bear")):
+                        return {"regime": "trend", "inferred": True}
+                    if any(k in text for k in ("support", "resistance", "mean_reversion", "sr_near")):
+                        return {"regime": "range", "inferred": True}
+                    if any(k in text for k in ("stop_loss", "volatility", "spike")):
+                        return {"regime": "volatile", "inferred": True}
+                    return {"regime": "unknown", "inferred": False}
+
+                groups: Dict[str, Dict[str, Any]] = {}
+                inferred_used = 0
+                for r in clean_rows:
+                    reg_info = _infer_regime_from_trade(r)
+                    regime = str(reg_info.get("regime") or "unknown").strip().lower() or "unknown"
+                    if bool(reg_info.get("inferred")):
+                        inferred_used += 1
                     grp = groups.get(regime)
                     if not grp:
                         grp = {
@@ -3291,6 +3424,8 @@ class APIServer:
                     pnl = _to_float(r.get("pnl"))
                     fee = _to_float(r.get("fee"))
                     pnl_pct = _to_float(r.get("pnl_percent"))
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
                     qf = _to_float(mkt.get("effective_qty_factor"), 1.0)
                     grp["total_trades"] += 1
                     grp["total_pnl"] += pnl
@@ -3313,14 +3448,14 @@ class APIServer:
                     gross_profit = sum(
                         _to_float(x.get("pnl"))
                         for x in clean_rows
-                        if str(((x.get("metadata") or {}).get("market_context") or {}).get("regime") or "unknown").strip().lower() == regime
+                        if str((_infer_regime_from_trade(x) or {}).get("regime") or "unknown").strip().lower() == regime
                         and _to_float(x.get("pnl")) > 0
                     )
                     gross_loss = abs(
                         sum(
                             _to_float(x.get("pnl"))
                             for x in clean_rows
-                            if str(((x.get("metadata") or {}).get("market_context") or {}).get("regime") or "unknown").strip().lower() == regime
+                            if str((_infer_regime_from_trade(x) or {}).get("regime") or "unknown").strip().lower() == regime
                             and _to_float(x.get("pnl")) < 0
                         )
                     )
@@ -3361,6 +3496,7 @@ class APIServer:
                         "input_trades": int(len(rows or [])),
                         "attributed_trades": int(len(clean_rows)),
                         "regime_count": int(len(out)),
+                        "inferred_regime_trades": int(inferred_used),
                     },
                     "data": out,
                     "generated_at": datetime.now().isoformat(),
@@ -3429,6 +3565,18 @@ class APIServer:
                         nonzero_pnl_pct += 1
 
                 regime_cov = (with_regime / total) if total else 0.0
+                inferred_regime = 0
+                for r in filtered:
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+                    direct = str(mkt.get("regime") or md.get("regime") or md.get("market_regime") or r.get("market_regime") or "").strip().lower()
+                    if direct:
+                        inferred_regime += 1
+                        continue
+                    text = f"{str(r.get('strategy') or '').strip().lower()} {str(r.get('reasoning') or '').strip().lower()}"
+                    if any(k in text for k in ("trend", "breakout", "momentum", "bull", "bear", "support", "resistance", "mean_reversion", "sr_near", "stop_loss", "volatility", "spike")):
+                        inferred_regime += 1
+                effective_regime_cov = (inferred_regime / total) if total else 0.0
                 pnl_cov = (nonzero_pnl / total) if total else 0.0
                 pnl_pct_cov = (nonzero_pnl_pct / total) if total else 0.0
                 qty_cov = (with_qty_factor / total) if total else 0.0
@@ -3448,12 +3596,14 @@ class APIServer:
                     "sample": {
                         "total": total,
                         "with_regime": int(with_regime),
+                        "with_regime_or_inferred": int(inferred_regime),
                         "with_effective_qty_factor": int(with_qty_factor),
                         "nonzero_pnl": int(nonzero_pnl),
                         "nonzero_pnl_percent": int(nonzero_pnl_pct),
                     },
                     "coverage": {
                         "regime_coverage": round(regime_cov, 4),
+                        "effective_regime_coverage": round(effective_regime_cov, 4),
                         "qty_factor_coverage": round(qty_cov, 4),
                         "nonzero_pnl_coverage": round(pnl_cov, 4),
                         "nonzero_pnl_percent_coverage": round(pnl_pct_cov, 4),

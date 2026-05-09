@@ -216,18 +216,18 @@ class ScannerOpportunityGate:
         except Exception:
             pass
 
-        # If MI already gave a tradable price and at least one side of quote,
-        # accept MI-derived ticker to reduce ticker_empty false negatives.
+        # If MI already gave a tradable price, accept it as ticker fallback.
+        # Bid/ask can be missing on transient collector degradation; in that
+        # case spread checks will be skipped naturally and other guards still apply.
         ticker = None
         try:
             if mi_view_price and float(mi_view_price or 0) > 0:
-                if (mi_view_bid and float(mi_view_bid or 0) > 0) or (mi_view_ask and float(mi_view_ask or 0) > 0):
-                    ticker = {
-                        "last": float(mi_view_price),
-                        "bid": float(mi_view_bid or 0) if mi_view_bid else 0,
-                        "ask": float(mi_view_ask or 0) if mi_view_ask else 0,
-                    }
-                    metrics["ticker_from_mi_view"] = True
+                ticker = {
+                    "last": float(mi_view_price),
+                    "bid": float(mi_view_bid or 0) if mi_view_bid else 0,
+                    "ask": float(mi_view_ask or 0) if mi_view_ask else 0,
+                }
+                metrics["ticker_from_mi_view"] = True
         except Exception:
             ticker = None
 
@@ -248,6 +248,17 @@ class ScannerOpportunityGate:
                     metrics["ticker_from_cached_symbol_view"] = True
             except Exception:
                 ticker = None
+            # Last-resort fallback: use opportunity entry_price as tradable last.
+            # This avoids dropping otherwise valid opportunities on transient
+            # ticker outages; downstream RR/slippage/risk guards still apply.
+            if (not ticker) or float(ticker.get("last") or ticker.get("close") or 0.0) <= 0:
+                try:
+                    ep = float(getattr(opportunity, "entry_price", 0) or 0)
+                except Exception:
+                    ep = 0.0
+                if ep > 0:
+                    ticker = {"last": ep, "bid": 0.0, "ask": 0.0}
+                    metrics["ticker_from_opportunity_entry"] = True
             if not ticker or float(ticker.get("last") or ticker.get("close") or 0.0) <= 0:
                 return ScannerGateResult(False, "ticker_empty", metrics)
 

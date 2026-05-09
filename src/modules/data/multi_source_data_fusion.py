@@ -146,7 +146,7 @@ class MultiSourceDataFusion:
                             source_type=source_info["type"],
                             timestamp=datetime.now(),
                             symbol=symbol,
-                            value=data
+                            value=data,
                         ))
                     else:
                         self._mark_source_fail(name, "empty_data")
@@ -266,7 +266,12 @@ class MultiSourceDataFusion:
                             pass
                 else:
                     price = getattr(dp.value, "price", None)
+                    # 兼容交易所 MarketData(close/open/quote_volume) 结构
+                    if price is None:
+                        price = getattr(dp.value, "close", None)
                     volume = getattr(dp.value, "volume", None)
+                    if volume is None:
+                        volume = getattr(dp.value, "quote_volume", None)
                     change_24h = getattr(dp.value, "change_24h", None)
                     if price is not None:
                         prices.append(price)
@@ -282,6 +287,21 @@ class MultiSourceDataFusion:
                             sentiment_weights.append(0.6)
                         except Exception:
                             pass
+                    # 对仅提供 open/close 的交易所行情，计算短期动量情绪兜底
+                    if change_24h is None:
+                        o = getattr(dp.value, "open", None)
+                        c = getattr(dp.value, "close", None)
+                        try:
+                            of = float(o) if o is not None else 0.0
+                            cf = float(c) if c is not None else 0.0
+                            if of > 0 and cf > 0:
+                                # 以百分比变化映射到 [-1,1]；与 change_24h 路径保持一致缩放
+                                s = ((cf - of) / of * 100.0) / 5.0
+                                s = max(-1.0, min(1.0, s))
+                                sentiments.append(s)
+                                sentiment_weights.append(0.6)
+                        except Exception:
+                            pass
         
         if prices:
             fused.price = sum(prices) / len(prices)
@@ -293,6 +313,27 @@ class MultiSourceDataFusion:
                 fused.sentiment = sum(s * w for s, w in zip(sentiments, sentiment_weights)) / sw
             else:
                 fused.sentiment = sum(sentiments) / len(sentiments)
+
+        # 订单簿深度不平衡已在 loop 前段写入 fused.technical_indicators。
+        # 1m K 线 close-open 往往极接近 0，会导致 fused.sentiment 远低于 hold_override 的 min_abs_sent，
+        # 此时用盘口不平衡补强（仍在 [-1,1]）。
+        try:
+            imb_raw = fused.technical_indicators.get("depth_imbalance")
+            if imb_raw is not None:
+                imb_f = float(imb_raw)
+                imb_f = max(-1.0, min(1.0, imb_f))
+                if fused.sentiment is None:
+                    fused.sentiment = imb_f
+                else:
+                    sf = float(fused.sentiment)
+                    candle_weak = abs(sf) < 0.015
+                    w_ob = 0.65 if candle_weak else 0.35
+                    fused.sentiment = max(
+                        -1.0,
+                        min(1.0, sf * (1.0 - w_ob) + imb_f * w_ob),
+                    )
+        except Exception:
+            pass
         
         # 置信度按“可用数据源数量/已注册数据源数量”归一化，
         # 避免因为写死分母导致即便多源都返回仍长期偏低。

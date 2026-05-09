@@ -22,6 +22,7 @@ from src.modules.core.decision_contract import normalize_strategy_field
 
 logger = logging.getLogger(__name__)
 
+
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -859,6 +860,11 @@ class TradeHistoryService:
         """保存到SQLite数据库"""
         if self.db_storage:
             from src.modules.core.historical_data_storage import TradeRecord as DBTradeRecord
+            meta_json = ""
+            try:
+                meta_json = json.dumps(trade.metadata or {}, ensure_ascii=False)
+            except Exception:
+                meta_json = ""
             db_record = DBTradeRecord(
                 symbol=trade.symbol,
                 side=trade.side,
@@ -869,7 +875,13 @@ class TradeHistoryService:
                 order_id=trade.order_id,
                 pnl=trade.pnl,
                 fee=trade.fee,
-                reasoning=trade.reasoning
+                reasoning=trade.reasoning,
+                pnl_percent=trade.pnl_percent,
+                strategy=trade.strategy,
+                stop_loss=trade.stop_loss,
+                take_profit=trade.take_profit,
+                leverage=trade.leverage,
+                metadata_json=meta_json,
             )
             await self.db_storage.save_trade(db_record)
     
@@ -892,6 +904,18 @@ class TradeHistoryService:
 
                     side_raw = str(row.get("side", "buy") or "buy").strip().lower()
                     side_norm = {"long": "buy", "short": "sell"}.get(side_raw, side_raw or "buy")
+                    row_meta: Dict[str, Any] = {}
+                    try:
+                        raw_meta = row.get("metadata_json")
+                        if isinstance(raw_meta, str) and raw_meta.strip():
+                            parsed = json.loads(raw_meta)
+                            if isinstance(parsed, dict):
+                                row_meta = parsed
+                    except Exception:
+                        row_meta = {}
+                    row_meta = dict(row_meta)
+                    row_meta["source"] = "historical_db"
+                    row_meta["db_id"] = row.get("id")
                     loaded.append(
                         TradeRecord(
                             trade_id=f"db_{row.get('id', idx)}",
@@ -903,11 +927,16 @@ class TradeHistoryService:
                             price=_to_float(row.get("price"), 0.0),
                             fee=_to_float(row.get("fee"), 0.0),
                             pnl=_to_float(row.get("pnl"), 0.0),
+                            pnl_percent=_to_float(row.get("pnl_percent"), 0.0),
                             status="filled",
+                            strategy=str(row.get("strategy") or "unknown"),
+                            stop_loss=_to_float(row.get("stop_loss")) if row.get("stop_loss") is not None else None,
+                            take_profit=_to_float(row.get("take_profit")) if row.get("take_profit") is not None else None,
+                            leverage=_to_int(row.get("leverage"), 1),
                             reasoning=str(row.get("reasoning") or ""),
                             timestamp=str(row.get("timestamp") or datetime.now().isoformat()),
                             # Rows loaded from persistent DB are real history, not synthetic bootstrap.
-                            metadata={"source": "historical_db", "db_id": row.get("id")},
+                            metadata=row_meta,
                         )
                     )
 

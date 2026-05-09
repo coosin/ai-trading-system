@@ -273,6 +273,9 @@ class AccountRiskMonitor:
         for pos_risk in account.position_risks:
             if pos_risk.risk_level == RiskLevel.CRITICAL:
                 return RiskLevel.CRITICAL
+        
+        # If any position is HIGH (but none are CRITICAL), elevate to HIGH.
+        for pos_risk in account.position_risks:
             if pos_risk.risk_level == RiskLevel.HIGH:
                 return RiskLevel.HIGH
         
