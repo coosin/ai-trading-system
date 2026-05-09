@@ -18,6 +18,7 @@
 
 - `symbol_max_margin_ratio`：**单币种总保证金占用上限**（已有仓位 + 新单，口径=available），默认 `0.2`。
 - `max_same_direction_positions`：同向持仓数上限（long/short 分别计数）。
+- `max_same_direction_ratio`（`ai_core_runtime`）：同向集中度上限（投影占比），默认 `0.7`。
 - `max_positions_oneway`：单向模式总持仓上限。
 - `max_positions_hedge`：双向对冲并存时总持仓上限。
 - `hard_max_positions`：最终硬上限（任何路径不得突破）。
@@ -38,6 +39,7 @@
 
 - `min_confidence_to_trade`：交易最低置信度
 - `ai_core_min_confidence_to_open`：开仓专用最低置信度
+- `ai_core_min_confidence_floor`：开仓最小置信度地板（运行时覆盖后仍不低于此值）
 - `min_rr_to_trade`：最低盈亏比（合成 RR）
 - `max_spread_bps_to_trade`：点差门控
 - `min_data_quality_to_trade`：数据质量门控
@@ -49,11 +51,14 @@
 - `microstructure_enable_funding_oi_gates`：是否启用 funding/OI 微结构门控
 - `microstructure_max_abs_funding_rate_to_trade`：资金费率绝对值上限（超限拒绝开仓）
 - `microstructure_min_open_interest_to_trade`：最小持仓量阈值（低流动性拒绝开仓）
+- `enable_replace_worst_on_full_positions`：满仓时是否允许“平最差仓再开新仓”
+- `replace_worst_min_confidence`：触发满仓替换的最小新信号置信度
 
 验证：
 
 - `GET /api/v1/modules/ai/frequency-profile`：看当前档位与 `min_confidence_to_trade` 等核心门槛。
 - `GET /api/v1/modules/commander/trading-diagnosis`：看 `ai_core.execution_guards.config` + `stats`（被哪些门控拦截）。
+- `GET /api/v1/modules/commander/trading-diagnosis`：新增 `opportunity_cost`，用于评估门控错失收益成本。
 
 > 重要（2026-05-06）：`analysis_hard_gate` 依赖 `decision.market_analysis.quality_score/confidence`。当前版本已修复并确保多源融合/情报载荷会写入该字段；若看到日志反复 `q=none c=none`，优先排查是否有旧进程/旧代码仍在跑。
 
@@ -173,6 +178,12 @@
 - `profit_protect_lock_1/2: 0.002 / 0.008`
 - `profit_protect_tighten_factor: 0.82`
 - `layered_trailing_tp_drawdown_levels`: `(0.03,0.008) (0.06,0.014) (0.10,0.02)`
+
+2026-05-10 策略增强补充（已应用）：
+
+- `initial_trailing_offset: 0.025`
+- `tier2_trailing_offset: 0.018`
+- 开仓风险距离支持波动两档（低波动 4%，高波动 6%）
 
 适用场景：出现“浮盈后回吐成亏损离场”时，优先用这一组参数先压回吐，再观察 24h/72h。
 

@@ -127,9 +127,11 @@ class AICoreDecisionEngine:
             "aggressive_mode": False,
             "auto_create_strategy": True,
             # 开仓/交易置信度阈值（用户要求：>=65% 才允许开仓）
-            "min_confidence_to_trade": 0.73,
+            "min_confidence_to_trade": 0.65,
             # Explicit open gate: avoid low-confidence churn
-            "ai_core_min_confidence_to_open": 0.73,
+            "ai_core_min_confidence_to_open": 0.65,
+            # Runtime floor to avoid accidental over-relax from hot overrides.
+            "ai_core_min_confidence_floor": 0.65,
             "min_data_quality_to_trade": 0.55,
             "analysis_hard_gate_for_open": True,
             "analysis_min_confidence_for_open": 0.55,
@@ -143,9 +145,21 @@ class AICoreDecisionEngine:
             "min_rr_to_trade": 1.15,
             "max_spread_bps_to_trade": 40.0,
             "max_abs_depth_imbalance_to_trade": 0.92,
+            "max_same_direction_ratio": 0.7,
+            "enable_replace_worst_on_full_positions": True,
+            "replace_worst_min_confidence": 0.75,
+            # Dynamic microstructure gate by volatility regime:
+            # high vol => slightly relax imbalance threshold; low vol => slightly tighten.
+            "dynamic_depth_imbalance_gate_enable": True,
+            "dynamic_depth_imbalance_relax_high_vol": 0.03,
+            "dynamic_depth_imbalance_tighten_low_vol": 0.03,
             "microstructure_enable_funding_oi_gates": True,
             "microstructure_max_abs_funding_rate_to_trade": 0.0012,
             "microstructure_min_open_interest_to_trade": None,
+            # ATR-regime stop-loss distance for open synthetic RR (execution preflight).
+            "open_stop_loss_use_atr_regime": True,
+            "open_stop_loss_pct_low_vol": 0.04,
+            "open_stop_loss_pct_high_vol": 0.06,
             "degraded_data_quantity_factor": 0.68,
             "low_balance_usdt_threshold": 25.0,
             # 单笔保证金预算（用户要求：总资金 5%~10%）
@@ -385,11 +399,12 @@ class AICoreDecisionEngine:
         # 主动性扫描器推送的机会（默认不自动开仓，仅进入本引擎决策上下文）
         self._scanner_hints: Dict[str, Dict[str, Any]] = {}
         self._scanner_hint_ttl_sec: float = 5400.0
+        self._rejected_signals: List[Dict[str, Any]] = []
         self._checkpoint_store = AICoreCheckpointStore()
         self._last_checkpoint_save_at: Optional[datetime] = None
 
         logger.info("🧠 AI核心决策引擎初始化（完整控制权版本）")
-    
+
     async def initialize(self) -> None:
         """初始化 - 获取所有模块引用"""
         logger.info("初始化AI核心决策引擎...")
@@ -3237,7 +3252,13 @@ class AICoreDecisionEngine:
             try:
                 mi = getattr(self.main_controller, "market_intelligence", None) if self.main_controller else None
                 if mi and hasattr(mi, "get_symbol_view"):
-                    mi_view = await mi.get_symbol_view(symbol, include_snapshot=False)
+                    _to_s = float(self.config.get("mi_view_timeout_s", 0.85) or 0.85)
+                    try:
+                        mi_view = await asyncio.wait_for(
+                            mi.get_symbol_view(symbol, include_snapshot=False), timeout=_to_s
+                        )
+                    except asyncio.TimeoutError:
+                        mi_view = None
             except Exception:
                 mi_view = None
             
@@ -3366,10 +3387,17 @@ class AICoreDecisionEngine:
             # 交由后续 ExecutionGateway 统一走 S1 单写入所有权。
             if decision and decision.action == "hold" and bool(self.config.get("hold_avoidance_override_enabled", True)):
                 try:
+                    override_skip_reason = ""
                     fusion_conf = float(multi_source_analysis.get("confidence", 0) or 0)
                     fusion_sent = multi_source_analysis.get("sentiment", 0)
+                    fusion_signal_strength = multi_source_analysis.get("signal_strength", 0)
                     strat_count = int(strategy_advice.get("count", 0) or 0)
-                    risk_level = risk_assessment.get("level", "unknown")
+                    risk_assessment_level = risk_assessment.get("level", "unknown")
+                    # For the HOLD->(buy/sell) conversion gate, prefer decision.risk_level to avoid
+                    # accidental short-circuit when account-level risk_assessment is stricter
+                    # than the per-decision risk label returned by the AI prompt.
+                    decision_risk_level = str(getattr(decision, "risk_level", "") or "").strip()
+                    risk_level = decision_risk_level if decision_risk_level else str(risk_assessment_level or "unknown")
                     min_conf = float(self.config.get("min_confidence_to_trade", 0.6))
                     min_abs_sent = float(self.config.get("hold_avoidance_override_min_abs_sentiment", 0.06) or 0.06)
                     mi_q_min = float(self.config.get("hold_avoidance_override_min_mi_quality_score", 0.62) or 0.62)
@@ -3409,6 +3437,17 @@ class AICoreDecisionEngine:
                         mi_qf = float(mi_q) if mi_q is not None else 0.0
                     except Exception:
                         mi_qf = 0.0
+                    # If MI quality is missing/degraded, fall back to multi-source analysis quality.
+                    # This keeps hold_avoidance_override from being permanently blocked by
+                    # snapshot timeouts while still requiring a real quality signal.
+                    if mi_qf <= 0.0:
+                        try:
+                            _mq = multi_source_analysis.get("quality_score") if isinstance(multi_source_analysis, dict) else None
+                            _mqf = float(_mq) if _mq is not None else 0.0
+                            if _mqf > mi_qf:
+                                mi_qf = _mqf
+                        except Exception:
+                            pass
                     try:
                         mi_conff = float(mi_conf) if mi_conf is not None else 0.0
                     except Exception:
@@ -3514,9 +3553,28 @@ class AICoreDecisionEngine:
                         bull_evidence = bull_evidence or bull_release
                         bear_evidence = bear_evidence or bear_release
 
+                    risk_ok = str(risk_level or "").lower() in ("low", "medium")
+                    # Runtime evidence shows many HOLD decisions are tagged as high risk.
+                    # Allow limited override for "high" only when confidence+quality are stronger;
+                    # keep "critical" fully blocked for capital safety.
+                    if str(risk_level or "").lower() == "high":
+                        high_risk_min_effective_conf = float(
+                            self.config.get("hold_override_high_risk_min_effective_conf", 0.50) or 0.50
+                        )
+                        high_risk_min_mi_quality = float(
+                            self.config.get("hold_override_high_risk_min_mi_quality", 0.55) or 0.55
+                        )
+                        high_risk_min_mi_conf = float(
+                            self.config.get("hold_override_high_risk_min_mi_conf", 0.30) or 0.30
+                        )
+                        risk_ok = bool(
+                            effective_conf >= max(min_conf, high_risk_min_effective_conf)
+                            and mi_qf >= max(mi_q_min, high_risk_min_mi_quality)
+                            and mi_conff >= max(autonomy_mi_conf_min, high_risk_min_mi_conf)
+                        )
                     if (
                         self.authorization.get("full_authorization")
-                        and risk_level in ("low", "medium")
+                        and risk_ok
                         and strat_count > 0
                         and (strict_ready or autonomy_ready)
                     ):
@@ -3577,6 +3635,7 @@ class AICoreDecisionEngine:
                                 decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
                                 self._last_hold_override_at[key] = now
                 except Exception as e:
+                    override_skip_reason = str(e)
                     logger.debug(f"hold override skipped: {e}")
             
             if decision:
@@ -4760,6 +4819,107 @@ class AICoreDecisionEngine:
             except Exception:
                 pass
 
+        async def _record_rejected_signal(reason: str, extras: Optional[Dict[str, Any]] = None) -> None:
+            """Opportunity-cost evidence: keep rejected signal snapshot for later attribution."""
+            row = {
+                "ts": datetime.utcnow().isoformat(),
+                "symbol": str(decision.symbol),
+                "side": str(decision.side),
+                "action": str(decision.action),
+                "confidence": float(getattr(decision, "confidence", 0.0) or 0.0),
+                "reason": str(reason),
+                "entry_price": float(getattr(decision, "entry_price", 0.0) or 0.0),
+                "extras": dict(extras or {}),
+            }
+            self._rejected_signals.append(row)
+            if len(self._rejected_signals) > 500:
+                self._rejected_signals = self._rejected_signals[-500:]
+            try:
+                if (
+                    self.main_controller
+                    and hasattr(self.main_controller, "memory_gateway")
+                    and self.main_controller.memory_gateway
+                ):
+                    await self.main_controller.memory_gateway.add_memory(
+                        memory_type="risk_event",
+                        content=f"rejected_signal: {row['symbol']} {row['side']} conf={row['confidence']:.3f} reason={row['reason']}",
+                        metadata=row,
+                        source_module="ai_core_decision_engine",
+                        importance=0.66,
+                        tags=["opportunity_cost", "rejected_signal", "execution_guard"],
+                    )
+            except Exception:
+                pass
+
+        async def _collect_full_position_snapshot() -> Dict[str, Any]:
+            rows: List[Dict[str, Any]] = []
+            try:
+                if self.exchange and hasattr(self.exchange, "get_positions"):
+                    got = await self.exchange.get_positions()
+                    if isinstance(got, list):
+                        rows = [x for x in got if isinstance(x, dict)]
+            except Exception:
+                rows = []
+            active = []
+            for p in rows:
+                try:
+                    sz = float(p.get("size", p.get("pos", 0)) or 0)
+                except Exception:
+                    sz = 0.0
+                if abs(sz) <= 0:
+                    continue
+                side = str(p.get("side") or ("long" if sz > 0 else "short")).lower()
+                conf = None
+                if isinstance(p.get("metadata"), dict):
+                    try:
+                        conf = float((p.get("metadata") or {}).get("open_confidence"))
+                    except Exception:
+                        conf = None
+                try:
+                    upl_pct = float(p.get("uplRatio", p.get("pnl_ratio", p.get("unrealized_pnl_percent", 0))) or 0)
+                except Exception:
+                    upl_pct = 0.0
+                try:
+                    upl_abs = float(p.get("upl", p.get("unrealized_pnl", 0)) or 0)
+                except Exception:
+                    upl_abs = 0.0
+                active.append(
+                    {
+                        "symbol": p.get("symbol") or p.get("instId"),
+                        "side": side,
+                        "size": abs(sz),
+                        "open_confidence": conf,
+                        "unrealized_pnl_percent": upl_pct,
+                        "unrealized_pnl": upl_abs,
+                    }
+                )
+            return {"count": len(active), "positions": active[:12]}
+
+        def _normalize_symbol(sym: Any) -> str:
+            s = str(sym or "").upper().strip()
+            if not s:
+                return ""
+            s = s.replace("-SWAP", "").replace("/SWAP", "")
+            s = s.replace("-", "/")
+            return s
+
+        def _position_quality_score(p: Dict[str, Any]) -> float:
+            conf = p.get("open_confidence")
+            try:
+                conf_v = float(conf) if conf is not None else 0.5
+            except Exception:
+                conf_v = 0.5
+            try:
+                pnl_pct = float(p.get("unrealized_pnl_percent", 0.0) or 0.0)
+            except Exception:
+                pnl_pct = 0.0
+            try:
+                pnl_abs = float(p.get("unrealized_pnl", 0.0) or 0.0)
+            except Exception:
+                pnl_abs = 0.0
+            abs_bonus = 0.02 if pnl_abs > 0 else (-0.02 if pnl_abs < 0 else 0.0)
+            return conf_v * 0.55 + pnl_pct * 0.35 + abs_bonus
+
         if decision.action == 'hold':
             # Record HOLD as an explicit trace so "no-trade" paths are observable
             # in decision-traces replay/analytics.
@@ -4963,6 +5123,7 @@ class AICoreDecisionEngine:
             variants = self._symbol_fetch_variants(decision.symbol)
             ticker = {}
             current_price = 0.0
+            ticker_errors: List[str] = []
             for sym_v in variants:
                 try:
                     tk = await self.exchange.get_ticker(sym_v)
@@ -4971,7 +5132,12 @@ class AICoreDecisionEngine:
                         ticker = tk or {}
                         current_price = px
                         break
-                except Exception:
+                except Exception as e:
+                    try:
+                        if len(ticker_errors) < 4:
+                            ticker_errors.append(f"{sym_v}:{type(e).__name__}:{str(e)[:120]}")
+                    except Exception:
+                        pass
                     continue
             
             if current_price <= 0:
@@ -5009,6 +5175,22 @@ class AICoreDecisionEngine:
                         if px > 0:
                             current_price = px
                             fb_used = "ticker.last"
+                    except Exception:
+                        pass
+                # (d) Use decision metadata market_context price (usually sourced from exchange WS path)
+                if current_price <= 0:
+                    try:
+                        md = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
+                        mc = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+                        px = float(
+                            mc.get("price")
+                            or mc.get("last_price")
+                            or mc.get("mark_price")
+                            or 0.0
+                        )
+                        if px > 0:
+                            current_price = px
+                            fb_used = "decision.metadata.market_context.price"
                     except Exception:
                         pass
                 if current_price <= 0:
@@ -5286,7 +5468,16 @@ class AICoreDecisionEngine:
                 if trailing_only:
                     off = float(sltp.get("initial_trailing_offset", 0.01) or 0.01)
                     mult = float(sltp.get("open_rr_synthetic_reward_multiple", 1.5) or 1.5)
-                    risk_px = current_price * off
+                    risk_off = off
+                    if bool(self.config.get("open_stop_loss_use_atr_regime", True)):
+                        try:
+                            profile = str((self._adaptive_guard_profile or {}).get("profile") or "normal").lower()
+                            low_sl = float(self.config.get("open_stop_loss_pct_low_vol", 0.04) or 0.04)
+                            high_sl = float(self.config.get("open_stop_loss_pct_high_vol", 0.06) or 0.06)
+                            risk_off = high_sl if profile == "high_vol" else low_sl
+                        except Exception:
+                            risk_off = off
+                    risk_px = current_price * max(0.001, float(risk_off))
                     reward_px = risk_px * mult
                     if decision.side == "long":
                         decision.stop_loss = current_price - risk_px
@@ -5464,12 +5655,37 @@ class AICoreDecisionEngine:
                         min_q_hard = float(self.config.get("min_data_quality_to_trade", 0.55) or 0.55)
                         min_c_hard = float(self.config.get("analysis_min_confidence_for_open", 0.55) or 0.55)
                         require_non_degraded = bool(self.config.get("analysis_require_not_degraded_for_open", True))
+                        allow_degraded_strong = bool(
+                            self.config.get("analysis_allow_degraded_with_strong_quality", True)
+                        )
+                        allow_deg_min_q = float(
+                            self.config.get("analysis_allow_degraded_min_quality", 0.95) or 0.95
+                        )
+                        allow_deg_min_c = float(
+                            self.config.get("analysis_allow_degraded_min_confidence", 0.95) or 0.95
+                        )
+                        allow_deg_need_fusion = bool(
+                            self.config.get("analysis_allow_degraded_require_fusion_provenance", True)
+                        )
+                        fusion_prov_ok = ("multi_source_fusion" in prov) if allow_deg_need_fusion else True
+                        degraded_blocked = bool(require_non_degraded and degraded)
+                        degraded_override = bool(
+                            degraded_blocked
+                            and allow_degraded_strong
+                            and q is not None
+                            and c2 is not None
+                            and q >= allow_deg_min_q
+                            and c2 >= allow_deg_min_c
+                            and fusion_prov_ok
+                        )
+                        if degraded_override:
+                            degraded_blocked = False
                         hard_fail = (
                             q is None
                             or c2 is None
                             or q < min_q_hard
                             or c2 < min_c_hard
-                            or (require_non_degraded and degraded)
+                            or degraded_blocked
                         )
                         if hard_fail:
                             self._execution_guards_stats["analysis_hard_rejected"] = int(
@@ -5506,10 +5722,18 @@ class AICoreDecisionEngine:
                     min_open_c += float((self._adaptive_guard_profile or {}).get("regime_min_conf_add", 0.0) or 0.0)
                 except Exception:
                     pass
+                min_open_c = max(
+                    min_open_c,
+                    float(self.config.get("ai_core_min_confidence_floor", 0.65) or 0.65),
+                )
                 if conf < min_open_c:
                     self._execution_guards_stats["confidence_open_rejected"] = int(
                         self._execution_guards_stats.get("confidence_open_rejected", 0)
                     ) + 1
+                    await _record_rejected_signal(
+                        "confidence_open_rejected",
+                        {"confidence": conf, "min_open_c": min_open_c},
+                    )
                     logger.warning(
                         "⚠️ 执行门控拒绝: open 置信度过低 conf=%.3f < %.3f symbol=%s",
                         conf,
@@ -5517,6 +5741,65 @@ class AICoreDecisionEngine:
                         decision.symbol,
                     )
                     return False
+
+                # Directional concentration cap (e.g. 70% same direction).
+                try:
+                    snap_for_ratio = await _collect_full_position_snapshot()
+                    rows_ratio = list((snap_for_ratio or {}).get("positions") or [])
+                    total_n = len(rows_ratio)
+                    if total_n > 0:
+                        incoming_side = str(decision.side or "").lower()
+                        same_n = sum(
+                            1
+                            for p in rows_ratio
+                            if str((p or {}).get("side") or "").lower() == incoming_side
+                        )
+                        incoming_symbol_norm = _normalize_symbol(decision.symbol)
+                        same_symbol_side_exists = any(
+                            _normalize_symbol((p or {}).get("symbol")) == incoming_symbol_norm
+                            and str((p or {}).get("side") or "").lower() == incoming_side
+                            for p in rows_ratio
+                        )
+                        projected_same = same_n if same_symbol_side_exists else (same_n + 1)
+                        projected_total = total_n if same_symbol_side_exists else (total_n + 1)
+                        projected_ratio = float(projected_same) / max(1.0, float(projected_total))
+                        max_ratio = float(self.config.get("max_same_direction_ratio", 0.7) or 0.7)
+                        replace_on_full_enabled = bool(
+                            self.config.get("enable_replace_worst_on_full_positions", True)
+                        )
+                        replace_min_conf = float(
+                            self.config.get("replace_worst_min_confidence", 0.75) or 0.75
+                        )
+                        incoming_conf = float(getattr(decision, "confidence", 0.0) or 0.0)
+                        full_positions = total_n >= int(self.config.get("max_positions", 5) or 5)
+                        allow_replace_bypass = bool(
+                            replace_on_full_enabled
+                            and full_positions
+                            and incoming_conf >= replace_min_conf
+                        )
+                        if projected_ratio > max_ratio:
+                            if allow_replace_bypass:
+                                pass
+                            else:
+                                await _record_rejected_signal(
+                                    "same_direction_ratio_rejected",
+                                    {
+                                        "projected_ratio": projected_ratio,
+                                        "max_same_direction_ratio": max_ratio,
+                                        "projected_same": projected_same,
+                                        "projected_total": projected_total,
+                                    },
+                                )
+                                logger.warning(
+                                    "⚠️ 执行门控拒绝: 同向集中度过高 ratio=%.3f > %.3f symbol=%s side=%s",
+                                    projected_ratio,
+                                    max_ratio,
+                                    decision.symbol,
+                                    incoming_side,
+                                )
+                                return False
+                except Exception as e:
+                    logger.debug(f"same direction ratio gate failed: {e}")
 
                 # 基于支撑/阻力的开仓择时门控：避免在关键位“撞墙”开仓。
                 try:
@@ -5547,6 +5830,10 @@ class AICoreDecisionEngine:
                                 decision.symbol,
                                 f"{float(dist_res)*100:.2f}%" if dist_res is not None else "n/a",
                             )
+                            await _record_rejected_signal(
+                                "sr_timing_long_near_resistance",
+                                {"dist_to_resistance_pct": dist_res, "breakout_up_confirmed": brk_up},
+                            )
                             return False
                         if decision.side == "short" and near_sup and (not brk_down):
                             self._execution_guards_stats["sr_timing_rejected"] = int(
@@ -5556,6 +5843,10 @@ class AICoreDecisionEngine:
                                 "⚠️ 执行门控拒绝: short 贴近支撑且未跌破 symbol=%s dist_sup=%s",
                                 decision.symbol,
                                 f"{float(dist_sup)*100:.2f}%" if dist_sup is not None else "n/a",
+                            )
+                            await _record_rejected_signal(
+                                "sr_timing_short_near_support",
+                                {"dist_to_support_pct": dist_sup, "breakdown_down_confirmed": brk_down},
                             )
                             return False
                 except Exception as e:
@@ -5575,7 +5866,22 @@ class AICoreDecisionEngine:
                             bid_vol = sum(float(x[1]) for x in ob.bids[:5])
                             ask_vol = sum(float(x[1]) for x in ob.asks[:5])
                             spread_bps = ((best_ask - best_bid) / max(1e-9, best_bid)) * 10000.0
-                            depth_imbalance = (bid_vol - ask_vol) / max(1e-9, bid_vol + ask_vol)
+                            depth_imbalance_top5 = (bid_vol - ask_vol) / max(1e-9, bid_vol + ask_vol)
+                            # Alternate imbalance definitions (more stable than top5 size-only):
+                            bid_vol_top20 = sum(float(x[1]) for x in ob.bids[:20])
+                            ask_vol_top20 = sum(float(x[1]) for x in ob.asks[:20])
+                            imb_top20 = (bid_vol_top20 - ask_vol_top20) / max(1e-9, bid_vol_top20 + ask_vol_top20)
+                            bid_notional_top20 = sum(float(x[0]) * float(x[1]) for x in ob.bids[:20])
+                            ask_notional_top20 = sum(float(x[0]) * float(x[1]) for x in ob.asks[:20])
+                            imb_notional_top20 = (bid_notional_top20 - ask_notional_top20) / max(
+                                1e-9, bid_notional_top20 + ask_notional_top20
+                            )
+                            # Use notional top20 as the effective microstructure signal for gating and SLTP tuning.
+                            # top5 size can be dominated by single near-touch "walls" and flip sign vs deeper book.
+                            use_notional_top20 = bool(
+                                self.config.get("microstructure_use_notional_top20_imbalance", True)
+                            )
+                            depth_imbalance = float(imb_notional_top20) if use_notional_top20 else float(depth_imbalance_top5)
                 except Exception as e:
                     logger.debug(f"执行前订单簿检查失败: {e}")
 
@@ -5603,8 +5909,40 @@ class AICoreDecisionEngine:
                         spread_bps, max_spread_bps, decision.symbol
                     )
                     return False
-                if depth_imbalance is not None and abs(depth_imbalance) > max_abs_imb:
+                eff_max_abs_imb = float(max_abs_imb)
+                if bool(self.config.get("dynamic_depth_imbalance_gate_enable", True)):
+                    try:
+                        atr_pct_1h = float((self._adaptive_guard_profile or {}).get("atr_pct_1h", 0.0) or 0.0)
+                        low_vol_thr = float(self.config.get("regime_low_vol_atr_pct", 0.005) or 0.005)
+                        high_vol_thr = float(self.config.get("regime_high_vol_atr_pct", 0.02) or 0.02)
+                        if atr_pct_1h >= high_vol_thr:
+                            eff_max_abs_imb = min(
+                                0.99,
+                                eff_max_abs_imb
+                                + float(
+                                    self.config.get("dynamic_depth_imbalance_relax_high_vol", 0.03) or 0.03
+                                ),
+                            )
+                        elif atr_pct_1h <= low_vol_thr:
+                            eff_max_abs_imb = max(
+                                0.80,
+                                eff_max_abs_imb
+                                - float(
+                                    self.config.get("dynamic_depth_imbalance_tighten_low_vol", 0.03) or 0.03
+                                ),
+                            )
+                    except Exception:
+                        eff_max_abs_imb = float(max_abs_imb)
+                if depth_imbalance is not None and abs(depth_imbalance) > eff_max_abs_imb:
                     self._execution_guards_stats["depth_imbalance_rejected"] += 1
+                    await _record_rejected_signal(
+                        "depth_imbalance_rejected",
+                        {
+                            "imbalance_abs": abs(float(depth_imbalance)),
+                            "max_abs_imb": float(max_abs_imb),
+                            "effective_max_abs_imb": float(eff_max_abs_imb),
+                        },
+                    )
                     logger.warning(
                         "⚠️ 执行门控拒绝: 深度失衡过大 imbalance=%.3f > %.3f symbol=%s",
                         abs(depth_imbalance), max_abs_imb, decision.symbol
@@ -5639,6 +5977,10 @@ class AICoreDecisionEngine:
                         self._execution_guards_stats["funding_rate_rejected"] = int(
                             self._execution_guards_stats.get("funding_rate_rejected", 0)
                         ) + 1
+                        await _record_rejected_signal(
+                            "funding_rate_rejected",
+                            {"funding_rate_abs": abs(fr_v), "max_abs_funding_rate": max_abs_fr},
+                        )
                         logger.warning(
                             "⚠️ 执行门控拒绝: funding 过高 |fr|=%.6f > %.6f symbol=%s",
                             abs(fr_v),
@@ -5797,6 +6139,11 @@ class AICoreDecisionEngine:
                 return False
 
             # 优先走主控制器执行验证网关，避免直接裸下单
+            gw = (
+                getattr(self.main_controller, "execution_gateway", None)
+                if self.main_controller
+                else None
+            )
             if self.main_controller and hasattr(self.main_controller, "execute_command"):
                 try:
                     from src.modules.core.execution_verifier import CommandType
@@ -5839,17 +6186,76 @@ class AICoreDecisionEngine:
                                 status,
                                 err,
                             )
-                        order = None
+                            if "持仓数" in str(err or "") or "风控红线" in str(err or ""):
+                                snap = await _collect_full_position_snapshot()
+                                # Full-position replacement path: strong incoming signal can replace worst position.
+                                try:
+                                    if (
+                                        is_open
+                                        and bool(self.config.get("enable_replace_worst_on_full_positions", True))
+                                        and float(getattr(decision, "confidence", 0.0) or 0.0)
+                                        >= float(self.config.get("replace_worst_min_confidence", 0.75) or 0.75)
+                                    ):
+                                        cands = list((snap or {}).get("positions") or [])
+                                        if cands:
+                                            worst = min(cands, key=_position_quality_score)
+                                            worst_symbol = _normalize_symbol(worst.get("symbol"))
+                                            worst_side = str(worst.get("side") or "").lower()
+                                            if worst_symbol and worst_side and gw:
+                                                close_res = await gw.close_swap(
+                                                    worst_symbol,
+                                                    worst_side,
+                                                    None,
+                                                    "ai_core",
+                                                    "replace_worst_on_full",
+                                                    context={
+                                                        "incoming_symbol": decision.symbol,
+                                                        "incoming_side": decision.side,
+                                                        "incoming_confidence": getattr(decision, "confidence", None),
+                                                        "reason": "full_positions_replace_worst",
+                                                        "trace_id": trace_id,
+                                                    },
+                                                )
+                                                close_ok = bool(close_res and isinstance(close_res, dict) and close_res.get("success"))
+                                                if close_ok:
+                                                    retry_open = await gw.open_swap(
+                                                        decision.symbol,
+                                                        decision.side,
+                                                        float(decision.quantity),
+                                                        int(decision.leverage),
+                                                        "ai_core",
+                                                        "ai_decision_open_replace_worst_retry",
+                                                        margin_mode="cross",
+                                                        price=None,
+                                                        context={
+                                                            "strategy_used": getattr(decision, "strategy_used", None),
+                                                            "decision_reasoning": getattr(decision, "reasoning", None),
+                                                            "confidence": getattr(decision, "confidence", None),
+                                                            "risk_level": getattr(decision, "risk_level", None),
+                                                            "rr": rr,
+                                                            "spread_bps": spread_bps,
+                                                            "depth_imbalance": depth_imbalance,
+                                                            "guard_profile": getattr(self, "_adaptive_guard_profile", None),
+                                                            "trace_id": trace_id,
+                                                            "replace_worst_retry": True,
+                                                        },
+                                                    )
+                                                    retry_ok = bool(
+                                                        retry_open
+                                                        and isinstance(retry_open, dict)
+                                                        and retry_open.get("success")
+                                                    )
+                                                    if retry_ok:
+                                                        order = retry_open
+                                except Exception as _e:
+                                    logger.debug(f"replace worst on full positions failed: {_e}")
+                        if order is None:
+                            order = None
                 except Exception as e:
                     logger.warning(f"执行验证网关调用失败，回退交易所直连: {e}")
 
             # 回退：ExecutionGateway（S1）；无 Gateway 时再直连交易所（避免在有 S1 时绕过策略双写）
             if order is None:
-                gw = (
-                    getattr(self.main_controller, "execution_gateway", None)
-                    if self.main_controller
-                    else None
-                )
                 if gw:
                     try:
                         if decision.action == "close":
@@ -6380,6 +6786,93 @@ class AICoreDecisionEngine:
                 ),
             },
         }
+
+    async def get_opportunity_cost_summary(self, lookback: int = 120) -> Dict[str, Any]:
+        """统计被拒绝信号的后续表现（机会成本视角）。"""
+        n = max(10, min(500, int(lookback or 120)))
+        rows = list(self._rejected_signals[-n:])
+        if not rows:
+            out_empty = {
+                "lookback": n,
+                "rejected_total": 0,
+                "evaluated": 0,
+                "missed_win_count": 0,
+                "missed_loss_count": 0,
+                "avg_forward_return_pct": None,
+                "top_missed_wins": [],
+            }
+            return out_empty
+
+        def _norm_symbol(s: Any) -> str:
+            x = str(s or "").strip().upper()
+            x = x.replace("-SWAP", "").replace("/SWAP", "")
+            return x.replace("-", "/")
+
+        async def _get_last_price(sym: str) -> Optional[float]:
+            if not self.exchange or not hasattr(self.exchange, "get_ticker"):
+                return None
+            cands = [sym, sym.replace("/", "-"), sym.replace("/", "-") + "-SWAP"]
+            for c in cands:
+                try:
+                    t = await self.exchange.get_ticker(c)
+                    if isinstance(t, dict):
+                        px = float(t.get("last", t.get("close", 0)) or 0)
+                        if px > 0:
+                            return px
+                except Exception:
+                    continue
+            return None
+
+        evaluated = 0
+        missed_win = 0
+        missed_loss = 0
+        returns: List[float] = []
+        wins: List[Dict[str, Any]] = []
+
+        for r in rows:
+            sym = _norm_symbol(r.get("symbol"))
+            side = str(r.get("side") or "").lower()
+            try:
+                entry = float(r.get("entry_price", 0) or 0)
+            except Exception:
+                entry = 0.0
+            if not sym or entry <= 0:
+                continue
+            last = await _get_last_price(sym)
+            if last is None or last <= 0:
+                continue
+            if side == "short":
+                fwd = (entry - last) / max(1e-9, entry)
+            else:
+                fwd = (last - entry) / max(1e-9, entry)
+            evaluated += 1
+            returns.append(float(fwd))
+            if fwd > 0:
+                missed_win += 1
+                wins.append(
+                    {
+                        "symbol": sym,
+                        "side": side,
+                        "reason": r.get("reason"),
+                        "confidence": r.get("confidence"),
+                        "forward_return_pct": round(float(fwd) * 100.0, 4),
+                    }
+                )
+            elif fwd < 0:
+                missed_loss += 1
+
+        avg_ret = (sum(returns) / len(returns)) if returns else None
+        wins.sort(key=lambda x: x.get("forward_return_pct", 0), reverse=True)
+        out = {
+            "lookback": n,
+            "rejected_total": len(rows),
+            "evaluated": evaluated,
+            "missed_win_count": missed_win,
+            "missed_loss_count": missed_loss,
+            "avg_forward_return_pct": (round(float(avg_ret) * 100.0, 4) if avg_ret is not None else None),
+            "top_missed_wins": wins[:8],
+        }
+        return out
 
     async def _refresh_runtime_guard_config(self) -> None:
         """支持运行期热更新执行门控阈值（由 ai_managed_config 驱动）。"""

@@ -231,6 +231,11 @@
   - 2026-05 升级补充字段：
     - `data.strategy_distribution_30d`：近30天策略维度统计（count/win_rate/total_pnl）
     - `data.decision_contract_integrity`：决策契约完整性（strategy/trace 覆盖率、按 source 分解、异常样本）
+    - `data.opportunity_cost`：被拒绝信号机会成本摘要（用于评估门控过严）
+      - `rejected_total` / `evaluated`
+      - `missed_win_count` / `missed_loss_count`
+      - `avg_forward_return_pct`
+      - `top_missed_wins[]`（symbol/side/reason/confidence/forward_return_pct）
   - 2026-04-28 补充关键诊断块：
     - `data.execution_reconciliation`：本地/交易所状态对账摘要（仓位漂移、孤儿挂单、修复建议）
     - `data.execution_reconciliation_protection`：对账保护层状态（symbol/global 锁）

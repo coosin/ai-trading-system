@@ -243,7 +243,7 @@ class AITradingEngine:
         self._symbol_side_open_legs: Dict[str, int] = {}
         
         logger.info("全智能AI交易引擎初始化完成")
-    
+
     async def initialize(self) -> None:
         """初始化AI交易引擎"""
         logger.info("初始化全智能AI交易引擎...")
@@ -416,6 +416,10 @@ class AITradingEngine:
             # register_data_source is synchronous; awaiting it causes NoneType await errors.
             self.data_fusion.register_data_source("binance", binance_source)
             self.data_fusion.register_data_source("coingecko", coingecko_source)
+            # Local runtime exchange fallback: when public HTTP sources timeout,
+            # still allow fusion layer to use the already-connected exchange feed.
+            if self.exchange and hasattr(self.exchange, "get_market_data"):
+                self.data_fusion.register_data_source("runtime_exchange", self.exchange, "exchange")
             
             logger.info("✅ 多源数据融合分析器已初始化")
         except Exception as e:
@@ -1805,6 +1809,10 @@ class AITradingEngine:
                 opening_long = decision.action == TradeAction.OPEN_LONG
                 opening_short = decision.action == TradeAction.OPEN_SHORT
                 existing = self.positions.get(decision.symbol)
+                total_positions = len(self.positions)
+                total_dir = max(1, long_cnt + short_cnt)
+                same_dir_count = long_cnt if opening_long else short_cnt
+                same_dir_ratio = float(same_dir_count) / float(total_dir)
 
                 if opening_long and long_cnt >= max_same and decision.symbol not in self.positions:
                     logger.info(f"📊 同向多仓已达上限({max_same})，拒绝新开多: {decision.symbol}")

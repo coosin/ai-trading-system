@@ -10,30 +10,43 @@ system:
   log_level: INFO
   environment: production
 llm:
-  # 主模型：小米MiMo + 备用：百度千帆
-  default_model: mimo-v2.5
+  # 主模型：小米MiMo Pro + MiMo + 备用：百度千帆
+  default_model: mimo-v2.5-pro
+  # 自动轮询策略：优先MiMo Pro，失败后降级，支持自动恢复
+  auto_polling:
+    enabled: true
+    strategy: priority_with_fallback
+    health_check_interval: 300
+    recovery_interval: 60
+    max_failures_before_switch: 2
+    cooldown_after_switch: 30
   models:
+  # 1. MiMo Pro - 旗舰推理模型，最高优先级
   - provider: openai
-    model_id: qianfan-code-latest
-    display_name: Baidu Qianfan Code Latest
-    api_key_env: BAIDU_QIANFAN_API_KEY
-    base_url: https://qianfan.baidubce.com/v2/coding
+    model_id: mimo-v2.5-pro
+    display_name: MiMo V2.5 Pro (旗舰)
+    api_key_env: MIMO_API_KEY
+    base_url: https://token-plan-cn.xiaomimimo.com/v1
     temperature: 0.5
-    max_tokens: 8000
+    max_tokens: 16000
     timeout: 45.0
     max_retries: 2
     cost_per_input_token: 0.0
     cost_per_output_token: 0.0
     context_window: 200000
     supports_vision: true
-    supports_reasoning: false
+    supports_reasoning: true
     enabled: true
-    priority: 20
+    priority: 100
+    region: cn
+    notes: 2亿信用点，非高峰0.8x系数，TTS免费
     fallback_models:
-    - mimo-v2.5-pro
+    - mimo-v2.5
+    - qianfan-code-latest
+  # 2. MiMo 标准版 - 主力模型
   - provider: openai
     model_id: mimo-v2.5
-    display_name: MiMo V2.5
+    display_name: MiMo V2.5 (主力)
     api_key_env: MIMO_API_KEY
     base_url: https://token-plan-cn.xiaomimimo.com/v1
     temperature: 0.6
@@ -46,32 +59,75 @@ llm:
     supports_vision: true
     supports_reasoning: false
     enabled: true
-    priority: 30
+    priority: 80
+    region: cn
+    notes: 2亿信用点，非高峰0.8x系数
     fallback_models:
+    - mimo-v2.5-pro
     - qianfan-code-latest
+  # 3. 百度千帆 - 备用模型
+  - provider: openai
+    model_id: qianfan-code-latest
+    display_name: Baidu Qianfan (备用)
+    api_key_env: BAIDU_QIANFAN_API_KEY
+    base_url: https://qianfan.baidubce.com/v2/coding
+    temperature: 0.5
+    max_tokens: 8000
+    timeout: 45.0
+    max_retries: 2
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 200000
+    supports_vision: true
+    supports_reasoning: false
+    enabled: true
+    priority: 50
+    region: cn
+    notes: 备用模型，当MiMo不可用时切换
+    fallback_models:
+    - mimo-v2.5-pro
+    - mimo-v2.5
   task_model_mapping:
+    # 所有任务类型优先使用MiMo Pro，其次是MiMo标准版，最后是百度千帆备用
     general:
+    - mimo-v2.5-pro
     - mimo-v2.5
     - qianfan-code-latest
     market_analysis:
+    - mimo-v2.5-pro
     - mimo-v2.5
     - qianfan-code-latest
     strategy_generation:
+    - mimo-v2.5-pro
     - mimo-v2.5
     - qianfan-code-latest
     signal_generation:
+    - mimo-v2.5-pro
     - mimo-v2.5
     - qianfan-code-latest
     risk_assessment:
+    - mimo-v2.5-pro
     - mimo-v2.5
     - qianfan-code-latest
     news_analysis:
+    - mimo-v2.5-pro
     - mimo-v2.5
     - qianfan-code-latest
     code_generation:
+    - mimo-v2.5-pro
     - mimo-v2.5
     - qianfan-code-latest
     natural_language:
+    - mimo-v2.5-pro
+    - mimo-v2.5
+    - qianfan-code-latest
+    # 新增任务类型映射
+    decision_making:
+    - mimo-v2.5-pro
+    - mimo-v2.5
+    - qianfan-code-latest
+    reasoning:
+    - mimo-v2.5-pro
     - mimo-v2.5
     - qianfan-code-latest
 trading:
@@ -457,11 +513,19 @@ ai_core:
     skip_backtest_if_cpu_above: 85
     skip_optimize_if_cpu_above: 85
 ai_core_runtime:
-  # 均衡：略降开仓置信门槛，仍高于分析硬门槛与 scale-in 分层要求
-  min_confidence_to_trade: 0.695
-  ai_core_min_confidence_to_open: 0.695
+  # 收益修复第一阶段：先压尾部回撤，再提升开仓质量门槛（可回滚小步调参）
+  min_confidence_to_trade: 0.65
+  ai_core_min_confidence_to_open: 0.65
+  ai_core_min_confidence_floor: 0.65
+  max_same_direction_ratio: 0.7
   # Batch1 tune (2026-05-04): small-step relaxation; keep >1.0 to avoid quality collapse.
-  min_rr_to_trade: 1.10
+  min_rr_to_trade: 1.85
+  # 当交易所/数据链路降级时，进一步收缩开仓仓位，降低回撤尾部
+  degraded_data_quantity_factor: 0.55
+  exchange_reachability_degraded_quantity_factor: 0.5
+  # 连亏冷却：更早触发、更长冷却，优先保护资金曲线
+  loss_streak_trigger: 2
+  loss_streak_cooldown_sec: 3600
   max_spread_bps_to_trade: 42.0
   # 统一分析链路硬门槛：分析质量/置信不足或降级数据时，禁止开仓
   analysis_hard_gate_for_open: true
@@ -482,15 +546,15 @@ ai_core_runtime:
       qty_mult: 1.05
       min_conf_add: -0.005
     range:
-      min_rr_mult: 1.02
-      spread_mult: 0.98
-      qty_mult: 0.92
-      min_conf_add: 0.008
+      min_rr_mult: 0.99
+      spread_mult: 1.0
+      qty_mult: 1.03
+      min_conf_add: 0.0
     high_vol:
-      min_rr_mult: 1.08
-      spread_mult: 0.92
-      qty_mult: 0.72
-      min_conf_add: 0.02
+      min_rr_mult: 1.16
+      spread_mult: 0.88
+      qty_mult: 0.55
+      min_conf_add: 0.03
     low_liquidity:
       min_rr_mult: 1.12
       spread_mult: 0.82
@@ -502,11 +566,15 @@ ai_core_runtime:
       qty_mult: 0.88
       min_conf_add: -0.012
   # 净边际：低波动时边际更薄，略降仍要求为正
-  edge_min_net_reward_pct: 0.0025
+  edge_min_net_reward_pct: 0.004
   # hold_avoidance_override：缓趋势下 fusion sentiment 往往较小，略放宽
   hold_avoidance_override_min_abs_sentiment: 0.034
   hold_avoidance_override_min_mi_quality_score: 0.545
+  hold_override_high_risk_min_effective_conf: 0.5
+  hold_override_high_risk_min_mi_quality: 0.55
+  hold_override_high_risk_min_mi_conf: 0.3
   hold_avoidance_override_require_mi_trend_alignment: false
+  hold_avoidance_override_cooldown_sec: 300
   ai_autonomy_min_conf_floor: 0.51
   ai_autonomy_min_mi_confidence: 0.565
   ai_autonomy_min_mi_quality_score: 0.535
@@ -697,11 +765,12 @@ ai_trading:
     risk_per_trade: 0.01
     trade_mode: real
     auto_risk_management: true
-    critical_risk_auto_close: false
+    critical_risk_auto_close: true
     critical_risk_auto_close_liq_only: true
     critical_risk_auto_close_max_liq_distance: 0.08
     critical_risk_auto_close_min_loss_pct: 25.0
-    max_loss_per_position: 0.05
+    # 收紧单仓最大亏损，避免单笔尾部风险吞噬整月收益
+    max_loss_per_position: 0.03
     daily_loss_limit: 0.1
     max_drawdown_limit: 0.15
     enable_microstructure_open_gates: true
@@ -711,7 +780,7 @@ ai_trading:
     microstructure_max_abs_funding_rate: 0.0012
     microstructure_min_open_interest: null
 learning_feedback:
-  stop_loss_penalty_step_hits: 3
+  stop_loss_penalty_step_hits: 2
   stop_loss_penalty_step_confidence: 0.05
   stop_loss_penalty_max_confidence: 0.15
 ai_learning:
@@ -739,9 +808,9 @@ stop_loss_take_profit:
   trailing_only_mode: true
   trailing_only_coerce_inputs: true
   trailing_active_on_open: true
-  initial_trailing_offset: 0.016
+  initial_trailing_offset: 0.025
   profit_tier2_pnl_threshold: 0.02
-  tier2_trailing_offset: 0.012
+  tier2_trailing_offset: 0.018
   trailing_momentum_adjust_enable: true
   default_stop_loss_percent: 0.04
   default_take_profit_percent: 0.08
@@ -759,17 +828,17 @@ stop_loss_take_profit:
   profit_protect_tighten_factor: 0.82
   profit_protect_regime_overrides:
     high_vol:
-      trigger_mult: 0.8
-      lock_mult: 1.25
-      tighten_mult: 0.92
+      trigger_mult: 0.75
+      lock_mult: 1.35
+      tighten_mult: 0.9
     low_liquidity:
       trigger_mult: 0.85
       lock_mult: 1.2
       tighten_mult: 0.94
     range:
-      trigger_mult: 0.95
-      lock_mult: 1.1
-      tighten_mult: 0.98
+      trigger_mult: 1.0
+      lock_mult: 1.05
+      tighten_mult: 1.0
     trend:
       trigger_mult: 1.1
       lock_mult: 0.9
@@ -813,7 +882,7 @@ memory:
   startup:
     working_days_recent: 3
     # experience/*.json 按 mtime 只载入最新 N 条；0 或与 key 组合的显式 null 表示不限制
-    experience_json_max_files: 1200
+    experience_json_max_files: 300
   default_scope: global
   scopes:
     enabled: true

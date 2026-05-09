@@ -1,5 +1,32 @@
 # 变更记录
 
+## 2026-05-10 — 满仓替换链路、同向集中度门控与机会成本诊断
+
+- **执行门控与仓位治理：**
+  - `AICoreDecisionEngine` 新增同向集中度门控 `max_same_direction_ratio`（默认 `0.7`），按“开仓后投影占比”判定是否拒绝。
+  - 新增“满仓高置信替换最差仓”执行路径：
+    - 当开仓在执行网关返回“风控红线/持仓数上限”时，若新信号置信度达到阈值（`replace_worst_min_confidence`），尝试先平质量最低持仓，再重试开仓。
+  - 同向门控与替换链路顺序已调整：满足“满仓 + 高置信 + 启用替换”时，不在同向门控提前终止，允许进入替换链路。
+
+- **止损与开仓风险参数同步：**
+  - `min_confidence_to_trade` / `ai_core_min_confidence_to_open` 调整至 `0.65`，并引入 `ai_core_min_confidence_floor` 防止运行时过度放松。
+  - `stop_loss_take_profit.initial_trailing_offset` 调整为 `0.025`；
+    `stop_loss_take_profit.tier2_trailing_offset` 调整为 `0.018`。
+  - 开仓合成风险距离支持按波动档位采用两档止损（低波动 `4%` / 高波动 `6%`）。
+
+- **机会成本闭环：**
+  - 新增被拒绝信号记录（`rejected_signal`）与 `ai_core` 内部机会成本汇总能力。
+  - `GET /api/v1/modules/commander/trading-diagnosis` 新增 `opportunity_cost` 输出：
+    - `rejected_total` / `evaluated`
+    - `missed_win_count` / `missed_loss_count`
+    - `avg_forward_return_pct`
+    - `top_missed_wins`
+
+- **验证结论（运行证据）：**
+  - “先平后开”替换链路已在实测中连续成功触发（风控红线 -> 平最差仓 -> 重试开仓）。
+  - 同向集中度门控在 100% 同向持仓场景稳定拦截同向新开仓。
+  - `trading-diagnosis.opportunity_cost` 已可稳定输出空样本与有样本两类结果。
+
 ## 2026-05-08 — 临界风险建议平仓可见性修复（close_recommendation）
 
 - **问题现象：**

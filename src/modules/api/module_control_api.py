@@ -22,6 +22,7 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         pass
     return float(default)
 
+
 def init_module_control_api(app, main_controller):
     """初始化模块控制API"""
     
@@ -2896,17 +2897,27 @@ def init_module_control_api(app, main_controller):
         out: Dict[str, Any] = {"timestamp": datetime.now().isoformat()}
         started = time.monotonic()
         total_budget = max(2.0, min(30.0, float(timeout_sec or 8.0)))
-
         def _remaining(default: float) -> float:
             left = total_budget - (time.monotonic() - started)
             return max(0.25, min(float(default), left))
 
         # 1) ai_core / ai_trading_engine 状态（技术判断路径）
+        core = getattr(mc, "ai_core", None)
         try:
-            core = getattr(mc, "ai_core", None)
             out["ai_core"] = core.get_status() if (core and hasattr(core, "get_status")) else None
         except Exception as e:
             out["ai_core_error"] = str(e)
+        try:
+            if core and hasattr(core, "get_opportunity_cost_summary"):
+                budget = _remaining(1.2)
+                out["opportunity_cost"] = await asyncio.wait_for(
+                    core.get_opportunity_cost_summary(lookback=120),
+                    timeout=budget,
+                )
+        except asyncio.TimeoutError:
+            out["opportunity_cost_error"] = "opportunity_cost_timeout"
+        except Exception as e:
+            out["opportunity_cost_error"] = str(e)
         try:
             eng = getattr(mc, "ai_trading_engine", None)
             out["ai_trading_engine"] = eng.get_status() if (eng and hasattr(eng, "get_status")) else None
@@ -2917,7 +2928,7 @@ def init_module_control_api(app, main_controller):
         try:
             gw = getattr(mc, "execution_gateway", None)
             if gw and hasattr(gw, "get_snapshot"):
-                snap = await asyncio.wait_for(gw.get_snapshot(), timeout=_remaining(1.8))
+                snap = await asyncio.wait_for(gw.get_snapshot(), timeout=_remaining(0.9))
                 if gw and hasattr(gw, "get_recent_events"):
                     snap["recent_events"] = await asyncio.wait_for(
                         gw.get_recent_events(limit=int(limit_events or 20)),
@@ -3354,6 +3365,35 @@ def init_module_control_api(app, main_controller):
 
             top_keys = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:8]
 
+            def _group_from_exchange_code(code: str) -> str:
+                c = str(code or "").upper()
+                if c in {"TIMEOUT", "CONNECTION_ERROR", "NETWORK_ERROR", "NO_EXCHANGE"}:
+                    return "exchange_connectivity"
+                if c in {"INSUFFICIENT_MARGIN", "INSUFFICIENT_FUNDS", "SIZE_TOO_SMALL"}:
+                    return "positioning_capital"
+                if c in {"INSTRUMENT_INVALID"}:
+                    return "symbol_contract"
+                if c in {"POLICY_DENIED", "HOSTING_MODE_DENIED", "RISK_REDLINE_DENIED", "OPEN_COOLDOWN_ACTIVE"}:
+                    return "risk_policy"
+                if c in {"ALREADY_CLOSED_NO_POSITION", "POST_CHECK_ANOMALY"}:
+                    return "post_trade_reconcile"
+                return "exchange_other"
+
+            group_label_map = {
+                "exchange_connectivity": "交易所连通性",
+                "positioning_capital": "仓位与资金",
+                "symbol_contract": "标的与合约",
+                "risk_policy": "风控与策略规则",
+                "post_trade_reconcile": "事后对账与收敛",
+                "exchange_other": "交易所其他",
+                "evidence_quality": "证据与数据质量",
+                "signal_confidence": "信号置信度",
+                "risk_reward": "盈亏比",
+                "microstructure": "微结构",
+                "ai_core_other": "AI核心其他",
+                "other": "其他",
+            }
+
             def _action_hint(code: str) -> str:
                 code = str(code or "").upper()
                 return {
@@ -3390,6 +3430,34 @@ def init_module_control_api(app, main_controller):
                     return "warn"
                 return "warn"
 
+            reason_label_map = {
+                "AI_CORE_GUARD:EXCHANGE_UNREACHABLE_OPEN_REJECTED": "交易所不可达拒单",
+                "AI_CORE_GUARD:EXCHANGE_DEGRADED_RISK_REDUCED": "交易所降级降风险",
+                "AI_CORE_GUARD:ANALYSIS_HARD_REJECTED": "分析硬门控拒单",
+                "AI_CORE_GUARD:CONFIDENCE_OPEN_REJECTED": "置信度不足拒单",
+                "AI_CORE_GUARD:OPEN_EVIDENCE_REJECTED": "证据不足拒单",
+                "AI_CORE_GUARD:RR_REJECTED": "盈亏比不足拒单",
+                "AI_CORE_GUARD:SPREAD_REJECTED": "点差过大拒单",
+                "AI_CORE_GUARD:DEPTH_IMBALANCE_REJECTED": "深度失衡拒单",
+                "AI_CORE_GUARD:FUNDING_RATE_REJECTED": "资金费率过高拒单",
+                "AI_CORE_GUARD:OPEN_INTEREST_REJECTED": "持仓量不足拒单",
+                "TIMEOUT": "交易所超时",
+                "CONNECTION_ERROR": "交易所连接错误",
+                "NETWORK_ERROR": "网络错误",
+                "NO_EXCHANGE": "交易所不可用",
+                "POLICY_DENIED": "策略规则拒绝",
+                "HOSTING_MODE_DENIED": "托管模式拒绝",
+                "RISK_REDLINE_DENIED": "触发风险红线",
+                "OPEN_COOLDOWN_ACTIVE": "开仓冷却中",
+                "INSUFFICIENT_MARGIN": "保证金不足",
+                "INSUFFICIENT_FUNDS": "余额不足",
+                "SIZE_TOO_SMALL": "下单张数过小",
+                "INSTRUMENT_INVALID": "无效合约标的",
+                "ALREADY_CLOSED_NO_POSITION": "无仓可平（幂等）",
+                "POST_CHECK_ANOMALY": "平仓后复核异常",
+                "EXCHANGE_ALL_OPERATIONS_FAILED": "交易所全路径拒绝",
+            }
+
             top: List[Dict[str, Any]] = []
             for k, v in top_keys:
                 # k = op:code:phase
@@ -3398,9 +3466,11 @@ def init_module_control_api(app, main_controller):
                 top.append(
                     {
                         "key": k,
+                        "key_label": reason_label_map.get(k, code),
                         "count": int(v),
                         "severity": _severity_from_exchange_code(code),
                         "category": "exchange_failure",
+                        "group": _group_from_exchange_code(code),
                         "action_hint": _action_hint(code),
                         "samples": samples.get(k, [])[:3],
                     }
@@ -3417,6 +3487,8 @@ def init_module_control_api(app, main_controller):
                 "rr_rejected": "AI_CORE_GUARD:RR_REJECTED",
                 "spread_rejected": "AI_CORE_GUARD:SPREAD_REJECTED",
                 "depth_imbalance_rejected": "AI_CORE_GUARD:DEPTH_IMBALANCE_REJECTED",
+                "funding_rate_rejected": "AI_CORE_GUARD:FUNDING_RATE_REJECTED",
+                "open_interest_rejected": "AI_CORE_GUARD:OPEN_INTEREST_REJECTED",
             }
             guard_hints = {
                 "exchange_unreachable_rejected": "交易所不可达，已阻断开仓；优先修复 TLS/代理/网络后再恢复自动开仓。",
@@ -3426,7 +3498,9 @@ def init_module_control_api(app, main_controller):
                 "open_evidence_rejected": "证据不足拒绝开仓：检查快照/K线是否缺失与超时。",
                 "rr_rejected": "盈亏比不足拒绝开仓：检查 SLTP 参数与 min_rr_to_trade。",
                 "spread_rejected": "点差过大拒绝开仓：检查流动性、交易时段与 max_spread_bps_to_trade。",
-                "depth_imbalance_rejected": "盘口深度失衡拒绝开仓：检查 max_abs_depth_imbalance_to_trade。",
+                "depth_imbalance_rejected": "盘口深度失衡拒绝开仓：检查 max_abs_depth_imbalance_to_trade 与 microstructure_use_notional_top20_imbalance。",
+                "funding_rate_rejected": "资金费率过高拒绝开仓：检查 microstructure_max_abs_funding_rate_to_trade 与交易拥挤度。",
+                "open_interest_rejected": "持仓量过低拒绝开仓：检查 microstructure_min_open_interest_to_trade 与品种流动性。",
             }
             guard_severity = {
                 "exchange_unreachable_rejected": "block",
@@ -3437,6 +3511,20 @@ def init_module_control_api(app, main_controller):
                 "rr_rejected": "block",
                 "spread_rejected": "block",
                 "depth_imbalance_rejected": "block",
+                "funding_rate_rejected": "block",
+                "open_interest_rejected": "block",
+            }
+            guard_group = {
+                "exchange_unreachable_rejected": "exchange_connectivity",
+                "exchange_degraded_risk_reduced": "exchange_connectivity",
+                "analysis_hard_rejected": "evidence_quality",
+                "open_evidence_rejected": "evidence_quality",
+                "confidence_open_rejected": "signal_confidence",
+                "rr_rejected": "risk_reward",
+                "spread_rejected": "microstructure",
+                "depth_imbalance_rejected": "microstructure",
+                "funding_rate_rejected": "microstructure",
+                "open_interest_rejected": "microstructure",
             }
             ai_core_diag = out.get("ai_core") if isinstance(out.get("ai_core"), dict) else {}
             eg_cfg = ai_core_diag.get("execution_guards") if isinstance(ai_core_diag.get("execution_guards"), dict) else {}
@@ -3448,33 +3536,97 @@ def init_module_control_api(app, main_controller):
                 top.append(
                     {
                         "key": reason_key,
+                        "key_label": reason_label_map.get(reason_key, reason_key),
                         "count": cnt,
                         "severity": guard_severity.get(stat_key, "warn"),
                         "category": "ai_core_guard",
+                        "group": guard_group.get(stat_key, "ai_core_other"),
                         "action_hint": guard_hints.get(stat_key, "检查 ai_core 执行门控配置与实时诊断。"),
                         "samples": [],
                     }
                 )
             top = sorted(top, key=lambda x: int(x.get("count", 0)), reverse=True)[:12]
+            grouped: Dict[str, Dict[str, Any]] = {}
+            for item in top:
+                grp = str(item.get("group") or "other")
+                cur = grouped.get(grp)
+                if not cur:
+                    cur = {
+                        "group": grp,
+                        "group_label": group_label_map.get(grp, grp),
+                        "count": 0,
+                        "severity": "warn",
+                        "top_keys": [],
+                    }
+                    grouped[grp] = cur
+                cur["count"] = int(cur.get("count", 0)) + int(item.get("count", 0) or 0)
+                sev = str(item.get("severity") or "warn")
+                if sev == "block":
+                    cur["severity"] = "block"
+                elif sev == "reduce" and str(cur.get("severity")) != "block":
+                    cur["severity"] = "reduce"
+                if len(cur["top_keys"]) < 3:
+                    cur["top_keys"].append(str(item.get("key") or ""))
             lead = top[0] if top else None
+            lead_group = (
+                sorted(
+                    list(grouped.values()),
+                    key=lambda x: int(x.get("count", 0)),
+                    reverse=True,
+                )[0]
+                if grouped
+                else None
+            )
             summary = "最近窗口未发现显著拒单/降级主因。"
+            summary_label = "运行稳定，未发现显著阻塞。"
             if isinstance(lead, dict):
                 sev = str(lead.get("severity") or "warn")
                 key = str(lead.get("key") or "")
+                key_label = str(lead.get("key_label") or key)
                 cnt = int(lead.get("count", 0) or 0)
+                grp = str((lead_group or {}).get("group") or lead.get("group") or "other")
+                grp_label = str((lead_group or {}).get("group_label") or group_label_map.get(grp, grp))
+                grp_cnt = int((lead_group or {}).get("count", 0) or 0) if isinstance(lead_group, dict) else cnt
                 if sev == "block":
-                    summary = f"当前主阻塞原因为 {key}（{cnt} 次），已触发阻断策略。"
+                    summary = (
+                        f"主风险分组={grp_label}（{grp_cnt} 次）；"
+                        f"主阻塞原因={key}（{cnt} 次），已触发阻断策略。"
+                    )
+                    summary_label = (
+                        f"{grp_label}为当前主阻塞（{grp_cnt}次），"
+                        f"其中{key_label}最突出（{cnt}次）。"
+                    )
                 elif sev == "reduce":
-                    summary = f"当前主降风险原因为 {key}（{cnt} 次），系统在降杠杆/降仓运行。"
+                    summary = (
+                        f"主风险分组={grp_label}（{grp_cnt} 次）；"
+                        f"主降风险原因={key}（{cnt} 次），系统在降杠杆/降仓运行。"
+                    )
+                    summary_label = (
+                        f"{grp_label}为当前主降风险来源（{grp_cnt}次），"
+                        f"核心因素为{key_label}（{cnt}次）。"
+                    )
                 else:
-                    summary = f"当前主要告警原因为 {key}（{cnt} 次），建议结合样本继续排查。"
+                    summary = (
+                        f"主风险分组={grp_label}（{grp_cnt} 次）；"
+                        f"主要告警原因={key}（{cnt} 次），建议结合样本继续排查。"
+                    )
+                    summary_label = (
+                        f"{grp_label}告警占比最高（{grp_cnt}次），"
+                        f"重点关注{key_label}（{cnt}次）。"
+                    )
 
             out["execution_attribution"] = {
                 "failures_in_window": len(fails),
                 "benign_failures_in_window": len(benign_fails),
                 "benign_failure_codes": sorted(list(benign_codes)),
                 "top_reasons": top,
+                "grouped_reasons": sorted(
+                    list(grouped.values()),
+                    key=lambda x: int(x.get("count", 0)),
+                    reverse=True,
+                ),
                 "summary": summary,
+                "summary_label": summary_label,
             }
         except Exception as e:
             out["execution_attribution_error"] = str(e)
