@@ -83,6 +83,7 @@ workspace/memory/core/MEMORY.md
 workspace/memory/core/SOUL.md
 workspace/memory/core/TRADING.md
 workspace/memory/core/USER.md
+workspace/trade_history/
 
 # Local config overrides (never commit)
 config/local.yaml
