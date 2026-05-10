@@ -1864,10 +1864,26 @@ class MainController:
         
         # 初始化执行验证器
         try:
+            trading_cfg_ev: Dict[str, Any] = {}
+            try:
+                trading_cfg_ev = await self.config_manager.get_config("trading", {}) or {}
+            except Exception:
+                trading_cfg_ev = {}
+            ev_nested = (
+                trading_cfg_ev.get("execution_verifier")
+                if isinstance(trading_cfg_ev.get("execution_verifier"), dict)
+                else {}
+            )
+            cd_ev = float(ev_nested.get("open_symbol_cooldown_sec", 900) or 900)
+            logger.info(
+                "ExecutionVerifier 配置: trading.execution_verifier.open_symbol_cooldown_sec=%.1f",
+                cd_ev,
+            )
             exec_config = ExecutionConfig(
                 timeout_seconds=30,
                 max_retries=3,
-                enable_verification=True
+                enable_verification=True,
+                verifier_open_symbol_cooldown_sec=cd_ev,
             )
             self.execution_verifier = ExecutionVerifier(exec_config)
             

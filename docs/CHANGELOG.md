@@ -22,10 +22,18 @@
     - `avg_forward_return_pct`
     - `top_missed_wins`
 
+- **ExecutionVerifier 探针开仓限频：**
+  - 配置项 `trading.execution_verifier.open_symbol_cooldown_sec`（默认 `900`）：同一交易对经 Verifier 成功开仓后，在冷却时间内再次 Verifier 开仓将被拒绝。
+  - 启动日志会打印 `ExecutionVerifier 配置: ... open_symbol_cooldown_sec=...`；命中冷却时打印 `VERIFIER_OPEN_COOLDOWN_SKIP`（WARNING），用于压制 `execution_verifier_open` 短时风暴（运行证据已见 DOGE/USDT 等场景）。
+
+- **Trading Monitor：**
+  - 策略绩效类 `low_win_rate` / `low_sharpe` 告警增加最小成交样本门槛与按 (策略, 告警类型) 冷却，并将 INFO 级告警改为 `logger.info`，减轻日志刷屏。
+
 - **验证结论（运行证据）：**
   - “先平后开”替换链路已在实测中连续成功触发（风控红线 -> 平最差仓 -> 重试开仓）。
   - 同向集中度门控在 100% 同向持仓场景稳定拦截同向新开仓。
   - `trading-diagnosis.opportunity_cost` 已可稳定输出空样本与有样本两类结果。
+  - Verifier 同 symbol 冷却：`app.log` 已出现 `VERIFIER_OPEN_COOLDOWN_SKIP` 与 `execution_verifier_open_symbol_cooldown` 错误回传至决策引擎。
 
 ## 2026-05-08 — 临界风险建议平仓可见性修复（close_recommendation）
 

@@ -26,6 +26,12 @@
 
 验证：`trading-diagnosis.data.position_limits_snapshot`。
 
+### 1.1b ExecutionVerifier 探针开仓冷却（`trading.execution_verifier`）
+
+- `open_symbol_cooldown_sec`：同一交易对经 **ExecutionVerifier** 路径**成功**开仓后，在多少秒内禁止再次经 Verifier 对该品种发起开仓（默认 `900`）。设为 `0` 关闭。
+- 目的：压制 `reason=execution_verifier_open` 的短时连开与换手噪声。
+- 验证：`logs/app.log` 检索 `ExecutionVerifier 配置: ... open_symbol_cooldown_sec`（启动时）；命中冷却时检索 `VERIFIER_OPEN_COOLDOWN_SKIP`（WARNING）。**不**影响 `ai_decision_open` / `replace_worst_retry` 等不经 Verifier 冷却的路径。
+
 ---
 
 ### 1.2 AI 主决策（ai_core）开仓门控（关键）

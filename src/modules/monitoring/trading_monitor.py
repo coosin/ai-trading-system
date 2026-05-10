@@ -165,7 +165,24 @@ class TradingMonitor:
             "max_pending_time": 300,  # 秒
             "min_fill_rate": 0.8  # 80%
         })
-    
+        # 策略绩效类 INFO 告警：样本过少时无意义；冷却避免监控循环刷日志
+        self.strategy_perf_min_trades_for_alert = int(
+            config.get("strategy_perf_min_trades_for_alert", 5) or 5
+        )
+        self.strategy_perf_alert_cooldown_sec = float(
+            config.get("strategy_perf_alert_cooldown_sec", 900) or 900
+        )
+        self._strategy_perf_alert_last: Dict[Tuple[str, str], float] = {}
+
+    def _strategy_perf_cooldown_allows(self, strategy_name: str, alert_type: str) -> bool:
+        key = (strategy_name, alert_type)
+        now = time.time()
+        last = self._strategy_perf_alert_last.get(key, 0.0)
+        if now - last < self.strategy_perf_alert_cooldown_sec:
+            return False
+        self._strategy_perf_alert_last[key] = now
+        return True
+
     async def initialize(self) -> bool:
         """初始化交易监控器"""
         try:
@@ -411,27 +428,35 @@ class TradingMonitor:
     async def _check_strategy_performance(self):
         """检查策略性能"""
         for strategy_name, performance in self.strategy_performance.items():
+            if performance.total_trades < self.strategy_perf_min_trades_for_alert:
+                continue
             # 检查胜率
-            if performance.win_rate < 0.4:
+            if performance.win_rate < 0.4 and self._strategy_perf_cooldown_allows(
+                strategy_name, "low_win_rate"
+            ):
                 await self._generate_trading_alert(
                     AlertSeverity.INFO,
                     "low_win_rate",
                     f"Low win rate for {strategy_name}: {performance.win_rate:.2f}",
                     {
                         "strategy": strategy_name,
-                        "win_rate": performance.win_rate
+                        "win_rate": performance.win_rate,
+                        "total_trades": performance.total_trades,
                     }
                 )
-            
+
             # 检查夏普比率
-            if performance.sharpe_ratio < 0.5:
+            if performance.sharpe_ratio < 0.5 and self._strategy_perf_cooldown_allows(
+                strategy_name, "low_sharpe"
+            ):
                 await self._generate_trading_alert(
                     AlertSeverity.INFO,
                     "low_sharpe",
                     f"Low Sharpe ratio for {strategy_name}: {performance.sharpe_ratio:.2f}",
                     {
                         "strategy": strategy_name,
-                        "sharpe_ratio": performance.sharpe_ratio
+                        "sharpe_ratio": performance.sharpe_ratio,
+                        "total_trades": performance.total_trades,
                     }
                 )
     
@@ -454,8 +479,12 @@ class TradingMonitor:
         # 限制告警历史大小
         if len(self.alert_history) > self.max_alert_history:
             self.alert_history = self.alert_history[-self.max_alert_history:]
-        
-        logger.warning(f"Trading Alert [{severity.value}]: {message}")
+
+        line = f"Trading Alert [{severity.value}]: {message}"
+        if severity == AlertSeverity.INFO:
+            logger.info(line)
+        else:
+            logger.warning(line)
     
     def get_active_alerts(self) -> List[TradingAlert]:
         """获取活跃告警"""

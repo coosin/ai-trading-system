@@ -208,6 +208,9 @@ trading:
     scale_in_min_confidence_2: 0.77
     scale_in_min_confidence_3: 0.82
     scale_in_min_confidence_4: 0.87
+  # ExecutionVerifier 开仓探针：同一交易对最短间隔（秒）。0=关闭。用于压制 execution_verifier_open 短时风暴。
+  execution_verifier:
+    open_symbol_cooldown_sec: 900
   order:
     type: market
     time_in_force: GTC

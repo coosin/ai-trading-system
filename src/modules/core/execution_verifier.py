@@ -132,6 +132,8 @@ class ExecutionConfig:
     log_dir: str = "logs/executions"
     enable_verification: bool = True
     verification_timeout_seconds: int = 10
+    # verifier 开仓探针在同一 symbol 上的最小间隔（秒）；0 表示关闭。压制 execution_verifier_open 风暴。
+    verifier_open_symbol_cooldown_sec: float = 900.0
 
 
 class ExecutionVerifier:
@@ -179,8 +181,12 @@ class ExecutionVerifier:
         self._audit_logger = None
         self._stop_loss_manager = None
         self._main_controller = None
-        
-        logger.info("执行验证器初始化完成")
+        self._verifier_symbol_last_open: Dict[str, float] = {}
+
+        logger.info(
+            "执行验证器初始化完成 verifier_open_symbol_cooldown_sec=%.1f",
+            float(getattr(self.config, "verifier_open_symbol_cooldown_sec", 0.0) or 0.0),
+        )
     
     def set_main_controller(self, main_controller: Any) -> None:
         """注入主控制器，用于 S1（ExecutionGateway）统一开平仓出口。"""
@@ -205,6 +211,12 @@ class ExecutionVerifier:
     def register_verifier(self, command_type: CommandType, verifier: Callable):
         """注册验证器"""
         self._verifiers[command_type] = verifier
+
+    @staticmethod
+    def _symbol_key_for_verifier_cooldown(sym: str) -> str:
+        x = str(sym or "").strip().upper().replace("-SWAP", "").replace("/SWAP", "")
+        x = x.split(":")[0] if ":" in x else x
+        return x or "__unknown__"
 
     @staticmethod
     def _normalize_swap_side(raw: Any) -> Optional[str]:
@@ -429,6 +441,26 @@ class ExecutionVerifier:
             self._stats["failed"] += 1
             return result
 
+        cd = float(getattr(self.config, "verifier_open_symbol_cooldown_sec", 0.0) or 0.0)
+        nk = self._symbol_key_for_verifier_cooldown(sym)
+        if cd > 0:
+            now = time.time()
+            last = float(self._verifier_symbol_last_open.get(nk, 0.0) or 0.0)
+            if last > 0 and (now - last) < cd:
+                remain = cd - (now - last)
+                result.status = ExecutionStatus.FAILED
+                result.error_message = (
+                    f"execution_verifier_open_symbol_cooldown: {nk} wait {remain:.0f}s (min_interval={cd:.0f}s)"
+                )
+                self._stats["failed"] += 1
+                logger.warning(
+                    "VERIFIER_OPEN_COOLDOWN_SKIP symbol=%s remain_sec=%.0f cooldown_sec=%.0f",
+                    nk,
+                    remain,
+                    cd,
+                )
+                return result
+
         try:
             gres = await gw.open_swap(
                 sym,
@@ -460,6 +492,8 @@ class ExecutionVerifier:
             return result
 
         if gres.get("success"):
+            if cd > 0:
+                self._verifier_symbol_last_open[nk] = time.time()
             result.status = ExecutionStatus.SUCCESS
             result.details = {
                 "order_id": (gres.get("orderId") or gres.get("order_id") or gres.get("id")),
