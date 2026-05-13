@@ -6,6 +6,7 @@
 用法:
   python3 scripts/network_connectivity_smoke.py
   python3 scripts/network_connectivity_smoke.py --redis   # 需 REDIS_HOST / REDIS_PORT
+  OPENCLAW_API_BASE=http://127.0.0.1:8000 python3 scripts/network_connectivity_smoke.py --include-api
   python3 scripts/network_connectivity_smoke.py --api-url http://127.0.0.1:8000/api/v1/system/health
 """
 from __future__ import annotations
@@ -16,6 +17,12 @@ import socket
 import sys
 import urllib.error
 import urllib.request
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.utils.openclaw_api_client import openclaw_api_url
 
 
 def _check_dns(host: str) -> tuple[bool, str]:
@@ -70,7 +77,12 @@ def main() -> int:
     p.add_argument(
         "--api-url",
         default="",
-        help="可选：本机 API 健康检查 URL（如 http://127.0.0.1:8000/api/v1/system/health）",
+        help="可选：本机 API 健康检查完整 URL",
+    )
+    p.add_argument(
+        "--include-api",
+        action="store_true",
+        help="额外请求本机 OpenClaw health（OPENCLAW_API_BASE / ACCEPTANCE_BASE / BASE_URL 或默认 127.0.0.1:8000）",
     )
     args = p.parse_args()
 
@@ -85,6 +97,9 @@ def main() -> int:
         checks.append(("Redis ping", _check_redis))
     if (args.api_url or "").strip():
         u = (args.api_url or "").strip()
+        checks.append(("API health", lambda url=u: _check_https(url, timeout=15.0)))
+    elif args.include_api:
+        u = openclaw_api_url("/api/v1/system/health")
         checks.append(("API health", lambda url=u: _check_https(url, timeout=15.0)))
 
     for name, fn in checks:

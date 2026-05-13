@@ -117,6 +117,7 @@ data/backtest/
 workspace/probes/
 workspace/tuning_runs/
 data/runtime/
+data/.ssl_merged_ca/
 
 # Process bookkeeping (PID files); keep directory only in git
 runtime/*

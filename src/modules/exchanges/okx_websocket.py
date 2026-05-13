@@ -35,6 +35,9 @@ class OKXWebSocketHub:
         self._tasks: List[asyncio.Task] = []
         self._stop = asyncio.Event()
         self._ticker_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._public_ws_unstable_count: int = 0
+        self._public_ws_suspended_until: float = 0.0
 
     def ws_private_url(self) -> str:
         configured = str(getattr(self._ex, "ws_private_url", "") or "").strip()
@@ -44,11 +47,20 @@ class OKXWebSocketHub:
             return "wss://wspap.okx.com:8443/ws/v5/private"
         return "wss://ws.okx.com:8443/ws/v5/private"
 
-    def _ws_headers(self) -> Dict[str, str]:
+    def _public_ws_headers(self) -> Dict[str, str]:
+        return {}
+
+    def _private_ws_headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {}
         if getattr(self._ex, "testnet", False) or getattr(self._ex, "simulated_order_only", False):
             h["x-simulated-trading"] = "1"
         return h
+
+    def _private_positions_ws_enabled(self) -> bool:
+        raw = str(os.getenv("OPENCLAW_OKX_WS_PRIVATE_POSITIONS", "0") or "0").strip().lower()
+        if raw not in ("1", "true", "yes", "on"):
+            return False
+        return bool(self._ex.api_key and self._ex.api_secret and hasattr(self._ex, "merge_positions_ws_update"))
 
     def build_login_arg(self) -> Dict[str, str]:
         ts = str(int(time.time()))
@@ -86,7 +98,18 @@ class OKXWebSocketHub:
             return None
         return data
 
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        sess = self._session
+        if sess is not None and not getattr(sess, "closed", True):
+            return sess
+        connector = self._ex._new_tcp_connector(self._ex._build_ssl_context())
+        self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
+        return self._session
+
     async def start(self) -> None:
+        self._tasks = [t for t in self._tasks if not t.done()]
+        if self._tasks:
+            return
         raw = os.getenv(
             "OPENCLAW_OKX_WS_TICKER_INSTIDS",
             (
@@ -99,8 +122,10 @@ class OKXWebSocketHub:
         instids = [x.strip() for x in raw.split(",") if x.strip()]
         self._stop.clear()
         self._tasks.append(asyncio.create_task(self._public_tickers_loop(instids), name="okx-ws-public-tickers"))
-        if self._ex.api_key and self._ex.api_secret:
+        if self._private_positions_ws_enabled():
             self._tasks.append(asyncio.create_task(self._private_positions_loop(), name="okx-ws-private-positions"))
+        elif self._ex.api_key and self._ex.api_secret:
+            logger.info("OKX WS 私有 positions 未启用；继续使用 REST 持仓同步")
 
     async def stop(self) -> None:
         self._stop.set()
@@ -112,25 +137,36 @@ class OKXWebSocketHub:
             except asyncio.CancelledError:
                 pass
         self._tasks.clear()
+        sess = self._session
+        self._session = None
+        if sess is not None:
+            try:
+                await sess.close()
+            except Exception:
+                pass
 
     async def _public_tickers_loop(self, inst_ids: List[str]) -> None:
         backoff = 1.0
+        min_stable_sec = float(os.getenv("OPENCLAW_OKX_WS_MIN_STABLE_SEC", "20") or "20")
+        suspend_after = max(2, int(os.getenv("OPENCLAW_OKX_WS_SUSPEND_AFTER_FAILS", "3") or "3"))
+        suspend_sec = float(os.getenv("OPENCLAW_OKX_WS_SUSPEND_SEC", "300") or "300")
         while not self._stop.is_set():
             try:
-                sess = self._ex._session
-                if sess is None or getattr(sess, "closed", True):
-                    await asyncio.sleep(1.0)
+                if time.time() < self._public_ws_suspended_until:
+                    await asyncio.sleep(min(5.0, self._public_ws_suspended_until - time.time()))
                     continue
+                sess = await self._ensure_session()
                 if self._ex._proxy_only and not self._ex._proxy_url:
                     logger.warning("OKX WS 公共频道跳过：OPENCLAW_OKX_PROXY_ONLY=1 且无代理")
                     await asyncio.sleep(30.0)
                     continue
 
                 args = [{"channel": "tickers", "instId": iid} for iid in inst_ids]
-                kwargs: Dict[str, Any] = {"headers": self._ws_headers()}
+                kwargs: Dict[str, Any] = {"headers": self._public_ws_headers()}
                 if self._ex._proxy_url:
                     kwargs["proxy"] = self._ex._proxy_url
 
+                connected_at = time.time()
                 async with sess.ws_connect(self._ex.ws_url, **kwargs) as ws:
                     await ws.send_str(json.dumps({"op": "subscribe", "args": args}, separators=(",", ":")))
                     logger.info("OKX WS 已订阅 tickers: %s", ",".join(inst_ids))
@@ -159,8 +195,18 @@ class OKXWebSocketHub:
                                 if ev == "error":
                                     logger.warning("OKX WS 公共频道错误: %s", data)
                             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                                logger.warning(
+                                    "OKX WS 公共频道关闭: type=%s close_code=%s",
+                                    msg.type.name,
+                                    getattr(ws, "close_code", None),
+                                )
                                 break
                             elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logger.warning(
+                                    "OKX WS 公共频道错误关闭: close_code=%s error=%s",
+                                    getattr(ws, "close_code", None),
+                                    getattr(ws, "exception", lambda: None)(),
+                                )
                                 break
                     finally:
                         ping_task.cancel()
@@ -168,9 +214,24 @@ class OKXWebSocketHub:
                             await ping_task
                         except asyncio.CancelledError:
                             pass
+                alive_for = time.time() - connected_at
+                if alive_for < min_stable_sec and not self._stop.is_set():
+                    self._public_ws_unstable_count += 1
+                    if self._public_ws_unstable_count >= suspend_after:
+                        self._public_ws_suspended_until = time.time() + suspend_sec
+                        logger.warning(
+                            "OKX WS 公共频道短连异常过多，暂停 %.0fs 后再试: alive_for=%.1fs failures=%s",
+                            suspend_sec,
+                            alive_for,
+                            self._public_ws_unstable_count,
+                        )
+                else:
+                    self._public_ws_unstable_count = 0
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if self._session is not None and getattr(self._session, "closed", True):
+                    self._session = None
                 logger.warning("OKX WS 公共频道异常，%.1fs 后重连: %s", backoff, e)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.8, 45.0)
@@ -179,15 +240,12 @@ class OKXWebSocketHub:
         backoff = 1.0
         while not self._stop.is_set():
             try:
-                sess = self._ex._session
-                if sess is None or getattr(sess, "closed", True):
-                    await asyncio.sleep(1.0)
-                    continue
+                sess = await self._ensure_session()
                 if self._ex._proxy_only and not self._ex._proxy_url:
                     await asyncio.sleep(30.0)
                     continue
 
-                kwargs: Dict[str, Any] = {"headers": self._ws_headers()}
+                kwargs: Dict[str, Any] = {"headers": self._private_ws_headers()}
                 if self._ex._proxy_url:
                     kwargs["proxy"] = self._ex._proxy_url
 
@@ -251,6 +309,8 @@ class OKXWebSocketHub:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if self._session is not None and getattr(self._session, "closed", True):
+                    self._session = None
                 logger.warning("OKX WS 私有频道异常，%.1fs 后重连: %s", backoff, e)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.8, 45.0)

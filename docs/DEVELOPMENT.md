@@ -60,6 +60,8 @@ python run_api.py
 
 ## 4. 最小联调检查
 
+联调前可在 shell 中设置 **`OPENCLAW_API_BASE`**（推荐），与 `docs/API_REFERENCE.md`「API 基址、只读巡检链与 Surface」及 `GET /api/v1/modules/surface/registry` 中的 **`api_base_env`** 一致；未设置时下列示例中的主机仍默认为 `http://127.0.0.1:8000`。
+
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/system/health
 curl -s http://127.0.0.1:8000/api/v1/s1/verify

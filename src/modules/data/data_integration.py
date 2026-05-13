@@ -19,8 +19,67 @@ from abc import ABC, abstractmethod
 logger = logging.getLogger(__name__)
 
 
+def _coingecko_enabled() -> bool:
+    return str(os.getenv("OPENCLAW_ENABLE_COINGECKO", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _datasource_ssl_context() -> ssl.SSLContext:
-    ctx = ssl.create_default_context(cafile=certifi.where())
+    """
+    公共行情/第三方 HTTPS。
+
+    ``OPENCLAW_DATASOURCE_INSECURE_SSL=1``：关闭校验（仅排障；生产请修 CA 或配置 ``OPENCLAW_SSL_CA_BUNDLE``）。
+
+    ``OPENCLAW_DATASOURCE_SSL_MODE``（默认 ``auto``）：
+    - ``auto``：存在代理或额外 CA 提示时优先 ``merged``，否则走 ``system``。
+    - ``system``：``ssl.create_default_context()``，使用本机 OpenSSL 默认 CA（常见 Linux 上更贴近 curl）。
+    - ``certifi``：Mozilla certifi 包（适合容器/精简根证书环境）。
+    - ``merged``：与 OKX 相同的 certifi+环境 CA 合并 PEM（需 MITM 企业根时）。
+    """
+    if str(os.getenv("OPENCLAW_DATASOURCE_INSECURE_SSL", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        logger.warning(
+            "数据源 HTTPS 校验已关闭（OPENCLAW_DATASOURCE_INSECURE_SSL=1），存在中间人风险；请尽快恢复校验"
+        )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        return ctx
+    mode = (os.getenv("OPENCLAW_DATASOURCE_SSL_MODE") or "auto").strip().lower()
+    if mode == "auto":
+        has_proxy = any(
+            (os.getenv(k) or "").strip()
+            for k in (
+                "OPENCLAW_HTTPS_PROXY",
+                "OPENCLAW_HTTP_PROXY",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "https_proxy",
+                "http_proxy",
+            )
+        )
+        has_extra_ca_hint = any(
+            (os.getenv(k) or "").strip()
+            for k in ("OPENCLAW_SSL_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+        )
+        mode = "merged" if (has_proxy or has_extra_ca_hint) else "system"
+    if mode in ("merged", "merge"):
+        from src.utils.ssl_bundle import openclaw_merged_cafile
+
+        ctx = ssl.create_default_context(cafile=openclaw_merged_cafile())
+    elif mode in ("certifi", "mozilla", "pip"):
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    else:
+        ctx = ssl.create_default_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     return ctx
 
@@ -56,8 +115,25 @@ class DataSourceBase(ABC):
         self._session: Optional[aiohttp.ClientSession] = None
         self._initialized = False
 
+    def _effective_proxy_url(self) -> Optional[str]:
+        """显式 proxy_url 优先，否则与 ``proxy_url_for_data_sources`` 一致读环境（systemd 常未继承 shell 的 export）。"""
+        if self.proxy_url and str(self.proxy_url).strip():
+            return str(self.proxy_url).strip()
+        for key in (
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "OPENCLAW_HTTPS_PROXY",
+            "OPENCLAW_HTTP_PROXY",
+        ):
+            v = (os.getenv(key) or "").strip()
+            if v:
+                return v
+        return None
+
     async def _open_session(self) -> None:
-        """创建会话：HTTPS 目标必须校验 TLS；禁用 trust_env 避免与显式 proxy= 叠加。"""
+        """创建会话：HTTPS 校验 TLS；具体请求是否走代理由 ``_effective_proxy_url`` / trust_env 决定。"""
         if self._session and not self._session.closed:
             return
         connector = aiohttp.TCPConnector(
@@ -66,13 +142,20 @@ class DataSourceBase(ABC):
             ttl_dns_cache=max(10, int(os.getenv("OPENCLAW_DATASOURCE_DNS_TTL", "300") or "300")),
             limit=max(8, int(os.getenv("OPENCLAW_DATASOURCE_CONNECTOR_LIMIT", "32") or "32")),
         )
-        self._session = aiohttp.ClientSession(connector=connector, trust_env=False)
+        # 默认跟随 HTTP(S)_PROXY：与 LLM/OKX 一致走本机代理时，直连常触发 MITM 证书校验失败。
+        _trust_env = str(os.getenv("OPENCLAW_DATASOURCE_TRUST_ENV", "1")).strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        self._session = aiohttp.ClientSession(connector=connector, trust_env=_trust_env)
     
     async def initialize(self) -> bool:
         """初始化数据源"""
         if self._initialized:
             return True
-        
+
         await self._open_session()
         self._initialized = True
         logger.info(f"{self.__class__.__name__} 初始化完成")
@@ -92,7 +175,7 @@ class DataSourceBase(ABC):
         self, url: str, params: Optional[Dict[str, Any]] = None, log_label: str = "source"
     ) -> Tuple[bool, Any]:
         """GET JSON，带短重试；代理隧道半开时重建会话。"""
-        proxy = self.proxy_url if self.proxy_url else None
+        proxy = self._effective_proxy_url()
         retries = _datasource_max_retries()
         timeout = _datasource_timeout()
         last_err: Optional[str] = None
@@ -102,7 +185,10 @@ class DataSourceBase(ABC):
                     await self.initialize()
                 if self._session is None:
                     await self._open_session()
-                async with self._session.get(url, params=params, proxy=proxy, timeout=timeout) as resp:
+                req_kw: Dict[str, Any] = {"params": params, "timeout": timeout}
+                if proxy:
+                    req_kw["proxy"] = proxy
+                async with self._session.get(url, **req_kw) as resp:
                     if resp.status == 200:
                         return True, await resp.json()
                     last_err = f"HTTP {resp.status}"
@@ -112,6 +198,15 @@ class DataSourceBase(ABC):
                         continue
             except aiohttp.ClientError as e:
                 last_err = f"{type(e).__name__}: {e}"
+                # TLS/证书错误在同一 CA/代理配置下重试不会自愈，直接返回减少阻塞。
+                if isinstance(
+                    e,
+                    (
+                        aiohttp.ClientConnectorCertificateError,
+                        aiohttp.ClientConnectorSSLError,
+                    ),
+                ):
+                    break
                 if attempt < retries - 1:
                     logger.debug("%s ClientError (attempt %s/%s): %s", log_label, attempt + 1, retries, last_err)
                     await self._recycle_session()
@@ -217,6 +312,7 @@ class CoinGeckoDataSource(DataSourceBase):
         super().__init__(proxy_url)
         self.api_url = "https://api.coingecko.com/api/v3"
         self.api_key = api_key
+        self._disabled_until_ts: float = 0.0
     
     def _get_coin_id(self, symbol: str) -> str:
         """获取CoinGecko币种ID"""
@@ -237,6 +333,10 @@ class CoinGeckoDataSource(DataSourceBase):
     
     async def get_market_data(self, symbol: str) -> Optional[MarketData]:
         """获取市场数据"""
+        if not _coingecko_enabled():
+            return None
+        if time.time() < float(self._disabled_until_ts or 0.0):
+            return None
         coin_id = self._get_coin_id(symbol)
         url = f"{self.api_url}/simple/price"
         params = {
@@ -255,7 +355,14 @@ class CoinGeckoDataSource(DataSourceBase):
                 change_24h=coin_data.get("usd_24h_change", 0),
                 source="coingecko",
             )
-        _coin_gecko_log_fail(self, data if not ok else "missing coin_id in response")
+        err_text = str(data if not ok else "missing coin_id in response")
+        if "ClientConnectorCertificateError" in err_text:
+            self._disabled_until_ts = time.time() + 1800.0
+            logger.warning("CoinGecko TLS 证书链异常，暂停该数据源 30 分钟以避免持续拖慢分析链路")
+        elif "ConnectionTimeoutError" in err_text or "TimeoutError" in err_text:
+            self._disabled_until_ts = time.time() + 300.0
+            logger.warning("CoinGecko 网络超时，暂停该数据源 5 分钟以避免持续拖慢分析链路")
+        _coin_gecko_log_fail(self, err_text)
         return None
     
     async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict]:

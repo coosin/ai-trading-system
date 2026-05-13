@@ -181,9 +181,17 @@ def proxy_url_for_data_sources(config_manager: Any) -> str:
     """
     供无法注入环境时的同步回退：优先环境变量，其次 ConfigManager 快照。
     """
-    env_u = (os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
-    if env_u:
-        return env_u
+    for key in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "OPENCLAW_HTTPS_PROXY",
+        "OPENCLAW_HTTP_PROXY",
+    ):
+        env_u = (os.getenv(key) or "").strip()
+        if env_u:
+            return env_u
     try:
         if config_manager and hasattr(config_manager, "get_config_sync"):
             px = config_manager.get_config_sync("proxy", {}) or {}

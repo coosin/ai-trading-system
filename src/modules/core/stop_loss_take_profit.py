@@ -199,6 +199,7 @@ class StopLossTakeProfitConfig:
     profit_protect_regime_overrides: Dict[str, Dict[str, float]] = field(
         default_factory=lambda: {
             "high_vol": {"trigger_mult": 0.80, "lock_mult": 1.25, "tighten_mult": 0.92},
+            "volatile": {"trigger_mult": 0.80, "lock_mult": 1.25, "tighten_mult": 0.92},
             "low_liquidity": {"trigger_mult": 0.85, "lock_mult": 1.20, "tighten_mult": 0.94},
             "range": {"trigger_mult": 0.95, "lock_mult": 1.10, "tighten_mult": 0.98},
             "trend": {"trigger_mult": 1.10, "lock_mult": 0.90, "tighten_mult": 1.05},
@@ -226,6 +227,7 @@ class StopLossTakeProfitConfig:
     # 仅限制「活跃跟踪」数量；已触发/已取消的历史单不计入（否则会误伤 sync_open_positions）
     max_orders: int = 100
     persist_file: str = "data/stop_loss_orders.json"
+    persist_history_limit: int = 200
     sync_exchange_positions_on_startup: bool = True
     # 运行中周期性把交易所持仓再登记到 SLTP（防止仅启动时同步一次后漂移）
     exchange_resync_interval_sec: int = 45
@@ -261,6 +263,21 @@ class StopLossTakeProfitConfig:
     sr_partial_tp_trigger_pnl: float = 0.01
     sr_partial_close_ratio: float = 0.25
     sr_breakeven_lock_pct: float = 0.0015
+    # 净收益门槛：避免在名义盈利但不足以覆盖双边手续费/滑点时过早止盈。
+    min_net_take_profit_percent: float = 0.003
+    min_net_take_profit_regime_overrides: Dict[str, float] = field(
+        default_factory=lambda: {
+            "normal": 0.0024,
+            "range": 0.0022,
+            "low_vol_grind": 0.0025,
+            "trend": 0.0034,
+            "high_vol": 0.0042,
+            "volatile": 0.0042,
+            "low_liquidity": 0.0048,
+        }
+    )
+    fee_rate_per_side: float = 0.0005
+    slippage_rate_per_side: float = 0.0003
 
 
 def _coerce_stop_loss_take_profit_field(name: str, raw: Any, template: StopLossTakeProfitConfig) -> Any:
@@ -365,6 +382,9 @@ class StopLossTakeProfitManager:
             "trailing_updates": 0,
             "breakeven_activated": 0,
             "partial_tp_executed": 0,
+            "tp_net_edge_suppressed": 0,
+            "tp_net_edge_suppressed_by_regime": {},
+            "tp_net_edge_suppressed_by_reason": {},
             "time_stop_triggered": 0,
             "dynamic_adjustments": 0,
             # SR（支撑/阻力）关键位出场观测
@@ -379,6 +399,8 @@ class StopLossTakeProfitManager:
         # 最近 SR 事件（用于运维/调参观测，避免必须翻日志）
         self._sr_recent_events: List[Dict[str, Any]] = []
         self._sr_recent_events_cap: int = 50
+        self._tp_edge_recent_events: List[Dict[str, Any]] = []
+        self._tp_edge_recent_events_cap: int = 50
         
         self._persist_path = Path(self.config.persist_file)
         self._persist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1073,6 +1095,41 @@ class StopLossTakeProfitManager:
 
     def _count_active_orders(self) -> int:
         return sum(1 for o in self.orders.values() if o.status == StopLossTakeProfitStatus.ACTIVE)
+
+    @staticmethod
+    def _is_terminal_status(status: StopLossTakeProfitStatus) -> bool:
+        return status in {
+            StopLossTakeProfitStatus.TRIGGERED,
+            StopLossTakeProfitStatus.CANCELLED,
+        }
+
+    def _prune_historical_orders(self) -> None:
+        """保留全部活跃单，仅裁剪过多的终态历史单，避免持久化文件无限增长。"""
+        hist_limit = max(0, int(getattr(self.config, "persist_history_limit", 200) or 0))
+        if hist_limit <= 0:
+            return
+        terminal: List[StopLossTakeProfitOrder] = []
+        for order in self.orders.values():
+            if self._is_terminal_status(order.status):
+                terminal.append(order)
+        if len(terminal) <= hist_limit:
+            return
+        terminal.sort(
+            key=lambda o: (
+                getattr(o, "updated_at", None) or getattr(o, "triggered_at", None) or getattr(o, "created_at", datetime.min)
+            ),
+            reverse=True,
+        )
+        keep_ids = {o.order_id for o in terminal[:hist_limit]}
+        drop_ids = {o.order_id for o in terminal[hist_limit:]}
+        if not drop_ids:
+            return
+        for oid in list(drop_ids):
+            self.orders.pop(oid, None)
+        for k in list(self.order_index.keys()):
+            if self.order_index.get(k) in drop_ids:
+                del self.order_index[k]
+        logger.info("SLTP: 已裁剪历史终态订单 %s 条，保留最近 %s 条", len(drop_ids), hist_limit)
 
     def _reprice_sl_tp_from_order(self, order: StopLossTakeProfitOrder) -> None:
         """入场价变化后按订单内保存的 SL/TP 类型与比例重算价格。"""
@@ -1912,6 +1969,8 @@ class StopLossTakeProfitManager:
                 continue
             if pnl_percent < level_percent:
                 continue
+            if not self._take_profit_edge_ok(order, pnl_percent, reason="layered_partial_take_profit"):
+                return
             base_qty = float(order.quantity or 0)
             close_qty = min(base_qty * level_ratio, float(order.remaining_quantity or 0))
             if close_qty <= 1e-12:
@@ -2206,6 +2265,8 @@ class StopLossTakeProfitManager:
                         if order.side == "long" and near_res and (not brk_up):
                             self._stats["sr_near_resistance_events"] += 1
                             if not bool(meta.get("sr_partial_done_near_resistance", False)):
+                                if not self._take_profit_edge_ok(order, pnl, reason="sr_near_resistance_partial_take_profit"):
+                                    return
                                 close_qty = max(
                                     0.0, min(float(order.remaining_quantity or 0.0), float(order.remaining_quantity or 0.0) * close_ratio)
                                 )
@@ -2273,6 +2334,8 @@ class StopLossTakeProfitManager:
                         elif order.side == "short" and near_sup and (not brk_down):
                             self._stats["sr_near_support_events"] += 1
                             if not bool(meta.get("sr_partial_done_near_support", False)):
+                                if not self._take_profit_edge_ok(order, pnl, reason="sr_near_support_partial_take_profit"):
+                                    return
                                 close_qty = max(
                                     0.0, min(float(order.remaining_quantity or 0.0), float(order.remaining_quantity or 0.0) * close_ratio)
                                 )
@@ -2777,6 +2840,8 @@ class StopLossTakeProfitManager:
     ) -> StopLossTakeProfitOrder:
         """触发止盈"""
         pnl_percent = self._calculate_pnl_percent(order, current_price)
+        if not self._take_profit_edge_ok(order, pnl_percent, reason="take_profit"):
+            return order
         if await self._coord_duplicate_suppress_if_needed(order, trigger_kind="take_profit"):
             return order
         try:
@@ -2979,6 +3044,99 @@ class StopLossTakeProfitManager:
             return (current_price - order.entry_price) / order.entry_price
         else:
             return (order.entry_price - current_price) / order.entry_price
+
+    def _estimate_net_take_profit_percent(self, pnl_percent: float) -> float:
+        """估算扣除双边手续费与滑点后的净收益率。"""
+        fee_rate = float(getattr(self.config, "fee_rate_per_side", 0.0005) or 0.0005)
+        slippage_rate = float(getattr(self.config, "slippage_rate_per_side", 0.0003) or 0.0003)
+        total_cost = 2.0 * (fee_rate + slippage_rate)
+        return float(pnl_percent or 0.0) - total_cost
+
+    def _get_order_regime(self, order: StopLossTakeProfitOrder) -> str:
+        try:
+            meta = order.metadata if isinstance(order.metadata, dict) else {}
+            gp = meta.get("guard_profile") if isinstance(meta.get("guard_profile"), dict) else {}
+            regime = (
+                meta.get("profit_protect_regime")
+                or gp.get("regime")
+                or gp.get("profile")
+                or (meta.get("market_context") or {}).get("regime")
+                or "normal"
+            )
+            regime_s = str(regime or "normal").strip().lower()
+            return regime_s or "normal"
+        except Exception:
+            return "normal"
+
+    def _effective_min_net_take_profit_percent(self, order: StopLossTakeProfitOrder) -> float:
+        base = float(getattr(self.config, "min_net_take_profit_percent", 0.003) or 0.003)
+        try:
+            regime = self._get_order_regime(order)
+            overrides = getattr(self.config, "min_net_take_profit_regime_overrides", {}) or {}
+            if isinstance(overrides, dict):
+                ov = overrides.get(regime)
+                if ov is None and regime == "volatile":
+                    ov = overrides.get("high_vol")
+                if ov is None and regime == "high_vol":
+                    ov = overrides.get("volatile")
+                if ov is not None:
+                    return max(0.0, float(ov))
+        except Exception:
+            pass
+        return base
+
+    def _take_profit_edge_ok(self, order: StopLossTakeProfitOrder, pnl_percent: float, *, reason: str) -> bool:
+        """止盈前净收益检查，避免手续费型假盈利出场。"""
+        regime = self._get_order_regime(order)
+        min_net = self._effective_min_net_take_profit_percent(order)
+        net_pnl = self._estimate_net_take_profit_percent(pnl_percent)
+        if net_pnl + 1e-12 >= min_net:
+            return True
+        self._stats["tp_net_edge_suppressed"] = int(self._stats.get("tp_net_edge_suppressed", 0) or 0) + 1
+        by_regime = self._stats.get("tp_net_edge_suppressed_by_regime")
+        if not isinstance(by_regime, dict):
+            by_regime = {}
+            self._stats["tp_net_edge_suppressed_by_regime"] = by_regime
+        by_regime[regime] = int(by_regime.get(regime, 0) or 0) + 1
+        by_reason = self._stats.get("tp_net_edge_suppressed_by_reason")
+        if not isinstance(by_reason, dict):
+            by_reason = {}
+            self._stats["tp_net_edge_suppressed_by_reason"] = by_reason
+        reason_key = str(reason or "unknown").strip() or "unknown"
+        by_reason[reason_key] = int(by_reason.get(reason_key, 0) or 0) + 1
+        try:
+            meta = dict(order.metadata or {})
+            meta["last_tp_edge_suppressed_at"] = datetime.now().isoformat()
+            meta["last_tp_edge_suppressed_reason"] = str(reason)
+            meta["last_tp_edge_regime"] = str(regime)
+            meta["last_tp_edge_gross_pnl_percent"] = float(pnl_percent or 0.0)
+            meta["last_tp_edge_net_pnl_percent"] = float(net_pnl)
+            meta["last_tp_edge_min_net_percent"] = float(min_net)
+            order.metadata = meta
+        except Exception:
+            pass
+        self._record_tp_edge_event(
+            {
+                "symbol": str(order.symbol or ""),
+                "regime": regime,
+                "reason": reason_key,
+                "gross_pnl_percent": float(pnl_percent or 0.0),
+                "net_pnl_percent": float(net_pnl),
+                "min_net_percent": float(min_net),
+                "side": str(order.side or ""),
+                "order_id": str(order.order_id or ""),
+            }
+        )
+        logger.info(
+            "⏭️ 抑制过早止盈: %s regime=%s reason=%s gross=%.4f%% net=%.4f%% min_net=%.4f%%",
+            order.symbol,
+            regime,
+            reason_key,
+            float(pnl_percent or 0.0) * 100.0,
+            float(net_pnl) * 100.0,
+            float(min_net) * 100.0,
+        )
+        return False
     
     async def modify_order(
         self,
@@ -3097,6 +3255,7 @@ class StopLossTakeProfitManager:
             "total_orders_tracked": len(self.orders),
             "single_active_per_index": True,
             "sr_recent_events": list(self._sr_recent_events)[-self._sr_recent_events_cap :],
+            "tp_edge_recent_events": list(self._tp_edge_recent_events)[-self._tp_edge_recent_events_cap :],
         }
 
     def _enrich_sr_event_with_close_error(
@@ -3120,6 +3279,17 @@ class StopLossTakeProfitManager:
             self._sr_recent_events.append(e)
             if len(self._sr_recent_events) > int(self._sr_recent_events_cap):
                 self._sr_recent_events = self._sr_recent_events[-int(self._sr_recent_events_cap) :]
+        except Exception:
+            pass
+
+    def _record_tp_edge_event(self, event: Dict[str, Any]) -> None:
+        try:
+            e = dict(event or {})
+            if "ts" not in e:
+                e["ts"] = datetime.now().isoformat()
+            self._tp_edge_recent_events.append(e)
+            if len(self._tp_edge_recent_events) > int(self._tp_edge_recent_events_cap):
+                self._tp_edge_recent_events = self._tp_edge_recent_events[-int(self._tp_edge_recent_events_cap) :]
         except Exception:
             pass
     
@@ -3222,9 +3392,12 @@ class StopLossTakeProfitManager:
     async def _save_orders(self):
         """保存订单到文件"""
         try:
+            self._prune_historical_orders()
             data = {
                 "orders": {oid: order.to_dict() for oid, order in self.orders.items()},
                 "stats": self._stats,
+                "sr_recent_events": list(self._sr_recent_events)[-self._sr_recent_events_cap :],
+                "tp_edge_recent_events": list(self._tp_edge_recent_events)[-self._tp_edge_recent_events_cap :],
                 "saved_at": datetime.now().isoformat()
             }
             
@@ -3296,8 +3469,21 @@ class StopLossTakeProfitManager:
                     self.order_index[idx_key] = oid
             
             self._stats.update(data.get("stats", {}))
-            
-            logger.info(f"加载 {len(self.orders)} 个止盈止损订单")
+            sr_recent = data.get("sr_recent_events", [])
+            tp_recent = data.get("tp_edge_recent_events", [])
+            self._sr_recent_events = list(sr_recent)[-int(self._sr_recent_events_cap) :] if isinstance(sr_recent, list) else []
+            self._tp_edge_recent_events = list(tp_recent)[-int(self._tp_edge_recent_events_cap) :] if isinstance(tp_recent, list) else []
+            self._prune_historical_orders()
+            active_n = sum(1 for o in self.orders.values() if o.status == StopLossTakeProfitStatus.ACTIVE)
+            pending_n = sum(1 for o in self.orders.values() if o.status == StopLossTakeProfitStatus.PENDING_CLOSE)
+            history_n = len(self.orders) - active_n - pending_n
+            logger.info(
+                "加载止盈止损订单: total=%s active=%s pending_close=%s history=%s",
+                len(self.orders),
+                active_n,
+                pending_n,
+                history_n,
+            )
             
         except Exception as e:
             logger.error(f"加载止盈止损订单失败: {e}")

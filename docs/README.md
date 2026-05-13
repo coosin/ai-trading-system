@@ -16,7 +16,7 @@
 | [**ENGINEERING.md**](./ENGINEERING.md) | 工程主文档：架构、配置模型、模块边界 |
 | [**OPERATIONS.md**](./OPERATIONS.md) | 运维主文档：部署、网络、健康、巡检 |
 | [**DEVELOPMENT.md**](./DEVELOPMENT.md) | 开发主文档：环境、测试、目录、规范 |
-| [**API_REFERENCE.md**](./API_REFERENCE.md) | API 主文档：REST/WebSocket、鉴权、对接建议 |
+| [**API_REFERENCE.md**](./API_REFERENCE.md) | API 主文档：REST/WebSocket、鉴权、对接建议；含 **API 基址**（`OPENCLAW_API_BASE`）、**`surface/registry`** 的 `read_pipeline` / `api_base_env` 规范 |
 | [**TRADING_TUNING_GUIDE.md**](./TRADING_TUNING_GUIDE.md) | 交易参数调优：开平仓门控、仓位、SLTP、学习闭环 |
 | [**TRADING_DEBUG_PLAYBOOK.md**](./TRADING_DEBUG_PLAYBOOK.md) | 交易调试手册：开平仓排障、诊断路径、复测流程 |
 | [**CHANGELOG.md**](./CHANGELOG.md) | 变更记录 |

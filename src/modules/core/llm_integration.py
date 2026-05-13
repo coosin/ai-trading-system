@@ -569,10 +569,13 @@ class EnhancedLLMIntegration:
         
         from src.modules.core.enhanced_llm_manager import TaskType
         model_id = kwargs.pop('model_id', None) or provider
+        task_type = kwargs.pop('task_type', TaskType.GENERAL)
+        prefer_reasoning = bool(kwargs.pop('prefer_reasoning', False))
         response = await self.llm_manager.generate(
             prompt=full_prompt,
             model_id=model_id,
-            task_type=TaskType.GENERAL,
+            task_type=task_type,
+            prefer_reasoning=prefer_reasoning,
             **kwargs
         )
         

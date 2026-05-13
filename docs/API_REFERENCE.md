@@ -6,6 +6,36 @@
 
 **机器可读规范（与线上一致，由运行中服务导出）:** 同目录下 [`API_OPENAPI_FULL.json`](./API_OPENAPI_FULL.json)（OpenAPI 3.1，当前约 181 条路径；含请求体、查询参数、422 校验模型等）。
 
+## API 基址、只读巡检链与 Surface（2026-05-13）
+
+### 环境变量：HTTP API 基址
+
+脚本、巡检与外部自动化应使用**同一套**基址解析规则，避免硬编码 `127.0.0.1:8000` 与 Docker/反代端口不一致。
+
+**优先级**（与 [`src/utils/openclaw_api_client.py`](../src/utils/openclaw_api_client.py) 一致）：
+
+1. **`OPENCLAW_API_BASE`**（推荐，语义专指本交易控制面 HTTP API）
+2. **`ACCEPTANCE_BASE`**（验收脚本历史兼容）
+3. **`BASE_URL`**（通用）
+4. 默认 `http://127.0.0.1:8000`
+
+Shell 示例：
+
+```bash
+export OPENCLAW_API_BASE=http://127.0.0.1:8000
+curl -s "${OPENCLAW_API_BASE}/api/v1/system/health"
+```
+
+### `GET /api/v1/modules/surface/registry`
+
+除 **`catalog`**（合并后的静态路由发现表：模块/commander 等条目与 `route_catalog.extended_core_routes()` 按 `method + path` **去重**）外，响应还包含：
+
+- **`contract_version`**：Surface 编排契约版本（与 `module_surface.CONTRACT_VERSION` 对齐）。
+- **`read_pipeline`**：推荐的**只读**巡检与数据分析顺序，由 [`src/modules/api/route_catalog.py`](../src/modules/api/route_catalog.py) 中 **`read_pipeline_spec()`** 定义；值守与第三方客户端宜按该顺序拉取，减少重复打交易所与重复解析。
+- **`api_base_env`**：说明上述基址环境变量优先级（与代码字段一致，便于机器消费）。
+
+Python 侧建议调用 **`default_openclaw_api_base()`** / **`openclaw_api_url("/api/v1/...")`**，与已收敛脚本（如 `startup_acceptance.py`、`prod_stability_check.py`、`network_connectivity_smoke.py --include-api`、`system_probe_daily_summary.py`）保持一致。
+
 ## 健康检查（2026-05-07 更新）
 
 - `GET /api/v1/system/health`
@@ -325,7 +355,7 @@
   - `GET /api/v1/modules/commander/capabilities`
   - `GET /api/v1/modules/commander/tool-contract`
   - `GET /api/v1/modules/surface/channels`
-  - `GET /api/v1/modules/surface/registry`
+  - `GET /api/v1/modules/surface/registry`（含 **`read_pipeline`**、**`api_base_env`**、**`catalog`**；见上文「API 基址、只读巡检链与 Surface」）
 
 - **读取状态/对账**
   - `GET /api/v1/modules/commander/snapshot`
@@ -406,7 +436,7 @@
   - `GET /api/v1/trade/events?limit=...` -> 持续返回事件（用于前端与外部系统回放/对账）
   - `GET /api/v1/positions` -> 返回持仓结构（带 cache/stale 语义）
 - **调用地址建议**
-  - 推荐在脚本中统一声明：`BASE_URL=${BASE_URL:-http://127.0.0.1:8000}`，再用 `"$BASE_URL/..."` 访问接口，减少 Docker/裸机切换时的手工修改。
+  - 推荐在脚本中优先声明：`OPENCLAW_API_BASE=${OPENCLAW_API_BASE:-http://127.0.0.1:8000}`，再用 `"$OPENCLAW_API_BASE/..."` 访问接口；若无该变量，可回退 `ACCEPTANCE_BASE` / `BASE_URL`（与 `openclaw_api_client` 一致），减少 Docker/裸机/反代端口切换时的手工修改。
 
 ---
 

@@ -25,6 +25,8 @@ export APP_DIR_FOR_OPENCLAW="${APP_DIR}"
 NOHUP_LOG_FILE="${LOG_DIR}/nohup.out.log"
 NOHUP_MAX_MB="${OPENCLAW_NOHUP_MAX_MB:-50}"
 NOHUP_MAX_BACKUPS="${OPENCLAW_NOHUP_MAX_BACKUPS:-7}"
+HEALTH_URL="${OPENCLAW_HEALTH_URL:-http://127.0.0.1:8000/api/v1/system/health}"
+HEALTH_WAIT_SECONDS="${OPENCLAW_HEALTH_WAIT_SECONDS:-60}"
 
 rotate_nohup_log_if_needed() {
   local file="$1"
@@ -70,6 +72,28 @@ write_pid_everywhere() {
     mkdir -p "${HOME_RUNTIME}"
     echo "${NEW_PID}" > "${HOME_RUNTIME}/${PID_BASENAME}"
   fi
+}
+
+start_detached() {
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$PY" -m src.main </dev/null >> "$NOHUP_LOG_FILE" 2>&1 &
+  else
+    nohup "$PY" -m src.main </dev/null >> "$NOHUP_LOG_FILE" 2>&1 &
+  fi
+}
+
+wait_for_health() {
+  local waited=0
+  while [[ "$waited" -lt "$HEALTH_WAIT_SECONDS" ]]; do
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
 }
 
 running_pids() {
@@ -148,18 +172,23 @@ echo "Starting OpenClaw Trading System..."
 # src.main 已配置 RotatingFileHandler 写入 logs/app.log。
 # 若这里再把 stdout/stderr 重定向到同一文件，会造成每条日志“双写”。
 # 因此将 nohup 控制台输出落到独立文件，避免与应用文件日志重叠。
-nohup "$PY" -m src.main >> "$NOHUP_LOG_FILE" 2>&1 &
+start_detached
 sleep 3
 
 PIDS="$(running_pids)"
 if [[ -n "${PIDS}" ]]; then
   NEW_PID="$(echo "${PIDS}" | awk '{print $1}')"
   write_pid_everywhere "${NEW_PID}"
-  echo "SUCCESS: OpenClaw Trading System started (PID: $NEW_PID)"
-  echo "Log file: $LOG_DIR/app.log"
-  echo "Nohup output: $LOG_DIR/nohup.out.log"
-  echo "API docs: http://localhost:8000/docs"
-  exit 0
+  if wait_for_health; then
+    echo "SUCCESS: OpenClaw Trading System started (PID: $NEW_PID)"
+    echo "Log file: $LOG_DIR/app.log"
+    echo "Nohup output: $LOG_DIR/nohup.out.log"
+    echo "API docs: http://localhost:8000/docs"
+    exit 0
+  fi
+  echo "FAILED: process started but health endpoint did not become ready within ${HEALTH_WAIT_SECONDS}s"
+  echo "Check logs: tail -50 $LOG_DIR/app.log"
+  exit 1
 fi
 
 echo "FAILED: OpenClaw Trading System did not start"

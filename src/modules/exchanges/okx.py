@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import ssl
-import tempfile
 import time
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
@@ -22,45 +21,17 @@ from functools import wraps
 from urllib.parse import urlencode
 
 import aiohttp
-import certifi
 
 from .exchange_base import ExchangeBase, MarketData, OrderBook, Order, Balance, ExchangeInfo
 
 logger = logging.getLogger(__name__)
 
-_merged_okx_cafile_cache: Optional[str] = None
-
 
 def _okx_ssl_cafile_path() -> str:
-    """
-    Choose CA bundle for OKX REST/WS (aiohttp).
+    """OKX REST/WS：使用 certifi + 环境 CA 合并 bundle（见 src.utils.ssl_bundle）。"""
+    from src.utils.ssl_bundle import openclaw_merged_cafile
 
-    Priority:
-    1. Merge certifi + OPENCLAW_SSL_CA_BUNDLE when set (common for HTTPS-proxy MITM extra roots)
-    2. SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE when pointing at an existing file
-    3. certifi.where()
-    """
-    global _merged_okx_cafile_cache
-    extra = (os.getenv("OPENCLAW_SSL_CA_BUNDLE") or "").strip()
-    if extra and os.path.isfile(extra):
-        if _merged_okx_cafile_cache and os.path.isfile(_merged_okx_cafile_cache):
-            return _merged_okx_cafile_cache
-        try:
-            base = Path(certifi.where()).read_bytes().strip()
-            add = Path(extra).read_bytes().strip()
-            tmpdir = Path(os.getenv("TMPDIR") or tempfile.gettempdir())
-            merged = tmpdir / "openclaw_okx_merged_ca.pem"
-            merged.write_bytes(base + b"\n" + add + b"\n")
-            _merged_okx_cafile_cache = str(merged)
-            logger.info("OKX SSL: merged certifi + OPENCLAW_SSL_CA_BUNDLE -> %s", merged)
-            return _merged_okx_cafile_cache
-        except Exception as e:
-            logger.warning("OKX SSL: merge OPENCLAW_SSL_CA_BUNDLE failed (%s); falling back", e)
-    for envk in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
-        v = (os.getenv(envk) or "").strip()
-        if v and os.path.isfile(v):
-            return v
-    return certifi.where()
+    return openclaw_merged_cafile()
 
 
 def retry_on_error(max_retries=3, delay=1.0, backoff=2.0, allowed_exceptions=(Exception,)):
@@ -168,12 +139,15 @@ class OKXExchange(ExchangeBase):
         self._network_consecutive_failures: int = 0
         self._network_failure_threshold: int = 5
         self._last_recover_ts: float = 0.0
+        self._last_recover_warn_ts: float = 0.0
         self._recover_cooldown_s: float = float(
             os.getenv("OPENCLAW_OKX_RECOVER_COOLDOWN", "60") or "60"
         )
         # instruments 缓存（公开接口），用于下单前的最小张数/步进预检
         self._instrument_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._instrument_cache_ttl_s: float = 300.0
+        self._exchange_info_cache: Tuple[float, Optional[ExchangeInfo]] = (0.0, None)
+        self._exchange_info_ttl_s: float = float(os.getenv("OPENCLAW_OKX_EXCHANGE_INFO_TTL", "1800") or "1800")
         # Payload recorder: runtime channel-field matrix from live responses
         self._payload_recorder_enabled: bool = str(
             os.getenv("OPENCLAW_OKX_PAYLOAD_RECORDER", "1")
@@ -191,13 +165,24 @@ class OKXExchange(ExchangeBase):
         self._payload_channel_samples: Dict[str, int] = defaultdict(int)
         self._payload_last_flush_ts: float = 0.0
         self._ticker_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_TICKER_CACHE_TTL", "5") or "5")
+        self._klines_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_KLINES_CACHE_TTL", "8") or "8")
         self._balance_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_BALANCE_CACHE_TTL", "12") or "12")
         self._positions_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_POSITIONS_CACHE_TTL", "15") or "15")
         self._ticker_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._klines_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+        self._klines_inflight: Dict[str, asyncio.Task] = {}
         self._balances_cache: Tuple[float, List[Balance]] = (0.0, [])
         self._positions_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
+        self._balances_fetch_lock = asyncio.Lock()
+        self._positions_fetch_lock = asyncio.Lock()
+        self._private_busy_cooldown_s: float = float(
+            os.getenv("OPENCLAW_OKX_PRIVATE_BUSY_COOLDOWN", "8") or "8"
+        )
+        self._private_busy_until: Dict[str, float] = {}
+        self._private_busy_last_log_ts: Dict[str, float] = {}
         self._payload_expected_fields: Dict[str, List[str]] = {
-            "books": ["instId", "bids", "asks", "ts"],
+            # /api/v5/market/books 的 data[] 行通常不回传 instId；instId 体现在请求参数而非 row payload。
+            "books": ["bids", "asks", "ts"],
             "tickers": ["instId", "last", "bidPx", "askPx", "vol24h", "ts"],
             "funding-rate": ["instId", "fundingRate", "nextFundingTime"],
             "mark-price": ["instId", "markPx", "ts"],
@@ -219,6 +204,25 @@ class OKXExchange(ExchangeBase):
         """下单/平仓后丢弃持仓内存缓存，避免下游用旧快照误判 position_unchanged。"""
         self._positions_cache = (0.0, [])
 
+    def _mark_private_endpoint_busy(self, endpoint: str) -> None:
+        self._private_busy_until[str(endpoint)] = time.time() + max(1.0, self._private_busy_cooldown_s)
+
+    def _private_endpoint_busy_remaining(self, endpoint: str) -> float:
+        until = float(self._private_busy_until.get(str(endpoint), 0.0) or 0.0)
+        return max(0.0, until - time.time())
+
+    def _log_private_busy_skip(self, endpoint: str, source: str) -> None:
+        now = time.time()
+        last = float(self._private_busy_last_log_ts.get(str(endpoint), 0.0) or 0.0)
+        if now - last >= 10.0:
+            self._private_busy_last_log_ts[str(endpoint)] = now
+            logger.warning(
+                "⚠️ OKX 私有接口繁忙冷却中，跳过重复请求: %s source=%s remaining=%.1fs",
+                endpoint,
+                source,
+                self._private_endpoint_busy_remaining(endpoint),
+            )
+
     @property
     def is_connected(self) -> bool:
         """REST 会话是否可用（供控制面 /api/v1/exchanges 等展示；与 WS 订阅无关）。"""
@@ -232,8 +236,7 @@ class OKXExchange(ExchangeBase):
         统一 TLS：默认校验远端证书。
 
         - OPENCLAW_OKX_INSECURE_SSL=1：关闭校验（仅建议开发/受信内网排障；生产请用 OPENCLAW_SSL_CA_BUNDLE）。
-        - OPENCLAW_SSL_CA_BUNDLE=/path/to/extra.pem：与 certifi 合并（HTTPS 代理 MITM 常见）。
-        - SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE：完整替代 CA 文件。
+        - OPENCLAW_SSL_CA_BUNDLE / SSL_CERT_FILE 等：与 certifi 合并为单一 PEM（见 openclaw_merged_cafile）。
         """
         insecure = str(os.getenv("OPENCLAW_OKX_INSECURE_SSL", "0")).strip().lower() in (
             "1",
@@ -302,11 +305,18 @@ class OKXExchange(ExchangeBase):
             max(self._base_min_request_interval, float(self._adaptive_min_request_interval) * 1.2),
         )
         if self._network_consecutive_failures >= self._network_failure_threshold:
-            logger.warning(
-                "⚠️ OKX网络连续失败达到阈值(%s)，触发自愈恢复: %s",
-                self._network_consecutive_failures,
-                reason,
-            )
+            now = time.time()
+            if (
+                self._last_recover_warn_ts <= 0.0
+                or now - self._last_recover_warn_ts >= self._recover_cooldown_s
+                or self._network_consecutive_failures == self._network_failure_threshold
+            ):
+                logger.warning(
+                    "⚠️ OKX网络连续失败达到阈值(%s)，触发自愈恢复: %s",
+                    self._network_consecutive_failures,
+                    reason,
+                )
+                self._last_recover_warn_ts = now
             await self._attempt_network_recovery(reason)
 
     async def _attempt_network_recovery(self, reason: str) -> None:
@@ -479,12 +489,16 @@ class OKXExchange(ExchangeBase):
                 "path": "/api/v5/public/instruments?instType=SWAP",
                 "validator": lambda p: isinstance((p or {}).get("data"), list) and len((p or {}).get("data") or []) > 0,
             },
-            {
-                "name": "market_ticker_btc_swap",
-                "path": "/api/v5/market/ticker?instId=BTC-USDT-SWAP",
-                "validator": lambda p: isinstance((p or {}).get("data"), list) and len((p or {}).get("data") or []) > 0,
-            },
         ]
+        if str(os.getenv("OPENCLAW_OKX_PROBE_INCLUDE_TICKER", "0")).strip().lower() in ("1", "true", "yes", "on"):
+            checks.append(
+                {
+                    "name": "market_ticker_btc_swap",
+                    "path": "/api/v5/market/ticker?instId=BTC-USDT-SWAP",
+                    "validator": lambda p: isinstance((p or {}).get("data"), list)
+                    and len((p or {}).get("data") or []) > 0,
+                }
+            )
 
         async def _run_one(item: Dict[str, Any]) -> Dict[str, Any]:
             url = self.api_url + str(item.get("path") or "")
@@ -531,10 +545,16 @@ class OKXExchange(ExchangeBase):
         # - If core time endpoint is reachable, network path is partially available.
         #   Even with low composite score, classify as degraded (not unreachable) to reduce false P0.
         # - Only classify unreachable when core_time itself is unavailable.
-        status_text = "reachable" if score >= 0.67 else ("degraded" if score >= 0.34 else "unreachable")
+        # Use integer thresholds to avoid 2/3=0.6667 being misclassified by a rounded 0.67 cutoff.
+        if time_ok and ok_count >= 1:
+            status_text = "reachable"
+        elif time_ok or ok_count >= 1:
+            status_text = "degraded"
+        else:
+            status_text = "unreachable"
         if time_ok and status_text == "unreachable":
             status_text = "degraded"
-        overall_ok = time_ok and score >= 0.67
+        overall_ok = time_ok and status_text == "reachable"
 
         return {
             # backward-compatible keys
@@ -840,6 +860,29 @@ class OKXExchange(ExchangeBase):
         if ep.startswith("/api/v5/account/") or ep.startswith("/api/v5/trade/"):
             return "account"
         return "default"
+
+    def _is_private_endpoint(self, endpoint: str) -> bool:
+        ep = str(endpoint or "")
+        return ep.startswith("/api/v5/account/") or ep.startswith("/api/v5/trade/")
+
+    def _is_retryable_okx_code(self, code: Any, endpoint: str, message: str = "") -> bool:
+        code_s = str(code or "").strip()
+        if code_s in {"50011", "50013"}:
+            return True
+        if code_s == "50001" and self._is_private_endpoint(endpoint):
+            return True
+        msg = str(message or "").strip().lower()
+        if self._is_private_endpoint(endpoint) and any(
+            token in msg for token in ("temporarily unavailable", "service unavailable", "system busy")
+        ):
+            return True
+        return False
+
+    def _compute_retry_delay(self, current_delay: float, retry_backoff: float, endpoint: str, okx_code: Any) -> float:
+        delay = float(current_delay or 0.5)
+        if self._is_private_endpoint(endpoint) and str(okx_code or "").strip() == "50001":
+            delay = max(delay, 1.5)
+        return delay * max(1.2, float(retry_backoff or 1.5))
     
     async def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None, body: Dict[str, Any] = None) -> Any:
         """发送请求到OKX API - 带重试和限流机制"""
@@ -915,15 +958,20 @@ class OKXExchange(ExchangeBase):
                             
                             data = await response.json()
                             okx_code = str(data.get("code") or "")
-                            if okx_code == "50011" and attempt < max_retries:
+                            error_msg = self._extract_okx_error_message(data)
+                            if self._is_retryable_okx_code(okx_code, endpoint, error_msg) and attempt < max_retries:
                                 logger.warning(
-                                    "⚠️ OKX 限速(50011)，%.1fs 后重试: %s %s",
+                                    "⚠️ OKX 瞬时错误(%s)，%.1fs 后重试: %s %s msg=%s",
+                                    okx_code,
                                     retry_delay,
                                     method,
                                     endpoint,
+                                    error_msg[:160],
                                 )
+                                if self._is_private_endpoint(endpoint):
+                                    self._mark_private_endpoint_busy(endpoint)
                                 await asyncio.sleep(retry_delay)
-                                retry_delay *= retry_backoff
+                                retry_delay = self._compute_retry_delay(retry_delay, retry_backoff, endpoint, okx_code)
                                 continue
                             if okx_code == "0":
                                 await self._record_payload_sample(endpoint, data.get("data", []))
@@ -931,7 +979,6 @@ class OKXExchange(ExchangeBase):
                                 return data.get("data", [])
                             else:
                                 error_code = data.get('code', '')
-                                error_msg = self._extract_okx_error_message(data)
                                 if str(error_code) == "50102" and attempt < max_retries:
                                     synced = await self._sync_server_time_offset(proxy=proxy, force=True)
                                     if synced:
@@ -956,15 +1003,20 @@ class OKXExchange(ExchangeBase):
                             data = await response.json()
                             logger.debug(f"📥 OKX响应: {data}")
                             okx_code = str(data.get("code") or "")
-                            if okx_code == "50011" and attempt < max_retries:
+                            error_msg = self._extract_okx_error_message(data)
+                            if self._is_retryable_okx_code(okx_code, endpoint, error_msg) and attempt < max_retries:
                                 logger.warning(
-                                    "⚠️ OKX 限速(50011)，%.1fs 后重试: %s %s",
+                                    "⚠️ OKX 瞬时错误(%s)，%.1fs 后重试: %s %s msg=%s",
+                                    okx_code,
                                     retry_delay,
                                     method,
                                     endpoint,
+                                    error_msg[:160],
                                 )
+                                if self._is_private_endpoint(endpoint):
+                                    self._mark_private_endpoint_busy(endpoint)
                                 await asyncio.sleep(retry_delay)
-                                retry_delay *= retry_backoff
+                                retry_delay = self._compute_retry_delay(retry_delay, retry_backoff, endpoint, okx_code)
                                 continue
                             if okx_code == "0":
                                 await self._record_payload_sample(endpoint, data.get("data", []))
@@ -978,7 +1030,6 @@ class OKXExchange(ExchangeBase):
                                         logger.warning("⚠️ OKX 50102: 已同步服务器时间并重试 %s %s", method, endpoint)
                                         await asyncio.sleep(min(0.2, retry_delay))
                                         continue
-                                error_msg = self._extract_okx_error_message(data)
                                 logger.error(f"OKX API返回错误: {method} {endpoint} - code={data.get('code')}, msg={error_msg}")
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
@@ -992,15 +1043,20 @@ class OKXExchange(ExchangeBase):
                             
                             data = await response.json()
                             okx_code = str(data.get("code") or "")
-                            if okx_code == "50011" and attempt < max_retries:
+                            error_msg = self._extract_okx_error_message(data)
+                            if self._is_retryable_okx_code(okx_code, endpoint, error_msg) and attempt < max_retries:
                                 logger.warning(
-                                    "⚠️ OKX 限速(50011)，%.1fs 后重试: %s %s",
+                                    "⚠️ OKX 瞬时错误(%s)，%.1fs 后重试: %s %s msg=%s",
+                                    okx_code,
                                     retry_delay,
                                     method,
                                     endpoint,
+                                    error_msg[:160],
                                 )
+                                if self._is_private_endpoint(endpoint):
+                                    self._mark_private_endpoint_busy(endpoint)
                                 await asyncio.sleep(retry_delay)
-                                retry_delay *= retry_backoff
+                                retry_delay = self._compute_retry_delay(retry_delay, retry_backoff, endpoint, okx_code)
                                 continue
                             if okx_code == "0":
                                 await self._record_payload_sample(endpoint, data.get("data", []))
@@ -1008,7 +1064,6 @@ class OKXExchange(ExchangeBase):
                                 return data.get("data", [])
                             else:
                                 error_code = data.get('code', '')
-                                error_msg = self._extract_okx_error_message(data)
                                 if str(error_code) == "50102" and attempt < max_retries:
                                     synced = await self._sync_server_time_offset(proxy=proxy, force=True)
                                     if synced:
@@ -1149,13 +1204,38 @@ class OKXExchange(ExchangeBase):
             ssl_context = None
             
             try:
-                # 优先使用容器环境变量代理，保证与部署配置一致
-                env_proxy = (
-                    os.getenv("OPENCLAW_HTTPS_PROXY")
-                    or os.getenv("OPENCLAW_HTTP_PROXY")
-                    or os.getenv("HTTPS_PROXY")
-                    or os.getenv("HTTP_PROXY")
-                )
+                # OKX 优先支持独立代理变量，避免与全局 HTTP(S)_PROXY / mihomo 混用。
+                # 典型用法：仅将 OKX REST/WS 指向专线，而第三方数据、LLM 等保留现有全局出口。
+                # 同时维护一个“按优先级的候选列表”，便于专线异常时自动回退到全局代理。
+                env_proxy_candidates: List[str] = []
+                for key in (
+                    "OPENCLAW_OKX_HTTPS_PROXY",
+                    "OPENCLAW_OKX_HTTP_PROXY",
+                    "OPENCLAW_HTTPS_PROXY",
+                    "OPENCLAW_HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "HTTP_PROXY",
+                ):
+                    val = str(os.getenv(key, "") or "").strip()
+                    if val and val not in env_proxy_candidates:
+                        env_proxy_candidates.append(val)
+                try:
+                    cfg_mgr = getattr(self, "_config_manager", None)
+                    if cfg_mgr is None:
+                        from src.modules.core.config_manager import get_config_manager
+
+                        cfg_mgr = await get_config_manager()
+                    if cfg_mgr is not None:
+                        from src.modules.core.network_env_from_config import build_proxy_url_from_config
+
+                        proxy_cfg = await cfg_mgr.get_config("proxy", {})
+                        fallback_proxy = build_proxy_url_from_config(proxy_cfg if isinstance(proxy_cfg, dict) else {})
+                        fallback_proxy = str(fallback_proxy or "").strip()
+                        if fallback_proxy and fallback_proxy not in env_proxy_candidates:
+                            env_proxy_candidates.append(fallback_proxy)
+                except Exception as e:
+                    logger.debug("OKX 加载全局代理回退候选失败: %s", e)
+                env_proxy = env_proxy_candidates[0] if env_proxy_candidates else None
                 # 若检测到环境代理，则默认启用“proxy-only”（可通过 OPENCLAW_OKX_AUTO_PROXY_ONLY=0 关闭）。
                 # 原因：在很多服务器环境里 OKX 直连不可达，任何降级直连都会制造长超时与数据降级。
                 auto_proxy_only = str(os.getenv("OPENCLAW_OKX_AUTO_PROXY_ONLY", "1") or "1").strip().lower() in (
@@ -1188,11 +1268,46 @@ class OKXExchange(ExchangeBase):
                         self._proxy_only = True
                         logger.info("✅ OKX 检测到环境代理，自动启用 proxy-only（避免降级直连超时）")
                     ssl_context = self._build_ssl_context()
+                    selected_proxy = None
+                    probe_errors: List[str] = []
+                    for cand in env_proxy_candidates:
+                        test_connector = self._new_tcp_connector(ssl_context)
+                        test_session = aiohttp.ClientSession(connector=test_connector, connector_owner=True)
+                        try:
+                            timeout = aiohttp.ClientTimeout(total=5, connect=3, sock_read=3)
+                            async with test_session.get(
+                                self.api_url + "/api/v5/public/time",
+                                timeout=timeout,
+                                proxy=cand,
+                            ) as resp:
+                                payload = await resp.json()
+                            ts = float((((payload or {}).get("data") or [{}])[0] or {}).get("ts") or 0.0)
+                            if int(getattr(resp, "status", 0) or 0) < 400 and ts > 0:
+                                selected_proxy = cand
+                                logger.info("✅ OKX 环境代理预探测成功: %s", cand)
+                                break
+                            probe_errors.append(f"{cand}:bad_status")
+                        except Exception as e:
+                            probe_errors.append(f"{cand}:{type(e).__name__}")
+                        finally:
+                            try:
+                                await test_session.close()
+                            except Exception:
+                                pass
+
+                    if selected_proxy is None:
+                        selected_proxy = env_proxy
+                        logger.warning(
+                            "⚠️ OKX 环境代理预探测均失败，先使用最高优先级代理继续启动: %s; candidates=%s",
+                            selected_proxy,
+                            probe_errors,
+                        )
+
                     connector = self._new_tcp_connector(ssl_context)
-                    self._proxy_url = env_proxy
+                    self._proxy_url = selected_proxy
                     self._proxy_mode = "http"
                     self._proxy_from_env = True
-                    logger.info(f"✅ OKX使用环境代理: {env_proxy}")
+                    logger.info(f"✅ OKX使用环境代理: {selected_proxy}")
                 else:
                     logger.info("ℹ️ 未检测到环境代理，尝试通过proxy_manager获取")
 
@@ -1248,7 +1363,6 @@ class OKXExchange(ExchangeBase):
                 self._proxy_from_env = False
             
             self._session = aiohttp.ClientSession(connector=connector, connector_owner=True)
-            await self.get_exchange_info()
             self._running = True
             if self._payload_recorder_enabled:
                 logger.info(
@@ -1296,41 +1410,88 @@ class OKXExchange(ExchangeBase):
             logger.info(f"OKX交易所清理完成")
         except Exception as e:
             logger.error(f"OKX交易所清理失败: {e}")
-    
-    async def get_market_data(self, symbol: str, interval: str = "1m") -> MarketData:
-        """获取市场数据"""
+
+    def _normalize_okx_interval(self, interval: str) -> str:
         interval_map = {
             "1m": "1m",
             "5m": "5m",
             "15m": "15m",
+            "30m": "30m",
             "1h": "1H",
+            "1H": "1H",
             "4h": "4H",
-            "1d": "1D"
+            "4H": "4H",
+            "1d": "1D",
+            "1D": "1D",
+            "1w": "1W",
+            "1W": "1W",
         }
-        okx_interval = interval_map.get(interval, "1m")
-        
-        endpoint = "/api/v5/market/candles"
-        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
+        return interval_map.get(str(interval or "").strip(), "1H")
 
-        params = {
-            "instId": okx_symbol,
-            "bar": okx_interval,
-            "limit": 1
-        }
+    def _klines_cache_key(self, okx_symbol: str, okx_interval: str, limit: int) -> str:
+        return f"{okx_symbol}|{okx_interval}|{int(limit)}"
+
+    async def _fetch_klines_cached(self, okx_symbol: str, okx_interval: str, limit: int) -> List[Dict[str, Any]]:
+        cache_key = self._klines_cache_key(okx_symbol, okx_interval, limit)
+        now = time.time()
+        cached = self._klines_cache.get(cache_key)
+        if cached and (now - float(cached[0])) < self._klines_cache_ttl_s:
+            return list(cached[1])
+
+        inflight = self._klines_inflight.get(cache_key)
+        if inflight is not None and not inflight.done():
+            try:
+                return list(await inflight)
+            except Exception:
+                pass
+
+        async def _do_fetch() -> List[Dict[str, Any]]:
+            endpoint = "/api/v5/market/candles"
+            params = {"instId": okx_symbol, "bar": okx_interval, "limit": int(limit)}
+            data = await self._make_request("GET", endpoint, params)
+            out: List[Dict[str, Any]] = []
+            for candle in data or []:
+                out.append(
+                    {
+                        "timestamp": int(candle[0]),
+                        "open": float(candle[1]),
+                        "high": float(candle[2]),
+                        "low": float(candle[3]),
+                        "close": float(candle[4]),
+                        "volume": float(candle[5]),
+                        "quote_volume": float(candle[7]),
+                    }
+                )
+            self._klines_cache[cache_key] = (time.time(), list(out))
+            return out
+
+        task = asyncio.create_task(_do_fetch())
+        self._klines_inflight[cache_key] = task
+        try:
+            return list(await task)
+        finally:
+            if self._klines_inflight.get(cache_key) is task:
+                self._klines_inflight.pop(cache_key, None)
+    
+    async def get_market_data(self, symbol: str, interval: str = "1m") -> MarketData:
+        """获取市场数据"""
+        okx_interval = self._normalize_okx_interval(interval)
+        
+        okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
         
         try:
-            data = await self._make_request("GET", endpoint, params)
-            if data and len(data) > 0:
-                candle = data[0]
+            klines = await self._fetch_klines_cached(okx_symbol, okx_interval, 1)
+            if klines:
+                candle = klines[0]
                 return MarketData(
                     symbol=symbol,
-                    timestamp=datetime.fromtimestamp(int(candle[0]) / 1000),
-                    open=float(candle[1]),
-                    high=float(candle[2]),
-                    low=float(candle[3]),
-                    close=float(candle[4]),
-                    volume=float(candle[5]),
-                    quote_volume=float(candle[7])
+                    timestamp=datetime.fromtimestamp(int(candle["timestamp"]) / 1000),
+                    open=float(candle["open"]),
+                    high=float(candle["high"]),
+                    low=float(candle["low"]),
+                    close=float(candle["close"]),
+                    volume=float(candle["volume"]),
+                    quote_volume=float(candle["quote_volume"]),
                 )
         except Exception as e:
             logger.debug(f"获取OKX市场数据失败: {symbol} -> {okx_symbol}: {e}")
@@ -1348,41 +1509,12 @@ class OKXExchange(ExchangeBase):
         Returns:
             K线数据列表
         """
-        # OKX的时间间隔格式转换
-        interval_map = {
-            "1m": "1m",
-            "5m": "5m",
-            "15m": "15m",
-            "1h": "1H",
-            "4h": "4H",
-            "1d": "1D"
-        }
-        okx_interval = interval_map.get(interval, "1H")
-        
-        endpoint = "/api/v5/market/candles"
+        okx_interval = self._normalize_okx_interval(interval)
         okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
-
-        params = {
-            "instId": okx_symbol,
-            "bar": okx_interval,
-            "limit": min(limit, 300)
-        }
+        clamped_limit = min(limit, 300)
         
         try:
-            data = await self._make_request("GET", endpoint, params)
-            if data:
-                klines = []
-                for candle in data:
-                    klines.append({
-                        "timestamp": int(candle[0]),
-                        "open": float(candle[1]),
-                        "high": float(candle[2]),
-                        "low": float(candle[3]),
-                        "close": float(candle[4]),
-                        "volume": float(candle[5]),
-                        "quote_volume": float(candle[7])
-                    })
-                return klines
+            return await self._fetch_klines_cached(okx_symbol, okx_interval, clamped_limit)
         except Exception as e:
             logger.debug(f"获取OKX K线数据失败: {symbol} -> {okx_symbol}: {e}")
         return []
@@ -1682,31 +1814,49 @@ class OKXExchange(ExchangeBase):
         """获取资产余额"""
         now = time.time()
         cached_ts, cached_balances = self._balances_cache
-        if cached_balances and (now - cached_ts) < self._balance_cache_ttl_s:
+        if cached_ts > 0 and (now - cached_ts) < self._balance_cache_ttl_s:
             return list(cached_balances)
         endpoint = "/api/v5/account/balance"
-        
-        try:
-            data = await self._make_request("GET", endpoint)
-            balances = []
-            
-            if data and len(data) > 0:
-                for balance_data in data[0].get("details", []):
-                    balances.append(Balance(
-                        asset=balance_data["ccy"],
-                        free=float(balance_data["availEq"]),
-                        locked=float(balance_data["frozenBal"]),
-                        total=float(balance_data["eq"])
-                    ))
-            
-            self._balances_cache = (time.time(), list(balances))
-            return balances
-        except Exception as e:
-            logger.error(f"获取OKX资产余额失败: {e}")
-            if cached_balances:
-                logger.warning("⚠️ 使用余额缓存降级返回（age=%.1fs）", max(0.0, now - cached_ts))
+        if self._private_endpoint_busy_remaining(endpoint) > 0:
+            self._log_private_busy_skip(endpoint, "precheck")
+            if cached_ts > 0:
                 return list(cached_balances)
             return []
+
+        async with self._balances_fetch_lock:
+            now = time.time()
+            cached_ts, cached_balances = self._balances_cache
+            if cached_ts > 0 and (now - cached_ts) < self._balance_cache_ttl_s:
+                return list(cached_balances)
+            if self._private_endpoint_busy_remaining(endpoint) > 0:
+                self._log_private_busy_skip(endpoint, "locked")
+                if cached_ts > 0:
+                    return list(cached_balances)
+                return []
+
+            try:
+                data = await self._make_request("GET", endpoint)
+                balances = []
+
+                if data and len(data) > 0:
+                    for balance_data in data[0].get("details", []):
+                        balances.append(Balance(
+                            asset=balance_data["ccy"],
+                            free=float(balance_data["availEq"]),
+                            locked=float(balance_data["frozenBal"]),
+                            total=float(balance_data["eq"])
+                        ))
+
+                self._balances_cache = (time.time(), list(balances))
+                return balances
+            except Exception as e:
+                if any(code in str(e) for code in ("50001", "50011", "50013")):
+                    self._mark_private_endpoint_busy(endpoint)
+                logger.error(f"获取OKX资产余额失败: {e}")
+                if cached_ts > 0:
+                    logger.warning("⚠️ 使用余额缓存降级返回（age=%.1fs）", max(0.0, now - cached_ts))
+                    return list(cached_balances)
+                return []
     
     async def get_positions(self) -> List[Dict[str, Any]]:
         """
@@ -1715,9 +1865,14 @@ class OKXExchange(ExchangeBase):
         """
         now = time.time()
         cached_ts, cached_positions = self._positions_cache
-        if cached_positions and (now - cached_ts) < self._positions_cache_ttl_s:
+        if cached_ts > 0 and (now - cached_ts) < self._positions_cache_ttl_s:
             return list(cached_positions)
         endpoint = "/api/v5/account/positions"
+        if self._private_endpoint_busy_remaining(endpoint) > 0:
+            self._log_private_busy_skip(endpoint, "precheck")
+            if cached_ts > 0:
+                return list(cached_positions)
+            return []
 
         def _parse_row(pos_data: Dict[str, Any]) -> Dict[str, Any]:
             inst_id = pos_data.get("instId", "") or ""
@@ -1778,66 +1933,100 @@ class OKXExchange(ExchangeBase):
                 if prev is None or parsed["size"] > prev["size"]:
                     bucket[key] = parsed
 
-        last_error: Optional[Exception] = None
-
-        # 关键：不能先把「全量 positions」与 SWAP 再合并。
-        # OKX 全量接口有时仍带已平仓合约的陈旧行；若 SWAP 侧已无该 instId，
-        # 合并后会留下「幽灵仓位」（用户看到的 ETH 等假持仓）。
-        # 原则：U 本位永续以 instType=SWAP 为唯一真相源；仅当 SWAP 请求失败时再降级。
-
-        swap_bucket: Dict[str, Dict[str, Any]] = {}
-        try:
-            data = await self._make_request("GET", endpoint, params={"instType": "SWAP"})
-            _ingest_rows(data, swap_bucket)
-            out = list(swap_bucket.values())
-            try:
-                now = time.time()
-                n = len(out)
-                # only log when count changes or every 60s
-                if self._last_positions_nonzero_count != n or (now - float(self._last_positions_log_ts or 0.0)) >= 60.0:
-                    self._last_positions_nonzero_count = n
-                    self._last_positions_log_ts = now
-                    logger.info("OKX 持仓(SWAP 权威): 非零 %d 条", n)
-                else:
-                    logger.debug("OKX 持仓(SWAP 权威): 非零 %d 条 (log dedup)", n)
-            except Exception:
-                pass
-            self._positions_cache = (time.time(), list(out))
-            return out
-        except Exception as e:
-            last_error = e
-            logger.warning(f"OKX get_positions SWAP 失败，尝试降级: {e}")
-
-        fallback: Dict[str, Dict[str, Any]] = {}
-        for pv in ({"instType": "FUTURES"}, None):
-            try:
-                data = await self._make_request("GET", endpoint, params=pv)
-                _ingest_rows(data, fallback)
-            except Exception as e2:
-                last_error = e2
-                logger.debug(f"OKX get_positions 降级子查询失败 params={pv}: {e2}")
-                continue
-
-        if fallback:
-            out = list(fallback.values())
-            logger.info("OKX 持仓(降级合并 FUTURES/全量): 非零 %d 条", len(out))
-            self._positions_cache = (time.time(), list(out))
-            return out
-        if last_error:
-            logger.error(f"获取OKX持仓信息失败: {last_error}")
-        if cached_positions:
-            age = max(0.0, now - cached_ts)
-            stale_max = float(os.getenv("OPENCLAW_OKX_POSITIONS_STALE_MAX", "45") or "45")
-            if age <= max(1.0, stale_max):
-                logger.warning("⚠️ 使用持仓缓存降级返回（age=%.1fs）", age)
+        async with self._positions_fetch_lock:
+            now = time.time()
+            cached_ts, cached_positions = self._positions_cache
+            if cached_ts > 0 and (now - cached_ts) < self._positions_cache_ttl_s:
                 return list(cached_positions)
-            logger.warning("⚠️ 持仓缓存已过期（age=%.1fs > %.1fs），返回空以避免幽灵仓位", age, stale_max)
-        return []
+            if self._private_endpoint_busy_remaining(endpoint) > 0:
+                self._log_private_busy_skip(endpoint, "locked")
+                if cached_ts > 0:
+                    return list(cached_positions)
+                return []
+
+            last_error: Optional[Exception] = None
+
+            # 关键：不能先把「全量 positions」与 SWAP 再合并。
+            # OKX 全量接口有时仍带已平仓合约的陈旧行；若 SWAP 侧已无该 instId，
+            # 合并后会留下「幽灵仓位」（用户看到的 ETH 等假持仓）。
+            # 原则：U 本位永续以 instType=SWAP 为唯一真相源；仅当 SWAP 请求失败时再降级。
+
+            try:
+                swap_bucket: Dict[str, Dict[str, Any]] = {}
+                data = await self._make_request("GET", endpoint, params={"instType": "SWAP"})
+                _ingest_rows(data, swap_bucket)
+                out = list(swap_bucket.values())
+                try:
+                    now = time.time()
+                    n = len(out)
+                    # only log when count changes or every 60s
+                    if self._last_positions_nonzero_count != n or (now - float(self._last_positions_log_ts or 0.0)) >= 60.0:
+                        self._last_positions_nonzero_count = n
+                        self._last_positions_log_ts = now
+                        logger.info("OKX 持仓(SWAP 权威): 非零 %d 条", n)
+                    else:
+                        logger.debug("OKX 持仓(SWAP 权威): 非零 %d 条 (log dedup)", n)
+                except Exception:
+                    pass
+                self._positions_cache = (time.time(), list(out))
+                return out
+            except Exception as e:
+                last_error = e
+                if any(code in str(e) for code in ("50001", "50011", "50013")):
+                    self._mark_private_endpoint_busy(endpoint)
+                logger.warning(f"OKX get_positions SWAP 失败，尝试降级: {e}")
+
+            fallback: Dict[str, Dict[str, Any]] = {}
+            for pv in ({"instType": "FUTURES"}, None):
+                try:
+                    data = await self._make_request("GET", endpoint, params=pv)
+                    _ingest_rows(data, fallback)
+                except Exception as e2:
+                    last_error = e2
+                    if any(code in str(e2) for code in ("50001", "50011", "50013")):
+                        self._mark_private_endpoint_busy(endpoint)
+                    logger.debug(f"OKX get_positions 降级子查询失败 params={pv}: {e2}")
+                    continue
+
+            if fallback:
+                out = list(fallback.values())
+                logger.info("OKX 持仓(降级合并 FUTURES/全量): 非零 %d 条", len(out))
+                self._positions_cache = (time.time(), list(out))
+                return out
+            if last_error:
+                logger.error(f"获取OKX持仓信息失败: {last_error}")
+            if cached_ts > 0:
+                age = max(0.0, now - cached_ts)
+                stale_max = float(os.getenv("OPENCLAW_OKX_POSITIONS_STALE_MAX", "45") or "45")
+                if age <= max(1.0, stale_max):
+                    logger.warning("⚠️ 使用持仓缓存降级返回（age=%.1fs）", age)
+                    return list(cached_positions)
+                logger.warning("⚠️ 持仓缓存已过期（age=%.1fs > %.1fs），返回空以避免幽灵仓位", age, stale_max)
+            return []
     
     async def get_exchange_info(self) -> ExchangeInfo:
         """获取交易所信息"""
+        now = time.time()
+        cached_ts, cached_info = self._exchange_info_cache
+        if cached_info is not None and (now - float(cached_ts)) < float(self._exchange_info_ttl_s):
+            return cached_info
+
         endpoint = "/api/v5/public/instruments"
-        params = {"instType": "SPOT"}
+        params = {"instType": "SWAP"}
+
+        fallback_supported_symbols = [
+            "BTC/USDT/SWAP",
+            "ETH/USDT/SWAP",
+            "SOL/USDT/SWAP",
+            "BNB/USDT/SWAP",
+            "XRP/USDT/SWAP",
+            "ADA/USDT/SWAP",
+            "DOGE/USDT/SWAP",
+            "AVAX/USDT/SWAP",
+            "DOT/USDT/SWAP",
+            "LINK/USDT/SWAP",
+            "ATOM/USDT/SWAP",
+        ]
         
         try:
             data = await self._make_request("GET", endpoint, params)
@@ -1845,8 +2034,8 @@ class OKXExchange(ExchangeBase):
             supported_symbols = []
             for inst in data:
                 supported_symbols.append(inst["instId"].replace("-", "/"))
-            
-            return ExchangeInfo(
+
+            info = ExchangeInfo(
                 exchange_id="okx",
                 name="OKX",
                 api_url=self.api_url,
@@ -1858,18 +2047,22 @@ class OKXExchange(ExchangeBase):
                     "taker": 0.0015
                 }
             )
+            self._exchange_info_cache = (time.time(), info)
+            return info
         except Exception as e:
             logger.error(f"获取OKX交易所信息失败: {e}")
             # 返回默认信息
-            return ExchangeInfo(
+            info = ExchangeInfo(
                 exchange_id="okx",
                 name="OKX",
                 api_url=self.api_url,
                 ws_url=self.ws_url,
                 rate_limit=20,
-                supported_symbols=[],
+                supported_symbols=fallback_supported_symbols,
                 fee_structure={}
             )
+            self._exchange_info_cache = (time.time(), info)
+            return info
     
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
         """获取交易对信息"""
@@ -1984,13 +2177,19 @@ class OKXExchange(ExchangeBase):
         ):
             max_ms = float(os.getenv("OPENCLAW_OKX_WS_TICKER_MAX_AGE_MS", "3000") or "3000")
             row = hub.get_cached_ticker(okx_symbol, max_age_ms=max_ms)
+            if row is None:
+                warmup_ms = float(os.getenv("OPENCLAW_OKX_WS_TICKER_WARMUP_MS", "800") or "800")
+                deadline = time.time() + max(0.0, warmup_ms) / 1000.0
+                while row is None and time.time() < deadline:
+                    await asyncio.sleep(0.1)
+                    row = hub.get_cached_ticker(okx_symbol, max_age_ms=max_ms)
             _last = float((row or {}).get("last", 0) or 0)
             _bid = float((row or {}).get("bidPx", 0) or 0)
             _ask = float((row or {}).get("askPx", 0) or 0)
             if row and (_last > 0 or _bid > 0 or _ask > 0):
                 sod = float((row or {}).get("sodUtc8", 0) or 0)
                 chg = ((_last - sod) / sod) if (sod > 0 and _last > 0) else 0.0
-                return {
+                out = {
                     "symbol": symbol,
                     "last": _last,
                     "bid": _bid,
@@ -2003,6 +2202,8 @@ class OKXExchange(ExchangeBase):
                     "change_24h": chg,
                     "timestamp": int(row.get("ts", 0) or 0),
                 }
+                self._ticker_cache[okx_symbol] = (time.time(), dict(out))
+                return out
 
             # 若 WS 已启用但缓存暂未命中：优先尝试持仓 mark 价兜底，
             # 避免在“有仓位但无瞬时ticker缓存”时出现“无法获取最新价格”。
@@ -2389,35 +2590,11 @@ class OKXExchange(ExchangeBase):
     
     async def get_swap_klines(self, symbol: str, interval: str = "1H", limit: int = 100) -> List[Dict[str, Any]]:
         """获取永续合约K线数据"""
-        endpoint = "/api/v5/market/candles"
         okx_symbol = self._to_okx_inst_id(symbol, default_type="SWAP")
-        
-        interval_map = {
-            "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-            "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W"
-        }
-        bar = interval_map.get(interval, "1H")
-        
-        params = {
-            "instId": okx_symbol,
-            "bar": bar,
-            "limit": str(limit)
-        }
+        bar = self._normalize_okx_interval(interval)
         
         try:
-            data = await self._make_request("GET", endpoint, params)
-            klines = []
-            
-            for candle in data:
-                klines.append({
-                    "timestamp": int(candle[0]),
-                    "open": float(candle[1]),
-                    "high": float(candle[2]),
-                    "low": float(candle[3]),
-                    "close": float(candle[4]),
-                    "volume": float(candle[5])
-                })
-            
+            klines = await self._fetch_klines_cached(okx_symbol, bar, min(limit, 300))
             return list(reversed(klines))
         except Exception as e:
             logger.error(f"获取永续合约K线失败: {e}")

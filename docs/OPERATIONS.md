@@ -11,7 +11,7 @@
 - **Docker 模式**：继续使用本手册后续 `docker compose` 流程。
 - **裸机模式**（当前常用）：
   - 建议从项目根运行：`python3 run_api.py`（或由 systemd/supervisor 托管）
-  - 对外基址统一为：`http://127.0.0.1:8000`（本机）或实际监听地址
+  - 对外基址统一为：`http://127.0.0.1:8000`（本机）或实际监听地址；**脚本与巡检**建议在 `.env` 或 shell 中设置 **`OPENCLAW_API_BASE`**（优先于历史变量 `ACCEPTANCE_BASE`、`BASE_URL`），与 `src/utils/openclaw_api_client.py` 及 `GET /api/v1/modules/surface/registry` 返回的 **`api_base_env`** 对齐。
   - 若配置了代理，请确认 `NO_PROXY=127.0.0.1,localhost,redis`
   - 禁止把 `host.docker.internal` 写入裸机代理/上游地址
 
@@ -27,9 +27,83 @@ curl -s http://127.0.0.1:8000/api/v1/auth/status
 本页后续所有 `curl` 示例可统一替换为：
 
 ```bash
-BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
-curl -s "$BASE_URL/api/v1/system/health"
+OPENCLAW_API_BASE=${OPENCLAW_API_BASE:-http://127.0.0.1:8000}
+curl -s "$OPENCLAW_API_BASE/api/v1/system/health"
+# 兼容：未设置 OPENCLAW_API_BASE 时仍可使用 BASE_URL
+# BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
 ```
+
+只读巡检的**推荐顺序**以运行中 **`GET .../modules/surface/registry`** 的 **`read_pipeline`** 字段为准（与 `src/modules/api/route_catalog.py` 同源）。
+
+## 0.0 LLM 主模型现状（2026-05-12 起）
+
+当前生产主模型已切换为 **讯飞 Astron Code Latest**（OpenAI 兼容）：
+
+- `model_id`: `astron-code-latest`
+- `base_url`: `https://maas-coding-api.cn-huabei-1.xf-yun.com/v2`
+- `api_key_env`: `XFYUN_ASTRON_API_KEY`
+
+最小检查：
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/ai-models/default
+rg -n "astron-code-latest|maas-coding-api.cn-huabei-1.xf-yun.com" logs/app.log
+```
+
+判读重点：
+
+- 若默认模型仍不是 `astron-code-latest`
+  - 说明交易进程尚未重启或未重新加载模型配置
+- 若日志持续出现 `https://api.deepseek.com/v1/chat/completions` 与 `402 Payment Required`
+  - 说明旧 DeepSeek 路径仍在运行，需确认当前进程是否已切换到新配置
+- 若进程内最小调用返回 `success=true`
+  - 即可认定 Astron 主模型链路已恢复
+
+## 0.1 OKX 专线拓扑（2026-05-12 更新）
+
+当前运行建议将 **OKX** 与 **其他第三方流量** 分开看：
+
+- **普通第三方流量**
+  - 应用全局代理：`http://127.0.0.1:7890`
+  - 典型对象：LLM、新闻、Reddit、部分外部数据源
+
+- **OKX 专用流量**
+  - 应用内 OKX 独立代理变量：
+    - `OPENCLAW_OKX_HTTP_PROXY=http://127.0.0.1:7890`
+    - `OPENCLAW_OKX_HTTPS_PROXY=http://127.0.0.1:7890`
+    - `OPENCLAW_OKX_PROXY_ONLY=1`
+  - `mihomo` 对 `okx.com` / `okx.cab` 走独立 `OKX` 分组
+  - 当前推荐优先级：
+    - `AUTO -> DIRECT`
+  - 说明：
+    - 旧 GCP 本地隧道 `127.0.0.1:17892/17893` 当前未监听
+    - 不再把它们放在 `OKX` 主链路前排，避免 `connect refused` 持续污染交易链路
+
+`mihomo` 当前职责：
+
+- 继续作为全局 mixed-port 出口（`7890`）
+- 但 `okx.com` / `okx.cab` 已在 `OKX` 专用分组中独立分流
+- 当前推荐优先级：
+  - `AUTO -> DIRECT`
+
+### 0.1.1 最小巡检命令
+
+```bash
+curl -s http://127.0.0.1:9090/proxies/OKX
+curl -s http://127.0.0.1:8000/api/v1/system/health
+```
+
+判读重点：
+
+- 若 `system/health` 中出现：
+  - `ClientProxyConnectionError`
+  - `127.0.0.1:17892 connect error`
+  - 说明配置里仍残留旧 GCP 隧道路由，应优先检查 `/etc/mihomo/config.yaml` 与 `.env`
+- 若 `curl /proxies/OKX` 中 `now != AUTO`
+  - 说明 `mihomo` 已把 OKX 回退到次级链路，需要继续检查当前优选节点质量
+- 若 `app.log` 中没有：
+  - `OKX使用环境代理: http://127.0.0.1:7890`
+  - 说明交易进程未吃到当前独立 OKX 代理变量，优先检查 `.env` 与重启是否完成
 
 ---
 
@@ -60,7 +134,7 @@ docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --force
 ./scripts/deploy_production_stack.sh
 ```
 
-全栈网络与健康链（Compose 已起、脚本会进容器抽检）：仓库根执行 `bash scripts/verify_full_stack_network.sh`，以终端输出 **`VERIFY_FULL_STACK=PASS`** 为准。应用侧快照：`GET http://localhost:8000/api/v1/system/acceptance`；轮询脚本：`python3 scripts/startup_acceptance.py`（可用 `ACCEPTANCE_BASE` 改基址）。宿主机 Clash/TUN 与 `host.docker.internal` 说明见 **`deploy/HOST_CLASH_EGRESS.md`**。
+全栈网络与健康链（Compose 已起、脚本会进容器抽检）：仓库根执行 `bash scripts/verify_full_stack_network.sh`，以终端输出 **`VERIFY_FULL_STACK=PASS`** 为准。应用侧快照：`GET http://localhost:8000/api/v1/system/acceptance`；轮询脚本：`python3 scripts/startup_acceptance.py`（基址优先 **`OPENCLAW_API_BASE`**，其次 `ACCEPTANCE_BASE` / `BASE_URL`）。宿主机 Clash/TUN 与 `host.docker.internal` 说明见 **`deploy/HOST_CLASH_EGRESS.md`**。
 
 ### 1.2 仅重载代码（卷挂载）
 
@@ -183,7 +257,7 @@ curl -s http://localhost:8000/api/v1/modules/stop-loss/stats
 - `trade/events` 中出现 `trade.fill`（成交）与 `trade.position`（`sltp.create` / `sltp_stop_loss_triggered` 等）。
 - `production-audit.execution_spine.last_order_*` 与最近动作一致（source/op/symbol/size/success）。
 - `stop-loss/stats` 在触发后计数递增，`active_orders` 与持仓状态一致。
-- `surface/channels` 与 `surface/registry` 返回成功，用于前端与第三方 API 对接配置。
+- `surface/channels` 与 `surface/registry` 返回成功，用于前端与第三方 API 对接配置；其中 **`registry.read_pipeline`** 为推荐只读链顺序，**`registry.api_base_env`** 标明脚本应使用的环境变量优先级。
 
 ### 2.1.1 超时治理与降级观测（2026-04-20 新增）
 

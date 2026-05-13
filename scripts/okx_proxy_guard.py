@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 import urllib.error
@@ -25,11 +26,33 @@ import urllib.request
 OKX_TIME_URL = "https://www.okx.com/api/v5/public/time"
 
 
-def _http_get(url: str, timeout: float = 12.0) -> tuple[bool, float, str]:
+def _pick_proxy(explicit_proxy: str) -> str:
+    if str(explicit_proxy or "").strip():
+        return str(explicit_proxy).strip()
+    for key in (
+        "OPENCLAW_OKX_HTTPS_PROXY",
+        "OPENCLAW_OKX_HTTP_PROXY",
+        "OPENCLAW_HTTPS_PROXY",
+        "OPENCLAW_HTTP_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+    ):
+        val = str(os.getenv(key, "") or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _http_get(url: str, timeout: float = 12.0, proxy: str = "") -> tuple[bool, float, str]:
     t0 = time.perf_counter()
     req = urllib.request.Request(url, headers={"User-Agent": "openclaw-okx-proxy-guard/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = None
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+        with (opener.open(req, timeout=timeout) if opener else urllib.request.urlopen(req, timeout=timeout)) as resp:
             body = resp.read(512)
         ms = (time.perf_counter() - t0) * 1000.0
         ok = (b'"code":"0"' in body) or (b'"code": "0"' in body)
@@ -69,10 +92,10 @@ def _discover_provider_names(controller: str, secret: str) -> list[str]:
     return [str(k) for k in providers.keys() if str(k).strip()]
 
 
-def _run_probe(runs: int, timeout: float) -> dict:
+def _run_probe(runs: int, timeout: float, proxy: str) -> dict:
     rows = []
     for _ in range(max(1, runs)):
-        rows.append(_http_get(OKX_TIME_URL, timeout=timeout))
+        rows.append(_http_get(OKX_TIME_URL, timeout=timeout, proxy=proxy))
     oks = [r[0] for r in rows]
     lat = [r[1] for r in rows if r[0]]
     return {
@@ -88,6 +111,7 @@ def main() -> int:
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--timeout", type=float, default=12.0)
     p.add_argument("--max-latency-ms", type=float, default=1500.0)
+    p.add_argument("--proxy", default="", help="Explicit HTTP(S) proxy URL for OKX probe")
     p.add_argument("--repair", action="store_true", help="When unhealthy, trigger mihomo healthcheck/reload")
     p.add_argument("--mihomo-controller", default="http://127.0.0.1:9090")
     p.add_argument("--mihomo-secret", default="a930ed80f2cfed1c19d49140fa3cffe2")
@@ -95,11 +119,13 @@ def main() -> int:
     p.add_argument("--reload-path", default="/etc/mihomo/generated_from_openclaw.yaml")
     args = p.parse_args()
 
-    probe = _run_probe(args.runs, args.timeout)
+    proxy = _pick_proxy(args.proxy)
+    probe = _run_probe(args.runs, args.timeout, proxy)
     healthy = bool(probe["success_rate"] >= 0.67 and (probe["median_ms"] or 9e9) <= args.max_latency_ms)
 
     report = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "proxy": proxy or None,
         "okx_probe": probe,
         "healthy": healthy,
         "repair_attempted": False,
@@ -175,7 +201,7 @@ def main() -> int:
             }
         )
 
-        probe2 = _run_probe(max(2, args.runs), args.timeout)
+        probe2 = _run_probe(max(2, args.runs), args.timeout, proxy)
         report["okx_probe_after_repair"] = probe2
         report["healthy_after_repair"] = bool(
             probe2["success_rate"] >= 0.67 and (probe2["median_ms"] or 9e9) <= args.max_latency_ms
@@ -187,4 +213,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

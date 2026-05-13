@@ -131,6 +131,14 @@ class ScannerOpportunityGate:
             return ScannerGateResult(False, "empty_symbol", {})
 
         metrics: Dict[str, Any] = {"symbol": sym}
+        try:
+            effective_max_spread = float(self._c("max_spread_bps", 45.0) or 45.0)
+        except Exception:
+            effective_max_spread = 45.0
+        try:
+            effective_min_rr = float(self._c("min_risk_reward", 1.05) or 1.05)
+        except Exception:
+            effective_min_rr = 1.05
         mi_view_bid = None
         mi_view_ask = None
         mi_view_price = None
@@ -171,35 +179,42 @@ class ScannerOpportunityGate:
                     metrics["mi_best_bid"] = mi_view_bid
                 if mi_view_ask and mi_view_ask > 0:
                     metrics["mi_best_ask"] = mi_view_ask
-                if partial or prov == "unknown":
-                    # 只在 gate 未显式配置得更严格时才覆写（尊重用户配置）
-                    try:
-                        cur_spread = float(self._c("max_spread_bps", 45.0) or 45.0)
-                    except Exception:
-                        cur_spread = 45.0
-                    try:
-                        cur_rr = float(self._c("min_risk_reward", 1.05) or 1.05)
-                    except Exception:
-                        cur_rr = 1.05
-                    tightened_spread = min(cur_spread, float(self._c("partial_max_spread_bps", 35.0) or 35.0))
-                    tightened_rr = max(cur_rr, float(self._c("partial_min_risk_reward", 1.15) or 1.15))
-                    self.config["max_spread_bps"] = tightened_spread
-                    self.config["min_risk_reward"] = tightened_rr
-                    metrics["gate_tightened_for_partial"] = True
-                    metrics["tightened_max_spread_bps"] = tightened_spread
-                    metrics["tightened_min_risk_reward"] = tightened_rr
                 if q is not None:
                     try:
                         metrics["mi_quality_score"] = float(q)
                     except Exception:
                         pass
+                # partial 视图不应一律强制收紧。对于 provenance=live 且质量分较高的场景，
+                # 允许沿用显式 gate 配置，避免把“可交易但快照未全量”误判成低质量机会。
+                quality_score = metrics.get("mi_quality_score")
+                try:
+                    quality_score_f = float(quality_score) if quality_score is not None else None
+                except Exception:
+                    quality_score_f = None
+                should_tighten_for_partial = bool(partial or prov == "unknown")
+                if should_tighten_for_partial and prov == "live" and mi_view_price and mi_view_price > 0:
+                    if quality_score_f is not None and quality_score_f >= 0.80:
+                        should_tighten_for_partial = False
+                        metrics["partial_tightening_skipped"] = "live_high_quality"
+                if should_tighten_for_partial:
+                    tightened_spread = min(effective_max_spread, float(self._c("partial_max_spread_bps", 35.0) or 35.0))
+                    tightened_rr = max(effective_min_rr, float(self._c("partial_min_risk_reward", 1.15) or 1.15))
+                    effective_max_spread = tightened_spread
+                    effective_min_rr = tightened_rr
+                    metrics["gate_tightened_for_partial"] = True
+                    metrics["tightened_max_spread_bps"] = tightened_spread
+                    metrics["tightened_min_risk_reward"] = tightened_rr
                 if guards:
                     metrics["mi_guards"] = dict(guards)
                     # 若 gate 本身未显式配置，采用 MI 建议值
                     if "max_spread_bps" not in self.config:
-                        self.config["max_spread_bps"] = guards.get("max_spread_bps_to_trade", self._c("max_spread_bps", 45.0))
+                        effective_max_spread = float(
+                            guards.get("max_spread_bps_to_trade", effective_max_spread) or effective_max_spread
+                        )
                     if "min_risk_reward" not in self.config:
-                        self.config["min_risk_reward"] = guards.get("min_rr_to_trade", self._c("min_risk_reward", 1.05))
+                        effective_min_rr = float(
+                            guards.get("min_rr_to_trade", effective_min_rr) or effective_min_rr
+                        )
                     # 数据质量门槛（若 MI 给出了质量分与阈值建议）
                     try:
                         min_q = float(guards.get("min_quality_score_to_trade", 0) or 0)
@@ -270,7 +285,7 @@ class ScannerOpportunityGate:
         metrics["spread_bps"] = None
         metrics["change_24h"] = chg
 
-        max_spread = float(self._c("max_spread_bps", 45.0) or 0)
+        max_spread = float(effective_max_spread or 0)
         if max_spread > 0 and last > 0 and bid > 0 and ask > 0 and ask >= bid:
             mid = 0.5 * (bid + ask)
             spread_bps = ((ask - bid) / mid) * 10000.0 if mid > 0 else 9999.0
@@ -304,7 +319,7 @@ class ScannerOpportunityGate:
                     metrics,
                 )
 
-        min_rr = float(self._c("min_risk_reward", 1.05) or 0)
+        min_rr = float(effective_min_rr or 0)
         if min_rr > 0:
             rr = _risk_reward_ratio(opportunity)
             metrics["risk_reward"] = round(rr, 4)

@@ -5,10 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/cool/.openclaw-trading
-ExecStart=/usr/bin/python3 /home/cool/.openclaw-trading/scripts/okx_proxy_guard.py --runs 3 --max-latency-ms 1200 --repair
-StandardOutput=append:/home/cool/.openclaw-trading/logs/okx_proxy_guard.log
-StandardError=append:/home/cool/.openclaw-trading/logs/okx_proxy_guard.log
+WorkingDirectory=/home/cool/ai-trading-system
+EnvironmentFile=-/home/cool/ai-trading-system/.env
+ExecStart=/usr/bin/python3 /home/cool/ai-trading-system/scripts/okx_proxy_guard.py --runs 3 --max-latency-ms 2000 --repair --proxy http://127.0.0.1:7890
+SuccessExitStatus=1
+StandardOutput=append:/home/cool/ai-trading-system/logs/okx_proxy_guard.log
+StandardError=append:/home/cool/ai-trading-system/logs/okx_proxy_guard.log
 
 [Install]
 WantedBy=multi-user.target

@@ -7,7 +7,9 @@ import json
 import logging
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,22 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     except Exception:
         pass
     return float(default)
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _load_runtime_json(filename: str) -> Dict[str, Any]:
+    try:
+        runtime_dir = Path(__file__).resolve().parents[3] / "runtime"
+        payload = json.loads((runtime_dir / filename).read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
 
 def init_module_control_api(app, main_controller):
@@ -668,17 +686,38 @@ def init_module_control_api(app, main_controller):
     async def get_trading_symbols():
         """获取交易对配置"""
         blacklist = []
+        selector_payload = None
+        if main_controller and hasattr(main_controller, "dynamic_symbol_selector"):
+            selector = getattr(main_controller, "dynamic_symbol_selector", None)
+            if selector is not None:
+                try:
+                    symbols = await selector.get_trading_symbols()
+                    stats = selector.get_stats() if hasattr(selector, "get_stats") else {}
+                    if symbols:
+                        selector_payload = {
+                            "symbols": symbols,
+                            "blacklist": blacklist,
+                            "message": "dynamic symbol selector active",
+                            "source": "dynamic_symbol_selector",
+                            "selector_stats": stats,
+                        }
+                except Exception:
+                    pass
+        if selector_payload is not None:
+            return selector_payload
         if main_controller and hasattr(main_controller, 'ai_trading_engine'):
             engine = main_controller.ai_trading_engine
             if hasattr(engine, 'symbols'):
                 return {
                     "symbols": engine.symbols,
                     "blacklist": blacklist,
-                    "message": "ETH已允许交易"
+                    "message": "engine symbol config",
+                    "source": "ai_trading_engine",
                 }
         return {
             "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
-            "blacklist": blacklist
+            "blacklist": blacklist,
+            "source": "default_fallback",
         }
     
     @router.post("/trading/symbols/config")
@@ -885,10 +924,13 @@ def init_module_control_api(app, main_controller):
             "min_trade_interval",
             "min_confidence_to_trade",
             "ai_core_min_confidence_to_open",
+            "ai_core_min_confidence_floor",
             "min_data_quality_to_trade",
             "analysis_hard_gate_for_open",
             "analysis_min_confidence_for_open",
             "analysis_require_not_degraded_for_open",
+            "open_allow_snapshot_timeout_fallback",
+            "open_requires_full_snapshot",
             "min_rr_to_trade",
             "max_spread_bps_to_trade",
             "max_abs_depth_imbalance_to_trade",
@@ -904,6 +946,7 @@ def init_module_control_api(app, main_controller):
             "regime_trend_threshold",
             "regime_low_liquidity_spread_bps",
             "regime_profile_overrides",
+            "regime_policy_matrix",
             "pnl_health_sizing_enable",
             "pnl_health_lookback_trades",
             "pnl_health_bad_expectancy",
@@ -1007,6 +1050,8 @@ def init_module_control_api(app, main_controller):
                         "auto_tune_hold_override_allow_relax_without_recent_pnl",
                         "analysis_hard_gate_for_open",
                         "analysis_require_not_degraded_for_open",
+                        "open_allow_snapshot_timeout_fallback",
+                        "open_requires_full_snapshot",
                         "ai_autonomy_minimal_gates_enabled",
                         "ai_autonomy_allow_neutral_with_trend",
                         "ai_autonomy_require_trend_alignment",
@@ -1031,6 +1076,7 @@ def init_module_control_api(app, main_controller):
                         "auto_tune_hold_override_min_abs_sentiment_bounds",
                         "auto_tune_hold_override_min_mi_quality_score_bounds",
                         "regime_profile_overrides",
+                        "regime_policy_matrix",
                     ):
                         ai_core.config[k] = v
                         applied[k] = v
@@ -1327,8 +1373,43 @@ def init_module_control_api(app, main_controller):
         if main_controller:
             if hasattr(main_controller, 'ai_memory_manager') and main_controller.ai_memory_manager:
                 mem = main_controller.ai_memory_manager
-                # 兼容旧版内存管理器(list字段)与新版网关(get_stats接口)
                 if hasattr(mem, "get_stats"):
+                    try:
+                        raw = mem.get_stats() or {}
+                        if isinstance(raw, dict):
+                            backend = raw.get("backend") if isinstance(raw.get("backend"), dict) else {}
+                            quality = raw.get("quality") if isinstance(raw.get("quality"), dict) else {}
+                            by_layer = quality.get("by_layer") if isinstance(quality.get("by_layer"), dict) else {}
+                            by_category = quality.get("by_category") if isinstance(quality.get("by_category"), dict) else {}
+                            stats["short_term_count"] = int(
+                                by_layer.get("working", 0)
+                                or backend.get("by_layer", {}).get("working", 0)
+                                or raw.get("short_term_count", raw.get("short_term", 0))
+                                or 0
+                            )
+                            stats["long_term_count"] = int(
+                                by_layer.get("experience", 0)
+                                or backend.get("by_layer", {}).get("experience", 0)
+                                or raw.get("long_term_count", raw.get("long_term", 0))
+                                or 0
+                            )
+                            stats["trade_records"] = int(
+                                quality.get("trade_record_total", 0)
+                                or by_category.get("trade_record", 0)
+                                or backend.get("by_category", {}).get("trade_record", 0)
+                                or raw.get("trade_records", raw.get("trades", 0))
+                                or 0
+                            )
+                            stats["risk_events"] = int(
+                                by_category.get("risk_event", 0)
+                                or backend.get("by_category", {}).get("risk_event", 0)
+                                or raw.get("risk_events", raw.get("risks", 0))
+                                or 0
+                            )
+                    except Exception:
+                        pass
+                # 兼容旧版内存管理器(list字段)与新版网关(get_stats接口)
+                if stats["short_term_count"] == 0 and hasattr(mem, "get_stats"):
                     try:
                         raw = mem.get_stats() or {}
                         if isinstance(raw, dict):
@@ -1506,6 +1587,36 @@ def init_module_control_api(app, main_controller):
                         continue
                     clean_rows.append(r)
 
+                def _infer_regime_from_trade(r: Dict[str, Any]) -> Dict[str, Any]:
+                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                    mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+                    direct = (
+                        mkt.get("regime")
+                        or md.get("regime")
+                        or md.get("market_regime")
+                        or r.get("market_regime")
+                        or ""
+                    )
+                    direct_s = str(direct or "").strip().lower()
+                    if direct_s and direct_s != "unknown":
+                        return {"regime": direct_s, "inferred": False}
+
+                    strategy = str(
+                        md.get("strategy_id")
+                        or md.get("strategy_used")
+                        or r.get("strategy")
+                        or ""
+                    ).strip().lower()
+                    reasoning = str(r.get("reasoning") or "").strip().lower()
+                    text = f"{strategy} {reasoning}"
+                    if any(k in text for k in ("trend", "breakout", "momentum", "bull", "bear")):
+                        return {"regime": "trend", "inferred": True}
+                    if any(k in text for k in ("support", "resistance", "mean_reversion", "sr_near")):
+                        return {"regime": "range", "inferred": True}
+                    if any(k in text for k in ("stop_loss", "volatility", "spike")):
+                        return {"regime": "volatile", "inferred": True}
+                    return {"regime": "unknown", "inferred": False}
+
                 # Attribution grouped by regime
                 grp: Dict[str, Dict[str, Any]] = {}
                 with_regime = 0
@@ -1515,7 +1626,7 @@ def init_module_control_api(app, main_controller):
                 for r in clean_rows:
                     md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
                     mkt = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
-                    regime = str(mkt.get("regime") or "unknown").strip().lower() or "unknown"
+                    regime = str((_infer_regime_from_trade(r) or {}).get("regime") or "unknown").strip().lower() or "unknown"
                     if regime and regime != "unknown":
                         with_regime += 1
                     if mkt.get("effective_qty_factor") is not None:
@@ -3264,6 +3375,104 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             out["analysis_pipeline_assessment_error"] = str(e)
 
+        # 5.2) Entry timing diagnosis: HOLD tags + rejected open reasons (especially SR timing)
+        try:
+            etd: Dict[str, Any] = {}
+            core = getattr(mc, "ai_core", None)
+            dts = getattr(mc, "decision_trace_store", None)
+            if dts and hasattr(dts, "analyze_recent"):
+                ana = dts.analyze_recent(limit=120) or {}
+                top_hold_tags = ana.get("top_hold_reason_tags") if isinstance(ana, dict) else []
+                etd["hold_trace_summary"] = (ana.get("summary") if isinstance(ana, dict) else {}) or {}
+                etd["top_hold_reason_tags"] = top_hold_tags or []
+                hold_tag_map = {
+                    "mtf_conflict": "多周期冲突",
+                    "low_confidence": "置信度不足",
+                    "quality_insufficient": "数据质量不足",
+                    "trend_misalignment": "趋势不一致",
+                    "evidence_incomplete": "证据不完整",
+                    "neutral_market": "中性/震荡市况",
+                    "llm_unavailable_fallback": "LLM降级回退",
+                    "no_sr_entry_trigger": "未出现SR入场触发",
+                }
+                etd["top_hold_reason_labels"] = [
+                    {
+                        "key": str(item.get("key") or ""),
+                        "label": hold_tag_map.get(str(item.get("key") or ""), str(item.get("key") or "")),
+                        "count": int(item.get("count", 0) or 0),
+                    }
+                    for item in (top_hold_tags or [])
+                    if isinstance(item, dict)
+                ]
+
+            rejected_rows = list(getattr(core, "_rejected_signals", []) or []) if core is not None else []
+            recent_rejected = rejected_rows[-120:]
+            reason_counts: Dict[str, int] = {}
+            reason_samples: Dict[str, List[Dict[str, Any]]] = {}
+            for row in recent_rejected:
+                if not isinstance(row, dict):
+                    continue
+                reason = str(row.get("reason") or "unknown")
+                reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+                reason_samples.setdefault(reason, [])
+                if len(reason_samples[reason]) < 3:
+                    reason_samples[reason].append(
+                        {
+                            "ts": row.get("ts"),
+                            "symbol": row.get("symbol"),
+                            "side": row.get("side"),
+                            "confidence": row.get("confidence"),
+                            "entry_price": row.get("entry_price"),
+                            "extras": row.get("extras") if isinstance(row.get("extras"), dict) else {},
+                        }
+                    )
+            reason_label_map = {
+                "sr_entry_confirmation_missing_long": "多头缺少SR入场确认",
+                "sr_entry_confirmation_missing_short": "空头缺少SR入场确认",
+                "sr_timing_long_near_resistance": "多头贴近阻力未突破",
+                "sr_timing_short_near_support": "空头贴近支撑未跌破",
+                "same_direction_ratio_rejected": "同向集中度过高",
+                "loss_streak_cooldown_active": "连亏冷却中",
+                "loss_streak_cooldown_triggered": "触发连亏冷却",
+            }
+            top_rejected_reasons = [
+                {
+                    "key": key,
+                    "label": reason_label_map.get(key, key),
+                    "count": int(count),
+                    "samples": reason_samples.get(key, [])[:3],
+                }
+                for key, count in sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            ]
+            sr_keys = {
+                "sr_entry_confirmation_missing_long",
+                "sr_entry_confirmation_missing_short",
+                "sr_timing_long_near_resistance",
+                "sr_timing_short_near_support",
+            }
+            sr_reason_total = sum(int(reason_counts.get(k, 0) or 0) for k in sr_keys)
+            etd["rejected_signal_window"] = {
+                "sample_size": len(recent_rejected),
+                "top_reasons": top_rejected_reasons,
+                "sr_related_rejections": sr_reason_total,
+            }
+            if sr_reason_total > 0:
+                etd["summary"] = (
+                    f"最近拒单里 SR 择时相关原因 {sr_reason_total} 次，"
+                    "说明当前系统已开始把“位置不对”与“证据不足”分开。"
+                )
+            elif top_rejected_reasons:
+                lead = top_rejected_reasons[0]
+                etd["summary"] = (
+                    f"最近拒单主因是 {lead.get('label')}（{lead.get('count')} 次），"
+                    "可优先围绕该原因调参。"
+                )
+            else:
+                etd["summary"] = "最近窗口没有明显的开仓拒单样本。"
+            out["entry_timing_diagnosis"] = etd
+        except Exception as e:
+            out["entry_timing_diagnosis_error"] = str(e)
+
         # 6) 自动总结的“经验教训”与建议（轻量，避免误导）
         try:
             core = getattr(mc, "ai_core", None)
@@ -3736,6 +3945,507 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
+    @router.get("/commander/closed-loop-summary")
+    async def commander_closed_loop_summary(trace_limit: int = 120):
+        """
+        交易闭环摘要：
+        - 信号/门控/执行/持仓/退出/收益 的一页式诊断
+        - 优先面向运行中系统的优化排查，而不是纯历史报表
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            mc = main_controller
+            store = getattr(mc, "decision_trace_store", None)
+            traces = store.analyze_recent(limit=int(trace_limit or 120)) if (store and hasattr(store, "analyze_recent")) else {}
+            summary = traces.get("summary", {}) if isinstance(traces, dict) else {}
+            recent = traces.get("recent", []) if isinstance(traces, dict) else []
+
+            watch = _load_runtime_json("realtime_watch.latest.json")
+            analysis = watch.get("analysis", {}) if isinstance(watch.get("analysis"), dict) else {}
+            latest_trade = analysis.get("latest_trade", {}) if isinstance(analysis.get("latest_trade"), dict) else {}
+            best_regime = analysis.get("best_regime", {}) if isinstance(analysis.get("best_regime"), dict) else {}
+            worst_regime = analysis.get("worst_regime", {}) if isinstance(analysis.get("worst_regime"), dict) else {}
+            symbol_summaries = analysis.get("symbol_summaries", []) if isinstance(analysis.get("symbol_summaries"), list) else []
+            ai_core = getattr(mc, "ai_core", None)
+            rejected_rows = list(getattr(ai_core, "_rejected_signals", []) or []) if ai_core is not None else []
+            recent_advisory_rows = [
+                row for row in reversed(rejected_rows[-120:])
+                if isinstance(row, dict) and str(row.get("reason") or "") == "regime_advisory_only_rejected"
+            ]
+            llm_manager = getattr(mc, "enhanced_llm_manager", None) or (getattr(ai_core, "llm", None) if ai_core is not None else None)
+            sltp = getattr(mc, "stop_loss_manager", None)
+            sltp_stats = sltp.get_stats() if (sltp and hasattr(sltp, "get_stats")) else {}
+
+            gateway = getattr(mc, "execution_gateway", None)
+            gateway_snapshot = await gateway.get_snapshot() if (gateway and hasattr(gateway, "get_snapshot")) else {}
+            policy_metrics = gateway_snapshot.get("policy_metrics", {}) if isinstance(gateway_snapshot, dict) else {}
+            reconciliation = gateway_snapshot.get("reconciliation", {}) if isinstance(gateway_snapshot, dict) else {}
+            recon_summary = reconciliation.get("summary", {}) if isinstance(reconciliation, dict) else {}
+
+            monitor_summary = {}
+            try:
+                from src.modules.api.monitoring_api import get_monitoring_summary
+                monitor_summary = await get_monitoring_summary()
+            except Exception:
+                monitor_summary = {}
+
+            reason_counter: Counter[str] = Counter()
+            stage_counter: Counter[str] = Counter()
+            symbol_counter: Counter[str] = Counter()
+            hold_tag_counter: Counter[str] = Counter()
+            hold_symbol_counter: Counter[str] = Counter()
+            hold_regime_counter: Counter[str] = Counter()
+            hold_strategy_counter: Counter[str] = Counter()
+            hold_fallback_reason_counter: Counter[str] = Counter()
+            hold_fallback_model_counter: Counter[str] = Counter()
+            hold_recent_samples: List[Dict[str, Any]] = []
+            hold_fallback_count = 0
+            for row in recent:
+                if not isinstance(row, dict):
+                    continue
+                guard = row.get("guard", {}) if isinstance(row.get("guard"), dict) else {}
+                reason = str(guard.get("reason") or row.get("reason") or "unknown")
+                stage = str(guard.get("stage") or row.get("stage") or "unknown")
+                symbol = str(row.get("symbol") or "unknown")
+                reason_counter[reason] += 1
+                stage_counter[stage] += 1
+                symbol_counter[symbol] += 1
+                if reason == "hold_by_ai_decision":
+                    guard_extras = guard.get("extras") if isinstance(guard.get("extras"), dict) else {}
+                    intent = row.get("intent") if isinstance(row.get("intent"), dict) else {}
+                    intent_extras = intent.get("extras") if isinstance(intent.get("extras"), dict) else {}
+                    extras = guard_extras or intent_extras
+                    hold_tags = extras.get("hold_reason_tags") if isinstance(extras.get("hold_reason_tags"), dict) else {}
+                    sr_snapshot = extras.get("sr_snapshot") if isinstance(extras.get("sr_snapshot"), dict) else {}
+                    regime = str(extras.get("regime") or extras.get("market_regime") or "unknown")
+                    strategy_used = str(intent.get("strategy_used") or extras.get("strategy_used") or "")
+                    reasoning_excerpt = str(extras.get("reasoning_excerpt") or intent.get("reasoning") or "")
+                    llm_failure_reason = str(extras.get("llm_failure_reason") or "")
+                    llm_model_id = str(extras.get("llm_model_id") or "")
+                    hold_symbol_counter[symbol] += 1
+                    hold_regime_counter[regime] += 1
+                    hold_strategy_counter[strategy_used or "unknown"] += 1
+                    for tag_name, enabled in hold_tags.items():
+                        if bool(enabled):
+                            hold_tag_counter[str(tag_name)] += 1
+                    if (
+                        bool(hold_tags.get("llm_unavailable_fallback", False))
+                        or "llm_unavailable_fallback" in reasoning_excerpt.lower()
+                        or "fallback" in strategy_used.lower()
+                    ):
+                        hold_fallback_count += 1
+                        hold_fallback_reason_counter[llm_failure_reason or "unknown"] += 1
+                        hold_fallback_model_counter[llm_model_id or "unknown"] += 1
+                    if len(hold_recent_samples) < 10:
+                        hold_recent_samples.append(
+                            {
+                                "ts": row.get("updated_at") or row.get("created_at"),
+                                "symbol": symbol,
+                                "side": row.get("side"),
+                                "confidence": intent.get("confidence"),
+                                "risk_level": extras.get("risk_level"),
+                                "strategy_used": strategy_used,
+                                "regime": regime,
+                                "reasoning_excerpt": reasoning_excerpt,
+                                "llm_fallback_kind": extras.get("llm_fallback_kind"),
+                                "llm_failure_reason": llm_failure_reason or None,
+                                "llm_error_code": extras.get("llm_error_code"),
+                                "llm_model_id": llm_model_id or None,
+                                "llm_provider": extras.get("llm_provider"),
+                                "llm_latency_ms": extras.get("llm_latency_ms"),
+                                "active_tags": [str(k) for k, enabled in hold_tags.items() if bool(enabled)],
+                                "sr_trigger_present": not bool(hold_tags.get("no_sr_entry_trigger", False)),
+                                "sr_snapshot": sr_snapshot,
+                            }
+                        )
+
+            top_reject_reasons = [
+                {"reason": k, "count": int(v)}
+                for k, v in reason_counter.most_common(8)
+            ]
+            top_reject_symbols = [
+                {"symbol": k, "count": int(v)}
+                for k, v in symbol_counter.most_common(8)
+            ]
+            top_reject_stages = [
+                {"stage": k, "count": int(v)}
+                for k, v in stage_counter.most_common(8)
+            ]
+            top_hold_tags = [
+                {"tag": k, "count": int(v)}
+                for k, v in hold_tag_counter.most_common(8)
+            ]
+            top_hold_symbols = [
+                {"symbol": k, "count": int(v)}
+                for k, v in hold_symbol_counter.most_common(8)
+            ]
+            top_hold_regimes = [
+                {"regime": k, "count": int(v)}
+                for k, v in hold_regime_counter.most_common(8)
+            ]
+            top_hold_strategies = [
+                {"strategy_used": k, "count": int(v)}
+                for k, v in hold_strategy_counter.most_common(8)
+            ]
+            top_fallback_reasons = [
+                {"reason": k, "count": int(v)}
+                for k, v in hold_fallback_reason_counter.most_common(8)
+            ]
+            top_fallback_models = [
+                {"model_id": k, "count": int(v)}
+                for k, v in hold_fallback_model_counter.most_common(8)
+            ]
+            hold_total = int(sum(hold_symbol_counter.values()))
+            hold_fallback_ratio = float(hold_fallback_count) / float(hold_total) if hold_total > 0 else 0.0
+            llm_diag: Dict[str, Any] = {}
+            try:
+                if llm_manager is not None:
+                    task_map = getattr(llm_manager, "task_model_mapping", {}) or {}
+                    decision_model_order: List[str] = []
+                    for task_key, model_ids in task_map.items():
+                        task_name = str(getattr(task_key, "value", task_key) or "")
+                        if task_name == "decision_making" and isinstance(model_ids, list):
+                            decision_model_order = [str(mid) for mid in model_ids]
+                            break
+                    raw_unhealthy = getattr(llm_manager, "_unhealthy_until", {}) or {}
+                    active_circuit_breaks: List[Dict[str, Any]] = []
+                    now_ts = time.time()
+                    if isinstance(raw_unhealthy, dict):
+                        for model_id, until_ts in raw_unhealthy.items():
+                            remaining = max(0.0, float(until_ts or 0.0) - now_ts)
+                            if remaining > 0:
+                                active_circuit_breaks.append(
+                                    {
+                                        "model_id": str(model_id),
+                                        "seconds_remaining": round(remaining, 1),
+                                    }
+                                )
+                    usage_rows: List[Dict[str, Any]] = []
+                    usage_stats = llm_manager.get_usage_stats() if hasattr(llm_manager, "get_usage_stats") else {}
+                    if isinstance(usage_stats, dict):
+                        for model_id, stat in usage_stats.items():
+                            total_calls = _safe_int(getattr(stat, "total_calls", 0))
+                            success_calls = _safe_int(getattr(stat, "successful_calls", 0))
+                            success_rate = (float(success_calls) / float(total_calls)) if total_calls > 0 else 0.0
+                            usage_rows.append(
+                                {
+                                    "model_id": str(model_id),
+                                    "total_calls": total_calls,
+                                    "successful_calls": success_calls,
+                                    "failed_calls": _safe_int(getattr(stat, "failed_calls", 0)),
+                                    "success_rate": round(success_rate, 4),
+                                    "avg_latency_ms": round(_safe_float(getattr(stat, "avg_latency_ms", 0.0)), 1),
+                                }
+                            )
+                    usage_rows.sort(key=lambda x: (-x["total_calls"], x["model_id"]))
+                    llm_diag = {
+                        "default_model": str(getattr(llm_manager, "default_model", "") or ""),
+                        "decision_model_order": decision_model_order,
+                        "active_circuit_breaks": active_circuit_breaks,
+                        "usage": usage_rows[:8],
+                    }
+            except Exception:
+                llm_diag = {}
+
+            tp_net_edge_suppressed = _safe_int(
+                (sltp_stats or {}).get("tp_net_edge_suppressed", analysis.get("tp_net_edge_suppressed", 0))
+            )
+            opportunities_blocked = {
+                "guard_rejected": _safe_int(summary.get("guard_rejected", 0)),
+                "guard_passed": _safe_int(summary.get("guard_passed", 0)),
+                "execution_success": _safe_int(summary.get("execution_success", 0)),
+                "execution_failed": _safe_int(summary.get("execution_failed", 0)),
+                "reconciliation_blocked": _safe_int(summary.get("reconciliation_blocked", 0)),
+                "rr_rejected": _safe_int(analysis.get("rr_rejected", 0)),
+                "sr_timing_rejected": _safe_int(analysis.get("sr_timing_rejected", 0)),
+                "open_evidence_rejected": _safe_int(analysis.get("open_evidence_rejected", 0)),
+                "regime_advisory_only_rejected": _safe_int(analysis.get("regime_advisory_only_rejected", 0)),
+                "tp_net_edge_suppressed": tp_net_edge_suppressed,
+            }
+            tp_suppressed_by_regime_raw = (
+                (sltp_stats or {}).get("tp_net_edge_suppressed_by_regime")
+                or analysis.get("tp_net_edge_suppressed_by_regime", {})
+            )
+            tp_suppressed_by_reason_raw = (
+                (sltp_stats or {}).get("tp_net_edge_suppressed_by_reason")
+                or analysis.get("tp_net_edge_suppressed_by_reason", {})
+            )
+            tp_suppressed_by_regime = (
+                {
+                    str(k): _safe_int(v)
+                    for k, v in tp_suppressed_by_regime_raw.items()
+                    if _safe_int(v) > 0
+                }
+                if isinstance(tp_suppressed_by_regime_raw, dict)
+                else {}
+            )
+            tp_suppressed_by_reason = (
+                {
+                    str(k): _safe_int(v)
+                    for k, v in tp_suppressed_by_reason_raw.items()
+                    if _safe_int(v) > 0
+                }
+                if isinstance(tp_suppressed_by_reason_raw, dict)
+                else {}
+            )
+            tp_top_regimes = [
+                {"regime": k, "count": int(v)}
+                for k, v in sorted(tp_suppressed_by_regime.items(), key=lambda kv: int(kv[1]), reverse=True)[:5]
+            ]
+            tp_top_reasons = [
+                {"reason": k, "count": int(v)}
+                for k, v in sorted(tp_suppressed_by_reason.items(), key=lambda kv: int(kv[1]), reverse=True)[:5]
+            ]
+            tp_recent_events = (
+                (sltp_stats or {}).get("tp_edge_recent_events")
+                if isinstance((sltp_stats or {}).get("tp_edge_recent_events"), list)
+                else analysis.get("tp_edge_recent_events")
+            )
+            tp_recent_samples = list(tp_recent_events or [])[-10:]
+            tp_recent_by_regime: Counter[str] = Counter()
+            tp_recent_by_reason: Counter[str] = Counter()
+            for row in tp_recent_samples:
+                if not isinstance(row, dict):
+                    continue
+                tp_recent_by_regime[str(row.get("regime") or "unknown")] += 1
+                tp_recent_by_reason[str(row.get("reason") or "unknown")] += 1
+            tp_recent_top_regimes = [
+                {"regime": k, "count": int(v)}
+                for k, v in tp_recent_by_regime.most_common(5)
+            ]
+            tp_recent_top_reasons = [
+                {"reason": k, "count": int(v)}
+                for k, v in tp_recent_by_reason.most_common(5)
+            ]
+            advisory_symbol_counts: Counter[str] = Counter()
+            advisory_recent_samples: List[Dict[str, Any]] = []
+            for row in recent_advisory_rows:
+                symbol = str(row.get("symbol") or "unknown")
+                advisory_symbol_counts[symbol] += 1
+                if len(advisory_recent_samples) < 10:
+                    extras = row.get("extras") if isinstance(row.get("extras"), dict) else {}
+                    advisory_recent_samples.append(
+                        {
+                            "ts": row.get("ts"),
+                            "symbol": symbol,
+                            "side": row.get("side"),
+                            "confidence": row.get("confidence"),
+                            "entry_price": row.get("entry_price"),
+                            "regime": str(extras.get("regime") or "unknown"),
+                        }
+                    )
+            advisory_top_symbols = [
+                {"symbol": k, "count": int(v)}
+                for k, v in advisory_symbol_counts.most_common(5)
+            ]
+
+            realized_perf = {
+                "best_regime": best_regime,
+                "worst_regime": worst_regime,
+                "equity": _safe_float(analysis.get("equity")),
+                "position_count": _safe_int(analysis.get("position_count", 0)),
+                "latest_trade": latest_trade,
+            }
+
+            monitoring_gap = {
+                "monitoring_total_trades": _safe_int(monitor_summary.get("total_trades", 0)) if isinstance(monitor_summary, dict) else 0,
+                "strategy_perf_sources": len((monitor_summary.get("strategies") or [])) if isinstance(monitor_summary, dict) else 0,
+                "latest_trade_present_in_runtime_watch": bool(latest_trade),
+            }
+
+            optimization_hints: List[Dict[str, Any]] = []
+            if monitoring_gap["monitoring_total_trades"] == 0 and latest_trade:
+                optimization_hints.append(
+                    {
+                        "priority": "high",
+                        "area": "observability",
+                        "issue": "监控口径未接入真实成交闭环",
+                        "evidence": {
+                            "monitoring_total_trades": monitoring_gap["monitoring_total_trades"],
+                            "runtime_latest_trade_id": latest_trade.get("trade_id"),
+                        },
+                        "recommendation": "将 runtime_watch / 历史成交源回填到 monitoring_api 的 trades/strategies 汇总，避免收益面板空白。",
+                    }
+                )
+            if worst_regime and _safe_float(worst_regime.get("total_pnl")) < 0:
+                optimization_hints.append(
+                    {
+                        "priority": "high",
+                        "area": "strategy_regime",
+                        "issue": "波动 regime 持续亏损",
+                        "evidence": {
+                            "regime": worst_regime.get("regime"),
+                            "total_trades": _safe_int(worst_regime.get("total_trades", 0)),
+                            "win_rate": _safe_float(worst_regime.get("win_rate")),
+                            "total_pnl": _safe_float(worst_regime.get("total_pnl")),
+                            "expectancy": _safe_float(worst_regime.get("expectancy")),
+                        },
+                        "recommendation": "对 volatile regime 降杠杆/降仓位，或直接切换到 advisory-only，直到该 regime 的 expectancy 回正。",
+                    }
+                )
+            if opportunities_blocked["regime_advisory_only_rejected"] > 0:
+                optimization_hints.append(
+                    {
+                        "priority": "medium",
+                        "area": "execution_guard",
+                        "issue": "volatile regime 已进入 advisory-only 拦截",
+                        "evidence": {
+                            "regime_advisory_only_rejected": opportunities_blocked["regime_advisory_only_rejected"],
+                            "top_symbols": advisory_top_symbols,
+                        },
+                        "recommendation": "继续观察被拦截样本是否集中在 volatile；若后续 expectancy 回正，再逐步恢复小仓试单。",
+                    }
+                )
+            tp_recent_suppressed = len(tp_recent_samples)
+            if tp_recent_suppressed >= 10:
+                top_regime = tp_recent_top_regimes[0] if tp_recent_top_regimes else {}
+                optimization_hints.append(
+                    {
+                        "priority": "medium",
+                        "area": "exit_logic",
+                        "issue": "近期止盈净收益门槛抑制次数偏高",
+                        "evidence": {
+                            "recent_window_count": tp_recent_suppressed,
+                            "top_regimes": tp_recent_top_regimes,
+                            "top_reasons": tp_recent_top_reasons,
+                            "lifetime_total": opportunities_blocked["tp_net_edge_suppressed"],
+                        },
+                        "recommendation": (
+                            f"优先复核 {top_regime.get('regime', 'top regime')} 的 TP 分层和 min_net 阈值，"
+                            "避免小盈利长期无法兑现，资金占用过久。"
+                        ),
+                    }
+                )
+            if best_regime and worst_regime and str(best_regime.get("regime")) != str(worst_regime.get("regime")):
+                optimization_hints.append(
+                    {
+                        "priority": "medium",
+                        "area": "capital_allocation",
+                        "issue": "不同 regime 收益差异大",
+                        "evidence": {
+                            "best_regime": {
+                                "name": best_regime.get("regime"),
+                                "pnl": _safe_float(best_regime.get("total_pnl")),
+                                "win_rate": _safe_float(best_regime.get("win_rate")),
+                            },
+                            "worst_regime": {
+                                "name": worst_regime.get("regime"),
+                                "pnl": _safe_float(worst_regime.get("total_pnl")),
+                                "win_rate": _safe_float(worst_regime.get("win_rate")),
+                            },
+                        },
+                        "recommendation": "把仓位和开仓预算向正 expectancy regime 倾斜，负 expectancy regime 只保留试探仓。",
+                    }
+                )
+            if hold_fallback_count >= 3:
+                optimization_hints.append(
+                    {
+                        "priority": "high",
+                        "area": "llm_availability",
+                        "issue": "部分 hold 由 LLM 不可用回退触发",
+                        "evidence": {
+                            "fallback_hold_count": hold_fallback_count,
+                            "fallback_hold_ratio": round(hold_fallback_ratio, 4),
+                            "hold_total": hold_total,
+                            "top_fallback_reasons": top_fallback_reasons[:5],
+                            "top_fallback_models": top_fallback_models[:5],
+                            "top_hold_strategies": top_hold_strategies[:5],
+                        },
+                        "recommendation": "优先排查 LLM 可用性、超时和 provider 降级，否则会把系统性 fallback 误判成策略过于保守。",
+                    }
+                )
+            if llm_diag.get("active_circuit_breaks"):
+                top_break = (llm_diag.get("active_circuit_breaks") or [{}])[0]
+                optimization_hints.append(
+                    {
+                        "priority": "high",
+                        "area": "llm_routing",
+                        "issue": "决策模型存在活跃熔断",
+                        "evidence": {
+                            "default_model": llm_diag.get("default_model"),
+                            "decision_model_order": llm_diag.get("decision_model_order"),
+                            "active_circuit_breaks": llm_diag.get("active_circuit_breaks"),
+                        },
+                        "recommendation": (
+                            f"优先处理 {top_break.get('model_id', 'primary model')} 的连通性；"
+                            "若短期内仍频繁熔断，可把 decision_making 前置到更稳的模型。"
+                        ),
+                    }
+                )
+            if _safe_int(recon_summary.get("drift_total", 0)) > 0:
+                optimization_hints.append(
+                    {
+                        "priority": "high",
+                        "area": "execution_reconciliation",
+                        "issue": "本地与交易所持仓存在漂移",
+                        "evidence": {"reconciliation": recon_summary},
+                        "recommendation": "先修正持仓漂移，再谈收益优化，否则收益统计和止盈止损判断都不可信。",
+                    }
+                )
+
+            out = {
+                "loop_health": {
+                    "verdict": analysis.get("verdict", "unknown"),
+                    "risk_level": analysis.get("risk_level", "unknown"),
+                    "running_modules": _safe_int(analysis.get("running_modules", 0)),
+                    "active_alerts": _safe_int(analysis.get("active_alerts", 0)),
+                    "active_orders": _safe_int(analysis.get("active_orders", 0)),
+                    "position_count": _safe_int(analysis.get("position_count", 0)),
+                    "equity": _safe_float(analysis.get("equity")),
+                },
+                "signal_and_guard": {
+                    "decision_traces_summary": summary,
+                    "top_reject_reasons": top_reject_reasons,
+                    "top_reject_symbols": top_reject_symbols,
+                    "top_reject_stages": top_reject_stages,
+                    "hold_diagnostics": {
+                        "top_tags": top_hold_tags,
+                        "top_symbols": top_hold_symbols,
+                        "top_regimes": top_hold_regimes,
+                        "top_strategies": top_hold_strategies,
+                        "top_fallback_reasons": top_fallback_reasons,
+                        "top_fallback_models": top_fallback_models,
+                        "fallback_hold_count": hold_fallback_count,
+                        "fallback_hold_ratio": round(hold_fallback_ratio, 4),
+                        "hold_total": hold_total,
+                        "recent_samples": hold_recent_samples,
+                    },
+                    "current_symbol_bias": symbol_summaries,
+                },
+                "execution_and_reconciliation": {
+                    "policy_metrics": policy_metrics,
+                    "reconciliation_summary": recon_summary,
+                },
+                "exit_and_profitability": {
+                    "realized_performance": realized_perf,
+                    "opportunity_blocks": opportunities_blocked,
+                    "regime_advisory_only": {
+                        "top_symbols": advisory_top_symbols,
+                        "recent_samples": advisory_recent_samples,
+                    },
+                    "tp_edge_suppression": {
+                        "recent_window_count": tp_recent_suppressed,
+                        "recent_by_regime": dict(tp_recent_by_regime),
+                        "recent_by_reason": dict(tp_recent_by_reason),
+                        "recent_top_regimes": tp_recent_top_regimes,
+                        "recent_top_reasons": tp_recent_top_reasons,
+                        "lifetime_total": opportunities_blocked["tp_net_edge_suppressed"],
+                        "by_regime": tp_suppressed_by_regime,
+                        "by_reason": tp_suppressed_by_reason,
+                        "top_regimes": tp_top_regimes,
+                        "top_reasons": tp_top_reasons,
+                        "recent_samples": tp_recent_samples,
+                    },
+                },
+                "llm_diagnostics": llm_diag,
+                "observability_gaps": monitoring_gap,
+                "optimization_hints": optimization_hints,
+            }
+            return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
     @router.get("/commander/decision-traces/{trace_id}")
     async def commander_decision_trace_detail(trace_id: str):
         """按 trace_id 查看单条 AI 决策链路。"""
@@ -3887,13 +4597,16 @@ def init_module_control_api(app, main_controller):
         add_check("execution_gateway", gw is not None, "missing" if gw is None else "ok")
         if gw:
             try:
-                snap = await gw.get_snapshot()
+                snap = await asyncio.wait_for(gw.get_snapshot(), timeout=2.5)
                 details["execution_spine"] = snap
                 add_check(
                     "execution_spine.single_write_owner",
                     bool(snap.get("single_write_owner")),
                     str(snap.get("single_write_owner") or ""),
                 )
+            except asyncio.TimeoutError:
+                details["execution_spine"] = {"degraded": True, "error": "snapshot_timeout"}
+                add_check("execution_spine", False, "snapshot_timeout")
             except Exception as e:
                 add_check("execution_spine", False, str(e))
 
@@ -3901,13 +4614,16 @@ def init_module_control_api(app, main_controller):
         add_check("ai_core", ac is not None, "missing" if ac is None else "ok")
 
         try:
-            brain = await mc.get_ai_managed_config(
-                "ai_brain",
-                {
-                    "primary_controller": "ai_core",
-                    "single_write_owner": "ai_core",
-                    "enable_secondary_controller": False,
-                },
+            brain = await asyncio.wait_for(
+                mc.get_ai_managed_config(
+                    "ai_brain",
+                    {
+                        "primary_controller": "ai_core",
+                        "single_write_owner": "ai_core",
+                        "enable_secondary_controller": False,
+                    },
+                ),
+                timeout=2.0,
             )
             details["ai_brain"] = {
                 "primary_controller": brain.get("primary_controller"),
@@ -3936,12 +4652,18 @@ def init_module_control_api(app, main_controller):
         ait = getattr(mc, "ai_trading_engine", None)
         if ait and hasattr(ait, "_autonomous_trading_execution_allowed"):
             try:
-                allow_loop = await ait._autonomous_trading_execution_allowed()
+                allow_loop = await asyncio.wait_for(
+                    ait._autonomous_trading_execution_allowed(),
+                    timeout=2.0,
+                )
                 details["ai_trading_engine"] = {
                     "autonomous_trading_loop_allowed": allow_loop,
                 }
                 try:
-                    pol = await mc.get_ai_managed_config("ai_brain", {})
+                    pol = await asyncio.wait_for(
+                        mc.get_ai_managed_config("ai_brain", {}),
+                        timeout=2.0,
+                    )
                     swo2 = str(
                         pol.get("single_write_owner") or pol.get("primary_controller") or "ai_core"
                     ).strip().lower()
@@ -3963,12 +4685,14 @@ def init_module_control_api(app, main_controller):
                 add_check("ai_trading_engine_policy", False, str(e))
 
         try:
-            sys_status = await mc.get_system_status()
+            sys_status = await asyncio.wait_for(mc.get_system_status(), timeout=4.0)
             details["system_status_keys"] = list(sys_status.keys()) if isinstance(sys_status, dict) else []
             if isinstance(sys_status, dict) and "execution_spine" in sys_status:
                 add_check("get_system_status.execution_spine", True, "present")
             else:
                 add_check("get_system_status.execution_spine", False, "missing in status payload")
+        except asyncio.TimeoutError:
+            add_check("get_system_status", False, "timeout")
         except Exception as e:
             add_check("get_system_status", False, str(e))
 

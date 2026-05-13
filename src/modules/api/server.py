@@ -1046,12 +1046,14 @@ class APIServer:
                 probe = getattr(ex, "probe_public_api", None) if ex is not None else None
                 if callable(probe):
                     try:
-                        # Keep health endpoint responsive under degraded exchange network.
-                        pr = await asyncio.wait_for(probe(timeout_sec=0.9), timeout=1.1)
+                        # Keep health endpoint responsive, but avoid turning transient slow public
+                        # endpoints into a false system-level degraded status too aggressively.
+                        pr = await asyncio.wait_for(probe(timeout_sec=4.2), timeout=5.0)
                     except Exception as _e:
                         pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
                     probe_status = str((pr or {}).get("status_text") or "").strip().lower()
                     ok = bool((pr or {}).get("ok"))
+                    core_time_ok = bool((pr or {}).get("core_time_ok"))
                     if probe_status not in {"reachable", "degraded", "unreachable"}:
                         probe_status = "reachable" if ok else "unreachable"
                     reachability = {
@@ -1059,12 +1061,15 @@ class APIServer:
                         "status": probe_status,
                         "probe": pr,
                     }
-                    if probe_status != "reachable":
+                    if probe_status == "unreachable" or not core_time_ok:
                         status = "degraded"
-                        if probe_status == "unreachable":
-                            reachability["hint"] = (
-                                "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network."
-                            )
+                        reachability["hint"] = (
+                            "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network."
+                        )
+                    elif probe_status == "degraded":
+                        # Public time endpoint is alive; treat this as upstream latency/jitter
+                        # instead of a full system unhealthy signal.
+                        reachability["note"] = "partial_public_probe_timeout"
                 elif ex is None:
                     reachability = {"ok": None, "status": "unknown", "message": "exchange_unavailable"}
                 else:
@@ -2582,7 +2587,7 @@ class APIServer:
                 probe = getattr(ex, "probe_public_api", None)
                 if callable(probe):
                     try:
-                        pr = await asyncio.wait_for(probe(timeout_sec=1.8), timeout=2.2)
+                        pr = await asyncio.wait_for(probe(timeout_sec=4.2), timeout=5.0)
                     except Exception as _e:
                         pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:200]}
                     probe_status = str((pr or {}).get("status_text") or "").strip().lower()
@@ -5016,8 +5021,10 @@ class APIServer:
 
         try:
             from src.modules.api.monitoring_api import router as monitoring_router
-            from src.modules.api.monitoring_api import set_proactive_ai
+            from src.modules.api.monitoring_api import set_proactive_ai, set_main_controller
             self.app.include_router(monitoring_router)
+            if self.main_controller:
+                set_main_controller(self.main_controller)
             if self.main_controller and hasattr(self.main_controller, "proactive_ai"):
                 set_proactive_ai(self.main_controller.proactive_ai)
             logger.info("✅ 监控API已初始化")

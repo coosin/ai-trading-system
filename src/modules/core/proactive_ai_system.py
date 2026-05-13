@@ -161,6 +161,12 @@ class ProactiveMarketScanner:
         self._skip_breakout_if_same_side = bool(
             self.config.get("proactive_skip_breakout_if_same_side_position", True)
         )
+        self._skip_same_side_any_opportunity = bool(
+            self.config.get(
+                "proactive_skip_same_side_position_any_opportunity",
+                self._skip_breakout_if_same_side,
+            )
+        )
         # 执行门槛：默认高于 0.7，减少「略靠近极值就开仓」
         self._execute_min_confidence = float(
             self.config.get("proactive_execute_min_confidence", 0.78)
@@ -190,6 +196,17 @@ class ProactiveMarketScanner:
             self.config.get("proactive_ai_core_forward_cooldown_sec", 180)
         )
         self._last_ai_core_hint_at: Dict[str, datetime] = {}
+        self._ai_core_forward_stable_window_sec = float(
+            self.config.get("proactive_ai_core_forward_stable_window_sec", 240)
+        )
+        self._volatility_spike_forward_cooldown_sec = float(
+            self.config.get("proactive_volatility_spike_forward_cooldown_sec", 600)
+        )
+        self._volatility_spike_forward_stable_window_sec = float(
+            self.config.get("proactive_volatility_spike_forward_stable_window_sec", 900)
+        )
+        self._last_ai_core_hint_signature: Dict[str, str] = {}
+        self._last_ai_core_hint_signature_at: Dict[str, datetime] = {}
         self._opportunity_gate: Any = None
         self._last_opportunity_log_at: Dict[str, datetime] = {}
         self._opportunity_log_cooldown_sec: float = float(self.config.get("opportunity_log_cooldown_sec", 120) or 120)
@@ -207,6 +224,52 @@ class ProactiveMarketScanner:
     @staticmethod
     def _norm_symbol_key(symbol: str) -> str:
         return str(symbol or "").replace(" ", "").upper()
+
+    @staticmethod
+    def _round_sig(value: Any, digits: int = 4) -> Any:
+        try:
+            return round(float(value), digits)
+        except Exception:
+            return None
+
+    def _opportunity_forward_signature(
+        self,
+        opportunity: MarketOpportunity,
+        gate_metrics: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        gm = dict(gate_metrics or {})
+        opp_type = str(opportunity.opportunity_type.value or "")
+        sig_digits_price = 4 if opp_type == OpportunityType.VOLATILITY_SPIKE.value else 5
+        sig_digits_conf = 2 if opp_type == OpportunityType.VOLATILITY_SPIKE.value else 3
+        payload = {
+            "symbol": str(opportunity.symbol or ""),
+            "type": opp_type,
+            "direction": str(opportunity.direction or ""),
+            "confidence": self._round_sig(opportunity.confidence, sig_digits_conf),
+            "entry_price": self._round_sig(opportunity.entry_price, sig_digits_price),
+            "stop_loss": self._round_sig(opportunity.stop_loss, sig_digits_price),
+            "take_profit": self._round_sig(opportunity.take_profit, sig_digits_price),
+            "priority": int(getattr(opportunity, "priority", 0) or 0),
+            "rr": self._round_sig(gm.get("risk_reward"), 3),
+            "slippage": self._round_sig(gm.get("entry_vs_last_slippage_pct"), 4),
+            "atr_pct_1h": self._round_sig(gm.get("atr_pct_1h"), 4),
+            "insight_trend": str(gm.get("insight_trend") or ""),
+            "insight_strength": self._round_sig(gm.get("insight_trend_strength"), 3),
+        }
+        try:
+            return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return str(payload)
+
+    def _forward_cooldown_for_opportunity(self, opportunity: MarketOpportunity) -> float:
+        if str(opportunity.opportunity_type.value or "") == OpportunityType.VOLATILITY_SPIKE.value:
+            return float(self._volatility_spike_forward_cooldown_sec)
+        return float(self._ai_core_forward_cooldown_sec)
+
+    def _forward_stable_window_for_opportunity(self, opportunity: MarketOpportunity) -> float:
+        if str(opportunity.opportunity_type.value or "") == OpportunityType.VOLATILITY_SPIKE.value:
+            return float(self._volatility_spike_forward_stable_window_sec)
+        return float(self._ai_core_forward_stable_window_sec)
 
     @staticmethod
     def _breakout_sl_tp(
@@ -325,6 +388,12 @@ class ProactiveMarketScanner:
             self._skip_breakout_if_same_side = bool(
                 self.config.get("proactive_skip_breakout_if_same_side_position", self._skip_breakout_if_same_side)
             )
+            self._skip_same_side_any_opportunity = bool(
+                self.config.get(
+                    "proactive_skip_same_side_position_any_opportunity",
+                    self._skip_same_side_any_opportunity,
+                )
+            )
             self._auto_execute_opportunities = bool(
                 self.config.get("proactive_auto_execute_opportunities", self._auto_execute_opportunities)
             )
@@ -332,6 +401,24 @@ class ProactiveMarketScanner:
                 self.config.get(
                     "proactive_ai_core_forward_cooldown_sec",
                     self._ai_core_forward_cooldown_sec,
+                )
+            )
+            self._ai_core_forward_stable_window_sec = float(
+                self.config.get(
+                    "proactive_ai_core_forward_stable_window_sec",
+                    self._ai_core_forward_stable_window_sec,
+                )
+            )
+            self._volatility_spike_forward_cooldown_sec = float(
+                self.config.get(
+                    "proactive_volatility_spike_forward_cooldown_sec",
+                    self._volatility_spike_forward_cooldown_sec,
+                )
+            )
+            self._volatility_spike_forward_stable_window_sec = float(
+                self.config.get(
+                    "proactive_volatility_spike_forward_stable_window_sec",
+                    self._volatility_spike_forward_stable_window_sec,
                 )
             )
 
@@ -346,6 +433,17 @@ class ProactiveMarketScanner:
                 from src.modules.core.scanner_opportunity_gate import ScannerOpportunityGate
 
                 gc = self.config.get("scanner_opportunity_gate") or {}
+                try:
+                    logger.info(
+                        "ScannerOpportunityGate config loaded: enabled=%s max_spread_bps=%s max_entry_vs_last_slippage_pct=%s min_risk_reward=%s partial_min_risk_reward=%s",
+                        gc.get("enabled"),
+                        gc.get("max_spread_bps"),
+                        gc.get("max_entry_vs_last_slippage_pct"),
+                        gc.get("min_risk_reward"),
+                        gc.get("partial_min_risk_reward"),
+                    )
+                except Exception:
+                    pass
                 self._opportunity_gate = (
                     ScannerOpportunityGate(self.exchange, gc, main_controller=self.main_controller) if self.exchange else None
                 )
@@ -1023,13 +1121,25 @@ class ProactiveMarketScanner:
             f"{opportunity.opportunity_type.value}:{opportunity.direction}"
         )
         now = datetime.now()
-        last = self._last_ai_core_hint_at.get(fk)
-        if last and (now - last).total_seconds() < self._ai_core_forward_cooldown_sec:
-            return
 
         gate_metrics: Dict[str, Any] = {}
         gate_reason = ""
         self._forward_attempted += 1
+        if self._skip_same_side_any_opportunity:
+            try:
+                if await self._has_same_side_position(opportunity.symbol, opportunity.direction):
+                    self._gate_reject_count += 1
+                    self._gate_reject_reasons["same_side_position_existing"] += 1
+                    self._gate_reject_symbols[str(opportunity.symbol or "unknown")] += 1
+                    logger.info(
+                        "⛔ 同品种同向持仓已存在，不转发 ai_core: %s %s type=%s",
+                        opportunity.symbol,
+                        opportunity.direction,
+                        opportunity.opportunity_type.value,
+                    )
+                    return
+            except Exception:
+                pass
         if self._opportunity_gate:
             gr = await self._opportunity_gate.evaluate(
                 opportunity, self._insights.get(opportunity.symbol)
@@ -1098,8 +1208,32 @@ class ProactiveMarketScanner:
             gate_reason = gr.reason
             gate_metrics = dict(gr.metrics or {})
 
+        cooldown_sec = self._forward_cooldown_for_opportunity(opportunity)
+        stable_window_sec = self._forward_stable_window_for_opportunity(opportunity)
+        last = self._last_ai_core_hint_at.get(fk)
+        if last and (now - last).total_seconds() < cooldown_sec:
+            return
+        sig = self._opportunity_forward_signature(opportunity, gate_metrics)
+        last_sig = self._last_ai_core_hint_signature.get(fk)
+        last_sig_at = self._last_ai_core_hint_signature_at.get(fk)
+        if (
+            last_sig
+            and sig == last_sig
+            and last_sig_at is not None
+            and (now - last_sig_at).total_seconds() < stable_window_sec
+        ):
+            return
+
         self._last_ai_core_hint_at[fk] = now
+        self._last_ai_core_hint_signature[fk] = sig
+        self._last_ai_core_hint_signature_at[fk] = now
+        scanner_trace_id = (
+            f"scanner-{self._norm_symbol_key(opportunity.symbol)}-"
+            f"{opportunity.opportunity_type.value}-{opportunity.direction}-"
+            f"{int(datetime.now().timestamp())}"
+        )
         payload = {
+            "trace_id": scanner_trace_id,
             "symbol": opportunity.symbol,
             "direction": opportunity.direction,
             "opportunity_type": opportunity.opportunity_type.value,

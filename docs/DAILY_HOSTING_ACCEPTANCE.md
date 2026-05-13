@@ -7,7 +7,7 @@
 
 ## 0) 验收前提
 
-- API 服务地址：默认 `http://127.0.0.1:8000`（可通过 `BASE_URL` 覆盖）
+- API 服务地址：默认 `http://127.0.0.1:8000`；脚本与自动化建议设置 **`OPENCLAW_API_BASE`**（其次 `BASE_URL` / `ACCEPTANCE_BASE`），与 `src/utils/openclaw_api_client.py` 及 **`GET /api/v1/modules/surface/registry`** 返回的 **`api_base_env`** 对齐。
 - 控制面已部署最新版本（含治理审计与工具契约接口）
 - 如为生产环境，先确保网络与 OKX 连通性基础正常
 

@@ -37,6 +37,7 @@ from src.modules.api.monitoring_api import (
     set_trading_monitor,
     set_anomaly_detector,
     set_enhanced_monitoring,
+    set_main_controller,
 )
 from src.modules.core.strategy_manager import StrategyManager
 from src.modules.strategies.portfolio_optimizer import PortfolioOptimizer
@@ -95,6 +96,27 @@ def _snapshot_pid_bookkeeping(process_pid: int) -> Dict[str, Any]:
         "pid_files": files,
         "any_pid_file_matches_process": any_match,
     }
+
+
+def _write_pid_bookkeeping(process_pid: int) -> None:
+    """Mirror current PID to all bookkeeping locations."""
+
+    paths: List[Path] = [Path("/tmp/openclaw-trading.pid")]
+    try:
+        paths.append(Path(__file__).resolve().parents[2] / "runtime" / "openclaw-trading.pid")
+    except Exception:
+        pass
+    home = os.environ.get("HOME")
+    if home:
+        paths.append(Path(home) / ".openclaw-trading" / "runtime" / "openclaw-trading.pid")
+
+    payload = f"{int(process_pid)}\n"
+    for p in paths:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(payload, encoding="utf-8")
+        except Exception as e:
+            logger.debug("写入 PID 账本失败 path=%s err=%s", p, e)
 from src.modules.core.correlation_monitor import CorrelationMonitor, CorrelationMonitorConfig
 from src.modules.core.strategy_hot_loader import StrategyHotLoader
 from src.modules.core.audit_logger import AuditLogger, AuditConfig, AuditEventType, AuditSeverity
@@ -317,6 +339,8 @@ class MainController:
         self._running = False
         self._last_strategy_research_at: Optional[datetime] = None
         self._strategy_research_running = False
+        self._logged_event_ids: List[str] = []
+        self._logged_event_id_set: set[str] = set()
 
         # 增强事件系统
         self.event_system = None
@@ -804,6 +828,7 @@ class MainController:
             return
 
         logger.info("初始化主控制器...")
+        _write_pid_bookkeeping(os.getpid())
 
         # 如果未显式传入配置管理器，则创建默认实例，保证可独立初始化（单测/脚本场景）
         if self.config_manager is None:
@@ -848,7 +873,6 @@ class MainController:
         
         # 初始化唯一记忆后端（OptimizedMemorySystem）
         from src.modules.core.optimized_memory_system import get_memory_system
-        import os
 
         # Prefer centralized config paths; fallback to env/default.
         cfg_workspace_path = None
@@ -1033,6 +1057,7 @@ class MainController:
         await self.trading_monitor.initialize()
         # 设置监控器实例到API模块
         set_trading_monitor(self.trading_monitor)
+        set_main_controller(self)
         
         # 初始化多策略管理器
         self.strategy_manager = StrategyManager(self.config_manager)
@@ -1477,10 +1502,18 @@ class MainController:
         try:
             from src.modules.data.data_integration import DataIntegration
             from src.modules.data.data_integration import BinanceDataSource, CoinGeckoDataSource
+            from src.modules.core.network_env_from_config import proxy_url_for_data_sources
+
             self.data_integration = DataIntegration(
                 config={},
                 third_party_integrator=getattr(self, "third_party_data_integrator", None),
             )
+
+            def _data_source_proxy() -> Optional[str]:
+                raw = proxy_url_for_data_sources(getattr(self, "config_manager", None))
+                return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+            ds_proxy = _data_source_proxy()
             # Register sources from config/config.yaml:data.sources (and optional local overrides)
             try:
                 data_cfg = await self.config_manager.get_config("data", {}) if self.config_manager else {}
@@ -1497,25 +1530,21 @@ class MainController:
                         continue
                     try:
                         if prov == "binance":
-                            proxy_url = None
-                            try:
-                                proxy_url = str(os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip() or None
-                            except Exception:
-                                proxy_url = None
-                            self.data_integration.register_source("binance", BinanceDataSource(proxy_url=proxy_url))
+                            self.data_integration.register_source(
+                                "binance", BinanceDataSource(proxy_url=ds_proxy)
+                            )
                         elif prov == "coingecko":
-                            proxy_url = None
-                            try:
-                                proxy_url = str(os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip() or None
-                            except Exception:
-                                proxy_url = None
-                            self.data_integration.register_source("coingecko", CoinGeckoDataSource(proxy_url=proxy_url))
+                            self.data_integration.register_source(
+                                "coingecko", CoinGeckoDataSource(proxy_url=ds_proxy)
+                            )
                     except Exception:
                         continue
             # Ensure at least one baseline source so health isn't empty.
             try:
                 if getattr(self.data_integration, "_sources", {}) == {}:
-                    self.data_integration.register_source("coingecko", CoinGeckoDataSource(proxy_url=None))
+                    self.data_integration.register_source(
+                        "coingecko", CoinGeckoDataSource(proxy_url=ds_proxy)
+                    )
             except Exception:
                 pass
             try:
@@ -1912,8 +1941,9 @@ class MainController:
                 if isinstance(trading_cfg.get("dynamic_symbols"), dict)
                 else {}
             )
-            su = str(contract.get("symbol_universe", "full_exchange") or "full_exchange").lower()
+            su = str(contract.get("symbol_universe", "preferred_pool") or "preferred_pool").lower()
             restricted = su in ("whitelist", "restricted", "list")
+            preferred_only = su in ("preferred_pool", "preferred", "ws_pool", "curated")
             allowed = contract.get("allowed_symbols")
             if not isinstance(allowed, list) or not allowed:
                 allowed = trading_cfg.get("symbols") or []
@@ -1932,6 +1962,7 @@ class MainController:
                 always_exclude=[str(x) for x in (dyn.get("always_exclude") or []) if x],
                 restricted_universe=restricted,
                 allowed_symbols=[str(x) for x in allowed if x] if restricted else [],
+                preferred_symbols_only=bool(dyn.get("preferred_symbols_only", preferred_only)),
             )
             self.dynamic_symbol_selector = DynamicSymbolSelector(selector_config)
             await self.dynamic_symbol_selector.initialize()
@@ -2985,40 +3016,40 @@ class MainController:
                 EventType.DATA_RECEIVED: CoreEventType.DATA_RECEIVED,
                 EventType.TRADE_SIGNAL: CoreEventType.TRADE_SIGNAL,
                 EventType.ALERT: CoreEventType.RISK_ALERT,
-                EventType.HEARTBEAT: CoreEventType.SYSTEM_START
             }
             
-            core_event_type = core_event_type_map.get(event_type, CoreEventType.SYSTEM_START)
+            core_event_type = core_event_type_map.get(event_type)
 
-            core_to_legacy_map = {
-                CoreEventType.SYSTEM_START: EventType.SYSTEM_START,
-                CoreEventType.SYSTEM_STOP: EventType.SYSTEM_STOP,
-                CoreEventType.MODULE_STARTED: EventType.MODULE_STARTED,
-                CoreEventType.MODULE_STOPPED: EventType.MODULE_STOPPED,
-                CoreEventType.MODULE_ERROR: EventType.MODULE_ERROR,
-                CoreEventType.CONFIG_CHANGED: EventType.CONFIG_CHANGED,
-                CoreEventType.DATA_RECEIVED: EventType.DATA_RECEIVED,
-                CoreEventType.TRADE_SIGNAL: EventType.TRADE_SIGNAL,
-                CoreEventType.RISK_ALERT: EventType.ALERT,
-            }
+            if core_event_type is not None:
+                core_to_legacy_map = {
+                    CoreEventType.SYSTEM_START: EventType.SYSTEM_START,
+                    CoreEventType.SYSTEM_STOP: EventType.SYSTEM_STOP,
+                    CoreEventType.MODULE_STARTED: EventType.MODULE_STARTED,
+                    CoreEventType.MODULE_STOPPED: EventType.MODULE_STOPPED,
+                    CoreEventType.MODULE_ERROR: EventType.MODULE_ERROR,
+                    CoreEventType.CONFIG_CHANGED: EventType.CONFIG_CHANGED,
+                    CoreEventType.DATA_RECEIVED: EventType.DATA_RECEIVED,
+                    CoreEventType.TRADE_SIGNAL: EventType.TRADE_SIGNAL,
+                    CoreEventType.RISK_ALERT: EventType.ALERT,
+                }
 
-            async def _wrapper(core_event):
-                try:
-                    legacy_event = SystemEvent(
-                        id=getattr(core_event, "id", str(uuid.uuid4())),
-                        type=core_to_legacy_map.get(getattr(core_event, "type", None), event_type),
-                        source=getattr(core_event, "source", "unknown"),
-                        data=getattr(core_event, "data", {}) or {},
-                        priority=0,
-                    )
-                    if asyncio.iscoroutinefunction(handler):
-                        await handler(legacy_event)
-                    else:
-                        handler(legacy_event)
-                except Exception as e:
-                    logger.error(f"事件处理器执行错误: {e}")
+                async def _wrapper(core_event):
+                    try:
+                        legacy_event = SystemEvent(
+                            id=getattr(core_event, "id", str(uuid.uuid4())),
+                            type=core_to_legacy_map.get(getattr(core_event, "type", None), event_type),
+                            source=getattr(core_event, "source", "unknown"),
+                            data=getattr(core_event, "data", {}) or {},
+                            priority=0,
+                        )
+                        if asyncio.iscoroutinefunction(handler):
+                            await handler(legacy_event)
+                        else:
+                            handler(legacy_event)
+                    except Exception as e:
+                        logger.error(f"事件处理器执行错误: {e}")
 
-            self.event_system.subscribe(core_event_type, _wrapper)
+                self.event_system.subscribe(core_event_type, _wrapper)
         
         logger.debug(f"注册事件处理器: {event_type.value} -> {handler.__name__}")
 
@@ -3092,6 +3123,7 @@ class MainController:
         if len(self.event_history) > self.event_history_limit:
             self.event_history = self.event_history[-self.event_history_limit:]
         
+        core_event_type = None
         if self.event_system:
             # 转换为核心事件类型
             core_event_type_map = {
@@ -3104,11 +3136,11 @@ class MainController:
                 EventType.DATA_RECEIVED: CoreEventType.DATA_RECEIVED,
                 EventType.TRADE_SIGNAL: CoreEventType.TRADE_SIGNAL,
                 EventType.ALERT: CoreEventType.RISK_ALERT,
-                EventType.HEARTBEAT: CoreEventType.SYSTEM_START
             }
             
-            core_event_type = core_event_type_map.get(event_type, CoreEventType.SYSTEM_START)
+            core_event_type = core_event_type_map.get(event_type)
             
+        if self.event_system and core_event_type is not None:
             # 转换优先级
             from src.modules.core.event_system import EventPriority
             event_priority = EventPriority.NORMAL
@@ -3168,78 +3200,94 @@ class MainController:
             系统状态信息
         """
         async with self._lock:
-            module_statuses = {}
-            for name, info in self.modules.items():
-                module_statuses[name] = {
-                    "status": info.status.value,
-                    "health": info.health_status.value,
-                    "uptime": info.uptime.total_seconds() if info.uptime else 0,
-                    "error_count": info.error_count,
-                    "last_error": info.last_error,
-                    "start_time": info.start_time.isoformat() if info.start_time else None,
-                    "stop_time": info.stop_time.isoformat() if info.stop_time else None,
-                }
+            module_infos = list(self.modules.items())
+            system_status = self.system_status
+            start_time = self.start_time
+            stop_time = self.stop_time
+            metrics = self.metrics.copy()
 
-            # 兼容：若 self.modules 未注册完整，回退到按关键属性统计真实模块连接状态
-            fallback_module_names = [
-                "event_system", "data_quality_system", "fault_tolerance", "enhanced_llm_manager",
-                "llm_integration", "ai_trading_engine", "ai_core",
-                "hierarchical_memory", "skill_manager", "smart_notification",
-                "trading_monitor", "strategy_manager", "risk_monitor",
-                "data_storage", "backup_manager", "database_manager",
-                "telegram_bot", "natural_language_interface",
-                "emergency_stop", "intelligent_monitoring", "security_manager", "fund_manager",
-                "unified_info_collector",
-                "dynamic_position_manager", "correlation_monitor", "strategy_hot_loader",
-                "audit_logger", "enhanced_monitoring", "stop_loss_manager",
-            ]
-            fallback_connected = [n for n in fallback_module_names if getattr(self, n, None) is not None]
-            fallback_statuses = {
-                n: {"status": "connected", "health": "unknown", "uptime": 0, "error_count": 0}
-                for n in fallback_connected
+        module_statuses = {}
+        for name, info in module_infos:
+            module_statuses[name] = {
+                "status": info.status.value,
+                "health": info.health_status.value,
+                "uptime": info.uptime.total_seconds() if info.uptime else 0,
+                "error_count": info.error_count,
+                "last_error": info.last_error,
+                "start_time": info.start_time.isoformat() if info.start_time else None,
+                "stop_time": info.stop_time.isoformat() if info.stop_time else None,
             }
 
-            module_count = len(self.modules) if len(self.modules) > 0 else len(fallback_module_names)
-            running_modules = (
-                len([m for m in self.modules.values() if m.status == ModuleStatus.RUNNING])
-                if len(self.modules) > 0
-                else len(fallback_connected)
+        # 兼容：若 self.modules 未注册完整，回退到按关键属性统计真实模块连接状态
+        fallback_module_names = [
+            "event_system", "data_quality_system", "fault_tolerance", "enhanced_llm_manager",
+            "llm_integration", "ai_trading_engine", "ai_core",
+            "hierarchical_memory", "skill_manager", "smart_notification",
+            "trading_monitor", "strategy_manager", "risk_monitor",
+            "data_storage", "backup_manager", "database_manager",
+            "telegram_bot", "natural_language_interface",
+            "emergency_stop", "intelligent_monitoring", "security_manager", "fund_manager",
+            "unified_info_collector",
+            "dynamic_position_manager", "correlation_monitor", "strategy_hot_loader",
+            "audit_logger", "enhanced_monitoring", "stop_loss_manager",
+        ]
+        fallback_connected = [n for n in fallback_module_names if getattr(self, n, None) is not None]
+        fallback_statuses = {
+            n: {"status": "connected", "health": "unknown", "uptime": 0, "error_count": 0}
+            for n in fallback_connected
+        }
+
+        module_count = len(module_infos) if len(module_infos) > 0 else len(fallback_module_names)
+        running_modules = (
+            len([info for _, info in module_infos if info.status == ModuleStatus.RUNNING])
+            if len(module_infos) > 0
+            else len(fallback_connected)
+        )
+
+        out: Dict[str, Any] = {
+            "system_status": system_status.value,
+            "start_time": start_time.isoformat() if start_time else None,
+            "stop_time": stop_time.isoformat() if stop_time else None,
+            "uptime": (
+                (datetime.now() - start_time).total_seconds()
+                if start_time and system_status == ModuleStatus.RUNNING
+                else 0
+            ),
+            "module_count": module_count,
+            "running_modules": running_modules,
+            "module_statuses": module_statuses if module_statuses else fallback_statuses,
+            "metrics": metrics,
+            "automation_profile": self.get_automation_profile(),
+            "hosting_mode": self.get_hosting_mode(),
+            "risk_redlines": self.get_risk_redlines(),
+        }
+        if getattr(self, "execution_gateway", None):
+            try:
+                out["execution_spine"] = await asyncio.wait_for(
+                    self.execution_gateway.get_snapshot(),
+                    timeout=2.5,
+                )
+            except asyncio.TimeoutError:
+                out["execution_spine"] = {"error": "snapshot_timeout", "degraded": True}
+            except Exception as e:
+                out["execution_spine"] = {"error": str(e)}
+        try:
+            limits = await asyncio.wait_for(
+                resolve_position_limits(config_manager=self.config_manager),
+                timeout=2.0,
             )
+            out["position_limits_snapshot"] = limits.to_dict()
+        except asyncio.TimeoutError:
+            out["position_limits_snapshot_error"] = "resolve_timeout"
+        except Exception as e:
+            out["position_limits_snapshot_error"] = str(e)
 
-            out: Dict[str, Any] = {
-                "system_status": self.system_status.value,
-                "start_time": self.start_time.isoformat() if self.start_time else None,
-                "stop_time": self.stop_time.isoformat() if self.stop_time else None,
-                "uptime": (
-                    (datetime.now() - self.start_time).total_seconds()
-                    if self.start_time and self.system_status == ModuleStatus.RUNNING
-                    else 0
-                ),
-                "module_count": module_count,
-                "running_modules": running_modules,
-                "module_statuses": module_statuses if module_statuses else fallback_statuses,
-                "metrics": self.metrics.copy(),
-                "automation_profile": self.get_automation_profile(),
-                "hosting_mode": self.get_hosting_mode(),
-                "risk_redlines": self.get_risk_redlines(),
-            }
-            if getattr(self, "execution_gateway", None):
-                try:
-                    out["execution_spine"] = await self.execution_gateway.get_snapshot()
-                except Exception as e:
-                    out["execution_spine"] = {"error": str(e)}
-            try:
-                limits = await resolve_position_limits(config_manager=self.config_manager)
-                out["position_limits_snapshot"] = limits.to_dict()
-            except Exception as e:
-                out["position_limits_snapshot_error"] = str(e)
+        try:
+            out["runtime_bookkeeping"] = _snapshot_pid_bookkeeping(int(os.getpid()))
+        except Exception as e:
+            out["runtime_bookkeeping_error"] = str(e)
 
-            try:
-                out["runtime_bookkeeping"] = _snapshot_pid_bookkeeping(int(os.getpid()))
-            except Exception as e:
-                out["runtime_bookkeeping_error"] = str(e)
-
-            return out
+        return out
 
     async def get_event_history(
         self, limit: int = 100, event_type: Optional[EventType] = None
@@ -5548,9 +5596,27 @@ class MainController:
     def _register_default_handlers(self) -> None:
         """注册默认事件处理器"""
 
+        def should_log_event(event: Any) -> bool:
+            event_id = str(getattr(event, "id", "") or "")
+            if not event_id:
+                return True
+            if event_id in self._logged_event_id_set:
+                return False
+            self._logged_event_id_set.add(event_id)
+            self._logged_event_ids.append(event_id)
+            if len(self._logged_event_ids) > 512:
+                stale_id = self._logged_event_ids.pop(0)
+                self._logged_event_id_set.discard(stale_id)
+            return True
+
         async def log_event_handler(event):
             """日志事件处理器"""
-            logger.info(f"事件: {event.type.value} from {event.source}")
+            if not should_log_event(event):
+                return
+            if getattr(event, "type", None) == CoreEventType.RISK_ALERT:
+                logger.debug(f"事件: {event.type.value} from {event.source}")
+            else:
+                logger.info(f"事件: {event.type.value} from {event.source}")
 
         async def error_event_handler(event):
             """错误事件处理器"""
@@ -5577,7 +5643,12 @@ class MainController:
         # 总是向旧的事件处理器系统注册（用于测试）
         async def old_log_event_handler(event: SystemEvent):
             """日志事件处理器"""
-            logger.info(f"事件: {event.type.value} from {event.source}")
+            if not should_log_event(event):
+                return
+            if event.type == EventType.ALERT:
+                logger.debug(f"事件: {event.type.value} from {event.source}")
+            else:
+                logger.info(f"事件: {event.type.value} from {event.source}")
 
         async def old_error_event_handler(event: SystemEvent):
             """错误事件处理器"""
@@ -5609,15 +5680,8 @@ class MainController:
         self.register_event_handler(EventType.ALERT, old_log_event_handler)
         self.register_event_handler(EventType.HEARTBEAT, old_log_event_handler)
 
-        # 注册到增强事件系统（如果可用）
-        if self.event_system:
-            self.event_system.subscribe(CoreEventType.SYSTEM_START, log_event_handler)
-            self.event_system.subscribe(CoreEventType.SYSTEM_STOP, log_event_handler)
-            self.event_system.subscribe(CoreEventType.MODULE_STARTED, log_event_handler)
-            self.event_system.subscribe(CoreEventType.MODULE_STOPPED, log_event_handler)
-            self.event_system.subscribe(CoreEventType.MODULE_ERROR, error_event_handler)
-            self.event_system.subscribe(CoreEventType.CONFIG_CHANGED, config_change_handler)
-            self.event_system.subscribe(CoreEventType.RISK_ALERT, log_event_handler)
+        # register_event_handler() 已负责把旧处理器桥接到增强事件系统。
+        # 这里不再直接 subscribe，避免同一事件在增强总线上被重复消费。
 
     # ========== 新增升级模块便捷方法 ==========
 

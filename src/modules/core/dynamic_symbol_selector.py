@@ -10,6 +10,7 @@
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
@@ -17,6 +18,12 @@ from enum import Enum
 import random
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_OKX_WS_TICKER_INSTIDS = (
+    "BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP,BNB-USDT-SWAP,"
+    "XRP-USDT-SWAP,DOGE-USDT-SWAP,ADA-USDT-SWAP,AVAX-USDT-SWAP,"
+    "DOT-USDT-SWAP,LINK-USDT-SWAP,ATOM-USDT-SWAP"
+)
 
 
 class SelectionCriteria(Enum):
@@ -66,11 +73,18 @@ class DynamicSymbolSelectorConfig:
     min_liquidity_score: float = 0.5        # 最小流动性评分
     enable_auto_discovery: bool = True      # 启用自动发现
     discovery_interval: int = 3600          # 发现间隔（秒）
+    discovery_probe_limit: int = 32         # 每轮最多探测多少个候选
+    discovery_concurrency: int = 8          # 并发探测 ticker 数
+    discovery_ticker_timeout_s: float = 4.0 # 单个 ticker 探测超时
+    selection_concurrency: int = 4          # 并发评估 symbol 数
+    selection_eval_timeout_s: float = 8.0   # 单个 symbol 评估超时
+    startup_warmup_sec: float = 8.0         # 冷启动等待交易所/WS 缓存预热
     always_include: List[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
     always_exclude: List[str] = field(default_factory=list)
     # symbol_universe=full_exchange：全所 USDT 永续候选；restricted 时仅保留 allowed_symbols
     restricted_universe: bool = False
     allowed_symbols: List[str] = field(default_factory=list)
+    preferred_symbols_only: bool = True      # 默认仅在主流高流动候选池中选币
     scoring_weights: Dict[str, float] = field(default_factory=lambda: {
         "liquidity": 0.25,
         "volatility": 0.20,
@@ -169,14 +183,15 @@ class DynamicSymbolSelector:
         
         try:
             markets = await self._fetch_markets_compat()
-            
+            candidates: List[str] = []
             for market in markets:
                 symbol = market.get("symbol", "")
-                
-                if not symbol.endswith("/USDT"):
+
+                normalized_symbol = self._normalize_candidate_symbol(symbol)
+                if not normalized_symbol:
                     continue
-                
-                if symbol in self.config.always_exclude:
+
+                if normalized_symbol in self.config.always_exclude or symbol in self.config.always_exclude:
                     continue
                 
                 # Some exchange connectors do not reliably tag market "type".
@@ -184,18 +199,53 @@ class DynamicSymbolSelector:
                 mtype = str(market.get("type") or "").lower()
                 if mtype and mtype not in ["swap", "future"]:
                     continue
-                
+
+                if normalized_symbol not in candidates:
+                    candidates.append(normalized_symbol)
+
+            if self.config.restricted_universe and self.config.allowed_symbols:
+                allow = {str(s).strip() for s in self.config.allowed_symbols if s}
+                candidates = [s for s in candidates if s in allow]
+
+            preferred_symbols = []
+            if self.config.always_include:
+                preferred_symbols.extend([s for s in self.config.always_include if s in candidates])
+            preferred_symbols.extend([s for s in self._preferred_candidates_from_exchange() if s in candidates])
+            preferred: List[str] = []
+            for sym in preferred_symbols:
+                if sym not in preferred:
+                    preferred.append(sym)
+            remainder = [s for s in candidates if s not in preferred]
+            if preferred and self.config.preferred_symbols_only and not self.config.restricted_universe:
+                candidates = list(preferred)
+            else:
+                candidates = preferred + remainder
+
+            probe_limit = max(
+                int(self.config.min_symbols or 1),
+                int(self.config.discovery_probe_limit or 32),
+            )
+            candidates = candidates[:probe_limit]
+
+            sem = asyncio.Semaphore(max(1, int(self.config.discovery_concurrency or 8)))
+
+            async def _probe(sym: str) -> Optional[str]:
                 try:
-                    ticker = await self._fetch_ticker_compat(symbol)
-                    
-                    volume_24h = ticker.get("quoteVolume", 0)
-                    if volume_24h < self.config.min_24h_volume:
-                        continue
-                    
-                    discovered.append(symbol)
-                    
-                except Exception as e:
-                    continue
+                    async with sem:
+                        ticker = await asyncio.wait_for(
+                            self._fetch_ticker_compat(sym),
+                            timeout=float(self.config.discovery_ticker_timeout_s or 4.0),
+                        )
+                    volume_24h = float((ticker or {}).get("quoteVolume", 0) or 0)
+                    if volume_24h >= self.config.min_24h_volume:
+                        return sym
+                except Exception:
+                    return None
+                return None
+
+            if candidates:
+                rows = await asyncio.gather(*[_probe(sym) for sym in candidates], return_exceptions=False)
+                discovered = [sym for sym in rows if sym]
             
             self._stats["total_discovered"] = len(discovered)
             logger.info(f"发现 {len(discovered)} 个可交易币种")
@@ -217,15 +267,30 @@ class DynamicSymbolSelector:
             )
             return list(self.config.always_include)
 
-        if self.config.restricted_universe and self.config.allowed_symbols:
-            allow = {str(s).strip() for s in self.config.allowed_symbols if s}
-            discovered = [s for s in discovered if s in allow]
-            if not discovered:
-                discovered = [s for s in self.config.always_include if s in allow] or list(
-                    self.config.always_include
-                )
-        
         return discovered
+
+    def _normalize_candidate_symbol(self, symbol: Any) -> str:
+        s = str(symbol or "").strip()
+        if not s:
+            return ""
+        s = s.replace("-", "/")
+        up = s.upper()
+        if up.endswith("/USDT/SWAP"):
+            return s[: -len("/SWAP")]
+        if up.endswith("/USDT"):
+            return s
+        return ""
+
+    def _preferred_candidates_from_exchange(self) -> List[str]:
+        raw = str(os.getenv("OPENCLAW_OKX_WS_TICKER_INSTIDS", DEFAULT_OKX_WS_TICKER_INSTIDS) or "").strip()
+        if not raw:
+            return []
+        out: List[str] = []
+        for inst_id in raw.split(","):
+            s = self._normalize_candidate_symbol(inst_id.strip())
+            if s and s not in out:
+                out.append(s)
+        return out
     
     async def evaluate_symbol(self, symbol: str) -> SymbolScore:
         """
@@ -384,6 +449,8 @@ class DynamicSymbolSelector:
                     or data.get("volume", 0) * (float(last or 0) if last else 0)
                     or 0
                 )
+                if float(last or 0) <= 0 and float(quote_vol or 0) <= 0:
+                    continue
                 return {
                     "last": float(last or 0),
                     "bid": float(bid or 0),
@@ -392,6 +459,31 @@ class DynamicSymbolSelector:
                 }
             except Exception as e:
                 logger.debug(f"{name}({symbol}) 失败: {e}")
+
+        # OKX WS-only 模式冷启动时 get_ticker() 可能因缓存未热而返回空；
+        # 这里直接走一次 REST ticker 兜底，避免 discovery 首轮全量判空。
+        make_request = getattr(self._exchange, "_make_request", None)
+        to_inst_id = getattr(self._exchange, "_to_okx_inst_id", None)
+        if callable(make_request) and callable(to_inst_id):
+            try:
+                inst_id = to_inst_id(symbol, default_type="SWAP")
+                rows = await make_request("GET", "/api/v5/market/ticker", {"instId": inst_id})
+                if isinstance(rows, list) and rows:
+                    row = rows[0] if isinstance(rows[0], dict) else {}
+                    last = float(row.get("last", 0) or 0)
+                    bid = float(row.get("bidPx", 0) or 0)
+                    ask = float(row.get("askPx", 0) or 0)
+                    quote_vol = float(row.get("volCcy24h", 0) or 0)
+                    if quote_vol <= 0:
+                        quote_vol = float(row.get("vol24h", 0) or 0) * max(last, 0.0)
+                    return {
+                        "last": last,
+                        "bid": bid,
+                        "ask": ask,
+                        "quoteVolume": float(quote_vol or 0),
+                    }
+            except Exception as e:
+                logger.debug(f"okx_rest_ticker_fallback({symbol}) 失败: {e}")
         return {}
 
     async def _fetch_ohlcv_compat(self, symbol: str, timeframe: str, limit: int = 24) -> List[List[float]]:
@@ -447,12 +539,23 @@ class DynamicSymbolSelector:
             最佳币种列表
         """
         scores = []
-        
-        for symbol in candidates:
-            score = await self.evaluate_symbol(symbol)
-            if score.comprehensive_score > 0:
+        sem = asyncio.Semaphore(max(1, int(self.config.selection_concurrency or 4)))
+
+        async def _eval(symbol: str) -> Optional[SymbolScore]:
+            try:
+                async with sem:
+                    return await asyncio.wait_for(
+                        self.evaluate_symbol(symbol),
+                        timeout=float(self.config.selection_eval_timeout_s or 8.0),
+                    )
+            except Exception:
+                return None
+
+        rows = await asyncio.gather(*[_eval(symbol) for symbol in candidates], return_exceptions=False)
+        for score in rows:
+            if isinstance(score, SymbolScore) and score.comprehensive_score > 0:
                 scores.append(score)
-                self.symbol_scores[symbol] = score
+                self.symbol_scores[score.symbol] = score
         
         scores.sort(key=lambda s: s.comprehensive_score, reverse=True)
         
@@ -480,7 +583,9 @@ class DynamicSymbolSelector:
     
     async def update_selection(self) -> List[str]:
         """更新选择"""
-        candidates = await self.discover_symbols()
+        candidates = list(self.candidate_symbols or [])
+        if not candidates:
+            candidates = await self.discover_symbols()
         self.candidate_symbols = candidates
         
         best_symbols = await self.select_best_symbols(candidates)
@@ -508,8 +613,12 @@ class DynamicSymbolSelector:
     
     async def _selection_loop(self):
         """选择循环"""
+        first_round = True
         while self._running:
             try:
+                if first_round and float(self.config.startup_warmup_sec or 0) > 0:
+                    await asyncio.sleep(float(self.config.startup_warmup_sec))
+                    first_round = False
                 await self.update_selection()
                 await asyncio.sleep(self.config.selection_interval)
             except asyncio.CancelledError:
@@ -520,8 +629,12 @@ class DynamicSymbolSelector:
     
     async def _discovery_loop(self):
         """发现循环"""
+        first_round = True
         while self._running:
             try:
+                if first_round and float(self.config.startup_warmup_sec or 0) > 0:
+                    await asyncio.sleep(float(self.config.startup_warmup_sec))
+                    first_round = False
                 candidates = await self.discover_symbols()
                 self.candidate_symbols = candidates
                 await asyncio.sleep(self.config.discovery_interval)

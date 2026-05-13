@@ -10,8 +10,8 @@ system:
   log_level: INFO
   environment: production
 llm:
-  # 主模型：小米MiMo Pro + MiMo + 备用：百度千帆
-  default_model: mimo-v2.5-pro
+  # 主模型：DeepSeek（OpenAI 兼容）为主，Astron 作为末级备用
+  default_model: deepseek-v4-flash
   # 自动轮询策略：优先MiMo Pro，失败后降级，支持自动恢复
   auto_polling:
     enabled: true
@@ -21,115 +21,112 @@ llm:
     max_failures_before_switch: 2
     cooldown_after_switch: 30
   models:
-  # 1. MiMo Pro - 旗舰推理模型，最高优先级
+  # 0. DeepSeek V4 Flash — 生产默认主模型（低延迟）
   - provider: openai
-    model_id: mimo-v2.5-pro
-    display_name: MiMo V2.5 Pro (旗舰)
-    api_key_env: MIMO_API_KEY
-    base_url: https://token-plan-cn.xiaomimimo.com/v1
-    temperature: 0.5
-    max_tokens: 16000
-    timeout: 45.0
-    max_retries: 2
-    cost_per_input_token: 0.0
-    cost_per_output_token: 0.0
-    context_window: 200000
-    supports_vision: true
-    supports_reasoning: true
-    enabled: true
-    priority: 100
-    region: cn
-    notes: 2亿信用点，非高峰0.8x系数，TTS免费
-    fallback_models:
-    - mimo-v2.5
-    - qianfan-code-latest
-  # 2. MiMo 标准版 - 主力模型
-  - provider: openai
-    model_id: mimo-v2.5
-    display_name: MiMo V2.5 (主力)
-    api_key_env: MIMO_API_KEY
-    base_url: https://token-plan-cn.xiaomimimo.com/v1
-    temperature: 0.6
-    max_tokens: 8000
-    timeout: 30.0
-    max_retries: 2
+    model_id: deepseek-v4-flash
+    display_name: DeepSeek V4 Flash
+    api_key_env: DEEPSEEK_API_KEY
+    base_url: https://api.deepseek.com/v1
+    temperature: 0.35
+    max_tokens: 16384
+    timeout: 60.0
+    max_retries: 4
     cost_per_input_token: 0.0
     cost_per_output_token: 0.0
     context_window: 128000
-    supports_vision: true
-    supports_reasoning: false
+    supports_vision: false
+    supports_reasoning: true
     enabled: true
-    priority: 80
-    region: cn
-    notes: 2亿信用点，非高峰0.8x系数
+    priority: 160
+    region: global
+    notes: Production primary via DeepSeek OpenAI-compatible endpoint
     fallback_models:
-    - mimo-v2.5-pro
-    - qianfan-code-latest
-  # 3. 百度千帆 - 备用模型
+    - deepseek-v4-pro
+    - astron-code-latest
+  # 1. DeepSeek V4 Pro — 高推理质量回退 / 重点任务优先
   - provider: openai
-    model_id: qianfan-code-latest
-    display_name: Baidu Qianfan (备用)
-    api_key_env: BAIDU_QIANFAN_API_KEY
-    base_url: https://qianfan.baidubce.com/v2/coding
-    temperature: 0.5
-    max_tokens: 8000
-    timeout: 45.0
-    max_retries: 2
+    model_id: deepseek-v4-pro
+    display_name: DeepSeek V4 Pro
+    api_key_env: DEEPSEEK_API_KEY
+    base_url: https://api.deepseek.com/v1
+    temperature: 0.30
+    max_tokens: 16384
+    timeout: 75.0
+    max_retries: 4
     cost_per_input_token: 0.0
     cost_per_output_token: 0.0
-    context_window: 200000
-    supports_vision: true
-    supports_reasoning: false
+    context_window: 128000
+    supports_vision: false
+    supports_reasoning: true
     enabled: true
-    priority: 50
-    region: cn
-    notes: 备用模型，当MiMo不可用时切换
+    priority: 150
+    region: global
+    notes: Deep reasoning fallback / preferred for complex decisions
     fallback_models:
-    - mimo-v2.5-pro
-    - mimo-v2.5
+    - deepseek-v4-flash
+    - astron-code-latest
+  # 2. 讯飞 Astron Code Latest — 末级备用
+  - provider: openai
+    model_id: astron-code-latest
+    display_name: iFlytek Astron Code Latest
+    api_key_env: XFYUN_ASTRON_API_KEY
+    base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2
+    temperature: 0.4
+    max_tokens: 16384
+    timeout: 60.0
+    max_retries: 3
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 128000
+    supports_vision: false
+    supports_reasoning: true
+    enabled: true
+    priority: 120
+    region: cn
+    notes: Final fallback via iFlytek MaaS coding OpenAI-compatible endpoint
+    fallback_models: []
   task_model_mapping:
-    # 所有任务类型优先使用MiMo Pro，其次是MiMo标准版，最后是百度千帆备用
+    # 默认优先 DeepSeek Flash；高推理任务优先 Pro；Astron 为末级备用
     general:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - astron-code-latest
     market_analysis:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - astron-code-latest
     strategy_generation:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - astron-code-latest
     signal_generation:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-flash
+    - deepseek-v4-pro
+    - astron-code-latest
     risk_assessment:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - astron-code-latest
     news_analysis:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-flash
+    - deepseek-v4-pro
+    - astron-code-latest
     code_generation:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - astron-code-latest
     natural_language:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
-    # 新增任务类型映射
+    - deepseek-v4-flash
+    - deepseek-v4-pro
+    - astron-code-latest
     decision_making:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-flash
+    - deepseek-v4-pro
+    - astron-code-latest
     reasoning:
-    - mimo-v2.5-pro
-    - mimo-v2.5
-    - qianfan-code-latest
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - astron-code-latest
 trading:
   # 默认关注列表（动态选币开启时仍作 always_include 候选）
   symbols:
@@ -144,7 +141,7 @@ trading:
     - grid
     trade_type: swap
     margin_mode: cross
-    symbol_universe: full_exchange
+    symbol_universe: preferred_pool
     allowed_symbols: []
     position_mode: oneway
     leverage_min: 20
@@ -184,6 +181,7 @@ trading:
     selection_interval: 300
     min_24h_volume: 10000000
     enable_auto_discovery: true
+    preferred_symbols_only: true
     always_exclude: []
   analysis_interval: 60
   # 略降：低波动期仍要求证据，但避免与执行层 0.71 双重过紧
@@ -248,7 +246,6 @@ risk:
     enabled: true
     interval: 10
     alert_channels:
-    - telegram
     - log
   limits:
     daily_loss_limit: 0.05
@@ -264,6 +261,8 @@ exchanges:
     secret_env: OKX_SECRET
     passphrase_env: OKX_PASSPHRASE
     testnet: false
+    # 若 API Key 在 OKX「模拟交易」创建，必须为 true，否则 REST 返回 50101（environment mismatch）
+    simulated_order_only: true
     rate_limit: 20
     timeout: 30
   binance:
@@ -295,7 +294,7 @@ data:
     enabled: true
     priority: 1
   - provider: coingecko
-    enabled: true
+    enabled: false
     priority: 2
   history_days: 365
   symbols:
@@ -342,7 +341,7 @@ monitoring:
     enabled: true
     channels:
       telegram:
-        enabled: true
+        enabled: false
         bot_token_env: TELEGRAM_BOT_TOKEN
         chat_id_env: TELEGRAM_CHAT_ID
       email:
@@ -365,20 +364,19 @@ api:
   health_check_interval: 30
   metrics_interval: 60
 telegram:
-  enabled: true
+  enabled: false
   bot_token_env: TELEGRAM_BOT_TOKEN
   chat_ids_env: TELEGRAM_CHAT_ID
   proxy: null
 # 即时消息总开关（覆盖 SmartNotification 与直连 TG）
 messaging:
   instant:
-    enabled: true
+    enabled: false
     channels:
-    - telegram
     - log
 openclaw_push:
-  # 默认开启 OpenClaw 实时推送（交易/风控/系统告警）
-  enabled: true
+  # 消息通道暂时关闭；保留本地日志即可
+  enabled: false
   # 默认标准接入点；若你的 OpenClaw 网关地址不同，请在 local.yaml 覆盖。
   url: http://127.0.0.1:18789/api/events/ingest
   token: ''
@@ -449,7 +447,7 @@ proxy:
   use_global_proxy: true
   # OKX 专用：HTTP 代理经 Clash CONNECT 频繁断开时，可将 ignore_env_proxy 设为 true（OKX REST 直连，需容器出口可达 www.okx.com）
   okx:
-    proxy_only: false
+    proxy_only: true
     ignore_env_proxy: false
   no_proxy_extra:
   - redis
@@ -459,7 +457,7 @@ proxy:
   global_proxy:
     enabled: true
     proxy_type: http
-    # 默认本机 Mihomo/Clash mixed-port；Docker bridge 可改为 host.docker.internal（见 config/local.example 或部署文档）
+    # 当前恢复为本机 Mihomo/Clash mixed-port；GCP 隧道链路延迟过高，暂不作为生产默认出口。
     host: 127.0.0.1
     port: 7890
     username_env: PROXY_USER
@@ -517,12 +515,16 @@ ai_core:
     skip_optimize_if_cpu_above: 85
 ai_core_runtime:
   # 收益修复第一阶段：先压尾部回撤，再提升开仓质量门槛（可回滚小步调参）
-  min_confidence_to_trade: 0.65
-  ai_core_min_confidence_to_open: 0.65
-  ai_core_min_confidence_floor: 0.65
+  min_confidence_to_trade: 0.60
+  ai_core_min_confidence_to_open: 0.60
+  ai_core_min_confidence_floor: 0.60
   max_same_direction_ratio: 0.7
+  # 盈利优化：满仓替换最差仓位曾造成系统性亏损；默认关闭（与运行时热更新对齐）
+  enable_replace_worst_on_full_positions: false
+  # 快照超时且缺 K 线时允许“有价降级放行”；保留其余硬门控，避免网络抖动把交易机会全部挡掉
+  open_allow_snapshot_timeout_fallback: true
   # Batch1 tune (2026-05-04): small-step relaxation; keep >1.0 to avoid quality collapse.
-  min_rr_to_trade: 1.85
+  min_rr_to_trade: 1.6
   # 当交易所/数据链路降级时，进一步收缩开仓仓位，降低回撤尾部
   degraded_data_quantity_factor: 0.55
   exchange_reachability_degraded_quantity_factor: 0.5
@@ -533,6 +535,7 @@ ai_core_runtime:
   # 统一分析链路硬门槛：分析质量/置信不足或降级数据时，禁止开仓
   analysis_hard_gate_for_open: true
   analysis_min_confidence_for_open: 0.53
+  mi_view_timeout_s: 2.8
   min_data_quality_to_trade: 0.53
   analysis_require_not_degraded_for_open: true
   # 低波动缓趋势：与引擎内 low_vol_grind 市况对齐（可热更新）
@@ -540,6 +543,13 @@ ai_core_runtime:
   # Batch1 tune: raise grind trend floor to filter sideways noise.
   regime_grind_min_trend_abs: 0.0007
   regime_grind_max_atr_mult: 1.25
+  # SR 由纯否决器升级为入场确认器：开仓前要求出现回踩/突破确认。
+  sr_timing_guard_enable: true
+  sr_entry_confirmation_required: false
+  # 放宽“靠近关键位”判定，避免 ETH/BNB 这类距支撑约 0.6%~0.8% 的场景长期被判为“不靠近关键位”
+  sr_near_level_pct: 0.0105
+  # 轻微放宽突破确认缓冲，减少刚越过阻力/支撑时被视为“尚未确认”的假阴性
+  sr_breakout_buffer_pct: 0.001
   low_vol_grind_profile_min_rr_mult: 0.98
   low_vol_grind_profile_spread_mult: 1.06
   regime_profile_overrides:
@@ -554,20 +564,52 @@ ai_core_runtime:
       qty_mult: 1.03
       min_conf_add: 0.0
     high_vol:
-      min_rr_mult: 1.16
-      spread_mult: 0.88
-      qty_mult: 0.55
-      min_conf_add: 0.03
-    low_liquidity:
-      min_rr_mult: 1.12
+      min_rr_mult: 1.35
       spread_mult: 0.82
-      qty_mult: 0.68
-      min_conf_add: 0.03
+      qty_mult: 0.25
+      min_conf_add: 0.07
+    volatile:
+      min_rr_mult: 1.35
+      spread_mult: 0.82
+      qty_mult: 0.25
+      min_conf_add: 0.07
+    low_liquidity:
+      min_rr_mult: 1.16
+      spread_mult: 0.76
+      qty_mult: 0.55
+      min_conf_add: 0.04
     low_vol_grind:
       min_rr_mult: 0.96
       spread_mult: 1.07
       qty_mult: 0.88
       min_conf_add: -0.012
+  regime_policy_matrix:
+    trend:
+      leverage_mult: 1.0
+      qty_mult: 1.0
+    range:
+      leverage_mult: 0.95
+      qty_mult: 0.95
+    low_vol_grind:
+      leverage_mult: 0.9
+      qty_mult: 0.92
+      sltp_profile: grind_tight
+    high_vol:
+      leverage_mult: 0.55
+      qty_mult: 0.65
+      sltp_profile: high_vol_wide
+      advisory_only: true
+    volatile:
+      leverage_mult: 0.55
+      qty_mult: 0.65
+      sltp_profile: high_vol_wide
+      advisory_only: true
+    low_liquidity:
+      leverage_mult: 0.8
+      qty_mult: 0.85
+    normal:
+      leverage_mult: 1.0
+      qty_mult: 1.0
   # 净边际：低波动时边际更薄，略降仍要求为正
   edge_min_net_reward_pct: 0.004
   # hold_avoidance_override：缓趋势下 fusion sentiment 往往较小，略放宽
@@ -579,8 +621,8 @@ ai_core_runtime:
   hold_avoidance_override_require_mi_trend_alignment: false
   hold_avoidance_override_cooldown_sec: 300
   ai_autonomy_min_conf_floor: 0.51
-  ai_autonomy_min_mi_confidence: 0.565
-  ai_autonomy_min_mi_quality_score: 0.535
+  ai_autonomy_min_mi_confidence: 0.53
+  ai_autonomy_min_mi_quality_score: 0.5
 ai_brain:
   primary_controller: ai_core
   single_write_owner: ai_core
@@ -613,6 +655,8 @@ proactive_scanner:
   proactive_auto_execute_opportunities: false
   # 转发给 ai_core 的冷却收敛到 60 秒
   proactive_ai_core_forward_cooldown_sec: 60
+  # 若机会内容几乎不变，则在更长窗口内不重复推送给 ai_core，减少同质噪声
+  proactive_ai_core_forward_stable_window_sec: 240
   # 均值回归机会的 confidence 由 |24h涨跌幅|×10 推导；0.55≈5.5% 才会触发执行评估。
   # 小幅放宽：置信度 >=74% 才允许自动开仓评估
   proactive_execute_min_confidence: 0.74
@@ -631,6 +675,9 @@ proactive_scanner:
   proactive_symbol_trade_cooldown_sec: 60
   breakout_trade_cooldown_sec: 60
   proactive_skip_breakout_if_same_side_position: true
+  proactive_skip_same_side_position_any_opportunity: true
+  proactive_volatility_spike_forward_cooldown_sec: 600
+  proactive_volatility_spike_forward_stable_window_sec: 900
   # 发现层小幅放宽：更容易捕捉波动异动
   # 略降：低波动期仍能发现「相对放大」的异动
   vol_spike_min_atr_pct_1h: 0.009
@@ -652,10 +699,12 @@ proactive_scanner:
     max_spread_bps: 45.0
     # 允许入场价与最新价存在一定偏差（突破/均值回归会用K线收盘或关键价位作为entry），
     # 过严会导致机会全部被门控拦截，从而看起来“系统不自动开仓”。
-    max_entry_vs_last_slippage_pct: 0.05
-    # 微调放宽：RR 门槛小降，减少边界机会被预检拦截
-    # Batch1 tune: small relaxation only; avoid one-shot drop to 1.0.
-    min_risk_reward: 1.05
+    max_entry_vs_last_slippage_pct: 0.057
+    # 扫描器只做“发现+初筛”，边界机会允许略宽，后续仍会经过 ai_core 执行门控。
+    min_risk_reward: 0.98
+    # partial/live 视图仍保守一些，但不要直接抬回 ai_core 的执行 RR。
+    partial_min_risk_reward: 0.98
+    partial_max_spread_bps: 35.0
     min_abs_change_24h: 0.0
     require_insight_trend_alignment: true
     min_volume_vs_avg_ratio: 0.0
@@ -761,7 +810,7 @@ ai_trading:
   - BNB/USDT
   ai_config:
     enabled: true
-    model_id: qianfan-code-latest
+    model_id: astron-code-latest
     analysis_interval: 120
     min_confidence: 0.74
     max_positions: 4
@@ -808,7 +857,8 @@ proactive_ai:
     opportunity_trend_strength_threshold: 0.04
     opportunity_cooldown_sec: 14400
 stop_loss_take_profit:
-  trailing_only_mode: true
+  # 恢复固定止盈 + 移动止损双轨（不再仅 trailing）
+  trailing_only_mode: false
   trailing_only_coerce_inputs: true
   trailing_active_on_open: true
   initial_trailing_offset: 0.025
@@ -831,6 +881,10 @@ stop_loss_take_profit:
   profit_protect_tighten_factor: 0.82
   profit_protect_regime_overrides:
     high_vol:
+      trigger_mult: 0.75
+      lock_mult: 1.35
+      tighten_mult: 0.9
+    volatile:
       trigger_mult: 0.75
       lock_mult: 1.35
       tighten_mult: 0.9
@@ -863,6 +917,17 @@ stop_loss_take_profit:
     - 0.014
   - - 0.1
     - 0.02
+  min_net_take_profit_percent: 0.003
+  min_net_take_profit_regime_overrides:
+    normal: 0.0021
+    range: 0.0018
+    low_vol_grind: 0.0019
+    trend: 0.0034
+    high_vol: 0.0042
+    volatile: 0.0042
+    low_liquidity: 0.0048
+  fee_rate_per_side: 0.0005
+  slippage_rate_per_side: 0.0003
   min_trailing_offset: 0.005
   max_trailing_offset: 0.2
   check_interval: 5

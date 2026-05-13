@@ -21,6 +21,7 @@ router = APIRouter(prefix="/api/v1/monitoring", tags=["monitoring"])
 _trading_monitor = None
 _enhanced_monitoring = None
 _anomaly_detector = None
+_main_controller = None
 
 def set_trading_monitor(monitor: TradingMonitor):
     """设置交易监控器实例"""
@@ -32,6 +33,45 @@ def set_enhanced_monitoring(monitor: Optional[Any]) -> None:
     """注册 MainController 的 EnhancedMonitoringSystem，供 /alerts 与摘要合并展示。"""
     global _enhanced_monitoring
     _enhanced_monitoring = monitor
+
+
+def set_main_controller(main_controller: Optional[Any]) -> None:
+    global _main_controller
+    _main_controller = main_controller
+
+
+def _to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+async def _load_trade_rows(limit: int = 200, days: int = 30, realized_only: bool = False) -> List[Dict[str, Any]]:
+    mc = _main_controller
+    trade_service = getattr(mc, "trade_history_service", None) if mc else None
+    if not trade_service or not hasattr(trade_service, "get_trade_history"):
+        return []
+    start_date = datetime.now() if int(days or 0) <= 0 else (datetime.now()).replace(microsecond=0)
+    if int(days or 0) > 0:
+        from datetime import timedelta
+        start_date = datetime.now() - timedelta(days=max(1, int(days or 30)))
+    rows = await trade_service.get_trade_history(start_date=start_date, limit=max(1, int(limit or 200)), offset=0)
+    out: List[Dict[str, Any]] = []
+    for row in (rows or []):
+        if not isinstance(row, dict):
+            continue
+        md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        src = str((md.get("source") or row.get("source") or "")).strip().lower()
+        if src == "db_bootstrap":
+            continue
+        if realized_only:
+            pnl = _to_float(row.get("pnl"))
+            pnl_pct = _to_float(row.get("pnl_percent"))
+            if not (abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12):
+                continue
+        out.append(row)
+    return out
 
 
 def _serialize_trading_alert(alert: TradingAlert) -> Dict[str, Any]:
@@ -88,6 +128,39 @@ async def get_monitoring_summary():
         raise HTTPException(status_code=503, detail="Monitoring system not initialized")
     
     out = dict(_trading_monitor.get_monitoring_summary())
+    try:
+        rows = await _load_trade_rows(limit=5000, days=30, realized_only=False)
+        if rows:
+            out["total_trades"] = len(rows)
+            out["symbols"] = sorted(
+                {
+                    str(r.get("symbol") or "").strip()
+                    for r in rows
+                    if str(r.get("symbol") or "").strip()
+                }
+            )
+            out["strategies"] = sorted(
+                {
+                    str(
+                        (r.get("metadata") or {}).get("strategy_id")
+                        or (r.get("metadata") or {}).get("strategy_used")
+                        or r.get("strategy")
+                        or r.get("strategy_used")
+                        or ""
+                    ).strip()
+                    for r in rows
+                    if str(
+                        (r.get("metadata") or {}).get("strategy_id")
+                        or (r.get("metadata") or {}).get("strategy_used")
+                        or r.get("strategy")
+                        or r.get("strategy_used")
+                        or ""
+                    ).strip()
+                }
+            )
+            out["trade_source"] = "trade_history_service"
+    except Exception as e:
+        logger.debug("monitoring summary trade_history fallback failed: %s", e)
     out["sources"] = {
         "trading_monitor": True,
         "enhanced_monitoring": _enhanced_monitoring is not None,
@@ -166,7 +239,32 @@ async def get_trade_history(limit: int = Query(50, description="返回的交易�
     """获取交易历史"""
     if not _trading_monitor:
         raise HTTPException(status_code=503, detail="Monitoring system not initialized")
-    
+
+    rows = await _load_trade_rows(limit=int(limit or 50), days=90, realized_only=False)
+    if rows:
+        out: List[Dict[str, Any]] = []
+        for row in rows[: max(1, int(limit or 50))]:
+            md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            out.append(
+                {
+                    "order_id": row.get("order_id") or row.get("id") or row.get("trade_id"),
+                    "symbol": row.get("symbol"),
+                    "side": row.get("side"),
+                    "quantity": _to_float(row.get("quantity")),
+                    "price": _to_float(row.get("price")),
+                    "status": row.get("status") or "filled",
+                    "timestamp": row.get("timestamp"),
+                    "executed_quantity": _to_float(row.get("executed_quantity", row.get("quantity"))),
+                    "avg_price": _to_float(row.get("avg_price", row.get("price"))),
+                    "fee": _to_float(row.get("fee")),
+                    "pnl": _to_float(row.get("pnl")),
+                    "pnl_percent": _to_float(row.get("pnl_percent")),
+                    "strategy": md.get("strategy_id") or md.get("strategy_used") or row.get("strategy"),
+                    "source": md.get("source") or row.get("source") or "trade_history_service",
+                }
+            )
+        return out
+
     trades = _trading_monitor.get_trade_history(limit)
     return [{
         "order_id": trade.order_id,
@@ -178,7 +276,8 @@ async def get_trade_history(limit: int = Query(50, description="返回的交易�
         "timestamp": trade.timestamp,
         "executed_quantity": trade.executed_quantity,
         "avg_price": trade.avg_price,
-        "fee": trade.fee
+        "fee": trade.fee,
+        "source": "trading_monitor",
     } for trade in trades]
 
 @router.get("/strategies")
@@ -187,6 +286,52 @@ async def get_strategy_performance():
     if not _trading_monitor:
         raise HTTPException(status_code=503, detail="Monitoring system not initialized")
     
+    rows = await _load_trade_rows(limit=10000, days=90, realized_only=True)
+    if rows:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            strategy_name = str(
+                md.get("strategy_id")
+                or md.get("strategy_used")
+                or row.get("strategy")
+                or row.get("strategy_used")
+                or "unknown"
+            ).strip() or "unknown"
+            grouped.setdefault(strategy_name, []).append(row)
+        result = {}
+        for strategy_name, items in grouped.items():
+            pnls = [_to_float(x.get("pnl")) for x in items]
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p < 0]
+            total = len(items)
+            total_pnl = sum(pnls)
+            gross_profit = sum(wins)
+            gross_loss = abs(sum(losses))
+            result[strategy_name] = {
+                "total_trades": total,
+                "win_trades": len(wins),
+                "loss_trades": len(losses),
+                "win_rate": (len(wins) / total) if total else 0.0,
+                "total_pnl": total_pnl,
+                "max_drawdown": 0.0,
+                "sharpe_ratio": 0.0,
+                "last_update": max(str(x.get("timestamp") or "") for x in items) if items else None,
+                "avg_win": (sum(wins) / len(wins)) if wins else 0.0,
+                "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
+                "profit_factor": (gross_profit / gross_loss) if gross_loss > 1e-12 else (9999.0 if gross_profit > 0 else 0.0),
+                "expectancy": (total_pnl / total) if total else 0.0,
+                "drawdown_duration": 0,
+                "current_drawdown": 0.0,
+                "win_streak": 0,
+                "loss_streak": 0,
+                "best_trade": max(pnls) if pnls else 0.0,
+                "worst_trade": min(pnls) if pnls else 0.0,
+                "avg_holding_period": 0.0,
+                "source": "trade_history_service",
+            }
+        return result
+
     performance = _trading_monitor.get_strategy_performance()
     result = {}
     for strategy_name, perf in performance.items():
@@ -210,7 +355,8 @@ async def get_strategy_performance():
             "loss_streak": perf.loss_streak,
             "best_trade": perf.best_trade,
             "worst_trade": perf.worst_trade,
-            "avg_holding_period": perf.avg_holding_period
+            "avg_holding_period": perf.avg_holding_period,
+            "source": "trading_monitor",
         }
     return result
 

@@ -132,6 +132,8 @@ class TradingSystem:
         self.api_server = None
         self.running = False
         self.shutdown_event = asyncio.Event()
+        self.shutdown_requested_by_signal = False
+        self.shutdown_completed = False
 
     async def initialize(self) -> None:
         """初始化系统"""
@@ -220,10 +222,11 @@ class TradingSystem:
 
     async def shutdown(self) -> None:
         """关闭系统"""
-        if not self.running:
+        if self.shutdown_completed:
             return
 
-        logger.info("正在关闭系统...")
+        if self.running:
+            logger.info("正在关闭系统...")
 
         try:
             if self.api_server:
@@ -238,6 +241,7 @@ class TradingSystem:
                 await cleanup_config_manager()
 
             self.running = False
+            self.shutdown_completed = True
             logger.info("✅ 系统已安全关闭")
 
         except Exception as e:
@@ -261,6 +265,7 @@ class TradingSystem:
         """处理关闭信号"""
         signal_name = signal.Signals(sig).name
         logger.info(f"收到信号: {signal_name}")
+        self.shutdown_requested_by_signal = True
         self.shutdown_event.set()
 
 
@@ -295,6 +300,9 @@ async def main() -> None:
     finally:
         if _process_lock:
             _process_lock.release()
+        if system.shutdown_requested_by_signal and system.shutdown_completed:
+            logging.shutdown()
+            os._exit(0)
 
 
 if __name__ == "__main__":

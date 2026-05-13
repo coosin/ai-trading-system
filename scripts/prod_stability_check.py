@@ -8,6 +8,7 @@ Goals:
 - Verify trading-diagnosis is responsive and key invariants are sane
 
 Usage:
+  OPENCLAW_API_BASE=http://127.0.0.1:8000 python3 scripts/prod_stability_check.py
   BASE_URL=http://127.0.0.1:8000 python3 scripts/prod_stability_check.py
   python3 scripts/prod_stability_check.py --base-url http://127.0.0.1:8000
 """
@@ -24,6 +25,12 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.utils.openclaw_api_client import default_openclaw_api_base
 
 def _now() -> str:
     return datetime.now().isoformat()
@@ -71,7 +78,14 @@ def _add(items: List[CheckItem], cid: str, ok: bool, severity: str, detail: str,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default=os.environ.get("BASE_URL", os.environ.get("ACCEPTANCE_BASE", "http://127.0.0.1:8000")))
+    ap.add_argument(
+        "--base-url",
+        default=os.environ.get("OPENCLAW_API_BASE")
+        or os.environ.get("BASE_URL")
+        or os.environ.get("ACCEPTANCE_BASE")
+        or "",
+        help="API 根，如 http://127.0.0.1:8000；默认同 OPENCLAW_API_BASE / BASE_URL / ACCEPTANCE_BASE",
+    )
     ap.add_argument("--timeout-sec", type=float, default=12.0)
     ap.add_argument("--diag-timeout-sec", type=float, default=8.0)
     # Cold start in production can take > 60s (module init + exchange + background tasks).
@@ -79,7 +93,7 @@ def main() -> int:
     ap.add_argument("--require-health", action="store_true", help="Fail if /system/health is not healthy (not just reachable)")
     args = ap.parse_args()
 
-    base = str(args.base_url or "").rstrip("/")
+    base = (str(args.base_url or "").strip().rstrip("/") or default_openclaw_api_base())
     t = float(args.timeout_sec or 12.0)
     diag_t = float(args.diag_timeout_sec or 8.0)
 

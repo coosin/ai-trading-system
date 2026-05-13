@@ -21,6 +21,8 @@ bash scripts/start-openclaw-trading.sh
 curl -s http://127.0.0.1:8000/api/v1/system/health
 ```
 
+脚本或外部系统对接时，建议在 `.env` 中设置 **`OPENCLAW_API_BASE=http://127.0.0.1:8000`**（或与反代一致的 URL），与 `GET /api/v1/modules/surface/registry` 返回的 **`api_base_env`** 及 **`docs/API_REFERENCE.md`** 说明一致。
+
 4. **Docker（可选）**：
 
 ```bash
@@ -29,7 +31,7 @@ docker compose up -d
 curl -s http://127.0.0.1:8000/api/v1/system/health
 ```
 
-5. **网络自检**：`python3 scripts/network_connectivity_smoke.py`  
+5. **网络自检**：`python3 scripts/network_connectivity_smoke.py`（可选 `OPENCLAW_API_BASE=... python3 scripts/network_connectivity_smoke.py --include-api` 顺带探活本机 API）  
 6. **系统验收**：`bash scripts/verify_full_stack_network.sh`（成功时输出含 **`VERIFY_FULL_STACK=PASS`**）；应用快照：`curl -s http://127.0.0.1:8000/api/v1/system/acceptance`
 
 ## 运行模式说明

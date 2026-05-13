@@ -14,7 +14,7 @@ import ast
 import math
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ from src.modules.core.timing_constants import (
     SLEEP_5MIN,
     SLEEP_1H,
 )
+from src.modules.core.enhanced_llm_manager import TaskType
 
 
 @dataclass
@@ -182,18 +183,23 @@ class AICoreDecisionEngine:
                 "trend": {"min_rr_mult": 0.95, "spread_mult": 1.06, "qty_mult": 1.05, "min_conf_add": -0.005},
                 # 横盘：略收紧于旧版 range，减少纯震荡噪声单
                 "range": {"min_rr_mult": 1.02, "spread_mult": 0.98, "qty_mult": 0.92, "min_conf_add": 0.008},
-                "high_vol": {"min_rr_mult": 1.08, "spread_mult": 0.92, "qty_mult": 0.72, "min_conf_add": 0.02},
+                "high_vol": {"min_rr_mult": 1.35, "spread_mult": 0.82, "qty_mult": 0.25, "min_conf_add": 0.07},
+                "volatile": {"min_rr_mult": 1.35, "spread_mult": 0.82, "qty_mult": 0.25, "min_conf_add": 0.07},
                 "low_liquidity": {"min_rr_mult": 1.12, "spread_mult": 0.82, "qty_mult": 0.68, "min_conf_add": 0.03},
                 # 低波动 + 有方向但未到「强趋势」阈值：典型「慢涨/慢磨」
                 "low_vol_grind": {"min_rr_mult": 0.96, "spread_mult": 1.07, "qty_mult": 0.88, "min_conf_add": -0.012},
             },
+            # 基于支撑/阻力的择时：不仅用于否决“撞墙/抄底失败”，也要求开仓前出现回踩/突破确认。
+            "sr_timing_guard_enable": True,
+            "sr_entry_confirmation_required": True,
             # 生产级治理矩阵：regime -> 执行层仓位/杠杆/（预留）SLTP 策略路由
             # 注意：这是“可回滚的运行时覆盖”层，默认只做轻度缩放；策略大改需配合验收脚本与巡检阈值。
             "regime_policy_matrix": {
                 "trend": {"leverage_mult": 1.00, "qty_mult": 1.00},
                 "range": {"leverage_mult": 0.95, "qty_mult": 0.95},
                 "low_vol_grind": {"leverage_mult": 0.90, "qty_mult": 0.92, "sltp_profile": "grind_tight"},
-                "high_vol": {"leverage_mult": 0.85, "qty_mult": 0.90, "sltp_profile": "high_vol_wide"},
+                "high_vol": {"leverage_mult": 0.55, "qty_mult": 0.65, "sltp_profile": "high_vol_wide", "advisory_only": True},
+                "volatile": {"leverage_mult": 0.55, "qty_mult": 0.65, "sltp_profile": "high_vol_wide", "advisory_only": True},
                 "low_liquidity": {"leverage_mult": 0.80, "qty_mult": 0.85},
                 "normal": {"leverage_mult": 1.00, "qty_mult": 1.00},
             },
@@ -285,6 +291,13 @@ class AICoreDecisionEngine:
             "hold_avoidance_override_min_abs_sentiment": 0.06,
             "hold_avoidance_override_min_mi_quality_score": 0.62,
             "hold_avoidance_override_require_mi_trend_alignment": True,
+            # scanner 弱 SR 触发：把高质量 scanner 机会作为“软确认”引入决策层，
+            # 仅影响 hold->open 的释放，不绕过执行门控。
+            "scanner_weak_sr_trigger_enabled": True,
+            "scanner_weak_sr_max_age_sec": 900,
+            "scanner_weak_sr_min_confidence": 0.80,
+            "scanner_weak_sr_min_risk_reward": 1.02,
+            "scanner_weak_sr_max_entry_drift_pct": 0.012,
             # AI 自主放权（最小门禁）模式
             "ai_autonomy_minimal_gates_enabled": True,
             "ai_autonomy_min_conf_floor": 0.52,
@@ -594,6 +607,125 @@ class AICoreDecisionEngine:
                 return pv
         return None
 
+    def _scanner_trace_context(self, symbol: str) -> Dict[str, Any]:
+        p = self._scanner_hint_payload_for_symbol(symbol)
+        if not isinstance(p, dict):
+            return {}
+        out: Dict[str, Any] = {
+            "upstream_scanner_trace_id": str(p.get("trace_id") or ""),
+            "upstream_scanner_opportunity_type": str(p.get("opportunity_type") or ""),
+            "upstream_scanner_direction": str(p.get("direction") or ""),
+            "upstream_scanner_confidence": p.get("confidence"),
+            "upstream_scanner_priority": p.get("priority"),
+            "upstream_scanner_gate_pass_reason": p.get("gate_pass_reason"),
+        }
+        gm = p.get("gate_metrics")
+        if isinstance(gm, dict) and gm:
+            out["upstream_scanner_gate_metrics"] = dict(gm)
+        return {k: v for k, v in out.items() if v not in (None, "", {}, [])}
+
+    def _scanner_weak_sr_trigger(self, symbol: str, technical: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "long": False,
+            "short": False,
+            "eligible": False,
+            "reason": "",
+        }
+        if not bool(self.config.get("scanner_weak_sr_trigger_enabled", True)):
+            out["reason"] = "disabled"
+            return out
+        p = self._scanner_hint_payload_for_symbol(symbol)
+        if not isinstance(p, dict):
+            out["reason"] = "no_scanner_hint"
+            return out
+        opp_type = str(p.get("opportunity_type") or "").strip().lower()
+        direction = str(p.get("direction") or "").strip().lower()
+        if opp_type not in {"breakout", "volatility_spike"}:
+            out["reason"] = f"type_not_supported:{opp_type or 'unknown'}"
+            return out
+        if direction not in {"long", "short"}:
+            out["reason"] = f"direction_invalid:{direction or 'unknown'}"
+            return out
+        try:
+            conf = float(p.get("confidence") or 0.0)
+        except Exception:
+            conf = 0.0
+        min_conf = float(self.config.get("scanner_weak_sr_min_confidence", 0.80) or 0.80)
+        if conf < min_conf:
+            out["reason"] = f"confidence_low:{conf:.2f}<{min_conf:.2f}"
+            out["confidence"] = conf
+            return out
+        try:
+            raw = str(p.get("received_at", "") or "").replace("Z", "+00:00")
+            ts = datetime.fromisoformat(raw)
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            age_sec = max(0.0, (datetime.now() - ts).total_seconds())
+        except Exception:
+            age_sec = 10**9
+        max_age = float(self.config.get("scanner_weak_sr_max_age_sec", 900) or 900)
+        if age_sec > max_age:
+            out["reason"] = f"stale_hint:{int(age_sec)}>{int(max_age)}"
+            out["age_sec"] = age_sec
+            return out
+        gm = p.get("gate_metrics") if isinstance(p.get("gate_metrics"), dict) else {}
+        rr = None
+        try:
+            rr = float(gm.get("risk_reward")) if gm.get("risk_reward") is not None else None
+        except Exception:
+            rr = None
+        min_rr = float(self.config.get("scanner_weak_sr_min_risk_reward", 1.02) or 1.02)
+        if rr is not None and rr < min_rr:
+            out["reason"] = f"risk_reward_low:{rr:.3f}<{min_rr:.3f}"
+            out["risk_reward"] = rr
+            return out
+
+        tech = technical or {}
+        price_now = 0.0
+        entry_price = 0.0
+        try:
+            price_now = float(tech.get("price", 0.0) or 0.0)
+        except Exception:
+            price_now = 0.0
+        try:
+            entry_price = float(p.get("entry_price") or 0.0)
+        except Exception:
+            entry_price = 0.0
+        drift_pct = None
+        if price_now > 0 and entry_price > 0:
+            drift_pct = abs(price_now - entry_price) / price_now
+            max_drift = float(self.config.get("scanner_weak_sr_max_entry_drift_pct", 0.012) or 0.012)
+            if drift_pct > max_drift:
+                out["reason"] = f"entry_drift_high:{drift_pct:.4f}>{max_drift:.4f}"
+                out["entry_drift_pct"] = drift_pct
+                return out
+
+        near_res = bool(tech.get("near_resistance", False))
+        near_sup = bool(tech.get("near_support", False))
+        brk_up = bool(tech.get("breakout_up_confirmed", False))
+        brk_down = bool(tech.get("breakdown_down_confirmed", False))
+        if direction == "long" and near_res and not brk_up:
+            out["reason"] = "blocked_by_near_resistance"
+            return out
+        if direction == "short" and near_sup and not brk_down:
+            out["reason"] = "blocked_by_near_support"
+            return out
+
+        out.update(
+            {
+                "eligible": True,
+                "reason": f"eligible:{opp_type}:{direction}",
+                "direction": direction,
+                "opportunity_type": opp_type,
+                "confidence": conf,
+                "age_sec": age_sec,
+                "risk_reward": rr,
+                "entry_drift_pct": drift_pct,
+            }
+        )
+        out[direction] = True
+        return out
+
     def _format_scanner_hint_block(self, symbol: str) -> str:
         p = self._scanner_hint_payload_for_symbol(symbol)
         if not p:
@@ -866,6 +998,9 @@ class AICoreDecisionEngine:
                                 if dts:
                                     trace_id = f"hold-{symbol.replace('/', '_')}-{int(datetime.now().timestamp())}"
                                     hold_extras = self._build_hold_trace_extras(decision=decision, source="main_decision_loop")
+                                    hold_extras = await self._enrich_hold_trace_extras_with_sr(
+                                        str(decision.symbol or symbol), hold_extras
+                                    )
                                     dts.record_intent(
                                         trace_id=trace_id,
                                         symbol=str(decision.symbol or symbol),
@@ -902,6 +1037,19 @@ class AICoreDecisionEngine:
     
     async def _auto_select_trading_symbols(self) -> List[str]:
         """AI自主选择交易币种 - 根据市场波动和机会，自由选择"""
+        mc = getattr(self, "main_controller", None)
+        selector = getattr(mc, "dynamic_symbol_selector", None) if mc else None
+        if selector and hasattr(selector, "get_trading_symbols"):
+            try:
+                selector_symbols = await selector.get_trading_symbols()
+                selector_symbols = [str(s) for s in selector_symbols if s]
+                if selector_symbols:
+                    selected = selector_symbols[:8]
+                    logger.info(f"📊 AI自主选择交易币种(selector): {selected}")
+                    return selected
+            except Exception as e:
+                logger.debug(f"读取动态选币结果失败，回退 AI 自主选择: {e}")
+
         # 尝试从交易所获取所有可用的USDT交易对
         all_symbols = []
         
@@ -2246,7 +2394,12 @@ class AICoreDecisionEngine:
 
 用简洁的中文回答，不超过100字。"""
 
-            response = await self.llm.generate(prompt, is_user_input=False)
+            response = await self.llm.generate(
+                prompt,
+                is_user_input=False,
+                task_type=TaskType.REASONING,
+                prefer_reasoning=True,
+            )
             
             if response and self.memory:
                 await self.memory.add_memory(
@@ -2638,7 +2791,12 @@ class AICoreDecisionEngine:
 
 只返回JSON。"""
 
-            response = await self.llm.generate(prompt, is_user_input=False)
+            response = await self.llm.generate(
+                prompt,
+                is_user_input=False,
+                task_type=TaskType.STRATEGY_GENERATION,
+                prefer_reasoning=True,
+            )
             
             if not response:
                 return None
@@ -3197,6 +3355,124 @@ class AICoreDecisionEngine:
             "partial": partial,
         }
         decision.market_analysis = payload
+
+    def _extract_llm_failure_meta(self, response: Any) -> Dict[str, Any]:
+        """Normalize failed/empty LLM response metadata for fallback attribution."""
+        if response is None:
+            return {"reason": "missing_response", "error_code": "NO_RESPONSE"}
+        error_code = str(getattr(response, "error_code", None) or "").strip().upper()
+        error_message = str(getattr(response, "error_message", None) or "").strip()
+        model_id = str(getattr(response, "model_id", None) or "").strip()
+        provider_raw = getattr(response, "provider", None)
+        provider = str(getattr(provider_raw, "value", provider_raw) or "").strip().lower()
+        try:
+            latency_ms = float(getattr(response, "latency_ms", 0.0) or 0.0)
+        except Exception:
+            latency_ms = 0.0
+        content = str(getattr(response, "content", "") or "").strip()
+        if not error_code and not content:
+            error_code = "EMPTY_CONTENT"
+        reason = error_code.lower() if error_code else "empty_content"
+        return {
+            "reason": reason,
+            "error_code": error_code or "EMPTY_CONTENT",
+            "error_message": error_message[:240],
+            "model_id": model_id,
+            "provider": provider,
+            "latency_ms": round(latency_ms, 1),
+        }
+
+    def _attach_llm_fallback_metadata(
+        self,
+        decision: Optional[TradeDecision],
+        *,
+        response: Any,
+        fallback_kind: str,
+        multi_source_analysis: Optional[Dict[str, Any]] = None,
+        mi_view: Any = None,
+    ) -> None:
+        """Attach structured LLM failure metadata to fallback decisions."""
+        if decision is None:
+            return
+        meta = self._extract_llm_failure_meta(response)
+        details = (
+            f"kind={fallback_kind}"
+            f" code={meta.get('error_code')}"
+            f" model={meta.get('model_id') or 'unknown'}"
+            f" provider={meta.get('provider') or 'unknown'}"
+            f" latency_ms={meta.get('latency_ms', 0.0)}"
+        )
+        if meta.get("error_message"):
+            details += f" msg={meta.get('error_message')}"
+        reasoning = str(getattr(decision, "reasoning", "") or "").strip()
+        if details not in reasoning:
+            decision.reasoning = f"{reasoning} [{details}]".strip()
+        ma = decision.market_analysis if isinstance(getattr(decision, "market_analysis", None), dict) else {}
+        ma.update(
+            {
+                "llm_fallback": True,
+                "llm_fallback_kind": fallback_kind,
+                "llm_failure_reason": meta.get("reason"),
+                "llm_error_code": meta.get("error_code"),
+                "llm_error_message": meta.get("error_message"),
+                "llm_model_id": meta.get("model_id"),
+                "llm_provider": meta.get("provider"),
+                "llm_latency_ms": meta.get("latency_ms"),
+            }
+        )
+        if multi_source_analysis is not None or mi_view is not None:
+            self._ensure_open_market_analysis_payload(
+                decision,
+                multi_source_analysis=multi_source_analysis or {},
+                mi_view=mi_view,
+            )
+            ma = decision.market_analysis if isinstance(getattr(decision, "market_analysis", None), dict) else ma
+            ma.update(
+                {
+                    "llm_fallback": True,
+                    "llm_fallback_kind": fallback_kind,
+                    "llm_failure_reason": meta.get("reason"),
+                    "llm_error_code": meta.get("error_code"),
+                    "llm_error_message": meta.get("error_message"),
+                    "llm_model_id": meta.get("model_id"),
+                    "llm_provider": meta.get("provider"),
+                    "llm_latency_ms": meta.get("latency_ms"),
+                }
+            )
+        decision.market_analysis = ma
+
+    def _should_skip_symbol_due_to_recent_guard_rejection(self, symbol: str) -> Tuple[bool, Optional[str]]:
+        """Short cooldown for symbols that were just rejected by hard execution guards."""
+        try:
+            cooldown = float(self.config.get("recent_guard_rejection_symbol_cooldown_sec", 180) or 180)
+            if cooldown <= 0:
+                return False, None
+            reasons = {
+                "sr_timing_short_near_support",
+                "sr_timing_long_near_resistance",
+                "same_direction_ratio_rejected",
+            }
+            now = datetime.utcnow()
+            symbol_norm = str(symbol or "").upper()
+            for row in reversed(list(self._rejected_signals or [])):
+                try:
+                    if str(row.get("symbol") or "").upper() != symbol_norm:
+                        continue
+                    reason = str(row.get("reason") or "")
+                    if reason not in reasons:
+                        continue
+                    ts_raw = str(row.get("ts") or "")
+                    if not ts_raw:
+                        continue
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+                    if (now - ts).total_seconds() < cooldown:
+                        return True, reason
+                    return False, None
+                except Exception:
+                    continue
+        except Exception:
+            return False, None
+        return False, None
     
     async def _ai_analyze_and_decide(self, symbol: str) -> Optional[TradeDecision]:
         """AI分析市场并做出决策 - 使用所有模块数据，全部实时获取"""
@@ -3211,6 +3487,10 @@ class AICoreDecisionEngine:
             # 让有限自调在 30~60 分钟窗口内可观察：评估频率提高，
             # 但真正参数变更仍受 cooldown/边界预算约束。
             await self._auto_tune_hold_avoidance_override()
+            skip_recent, skip_reason = self._should_skip_symbol_due_to_recent_guard_rejection(symbol)
+            if skip_recent:
+                logger.info("⏭️ 跳过重复分析: %s 最近刚被执行门控拒绝 reason=%s", symbol, skip_reason)
+                return None
             # 1. 获取市场数据 - 实时
             market_data = await self._get_market_data(symbol)
             logger.info(f"   ✅ 市场数据: 价格={market_data.get('price', 0)}")
@@ -3252,10 +3532,13 @@ class AICoreDecisionEngine:
             try:
                 mi = getattr(self.main_controller, "market_intelligence", None) if self.main_controller else None
                 if mi and hasattr(mi, "get_symbol_view"):
-                    _to_s = float(self.config.get("mi_view_timeout_s", 0.85) or 0.85)
+                    # Decision-time MI must prefer a full snapshot view; the control-plane fast path
+                    # is responsive but often degrades to ticker-only/cached data and pushes the
+                    # trading loop into systematic HOLD decisions.
+                    _to_s = float(self.config.get("mi_view_timeout_s", 2.8) or 2.8)
                     try:
                         mi_view = await asyncio.wait_for(
-                            mi.get_symbol_view(symbol, include_snapshot=False), timeout=_to_s
+                            mi.get_symbol_view(symbol, include_snapshot=True), timeout=_to_s
                         )
                     except asyncio.TimeoutError:
                         mi_view = None
@@ -3311,7 +3594,16 @@ class AICoreDecisionEngine:
                 market_intelligence=(mi_view.to_dict() if mi_view else None),
             )
             
-            response = await self.llm.generate(prompt, is_user_input=False)
+            response = await self.llm.generate(
+                prompt,
+                is_user_input=False,
+                task_type=TaskType.DECISION_MAKING,
+                prefer_reasoning=True,
+                max_retries=int(self.config.get("llm_decision_max_retries", 2) or 2),
+                # DeepSeek thinking mode can consume output budget and leave empty content
+                # for strict-JSON decision prompts; disable it on this path.
+                extra_body={"thinking": {"type": "disabled"}},
+            )
             
             if (not response) or (not str(getattr(response, "content", "") or "").strip()):
                 logger.warning(f"AI未返回决策，启用规则兜底: {symbol}")
@@ -3357,15 +3649,17 @@ class AICoreDecisionEngine:
                             strategy_used="s1_llm_unavailable_fallback",
                             risk_level=risk_level,
                         )
-                        self._ensure_open_market_analysis_payload(
+                        self._attach_llm_fallback_metadata(
                             fb_decision,
+                            response=response,
+                            fallback_kind="rule_open",
                             multi_source_analysis=multi_source_analysis,
                             mi_view=mi_view,
                         )
                         return fb_decision
                 except Exception:
                     pass
-                return TradeDecision(
+                fb_hold = TradeDecision(
                     symbol=symbol,
                     action="hold",
                     side="long",
@@ -3379,6 +3673,12 @@ class AICoreDecisionEngine:
                     strategy_used="s1_llm_unavailable_fallback",
                     risk_level=str(risk_assessment.get("level", "medium") or "medium"),
                 )
+                self._attach_llm_fallback_metadata(
+                    fb_hold,
+                    response=response,
+                    fallback_kind="hold",
+                )
+                return fb_hold
             
             decision = self._parse_ai_decision(response.content, symbol)
 
@@ -3463,6 +3763,17 @@ class AICoreDecisionEngine:
                         rsi_1h = float(technical.get("rsi_1h", 50.0) or 50.0)
                     except Exception:
                         rsi_1h = 50.0
+                    weak_sr = self._scanner_weak_sr_trigger(symbol, technical)
+                    weak_long_ready = bool(weak_sr.get("long", False))
+                    weak_short_ready = bool(weak_sr.get("short", False))
+                    near_res = bool(technical.get("near_resistance", False))
+                    near_sup = bool(technical.get("near_support", False))
+                    brk_up = bool(technical.get("breakout_up_confirmed", False))
+                    brk_down = bool(technical.get("breakdown_down_confirmed", False))
+                    sr_long_ready = bool(near_sup or brk_up or weak_long_ready)
+                    sr_short_ready = bool(near_res or brk_down or weak_short_ready)
+                    sr_reject_long = bool(near_sup and (not brk_down))
+                    sr_reject_short = bool(near_res and (not brk_up))
                     raw_chg_24h = (
                         market_data.get("change_24h")
                         if isinstance(market_data, dict)
@@ -3504,13 +3815,17 @@ class AICoreDecisionEngine:
                         1.5 if tech_bull else 0.0,  # 技术趋势权重最高
                         1.0 if mi_bull else 0.0,
                         1.0 if bias_bull else 0.0,
-                        0.5 if sentiment_bull else 0.0  # 情绪权重最低
+                        0.5 if sentiment_bull else 0.0,  # 情绪权重最低
+                        0.6 if weak_long_ready else 0.0,
+                        0.75 if (tech_bull and sr_reject_long) else 0.0,
                     ])
                     bear_strength = sum([
                         1.5 if tech_bear else 0.0,
                         1.0 if mi_bear else 0.0,
                         1.0 if bias_bear else 0.0,
-                        0.5 if sentiment_bear else 0.0
+                        0.5 if sentiment_bear else 0.0,
+                        0.6 if weak_short_ready else 0.0,
+                        0.75 if (tech_bear and sr_reject_short) else 0.0,
                     ])
                     # 只有一方明显强于另一方时才执行（差距>=0.5分）
                     evidence_clear = abs(bull_strength - bear_strength) >= 0.5
@@ -3553,6 +3868,10 @@ class AICoreDecisionEngine:
                         bull_evidence = bull_evidence or bull_release
                         bear_evidence = bear_evidence or bear_release
 
+                    if bool(self.config.get("sr_entry_confirmation_required", True)):
+                        bull_evidence = bull_evidence and sr_long_ready
+                        bear_evidence = bear_evidence and sr_short_ready
+
                     risk_ok = str(risk_level or "").lower() in ("low", "medium")
                     # Runtime evidence shows many HOLD decisions are tagged as high risk.
                     # Allow limited override for "high" only when confidence+quality are stronger;
@@ -3593,13 +3912,17 @@ class AICoreDecisionEngine:
                                 1.5 if tech_bull else 0.0,
                                 1.0 if mi_bull else 0.0,
                                 1.0 if bias_bull else 0.0,
-                                0.5 if sentiment_bull else 0.0
+                                0.5 if sentiment_bull else 0.0,
+                                0.6 if weak_long_ready else 0.0,
+                                0.75 if (tech_bull and sr_reject_long) else 0.0,
                             ])
                             bear_str = sum([
                                 1.5 if tech_bear else 0.0,
                                 1.0 if mi_bear else 0.0,
                                 1.0 if bias_bear else 0.0,
-                                0.5 if sentiment_bear else 0.0
+                                0.5 if sentiment_bear else 0.0,
+                                0.6 if weak_short_ready else 0.0,
+                                0.75 if (tech_bear and sr_reject_short) else 0.0,
                             ])
 
                             if bear_str > bull_str:
@@ -3614,7 +3937,10 @@ class AICoreDecisionEngine:
                                     f"ai_autonomy_override: strict={strict_ready} autonomy={autonomy_ready} "
                                     f"fusion_conf={fusion_conf:.2f} mi_conf={mi_conff:.2f} mi_q={mi_qf:.2f} "
                                     f"t1={t1} t4={t4} t1d={t1d} mi_trend={mi_tr} mi_bias={mi_bi} "
-                                    f"bear_str={bear_str:.1f} bull_str={bull_str:.1f}"
+                                    f"bear_str={bear_str:.1f} bull_str={bull_str:.1f} "
+                                    f"sr_long_ready={sr_long_ready} sr_short_ready={sr_short_ready} "
+                                    f"weak_sr={weak_sr.get('reason', '')} "
+                                    f"sr_reject_short={sr_reject_short}"
                                 )
                                 decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
                                 self._last_hold_override_at[key] = now
@@ -3630,7 +3956,10 @@ class AICoreDecisionEngine:
                                     f"ai_autonomy_override: strict={strict_ready} autonomy={autonomy_ready} "
                                     f"fusion_conf={fusion_conf:.2f} mi_conf={mi_conff:.2f} mi_q={mi_qf:.2f} "
                                     f"t1={t1} t4={t4} t1d={t1d} mi_trend={mi_tr} mi_bias={mi_bi} "
-                                    f"bull_str={bull_str:.1f} bear_str={bear_str:.1f}"
+                                    f"bull_str={bull_str:.1f} bear_str={bear_str:.1f} "
+                                    f"sr_long_ready={sr_long_ready} sr_short_ready={sr_short_ready} "
+                                    f"weak_sr={weak_sr.get('reason', '')} "
+                                    f"sr_reject_long={sr_reject_long}"
                                 )
                                 decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
                                 self._last_hold_override_at[key] = now
@@ -4371,6 +4700,40 @@ class AICoreDecisionEngine:
             if autonomy_enabled
             else "关闭（严格门禁）"
         )
+        sr_confirmation_required = bool(self.config.get("sr_entry_confirmation_required", True))
+        mtf_release_enabled = bool(self.config.get("ai_autonomy_enable_mtf_conflict_release", True))
+        mtf_release_requires_mi_bias = bool(
+            self.config.get("ai_autonomy_mtf_conflict_release_requires_mi_bias", True)
+        )
+        sr_rule_block = (
+            "SR 入场确认: 必须满足。long 优先 near_support/突破确认，short 优先 near_resistance/跌破确认；"
+            "若缺少确认，通常应 hold。"
+            if sr_confirmation_required
+            else "SR 入场确认: 非硬性必须。缺少 near_support/near_resistance/突破确认时，必须继续评估开仓，"
+            "只能下调 confidence 与仓位，不能把“没有 SR 触发”单独当作 hold 的充分理由；"
+            "只有在 long 贴近阻力未突破、或 short 贴近支撑未跌破时，才应默认 hold。"
+        )
+        mtf_rule_block = (
+            "多周期冲突处理: 若满足最小门禁，且至少一类方向证据成立"
+            + ("（并且 MI bias 不能明显反向）" if mtf_release_requires_mi_bias else "")
+            + "，不要机械地直接 hold；应继续判断是否可小仓位试单。"
+            if mtf_release_enabled
+            else "多周期冲突处理: 周期冲突时默认应 hold。"
+        )
+        autonomy_hold_rule_block = (
+            "重要: 若出现多周期矛盾或大周期与短周期方向不一致，不要把“周期冲突”本身当作 hold 的充分条件。"
+            " 只要最小门禁满足，且方向证据并未明显互相抵消，就应继续评估 buy/sell；仅当证据不足、"
+            "方向互相抵消，或 SR 风险显著不利时才 hold。"
+            if mtf_release_enabled
+            else "重要: 若出现多周期矛盾或大周期与短周期方向不一致，默认应 action=hold；但满足最小门禁时可例外。"
+        )
+        autonomy_sr_rule_block = (
+            "SR 解释规则: 当前配置下，near_support / near_resistance / breakout / breakdown 是加分项而非绝对硬门槛。"
+            " 缺少这些确认时，只能下调 confidence，不能单独作为 hold 的唯一理由。"
+            " 若技术、多源、MI 中至少一类方向证据成立，且风险允许，应优先考虑小仓位试单而非机械 hold。"
+            if not sr_confirmation_required
+            else "SR 解释规则: 当前配置要求 SR 入场确认，缺少确认时通常应 hold。"
+        )
         
         prompt = f"""你是一个拥有完整控制权的量化交易AI，正在24小时不间断运行。
 
@@ -4413,6 +4776,16 @@ class AICoreDecisionEngine:
 - MA20: {technical.get('ma20_1d', 0):.4f}
 - 趋势: {technical.get('trend_1d', 'unknown')}
 
+【支撑/阻力与入场位置】
+- 1H支撑: {technical.get('support_1h', 0):.4f}
+- 1H阻力: {technical.get('resistance_1h', 0):.4f}
+- 距支撑: {technical.get('dist_to_support_pct')}
+- 距阻力: {technical.get('dist_to_resistance_pct')}
+- near_support: {technical.get('near_support', False)}
+- near_resistance: {technical.get('near_resistance', False)}
+- breakout_up_confirmed: {technical.get('breakout_up_confirmed', False)}
+- breakdown_down_confirmed: {technical.get('breakdown_down_confirmed', False)}
+
 【可用策略】
 - 策略数量: {strategy_advice.get('count', 0)}
 - 策略详情: {json.dumps(strategy_advice.get('strategies', [])[:3], indent=2, ensure_ascii=False, default=str)[:2000]}
@@ -4442,8 +4815,12 @@ class AICoreDecisionEngine:
 - 最大持仓数: {self.config['max_positions']}
 - 最小交易置信度: {self.config.get('min_confidence_to_trade', 0.6)}
 - AI自主放权模式: {autonomy_rule_block}
+- {sr_rule_block}
+- {mtf_rule_block}
+- {autonomy_hold_rule_block}
+- {autonomy_sr_rule_block}
 - 主观平仓要求: 仅在「多周期趋势已实质反转」或风险不可接受时 action=close；不要因单根K线、短时反弹/回踩或单一指标抖动平仓；若证据不足请 hold。
-- 重要: 若出现「多周期矛盾」「大周期与短周期方向不一致」，默认应 action=hold；但满足“最小门禁”即可开仓：
+- 满足“最小门禁”时可继续评估开仓：
   (a) 置信度达到基础底线（>= {self.config.get('ai_autonomy_min_conf_floor', 0.52)}）；
   (b) 统一行情 quality_score >= {self.config.get('ai_autonomy_min_mi_quality_score', 0.55)}；
   (c) 至少一类方向证据成立（技术趋势一致 / MI趋势一致 / 多源sentiment显著）。
@@ -4455,8 +4832,15 @@ class AICoreDecisionEngine:
 2. 第三方数据的情绪是否支持你的判断
 3. 风险评估等级是否允许开仓
 4. 历史经验中是否有类似情况的教训
-5. 已有持仓时：优先让交易所侧止盈止损（SLTP）管理价位平仓；除非趋势明确反转，否则避免频繁 close
-6. confidence 应反映真实不确定性：存在周期冲突时默认 confidence 不得超过 0.75 且倾向 hold；但满足最小门禁与方向证据时，允许输出 buy/sell。
+5. 开仓择时必须考虑 SR 位置：
+   - long 优先在 near_support 回踩确认后，或 breakout_up_confirmed 后开仓
+   - short 优先在 near_resistance 反抽确认后，或 breakdown_down_confirmed 后开仓
+   - 若配置要求 SR 确认，则缺少确认时应明显下调开仓意愿
+   - 若配置不要求 SR 确认，则 absence of SR confirm 只能作为减分项，不能单独成为 hold 的唯一理由；若方向证据成立，优先输出较低 confidence / 较小仓位的 open
+   - 若 long 贴近阻力且未突破，或 short 贴近支撑且未跌破，默认应 hold
+6. 已有持仓时：优先让交易所侧止盈止损（SLTP）管理价位平仓；除非趋势明确反转，否则避免频繁 close
+7. confidence 应反映真实不确定性：存在周期冲突时默认 confidence 不得超过 0.75；但满足最小门禁时，不要因为“周期冲突”四个字就机械输出 hold，应结合方向证据、MI 质量、风险等级与 SR 风险继续判断 buy/sell/hold。
+8. 当你准备输出 hold 时，必须先自检：如果 hold 的核心理由只是“没有 near_support/near_resistance/breakout/breakdown”，但并不存在“long 贴近阻力未突破”或“short 贴近支撑未跌破”，且最小门禁满足，那么 hold 通常是错误的，应重新评估是否用小仓位开仓。
 
 请做出交易决策，返回JSON格式：
 
@@ -4497,6 +4881,15 @@ class AICoreDecisionEngine:
         strat = strategy_used if strategy_used is not None else getattr(decision, "strategy_used", None)
         risk = risk_level if risk_level is not None else getattr(decision, "risk_level", None)
         min_conf = float(self.config.get("min_confidence_to_trade", 0.6) or 0.6)
+        gp = self._adaptive_guard_profile if isinstance(getattr(self, "_adaptive_guard_profile", None), dict) else {}
+        regime = str(gp.get("regime") or "unknown")
+        profile = str(gp.get("profile") or "unknown")
+        strategy_used_s = str(strat or "")
+        market_analysis = (
+            getattr(decision, "market_analysis", None)
+            if decision is not None and isinstance(getattr(decision, "market_analysis", None), dict)
+            else {}
+        )
 
         tags = {
             "mtf_conflict": ("多周期" in txt and "矛盾" in txt)
@@ -4513,6 +4906,10 @@ class AICoreDecisionEngine:
             or ("evidence" in low and ("insufficient" in low or "incomplete" in low)),
             "neutral_market": ("震荡" in txt or "盘整" in txt or "中性" in txt)
             or ("choppy" in low or "sideways" in low or "neutral" in low),
+            "llm_unavailable_fallback": ("llm_unavailable_fallback" in low)
+            or ("fallback" in low and "hold" in low)
+            or ("fallback" in strategy_used_s.lower())
+            or bool(market_analysis.get("llm_fallback", False)),
         }
 
         return {
@@ -4521,11 +4918,66 @@ class AICoreDecisionEngine:
             "decision_confidence": conf,
             "min_confidence_to_trade": min_conf,
             "confidence_gap": (float(conf) - min_conf) if isinstance(conf, (int, float)) else None,
-            "strategy_used": str(strat or ""),
+            "strategy_used": strategy_used_s,
             "risk_level": str(risk or ""),
+            "regime": regime,
+            "guard_profile": profile,
             "reasoning_excerpt": txt[:280],
+            "llm_fallback_kind": market_analysis.get("llm_fallback_kind"),
+            "llm_failure_reason": market_analysis.get("llm_failure_reason"),
+            "llm_error_code": market_analysis.get("llm_error_code"),
+            "llm_error_message": market_analysis.get("llm_error_message"),
+            "llm_model_id": market_analysis.get("llm_model_id"),
+            "llm_provider": market_analysis.get("llm_provider"),
+            "llm_latency_ms": market_analysis.get("llm_latency_ms"),
             "hold_reason_tags": tags,
+            **self._scanner_trace_context(getattr(decision, "symbol", "") if decision is not None else ""),
         }
+
+    async def _enrich_hold_trace_extras_with_sr(
+        self, symbol: str, extras: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = dict(extras or {})
+        try:
+            sr = await self._get_technical_indicators(symbol)
+            weak_sr = self._scanner_weak_sr_trigger(symbol, sr)
+            out["sr_snapshot"] = {
+                "near_support": bool(sr.get("near_support", False)),
+                "near_resistance": bool(sr.get("near_resistance", False)),
+                "breakout_up_confirmed": bool(sr.get("breakout_up_confirmed", False)),
+                "breakdown_down_confirmed": bool(sr.get("breakdown_down_confirmed", False)),
+                "scanner_weak_long_trigger": bool(weak_sr.get("long", False)),
+                "scanner_weak_short_trigger": bool(weak_sr.get("short", False)),
+                "scanner_weak_reason": str(weak_sr.get("reason", "") or ""),
+                "dist_to_support_pct": sr.get("dist_to_support_pct"),
+                "dist_to_resistance_pct": sr.get("dist_to_resistance_pct"),
+            }
+            hold_tags = out.get("hold_reason_tags")
+            if isinstance(hold_tags, dict):
+                hold_tags["no_sr_entry_trigger"] = not bool(
+                    sr.get("near_support", False)
+                    or sr.get("near_resistance", False)
+                    or sr.get("breakout_up_confirmed", False)
+                    or sr.get("breakdown_down_confirmed", False)
+                    or weak_sr.get("long", False)
+                    or weak_sr.get("short", False)
+                )
+        except Exception as e:
+            out["sr_snapshot"] = {
+                "near_support": False,
+                "near_resistance": False,
+                "breakout_up_confirmed": False,
+                "breakdown_down_confirmed": False,
+                "scanner_weak_long_trigger": False,
+                "scanner_weak_short_trigger": False,
+                "scanner_weak_reason": f"sr_enrich_failed:{type(e).__name__}",
+                "dist_to_support_pct": None,
+                "dist_to_resistance_pct": None,
+            }
+            hold_tags = out.get("hold_reason_tags")
+            if isinstance(hold_tags, dict):
+                hold_tags["no_sr_entry_trigger"] = True
+        return out
     
     def _parse_ai_decision(self, response: str, symbol: str) -> Optional[TradeDecision]:
         """解析AI决策"""
@@ -4600,6 +5052,7 @@ class AICoreDecisionEngine:
                             strategy_used=str(data.get("strategy_used") or ""),
                             risk_level=str(data.get("risk_level") or ""),
                         )
+                        hold_extras.update(self._scanner_trace_context(symbol))
                         dts.record_intent(
                             trace_id=trace_id,
                             symbol=str(symbol),
@@ -4923,6 +5376,7 @@ class AICoreDecisionEngine:
         if decision.action == 'hold':
             # Record HOLD as an explicit trace so "no-trade" paths are observable
             # in decision-traces replay/analytics.
+            hold_trace_extras = await self._enrich_hold_trace_extras_with_sr(decision.symbol, hold_trace_extras)
             _record_intent(hold_trace_extras)
             _record_guard("rejected", "hold_by_ai_decision", "decision", hold_trace_extras)
             return True
@@ -5225,9 +5679,19 @@ class AICoreDecisionEngine:
                         # 若缺少K线证据则拒绝开仓；这类情形是“判断能力不足”，应保守等待。
                         if partial and any("klines_missing" in str(e) for e in errs):
                             # 快照超时场景下允许降级放行（默认开启），避免“网络抖动=全盘拒单”。
-                            timeout_only = any("snapshot_fetch_failed:TimeoutError" in str(e) for e in errs)
+                            # 这里允许的附带错误仅限于“价格已回退到交易所 ticker”这类良性降级，
+                            # 其余错误仍视为证据不足。
+                            timeout_hit = any("snapshot_fetch_failed:TimeoutError" in str(e) for e in errs)
+                            benign_error_markers = (
+                                "snapshot_fetch_failed:TimeoutError",
+                                "price_fallback_from_exchange_ticker",
+                                "klines_missing_in_snapshot",
+                            )
+                            only_benign_snapshot_errors = all(
+                                any(marker in str(e) for marker in benign_error_markers) for e in errs
+                            )
                             allow_timeout_fallback = bool(self.config.get("open_allow_snapshot_timeout_fallback", True))
-                            if timeout_only and allow_timeout_fallback:
+                            if timeout_hit and only_benign_snapshot_errors and allow_timeout_fallback:
                                 logger.warning(
                                     "⚠️ 开仓证据降级放行: symbol=%s reason=snapshot_timeout_with_klines_missing errors=%s",
                                     decision.symbol,
@@ -5601,6 +6065,7 @@ class AICoreDecisionEngine:
                         except Exception:
                             regime_leverage_mult = 1.0
                         sltp_profile = str(rp.get("sltp_profile") or "").strip()
+                        regime_advisory_only = bool(rp.get("advisory_only", False))
 
                     # 在低风险状态下做轻度放宽以提高开单率；高风险时反向收紧。
                     if bool(self.config.get("boost_on_low_risk", True)):
@@ -5636,11 +6101,30 @@ class AICoreDecisionEngine:
                         "regime_min_conf_add": float(regime_conf_add),
                         "regime_leverage_mult": float(regime_leverage_mult) if "regime_leverage_mult" in locals() else 1.0,
                         "sltp_profile": str(sltp_profile) if "sltp_profile" in locals() else "",
+                        "regime_advisory_only": bool(regime_advisory_only) if "regime_advisory_only" in locals() else False,
                     }
                 except Exception as e:
                     logger.debug(f"自适应门控计算失败: {e}")
 
             if not is_close:
+                try:
+                    if bool((self._adaptive_guard_profile or {}).get("regime_advisory_only", False)):
+                        regime_name = str((self._adaptive_guard_profile or {}).get("regime") or "unknown")
+                        self._execution_guards_stats["regime_advisory_only_rejected"] = int(
+                            self._execution_guards_stats.get("regime_advisory_only_rejected", 0) or 0
+                        ) + 1
+                        await _record_rejected_signal(
+                            "regime_advisory_only_rejected",
+                            {"regime": regime_name},
+                        )
+                        logger.warning(
+                            "⚠️ 执行门控拒绝: regime advisory-only symbol=%s regime=%s",
+                            decision.symbol,
+                            regime_name,
+                        )
+                        return False
+                except Exception:
+                    pass
                 # Hard gate: every open decision must carry usable analysis payload
                 # from the unified market analysis pipeline.
                 try:
@@ -5821,6 +6305,12 @@ class AICoreDecisionEngine:
                             "resistance_1h": sr.get("resistance_1h"),
                             "support_1h": sr.get("support_1h"),
                         }
+                        long_entry_ready = bool(near_sup or brk_up)
+                        short_entry_ready = bool(near_res or brk_down)
+                        self._adaptive_guard_profile["sr_entry_ready"] = {
+                            "long": long_entry_ready,
+                            "short": short_entry_ready,
+                        }
                         if decision.side == "long" and near_res and (not brk_up):
                             self._execution_guards_stats["sr_timing_rejected"] = int(
                                 self._execution_guards_stats.get("sr_timing_rejected", 0)
@@ -5835,6 +6325,30 @@ class AICoreDecisionEngine:
                                 {"dist_to_resistance_pct": dist_res, "breakout_up_confirmed": brk_up},
                             )
                             return False
+                        if (
+                            bool(self.config.get("sr_entry_confirmation_required", True))
+                            and decision.side == "long"
+                            and not long_entry_ready
+                        ):
+                            self._execution_guards_stats["sr_timing_rejected"] = int(
+                                self._execution_guards_stats.get("sr_timing_rejected", 0)
+                            ) + 1
+                            logger.info(
+                                "🕒 执行门控暂缓: long 缺少 SR 入场确认 symbol=%s near_sup=%s brk_up=%s",
+                                decision.symbol,
+                                near_sup,
+                                brk_up,
+                            )
+                            await _record_rejected_signal(
+                                "sr_entry_confirmation_missing_long",
+                                {
+                                    "near_support": near_sup,
+                                    "breakout_up_confirmed": brk_up,
+                                    "dist_to_support_pct": dist_sup,
+                                    "dist_to_resistance_pct": dist_res,
+                                },
+                            )
+                            return False
                         if decision.side == "short" and near_sup and (not brk_down):
                             self._execution_guards_stats["sr_timing_rejected"] = int(
                                 self._execution_guards_stats.get("sr_timing_rejected", 0)
@@ -5847,6 +6361,30 @@ class AICoreDecisionEngine:
                             await _record_rejected_signal(
                                 "sr_timing_short_near_support",
                                 {"dist_to_support_pct": dist_sup, "breakdown_down_confirmed": brk_down},
+                            )
+                            return False
+                        if (
+                            bool(self.config.get("sr_entry_confirmation_required", True))
+                            and decision.side == "short"
+                            and not short_entry_ready
+                        ):
+                            self._execution_guards_stats["sr_timing_rejected"] = int(
+                                self._execution_guards_stats.get("sr_timing_rejected", 0)
+                            ) + 1
+                            logger.info(
+                                "🕒 执行门控暂缓: short 缺少 SR 入场确认 symbol=%s near_res=%s brk_down=%s",
+                                decision.symbol,
+                                near_res,
+                                brk_down,
+                            )
+                            await _record_rejected_signal(
+                                "sr_entry_confirmation_missing_short",
+                                {
+                                    "near_resistance": near_res,
+                                    "breakdown_down_confirmed": brk_down,
+                                    "dist_to_support_pct": dist_sup,
+                                    "dist_to_resistance_pct": dist_res,
+                                },
                             )
                             return False
                 except Exception as e:
@@ -6097,6 +6635,7 @@ class AICoreDecisionEngine:
                     "spread_bps": spread_bps,
                     "depth_imbalance": depth_imbalance,
                     "guard_profile": getattr(self, "_adaptive_guard_profile", None),
+                    **self._scanner_trace_context(str(decision.symbol)),
                 }
             )
             _record_guard("passed", "ready_for_execution", "execution_preflight")
@@ -6463,7 +7002,7 @@ class AICoreDecisionEngine:
         try:
             mi = getattr(self.main_controller, "market_intelligence", None)
             if mi and hasattr(mi, "get_symbol_view"):
-                v = await mi.get_symbol_view(decision.symbol, include_snapshot=False)
+                v = await mi.get_symbol_view(decision.symbol, include_snapshot=True)
                 es = getattr(v, "execution_support", None)
                 sugg = (es.get("sltp_suggestions") or {}) if isinstance(es, dict) else {}
                 r2 = sugg.get("risk_pct")
@@ -6635,10 +7174,13 @@ class AICoreDecisionEngine:
                     "min_trade_interval": self.config.get("min_trade_interval"),
                     "min_confidence_to_trade": self.config.get("min_confidence_to_trade"),
                     "ai_core_min_confidence_to_open": self.config.get("ai_core_min_confidence_to_open"),
+                    "ai_core_min_confidence_floor": self.config.get("ai_core_min_confidence_floor"),
                     "min_data_quality_to_trade": self.config.get("min_data_quality_to_trade"),
                     "analysis_hard_gate_for_open": self.config.get("analysis_hard_gate_for_open"),
                     "analysis_min_confidence_for_open": self.config.get("analysis_min_confidence_for_open"),
                     "analysis_require_not_degraded_for_open": self.config.get("analysis_require_not_degraded_for_open"),
+                    "open_requires_full_snapshot": self.config.get("open_requires_full_snapshot"),
+                    "open_allow_snapshot_timeout_fallback": self.config.get("open_allow_snapshot_timeout_fallback"),
                     "exchange_reachability_gate_enabled": self.config.get("exchange_reachability_gate_enabled"),
                     "analysis_require_exchange_reachable_for_open": self.config.get("analysis_require_exchange_reachable_for_open"),
                     "exchange_reachability_probe_timeout_sec": self.config.get("exchange_reachability_probe_timeout_sec"),
@@ -6915,6 +7457,11 @@ class AICoreDecisionEngine:
                 "regime_low_liquidity_spread_bps",
                 "regime_grind_min_trend_abs",
                 "regime_grind_max_atr_mult",
+                "sr_timing_guard_enable",
+                "sr_entry_confirmation_required",
+                "sr_lookback_bars_1h",
+                "sr_near_level_pct",
+                "sr_breakout_buffer_pct",
                 "low_vol_grind_profile_min_rr_mult",
                 "low_vol_grind_profile_spread_mult",
                 "regime_profile_overrides",
@@ -6979,6 +7526,11 @@ class AICoreDecisionEngine:
                 "hold_avoidance_override_min_abs_sentiment",
                 "hold_avoidance_override_min_mi_quality_score",
                 "hold_avoidance_override_require_mi_trend_alignment",
+                "scanner_weak_sr_trigger_enabled",
+                "scanner_weak_sr_max_age_sec",
+                "scanner_weak_sr_min_confidence",
+                "scanner_weak_sr_min_risk_reward",
+                "scanner_weak_sr_max_entry_drift_pct",
                 "ai_autonomy_minimal_gates_enabled",
                 "ai_autonomy_min_conf_floor",
                 "ai_autonomy_min_mi_confidence",
@@ -7011,6 +7563,12 @@ class AICoreDecisionEngine:
                 "auto_tune_hold_override_allow_relax_without_recent_pnl",
                 "auto_tune_hold_override_max_total_min_abs_sentiment_delta_from_baseline",
                 "auto_tune_hold_override_max_total_min_mi_quality_score_delta_from_baseline",
+                # Position / replacement / evidence gates (must sync from config.yaml ai_core_runtime)
+                "max_same_direction_ratio",
+                "enable_replace_worst_on_full_positions",
+                "open_allow_snapshot_timeout_fallback",
+                "open_requires_full_snapshot",
+                "ai_core_min_confidence_floor",
             )
             bool_keys = {
                 "auto_adaptive_guards",
@@ -7037,6 +7595,9 @@ class AICoreDecisionEngine:
                 "ai_autonomy_mtf_conflict_release_requires_mi_bias",
                 "ai_autonomy_conflict_subtype_release_enabled",
                 "ai_autonomy_conflict_release_require_mi_confidence",
+                "enable_replace_worst_on_full_positions",
+                "open_allow_snapshot_timeout_fallback",
+                "open_requires_full_snapshot",
             }
             optional_float_keys = {
                 "auto_tune_group_step_rr",
@@ -7492,7 +8053,12 @@ class AICoreDecisionEngine:
 
 请直接回复用户，不要使用Markdown格式。"""
 
-            response = await self.llm.generate(prompt, is_user_input=False)
+            response = await self.llm.generate(
+                prompt,
+                is_user_input=False,
+                task_type=TaskType.NATURAL_LANGUAGE,
+                prefer_reasoning=True,
+            )
             
             if response and response.success and response.content:
                 return {"success": True, "response": response.content}

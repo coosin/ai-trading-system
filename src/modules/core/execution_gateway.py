@@ -1735,8 +1735,11 @@ class ExecutionGateway:
             "open_symbol_fail_count": dict(self._open_symbol_fail_count),
         }
         try:
-            rec = await self._reconciler.build_snapshot(
-                recent_events=list(self._snapshot.recent_events)
+            rec = await asyncio.wait_for(
+                self._reconciler.build_snapshot(
+                    recent_events=list(self._snapshot.recent_events)
+                ),
+                timeout=1.5,
             )
             self._reconciliation_protection.ingest_reconciliation(rec)
             out["reconciliation"] = rec

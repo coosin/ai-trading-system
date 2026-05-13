@@ -81,7 +81,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="系统巡检日报汇总")
     parser.add_argument("--input", default="logs/system_probe_report.jsonl", help="输入 JSONL 路径")
     parser.add_argument("--output", default="logs/system_probe_daily_summary.md", help="输出 Markdown 路径")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="API 基地址，用于附加盈利分析摘要")
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("OPENCLAW_API_BASE")
+        or os.environ.get("ACCEPTANCE_BASE")
+        or os.environ.get("BASE_URL")
+        or "http://127.0.0.1:8000",
+        help="API 基地址（优先 OPENCLAW_API_BASE），用于附加盈利分析摘要",
+    )
     parser.add_argument("--analytics-days", type=int, default=30, help="盈利分析窗口天数")
     parser.add_argument("--analytics-timeout-sec", type=float, default=8.0, help="盈利分析 API 超时")
     args = parser.parse_args()

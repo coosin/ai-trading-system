@@ -3442,8 +3442,67 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
         try:
             ths = getattr(mc, "trade_history_service", None)
             stats = await ths.get_statistics(days=1, force_refresh=True) if ths and hasattr(ths, "get_statistics") else {}
+            stats = dict(stats or {})
+            if ths and hasattr(ths, "get_trade_history"):
+                try:
+                    from datetime import timedelta
+
+                    rows = await ths.get_trade_history(
+                        start_date=datetime.now() - timedelta(days=1),
+                        limit=500,
+                        offset=0,
+                    )
+                    clean_rows = []
+                    for row in (rows or []):
+                        if not isinstance(row, dict):
+                            continue
+                        md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                        src = str((md.get("source") or row.get("source") or "")).strip().lower()
+                        if src == "db_bootstrap":
+                            continue
+                        clean_rows.append(row)
+                    realized_rows = []
+                    for row in clean_rows:
+                        try:
+                            pnl = float(row.get("pnl", 0) or 0)
+                        except Exception:
+                            pnl = 0.0
+                        try:
+                            pnl_percent = float(row.get("pnl_percent", 0) or 0)
+                        except Exception:
+                            pnl_percent = 0.0
+                        if abs(pnl) > 1e-12 or abs(pnl_percent) > 1e-12:
+                            realized_rows.append(row)
+                    stats["total_records"] = len(clean_rows)
+                    stats["realized_trades"] = len(realized_rows)
+                    if clean_rows:
+                        pnls = []
+                        wins = 0
+                        losses = 0
+                        for row in realized_rows:
+                            try:
+                                pnl = float(row.get("pnl", 0) or 0)
+                            except Exception:
+                                pnl = 0.0
+                            pnls.append(pnl)
+                            if pnl > 0:
+                                wins += 1
+                            elif pnl < 0:
+                                losses += 1
+                        total = len(realized_rows)
+                        if int(stats.get("total_trades", 0) or 0) == 0:
+                            stats.setdefault("max_drawdown", 0.0)
+                        stats["total_trades"] = total
+                        stats["win_rate"] = round((wins / total) * 100, 2) if total else 0.0
+                        stats["total_pnl"] = round(sum(pnls), 6)
+                        stats["winning_trades"] = wins
+                        stats["losing_trades"] = losses
+                        stats["source"] = "fallback:get_trade_history"
+                except Exception:
+                    pass
             summary = (
-                f"每日交易复盘 {today}: 总交易={stats.get('total_trades', 0)}, "
+                f"每日交易复盘 {today}: 已实现平仓={stats.get('total_trades', 0)}, "
+                f"总记录={stats.get('total_records', stats.get('total_trades', 0))}, "
                 f"胜率={stats.get('win_rate', 0)}%, 总盈亏={stats.get('total_pnl', 0)}, "
                 f"最大回撤={stats.get('max_drawdown', 0)}"
             )
@@ -3455,6 +3514,19 @@ action ∈ chat, system_status, trade_history, positions, balance, market_analys
                         for _id, entry in (getattr(backend, "_memories", {}) or {}).items():
                             md = dict(getattr(entry, "metadata", {}) or {})
                             if md.get("kind") == "daily_summary" and md.get("date") == today:
+                                if force and hasattr(self.unified_memory, "update"):
+                                    try:
+                                        await self.unified_memory.update(
+                                            str(_id),
+                                            summary,
+                                            metadata=base_metadata(
+                                                source_module="ai_command_executor",
+                                                kind="daily_summary",
+                                                extra={"date": today, "stats": stats},
+                                            ),
+                                        )
+                                    except Exception:
+                                        pass
                                 self._last_daily_summary_date = today
                                 return True
                 except Exception:

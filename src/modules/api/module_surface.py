@@ -13,7 +13,9 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, Body
 
-CONTRACT_VERSION = "2026.04.10"
+from src.modules.api.route_catalog import extended_core_routes, read_pipeline_spec
+
+CONTRACT_VERSION = "2026.05.13"
 MODULES_PREFIX = "/api/v1/modules"
 TRADE_PREFIX = "/api/v1/trade"
 MARKET_PREFIX = "/api/v1/market"
@@ -109,6 +111,14 @@ def build_static_route_catalog() -> List[Dict[str, Any]]:
     rows.append(r("GET", f"{MODULES_PREFIX}/surface/registry", impl, "surface", "API 总注册表"))
     rows.append(r("GET", f"{MODULES_PREFIX}/surface/channels", impl, "surface", "渠道契约"))
 
+    # 去重合并：顶层 /api/v1 常用只读路由（见 route_catalog.extended_core_routes）
+    seen = {(x["method"], x["path"]) for x in rows}
+    for row in extended_core_routes():
+        key = (row["method"], row["path"])
+        if key not in seen:
+            rows.append(row)
+            seen.add(key)
+
     return rows
 
 
@@ -150,6 +160,13 @@ def attach_module_surface_routes(router: APIRouter, main_controller: Any) -> Non
             "success": True,
             "contract_version": CONTRACT_VERSION,
             "catalog": catalog,
+            "read_pipeline": read_pipeline_spec(),
+            "api_base_env": {
+                "preferred": "OPENCLAW_API_BASE",
+                "aliases": ["ACCEPTANCE_BASE", "BASE_URL"],
+                "example": "http://127.0.0.1:8000",
+                "note": "脚本与巡检应优先读取 OPENCLAW_API_BASE，便于与 docker / 反代端口对齐。",
+            },
             "commander_capabilities": cap,
             "channels": build_channel_contract(),
             "timestamp": datetime.now().isoformat(),

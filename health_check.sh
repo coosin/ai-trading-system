@@ -112,7 +112,7 @@ fi
 # 7. 检查模块导入
 echo -e "${GREEN}[7/10]${NC} 检查核心模块..."
 MODULES_OK=true
-for module in unified_intelligent_memory user_intent_recognizer proxy_manager; do
+for module in user_intent_recognizer proxy_manager; do
     if python3 -c "from src.modules.core import $module" 2>/dev/null; then
         echo "  ✓ $module"
     else

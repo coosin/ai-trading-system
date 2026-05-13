@@ -1153,8 +1153,15 @@ class MarketIntelligenceEngine:
         # Prefer third_party sentiment -> onchain sentiment -> fall back to unknown.
         tp_sent = (intel.get("sentiment") or {}) if isinstance(intel, dict) else {}
         tp_trend = tp_sent.get("trend") if isinstance(tp_sent, dict) else None
+        health = (intel.get("health") or {}) if isinstance(intel, dict) else {}
+        onchain_health = str(health.get("onchain") or "").strip().lower() if isinstance(health, dict) else ""
         oc_sent = ((intel.get("onchain") or {}).get("sentiment")) if isinstance(intel, dict) else None
-        oc_trend = (oc_sent.get("sentiment") or oc_sent.get("trend")) if isinstance(oc_sent, dict) else None
+        oc_trend = None
+        # Mock onchain sentiment is advisory only; it should not become the primary trend
+        # source when third-party sentiment is missing/degraded, otherwise it creates
+        # systematic bullish conflicts against price/technical evidence.
+        if isinstance(oc_sent, dict) and onchain_health not in {"mock", "degraded"}:
+            oc_trend = oc_sent.get("sentiment") or oc_sent.get("trend")
         trend = str(tp_trend or oc_trend or "unknown").lower()
         if trend in ("bull", "bullish", "up"):
             trend_n = "bullish"
@@ -1169,7 +1176,11 @@ class MarketIntelligenceEngine:
         try:
             if isinstance(tp_sent, dict) and tp_sent.get("confidence") is not None:
                 conf = tp_sent.get("confidence")
-            elif isinstance(oc_sent, dict) and oc_sent.get("strength") is not None:
+            elif (
+                isinstance(oc_sent, dict)
+                and onchain_health not in {"mock", "degraded"}
+                and oc_sent.get("strength") is not None
+            ):
                 conf = oc_sent.get("strength")
         except Exception:
             conf = None
@@ -1823,4 +1834,3 @@ class MarketIntelligenceEngine:
         except Exception:
             return {}
         return {}
-

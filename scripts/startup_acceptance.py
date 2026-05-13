@@ -2,6 +2,7 @@
 """
 启动后验收：轮询 /api/v1/system/health，拉取 /api/v1/system/status 与 /api/v1/system/acceptance。
 用法：
+  OPENCLAW_API_BASE=http://127.0.0.1:8000 python3 scripts/startup_acceptance.py
   ACCEPTANCE_BASE=http://127.0.0.1:8000 python3 scripts/startup_acceptance.py
 """
 from __future__ import annotations
@@ -12,6 +13,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.utils.openclaw_api_client import default_openclaw_api_base
 
 
 def _get(url: str, timeout: float = 90.0) -> tuple[int, str]:
@@ -36,7 +43,9 @@ def wait_health(base: str, total_wait: float = 120.0, step: float = 3.0) -> None
 
 
 def main() -> int:
-    base = os.environ.get("ACCEPTANCE_BASE", "http://127.0.0.1:8000").rstrip("/")
+    base = (os.environ.get("OPENCLAW_API_BASE") or os.environ.get("ACCEPTANCE_BASE") or "").strip().rstrip("/")
+    if not base:
+        base = default_openclaw_api_base()
     print(f"验收目标: {base}")
     wait_health(base)
 

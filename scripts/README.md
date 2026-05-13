@@ -2,11 +2,15 @@
 
 This directory was aggressively cleaned and consolidated.
 
+## API base URL（规范）
+
+调用本仓库 HTTP API 的脚本应优先读取环境变量 **`OPENCLAW_API_BASE`**（其次 `ACCEPTANCE_BASE`、`BASE_URL`），与 **`src/utils/openclaw_api_client.py`** 及 **`GET /api/v1/modules/surface/registry`** 响应中的 **`api_base_env`** 一致。说明见 **`docs/API_REFERENCE.md`**（「API 基址、只读巡检链与 Surface」）与 **`docs/OPERATIONS.md`**。
+
 ## Active Scripts
 
 - `verify.py`
   - Unified entrypoint.
-  - `python3 scripts/verify.py trading --base-url http://127.0.0.1:8000`
+  - `python3 scripts/verify.py trading --base-url http://127.0.0.1:8000`（或先 `export OPENCLAW_API_BASE=...` 再传同一基址）
   - `python3 scripts/verify.py network --check-only`
 - `trading_exec_fullcheck.py`
   - End-to-end trading acceptance checks (diagnosis + SR sim + learning seed).
@@ -16,6 +20,7 @@ This directory was aggressively cleaned and consolidated.
   - Production proxy/clash baseline checks.
 - `network_connectivity_smoke.py`
   - Lightweight network connectivity smoke tests.
+  - Optional: `--include-api` hits `OPENCLAW_API_BASE`（经 `openclaw_api_url`）下的 `GET /api/v1/system/health`.
 - `proxy_mode_network_benchmark.py`
   - Proxy mode benchmark checks.
 - `startup_acceptance.py`
