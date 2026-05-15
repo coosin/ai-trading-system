@@ -211,6 +211,7 @@ class OptimizedMemorySystem:
         config_manager: Any = None,
         *,
         working_days_recent: int = 3,
+        working_json_max_files: Optional[int] = 800,
         experience_json_max_files: Optional[int] = 1200,
     ):
         if hasattr(self, '_initialized') and self._initialized:
@@ -222,6 +223,7 @@ class OptimizedMemorySystem:
             self._working_days_recent = max(1, int(working_days_recent))
         except Exception:
             self._working_days_recent = 3
+        self._working_json_max_files = working_json_max_files
         self._experience_json_max_files = experience_json_max_files
         
         if os.path.exists("/.dockerenv"):
@@ -370,8 +372,23 @@ class OptimizedMemorySystem:
             return
         days = days if days is not None else int(getattr(self, "_working_days_recent", 3) or 3)
         cutoff_date = datetime.now() - timedelta(days=days)
-        
-        for file_path in working_dir.glob("*.json"):
+
+        paths = sorted(
+            working_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        cap = getattr(self, "_working_json_max_files", None)
+        if isinstance(cap, int) and cap > 0 and len(paths) > cap:
+            skipped = len(paths) - cap
+            paths = paths[:cap]
+            logger.info(
+                "工作记忆启动加载限流: 载入 newest=%s，跳过较旧=%s（memory.startup.working_json_max_files）",
+                len(paths),
+                skipped,
+            )
+
+        for file_path in paths:
             try:
                 async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
                     data = json.loads(await f.read())
@@ -939,6 +956,7 @@ async def get_memory_system(
     workspace_path: Optional[str] = None,
     *,
     working_days_recent: int = 3,
+    working_json_max_files: Optional[int] = 800,
     experience_json_max_files: Optional[int] = 1200,
 ) -> OptimizedMemorySystem:
     """获取记忆系统单例。
@@ -949,6 +967,9 @@ async def get_memory_system(
       - 正整数: 仅按修改时间载入最新的这么多条 JSON
     """
     global _memory_instance
+    eff_working_cap = working_json_max_files
+    if isinstance(eff_working_cap, int) and eff_working_cap <= 0:
+        eff_working_cap = None
     eff_cap = experience_json_max_files
     if isinstance(eff_cap, int) and eff_cap <= 0:
         eff_cap = None
@@ -957,6 +978,7 @@ async def get_memory_system(
             storage_path=storage_path,
             workspace_path=workspace_path,
             working_days_recent=working_days_recent,
+            working_json_max_files=eff_working_cap,
             experience_json_max_files=eff_cap,
         )
         await _memory_instance.initialize()

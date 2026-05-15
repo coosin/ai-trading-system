@@ -123,6 +123,27 @@ class BaseLLMProvider(ABC):
         # OPENCLAW_LLM_DIRECT_FALLBACK=1 且代理连续失败时，切换为直连客户端（容器须能直达各模型 base_url）
         self._httpx_force_direct: bool = os.getenv("OPENCLAW_LLM_FORCE_DIRECT", "").strip().lower() in ("1", "true", "yes")
         self._env_force_direct: bool = self._httpx_force_direct
+        self._last_client_mode_log_key: Optional[str] = None
+        self._last_client_mode_log_ts: float = 0.0
+        self._last_transient_error_log_key: Optional[str] = None
+        self._last_transient_error_log_ts: float = 0.0
+
+    def _log_client_mode(self, key: str, message: str) -> None:
+        now = time.time()
+        if key == self._last_client_mode_log_key and (now - self._last_client_mode_log_ts) < 300.0:
+            return
+        self._last_client_mode_log_key = key
+        self._last_client_mode_log_ts = now
+        logger.info(message)
+
+    def _log_transient_failure(self, key: str, message: str, *, level: int = logging.WARNING) -> None:
+        now = time.time()
+        if key == self._last_transient_error_log_key and (now - self._last_transient_error_log_ts) < 15.0:
+            logger.debug(message)
+            return
+        self._last_transient_error_log_key = key
+        self._last_transient_error_log_ts = now
+        logger.log(level, message)
 
     def _base_host_bypasses_process_proxy(self) -> bool:
         """本机 / 宿主机网关上的 OpenAI 兼容端点不走 HTTP(S)_PROXY，避免 Mihomo 无法转发环回流量。"""
@@ -176,19 +197,22 @@ class BaseLLMProvider(ABC):
             kw["proxy"] = proxy
             # 仅走显式 HTTP(S)_PROXY，避免与 ALL_PROXY(socks) 叠加或触发 socksio 依赖问题
             kw["trust_env"] = False
-            logger.info(
+            self._log_client_mode(
+                f"proxy:{proxy}:ka={use_keepalive}:cc={force_connection_close}",
                 f"LLM Provider 使用代理: {proxy}（keep-alive: {'开' if use_keepalive else '关'}，connection-close: {'开' if force_connection_close else '关'}）"
             )
         elif self._base_host_bypasses_process_proxy():
-            logger.info("LLM Provider: base_url 为本机/网关主机，跳过进程 HTTP 代理直连")
+            self._log_client_mode("bypass-process-proxy", "LLM Provider: base_url 为本机/网关主机，跳过进程 HTTP 代理直连")
         elif self._httpx_force_direct:
             if self._env_force_direct:
-                logger.info(
+                self._log_client_mode(
+                    f"env-force-direct:ka={use_keepalive}:cc={force_connection_close}",
                     "LLM Provider: OPENCLAW_LLM_FORCE_DIRECT=1，直连模型端点"
                     f"（keep-alive: {'开' if use_keepalive else '关'}，connection-close: {'开' if force_connection_close else '关'}）"
                 )
             else:
-                logger.info(
+                self._log_client_mode(
+                    f"temp-force-direct:ka={use_keepalive}:cc={force_connection_close}",
                     "LLM Provider: 临时直连回退已启用"
                     f"（keep-alive: {'开' if use_keepalive else '关'}，connection-close: {'开' if force_connection_close else '关'}）"
                 )
@@ -240,10 +264,20 @@ class OpenAIProvider(BaseLLMProvider):
 
     @staticmethod
     def _detect_rate_limit_kind(status_code: int, error_text: str) -> Optional[str]:
-        """Best-effort classify 429/limit errors to support circuit breaking."""
+        """Best-effort classify quota/throttle errors to support fast failover."""
+        lower = (error_text or "").lower()
+        if status_code == 402:
+            quota_markers = (
+                "insufficient balance",
+                "insufficient_balance",
+                "payment required",
+                "quota exceeded",
+                "credit balance is too low",
+            )
+            if any(marker in lower for marker in quota_markers):
+                return "QUOTA_EXCEEDED"
         if status_code != 429:
             return None
-        lower = (error_text or "").lower()
         # Provider-specific quota wording (e.g. volc ark AccountQuotaExceeded)
         if "accountquotaexceeded" in lower or "quota exceeded" in lower or "exceeded the weekly usage quota" in lower:
             return "QUOTA_EXCEEDED"
@@ -389,7 +423,11 @@ class OpenAIProvider(BaseLLMProvider):
                 return response_obj
             except httpx.ReadTimeout as e:
                 latency_ms = (time.time() - start_time) * 1000
-                logger.warning(f"OpenAI API超时 (重试 {retry + 1}/{max_retries}): {type(e).__name__}")
+                phase = "快速失败" if network_fail_fast else f"重试 {retry + 1}/{max_retries}"
+                self._log_transient_failure(
+                    f"timeout:{self.config.model_id}:{type(e).__name__}:{network_fail_fast}",
+                    f"OpenAI API超时 ({phase}): {type(e).__name__}",
+                )
                 last_error = f"请求超时"
                 if network_fail_fast:
                     try:
@@ -455,7 +493,11 @@ class OpenAIProvider(BaseLLMProvider):
                 )
             except httpx.RequestError as e:
                 latency_ms = (time.time() - start_time) * 1000
-                logger.warning(f"OpenAI API网络错误 (重试 {retry + 1}/{max_retries}): {type(e).__name__}: {e}")
+                phase = "快速失败" if network_fail_fast else f"重试 {retry + 1}/{max_retries}"
+                self._log_transient_failure(
+                    f"request-error:{self.config.model_id}:{type(e).__name__}:{network_fail_fast}",
+                    f"OpenAI API网络错误 ({phase}): {type(e).__name__}: {e}",
+                )
                 last_error = f"网络错误: {type(e).__name__}"
                 if network_fail_fast:
                     try:
@@ -708,6 +750,8 @@ class EnhancedLLMManager:
         self._lock = asyncio.Lock()
         # Circuit breaker: model_id -> unix_ts (seconds) until which the model is considered unhealthy.
         self._unhealthy_until: Dict[str, float] = {}
+        self._all_unhealthy_log_until: Dict[str, float] = {}
+        self._no_model_log_until: Dict[str, float] = {}
 
     def _is_model_healthy(self, model_id: str) -> bool:
         until = float(self._unhealthy_until.get(model_id, 0.0) or 0.0)
@@ -728,6 +772,61 @@ class EnhancedLLMManager:
                 task_label,
             )
 
+    def _mark_model_group_unhealthy(
+        self,
+        model_id: str,
+        *,
+        seconds: float,
+        reason: str,
+        task_type: Optional[TaskType] = None,
+    ) -> None:
+        base = self.models.get(model_id)
+        if base is None:
+            self._mark_model_unhealthy(model_id, seconds=seconds, reason=reason, task_type=task_type)
+            return
+        group = []
+        for other_id, other in self.models.items():
+            if not other.enabled:
+                continue
+            if other.provider != base.provider:
+                continue
+            if str(other.base_url or "").strip() != str(base.base_url or "").strip():
+                continue
+            if str(other.api_key or "").strip() != str(base.api_key or "").strip():
+                continue
+            group.append(other_id)
+        if not group:
+            group = [model_id]
+        for other_id in group:
+            self._mark_model_unhealthy(other_id, seconds=seconds, reason=reason, task_type=task_type)
+
+    def _log_all_unhealthy_once(self, task_type: TaskType, candidate_ids: List[str]) -> None:
+        key = f"{task_type.value}:{','.join(candidate_ids)}"
+        now = time.time()
+        until = float(self._all_unhealthy_log_until.get(key, 0.0) or 0.0)
+        if now < until:
+            return
+        self._all_unhealthy_log_until[key] = now + 60.0
+        logger.warning(
+            "任务 %s 的候选模型当前均不可用，跳过外部调用并等待熔断恢复: %s",
+            task_type.value,
+            ",".join(candidate_ids),
+        )
+
+    def _log_no_model_once(self, task_type: TaskType) -> None:
+        now = time.time()
+        key = task_type.value
+        until = float(self._no_model_log_until.get(key, 0.0) or 0.0)
+        if now < until:
+            return
+        self._no_model_log_until[key] = now + 60.0
+        logger.warning("任务 %s 当前无可用模型，返回空响应并等待候选恢复", task_type.value)
+
+    def _clear_model_unhealthy(self, model_id: str) -> None:
+        """Successful calls clear circuit state so transient timeouts do not block fallbacks too long."""
+        if self._unhealthy_until.pop(model_id, None) is not None:
+            logger.debug("LLM circuit-break: cleared unhealthy state for %s after success", model_id)
+
     def _apply_failure_circuit_break(self, model_id: str, response: "LLMResponse", task_type: Optional[TaskType] = None) -> None:
         if not response or response.success:
             return
@@ -739,7 +838,7 @@ class EnhancedLLMManager:
         if code == "RATE_LIMIT":
             self._mark_model_unhealthy(model_id, seconds=rl_sec, reason=code, task_type=task_type)
         elif code == "QUOTA_EXCEEDED":
-            self._mark_model_unhealthy(model_id, seconds=quota_sec, reason=code, task_type=task_type)
+            self._mark_model_group_unhealthy(model_id, seconds=quota_sec, reason=code, task_type=task_type)
         elif code == "TIMEOUT":
             self._mark_model_unhealthy(model_id, seconds=to_sec, reason=code, task_type=task_type)
         elif code in {"NETWORK_ERROR", "HTTP_ERROR"}:
@@ -879,6 +978,7 @@ class EnhancedLLMManager:
                           max_cost: Optional[float] = None) -> Optional[str]:
         """根据任务选择最优模型"""
         task_candidates: List[str] = []
+        unhealthy_task_candidates: List[str] = []
         if task_type in self.task_model_mapping:
             for model_id in self.task_model_mapping[task_type]:
                 if model_id in self.providers:
@@ -887,6 +987,7 @@ class EnhancedLLMManager:
                     model = self.models.get(model_id)
                     if model and model.enabled:
                         if not self._is_model_healthy(model_id):
+                            unhealthy_task_candidates.append(model_id)
                             continue
                         if prefer_reasoning and not model.supports_reasoning:
                             continue
@@ -894,24 +995,6 @@ class EnhancedLLMManager:
                             if (model.cost_per_input_token + model.cost_per_output_token * 1000) > max_cost:
                                 continue
                         return model_id
-
-            # All task-preferred models are temporarily unhealthy. Prefer continuing with the
-            # highest-priority mapped model instead of returning "no model" and stalling decisions.
-            for model_id in task_candidates:
-                model = self.models.get(model_id)
-                if not model or not model.enabled:
-                    continue
-                if prefer_reasoning and not model.supports_reasoning:
-                    continue
-                if max_cost is not None:
-                    if (model.cost_per_input_token + model.cost_per_output_token * 1000) > max_cost:
-                        continue
-                logger.warning(
-                    "任务 %s 的候选模型当前均处于熔断，忽略健康熔断继续尝试 %s",
-                    task_type.value,
-                    model_id,
-                )
-                return model_id
         
         available_models = sorted(
             [m for m in self.models.values() if m.enabled and m.model_id in self.providers],
@@ -943,6 +1026,9 @@ class EnhancedLLMManager:
                     only_model_id,
                 )
                 return only_model_id
+
+        if unhealthy_task_candidates:
+            self._log_all_unhealthy_once(task_type, unhealthy_task_candidates)
         
         return None
 
@@ -975,13 +1061,15 @@ class EnhancedLLMManager:
                 logger.warning("请求模型 %s 当前处于熔断，但它是唯一可用模型，继续尝试调用", model_id)
         
         if not model_id:
-            logger.error("没有可用的模型")
+            self._log_no_model_once(task_type)
             return LLMResponse(
                 content="",
                 model_id="none",
                 provider=ModelProvider.CUSTOM,
                 success=False,
-                error_message="没有可用的模型"
+                error_message="没有可用的模型",
+                error_code="NO_HEALTHY_MODEL",
+                task_type=task_type,
             )
         
         if model_id not in self.providers:
@@ -1086,6 +1174,7 @@ class EnhancedLLMManager:
         stats.total_calls += 1
         
         if response.success:
+            self._clear_model_unhealthy(model_id)
             stats.successful_calls += 1
             stats.total_tokens += response.tokens_used
             stats.input_tokens += response.input_tokens
@@ -1113,17 +1202,16 @@ class EnhancedLLMManager:
 
     async def switch_model(self, model_id: str) -> bool:
         """切换默认模型"""
-        logger.info(f"[DEBUG switch_model] model_id: {model_id}", flush=True)
-        logger.info(f"[DEBUG switch_model] models keys: {list(self.models.keys())}", flush=True)
-        exists = model_id in self.models
-        logger.info(f"[DEBUG switch_model] model_id in models: {exists}", flush=True)
-        if exists:
-            logger.info(f"[DEBUG switch_model] model enabled: {self.models[model_id].enabled}", flush=True)
         if model_id in self.models and self.models[model_id].enabled:
             self.default_model = model_id
-            logger.info(f"默认模型已切换为: {model_id}")
+            logger.info("默认模型已切换为: %s", model_id)
             return True
-        logger.info(f"[DEBUG switch_model] returning False", flush=True)
+        logger.warning(
+            "切换默认模型失败: model_id=%s exists=%s enabled=%s",
+            model_id,
+            model_id in self.models,
+            self.models[model_id].enabled if model_id in self.models else False,
+        )
         return False
 
     async def set_model_api_key(self, model_id: str, api_key: str) -> bool:

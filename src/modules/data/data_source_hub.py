@@ -14,7 +14,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from src.modules.data.data_quality_advisor import DataQualityAdvisor
 from src.modules.data.binance_public_provider import get_binance_public_provider
 
@@ -201,9 +201,10 @@ class DataSourceHub:
     async def _fetch_safe(
         self,
         name: str,
-        coro,
+        coro_or_factory: Any,
         *,
         timeout_sec: Optional[float] = None,
+        retry_count: Optional[int] = None,
         default: Any = None,
         health: Optional[Dict[str, Any]] = None,
         errors: Optional[List[str]] = None,
@@ -216,13 +217,14 @@ class DataSourceHub:
         t0 = datetime.now()
         cfg = await self._cfg()
         to = float(timeout_sec if timeout_sec is not None else cfg.get("fetch_timeout_sec", 2.8) or 2.8)
-        retry_count = max(1, int(cfg.get("fetch_retry_count", 2) or 2))
+        retry_count = max(1, int(retry_count if retry_count is not None else (cfg.get("fetch_retry_count", 2) or 2)))
         retry_backoff = max(0.0, float(cfg.get("fetch_retry_backoff_sec", 0.25) or 0.25))
         last_err: Optional[Exception] = None
         # Retry on transient timeout/connection errors to reduce false degradations.
         for attempt in range(retry_count):
             try:
-                out = await asyncio.wait_for(coro, timeout=to)
+                current_coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+                out = await asyncio.wait_for(current_coro, timeout=to)
                 if health is not None:
                     health[name] = {
                         "status": "ok",
@@ -789,26 +791,39 @@ class DataSourceHub:
                         out["health"]["onchain"] = "mock"
             except Exception:
                 pass
-            sentiment = await self._fetch_safe(
-                "onchain.sentiment",
-                onchain.analyze_onchain_sentiment(symbol),
-                default=None,
-                health=health,
-                errors=errors,
-            )
-            flows = await self._fetch_safe(
-                "onchain.flows",
-                onchain.get_exchange_flows(symbol),
-                default=[],
-                health=health,
-                errors=errors,
-            )
-            whales = await self._fetch_safe(
-                "onchain.whales",
-                onchain.get_whale_activities(symbol, limit=20),
-                default=[],
-                health=health,
-                errors=errors,
+            onchain_tasks: Dict[str, asyncio.Task] = {
+                "sentiment": asyncio.create_task(
+                    self._fetch_safe(
+                        "onchain.sentiment",
+                        lambda: onchain.analyze_onchain_sentiment(symbol),
+                        default=None,
+                        health=health,
+                        errors=errors,
+                    )
+                ),
+                "flows": asyncio.create_task(
+                    self._fetch_safe(
+                        "onchain.flows",
+                        lambda: onchain.get_exchange_flows(symbol),
+                        default=[],
+                        health=health,
+                        errors=errors,
+                    )
+                ),
+                "whales": asyncio.create_task(
+                    self._fetch_safe(
+                        "onchain.whales",
+                        lambda: onchain.get_whale_activities(symbol, limit=20),
+                        default=[],
+                        health=health,
+                        errors=errors,
+                    )
+                ),
+            }
+            sentiment, flows, whales = await asyncio.gather(
+                onchain_tasks["sentiment"],
+                onchain_tasks["flows"],
+                onchain_tasks["whales"],
             )
             if "onchain.sentiment" not in enabled:
                 sentiment = None
@@ -824,14 +839,30 @@ class DataSourceHub:
         third = self._get_third_party_integrator()
         if third and any(k.startswith("third_party.") for k in enabled):
             sentiment_key = f"third_party_sentiment:{symbol}"
-            cs = await self._fetch_safe(
-                "third_party.sentiment",
-                third.get_comprehensive_sentiment(symbol),
-                timeout_sec=self._collector_timeout("third_party.sentiment", cfg),
-                default={},
-                health=health,
-                errors=errors,
+            news_key = f"third_party_news:{symbol}"
+            cs_task = asyncio.create_task(
+                self._fetch_safe(
+                    "third_party.sentiment",
+                    lambda: third.get_comprehensive_sentiment(symbol),
+                    timeout_sec=self._collector_timeout("third_party.sentiment", cfg),
+                    retry_count=1,
+                    default={},
+                    health=health,
+                    errors=errors,
+                )
             )
+            news_task = asyncio.create_task(
+                self._fetch_safe(
+                    "third_party.news",
+                    lambda: third.get_news_sentiment(symbol),
+                    timeout_sec=self._collector_timeout("third_party.news", cfg),
+                    retry_count=1,
+                    default={},
+                    health=health,
+                    errors=errors,
+                )
+            )
+            cs, news = await asyncio.gather(cs_task, news_task)
             if isinstance(cs, dict) and cs:
                 self._cache_set(sentiment_key, cs)
             else:
@@ -849,15 +880,24 @@ class DataSourceHub:
                         pass
             out["sentiment"] = self._sanitize(cs or {})
             out["health"]["third_party"] = "ok" if cs else "degraded"
-            news = await self._fetch_safe(
-                "third_party.news",
-                third.get_news_sentiment(symbol),
-                timeout_sec=self._collector_timeout("third_party.news", cfg),
-                default={},
-                health=health,
-                errors=errors,
-            )
+            if isinstance(news, dict) and news:
+                self._cache_set(news_key, news)
+            else:
+                cached_news = self._cache_get(
+                    news_key,
+                    ttl_sec=float(os.getenv("OPENCLAW_DATA_HUB_THIRD_PARTY_NEWS_CACHE_TTL", "900") or "900"),
+                )
+                if isinstance(cached_news, dict) and cached_news:
+                    news = dict(cached_news)
+                    if isinstance(health.get("third_party.news"), dict):
+                        health["third_party.news"]["status"] = "cache"
+                    try:
+                        errors.remove("third_party.news:timeout")
+                    except ValueError:
+                        pass
             out["news"] = self._sanitize(news or {})
+            if news and not cs:
+                out["health"]["third_party"] = "ok_partial"
             if "third_party.sentiment" not in enabled:
                 out["sentiment"] = {}
             if "third_party.news" not in enabled:
@@ -894,7 +934,7 @@ class DataSourceHub:
             task_specs["ticker"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.ticker",
-                    self.get_ticker(symbol),
+                    lambda: self.get_ticker(symbol),
                     timeout_sec=self._collector_timeout("exch.ticker", cfg),
                     default={},
                     health=health,
@@ -905,7 +945,7 @@ class DataSourceHub:
             task_specs["order_book"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.order_book",
-                    self.get_order_book(symbol, depth=20),
+                    lambda: self.get_order_book(symbol, depth=20),
                     timeout_sec=self._collector_timeout("exch.order_book", cfg),
                     default={},
                     health=health,
@@ -916,7 +956,7 @@ class DataSourceHub:
             task_specs["open_interest"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.open_interest",
-                    self.get_open_interest(symbol),
+                    lambda: self.get_open_interest(symbol),
                     timeout_sec=self._collector_timeout("exch.open_interest", cfg),
                     default={},
                     health=health,
@@ -927,7 +967,7 @@ class DataSourceHub:
             task_specs["funding_rate"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.funding_rate",
-                    self.get_funding_rate(symbol),
+                    lambda: self.get_funding_rate(symbol),
                     timeout_sec=self._collector_timeout("exch.funding_rate", cfg),
                     default=None,
                     health=health,
@@ -938,7 +978,7 @@ class DataSourceHub:
             task_specs["positions"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.positions",
-                    self.get_positions(),
+                    self.get_positions,
                     timeout_sec=self._collector_timeout("exch.positions", cfg),
                     default=[],
                     health=health,
@@ -949,7 +989,7 @@ class DataSourceHub:
             task_specs["open_orders"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.open_orders",
-                    self.get_open_orders(symbol=None),
+                    lambda: self.get_open_orders(symbol=None),
                     timeout_sec=self._collector_timeout("exch.open_orders", cfg),
                     default=[],
                     health=health,
@@ -960,7 +1000,7 @@ class DataSourceHub:
             task_specs["liquidation_proxy"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.liq_proxy",
-                    self.get_liquidation_proxy(symbol),
+                    lambda: self.get_liquidation_proxy(symbol),
                     timeout_sec=self._collector_timeout("exch.liq_proxy", cfg),
                     default={},
                     health=health,
@@ -971,7 +1011,7 @@ class DataSourceHub:
             task_specs["klines_1h"] = asyncio.create_task(
                 self._fetch_safe(
                     "exch.klines_1h",
-                    self.get_klines(symbol, interval="1H", limit=int(cfg.get("klines_1h_limit", 64) or 64)),
+                    lambda: self.get_klines(symbol, interval="1H", limit=int(cfg.get("klines_1h_limit", 64) or 64)),
                     timeout_sec=self._collector_timeout("exch.klines_1h", cfg),
                     default=[],
                     health=health,
@@ -1248,7 +1288,7 @@ class DataSourceHub:
             tasks[str(name)] = asyncio.create_task(
                 self._fetch_safe(
                     f"extra.{name}",
-                    fn(symbol),
+                    lambda fn=fn: fn(symbol),
                     default={},
                     health=extra_health,
                     errors=extra_errors,

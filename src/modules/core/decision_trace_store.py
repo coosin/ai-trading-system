@@ -106,6 +106,17 @@ class DecisionTraceStore:
                 "guard": {},
                 "execution": {},
                 "reconciliation": {},
+                "market_context": {},
+                "agent_outputs": {},
+                "workflow": {
+                    "mode": None,
+                    "current_stage": None,
+                    "status": "pending",
+                    "workflow_path": [],
+                    "last_transition_at": _utc_now(),
+                },
+                "stage_history": [],
+                "learning": {},
             }
             self._items.append(cur)
             self._by_trace_id[tid] = cur
@@ -144,6 +155,14 @@ class DecisionTraceStore:
             "leverage": leverage,
             "extras": dict(extras or {}),
         }
+        self._merge_semantic_fields(cur, extras or {}, source="intent")
+        self._advance_workflow(
+            cur,
+            stage="intent",
+            status="recorded",
+            mode=self._extract_workflow_mode(extras or {}),
+            workflow_path=self._extract_workflow_path(extras or {}),
+        )
         self._persist_to_disk()
 
     def record_guard_result(
@@ -163,6 +182,9 @@ class DecisionTraceStore:
             "stage": str(stage or "")[:120],
             "extras": dict(extras or {}),
         }
+        self._merge_semantic_fields(cur, extras or {}, source="guard")
+        wf_status = "blocked" if status in {"rejected", "skipped"} else ("passed" if status in {"passed", "allowed"} else status)
+        self._advance_workflow(cur, stage=f"guard:{str(stage or '').strip() or 'unknown'}", status=wf_status)
         self._persist_to_disk()
 
     def record_execution_result(
@@ -184,6 +206,9 @@ class DecisionTraceStore:
             "op": op,
             "extras": dict(extras or {}),
         }
+        self._merge_semantic_fields(cur, extras or {}, source="execution")
+        wf_status = "completed" if status == "success" else ("failed" if status in {"failed", "error", "rejected"} else status)
+        self._advance_workflow(cur, stage=f"execution:{str(op or source or 'unknown')}", status=wf_status)
         self._persist_to_disk()
 
     def record_reconciliation_result(
@@ -201,7 +226,153 @@ class DecisionTraceStore:
             "detail": str(detail or "")[:300],
             "extras": dict(extras or {}),
         }
+        self._merge_semantic_fields(cur, extras or {}, source="reconciliation")
+        wf_status = "reconciled" if status == "success" else ("reconcile_blocked" if status in {"blocked", "failed", "error"} else status)
+        self._advance_workflow(cur, stage="reconciliation", status=wf_status)
         self._persist_to_disk()
+
+    def record_agent_verdict(
+        self,
+        *,
+        trace_id: str,
+        agent_name: str,
+        verdict: Dict[str, Any],
+    ) -> None:
+        cur = self._touch(trace_id)
+        outputs = cur.get("agent_outputs") if isinstance(cur.get("agent_outputs"), dict) else {}
+        outputs[str(agent_name or "unknown")] = dict(verdict or {})
+        cur["agent_outputs"] = outputs
+        self._merge_semantic_fields(cur, verdict or {}, source=str(agent_name or "agent"))
+        self._persist_to_disk()
+
+    def record_learning_feedback(
+        self,
+        *,
+        trace_id: str,
+        lesson_summary: str,
+        mistake_tags: Optional[List[str]] = None,
+        tuning_suggestion: Optional[Dict[str, Any]] = None,
+        self_review_score: Optional[float] = None,
+    ) -> None:
+        cur = self._touch(trace_id)
+        cur["learning"] = {
+            "at": _utc_now(),
+            "lesson_summary": str(lesson_summary or "")[:500],
+            "mistake_tags": list(mistake_tags or []),
+            "tuning_suggestion": dict(tuning_suggestion or {}),
+            "self_review_score": self_review_score,
+        }
+        self._persist_to_disk()
+
+    def record_workflow_stage(
+        self,
+        *,
+        trace_id: str,
+        stage: str,
+        status: str,
+        mode: Optional[str] = None,
+        workflow_path: Optional[List[str]] = None,
+        extras: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        cur = self._touch(trace_id)
+        self._advance_workflow(
+            cur,
+            stage=stage,
+            status=status,
+            mode=mode,
+            workflow_path=workflow_path,
+            extras=extras,
+        )
+        self._persist_to_disk()
+
+    def _merge_semantic_fields(self, cur: Dict[str, Any], extras: Dict[str, Any], *, source: str) -> None:
+        if not isinstance(extras, dict):
+            return
+        market = cur.get("market_context") if isinstance(cur.get("market_context"), dict) else {}
+        for field in (
+            "regime_label",
+            "risk_posture",
+            "trend_state",
+            "volatility_state",
+            "liquidity_state",
+            "derivatives_state",
+            "stablecoin_flow_state",
+            "execution_quality_state",
+            "signal_conflict_score",
+            "strategy_stage",
+            "oos_status",
+            "live_drift_status",
+            "memory_refs",
+            "knowledge_refs",
+        ):
+            val = extras.get(field)
+            if val is None and field == "regime_label":
+                val = extras.get("regime")
+            if val is not None:
+                market[field] = val
+        cur["market_context"] = market
+        agents = cur.get("agent_outputs") if isinstance(cur.get("agent_outputs"), dict) else {}
+        if any(k in extras for k in ("risk_verdict", "execution_recommendation", "lesson_summary", "tuning_suggestion")):
+            agents[source] = {
+                "risk_verdict": extras.get("risk_verdict"),
+                "execution_recommendation": extras.get("execution_recommendation"),
+                "lesson_summary": extras.get("lesson_summary"),
+                "mistake_tags": extras.get("mistake_tags"),
+                "tuning_suggestion": extras.get("tuning_suggestion"),
+            }
+            cur["agent_outputs"] = agents
+
+    @staticmethod
+    def _extract_workflow_mode(extras: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(extras, dict):
+            return None
+        raw = extras.get("workflow_mode")
+        if raw is not None:
+            return str(raw)
+        dc = extras.get("decision_trace_contract")
+        if isinstance(dc, dict) and dc.get("workflow_mode") is not None:
+            return str(dc.get("workflow_mode"))
+        return None
+
+    @staticmethod
+    def _extract_workflow_path(extras: Dict[str, Any]) -> Optional[List[str]]:
+        if not isinstance(extras, dict):
+            return None
+        raw = extras.get("workflow_path")
+        if isinstance(raw, list):
+            return [str(x) for x in raw if str(x or "").strip()]
+        return None
+
+    def _advance_workflow(
+        self,
+        cur: Dict[str, Any],
+        *,
+        stage: str,
+        status: str,
+        mode: Optional[str] = None,
+        workflow_path: Optional[List[str]] = None,
+        extras: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        wf = cur.get("workflow") if isinstance(cur.get("workflow"), dict) else {}
+        now = _utc_now()
+        if mode is not None:
+            wf["mode"] = str(mode)
+        if workflow_path:
+            wf["workflow_path"] = [str(x) for x in workflow_path if str(x or "").strip()]
+        wf["current_stage"] = str(stage or "unknown")
+        wf["status"] = str(status or "unknown")
+        wf["last_transition_at"] = now
+        cur["workflow"] = wf
+
+        history = cur.get("stage_history") if isinstance(cur.get("stage_history"), list) else []
+        payload: Dict[str, Any] = {"at": now, "stage": str(stage or "unknown"), "status": str(status or "unknown")}
+        if mode is not None:
+            payload["mode"] = str(mode)
+        if extras:
+            payload["extras"] = dict(extras)
+        if not history or history[-1].get("stage") != payload["stage"] or history[-1].get("status") != payload["status"]:
+            history.append(payload)
+        cur["stage_history"] = history
 
     def get_recent(self, limit: int = 30) -> List[Dict[str, Any]]:
         lim = max(1, min(int(limit or 30), self._max_items))
@@ -229,6 +400,11 @@ class DecisionTraceStore:
         reconciliation_details: Dict[str, int] = {}
         symbol_counts: Dict[str, int] = {}
         hold_reason_tags: Dict[str, int] = {}
+        regimes: Dict[str, int] = {}
+        risk_verdicts: Dict[str, int] = {}
+        strategy_stages: Dict[str, int] = {}
+        workflow_stages: Dict[str, int] = {}
+        workflow_statuses: Dict[str, int] = {}
 
         for row in rows:
             if not isinstance(row, dict):
@@ -244,6 +420,27 @@ class DecisionTraceStore:
                 for tk, tv in hrt.items():
                     if tv:
                         hold_reason_tags[str(tk)] = int(hold_reason_tags.get(str(tk), 0)) + 1
+            market_context = row.get("market_context") if isinstance(row.get("market_context"), dict) else {}
+            regime = str(market_context.get("regime_label") or "")
+            if regime:
+                regimes[regime] = int(regimes.get(regime, 0)) + 1
+            stage_name = str(market_context.get("strategy_stage") or "")
+            if stage_name:
+                strategy_stages[stage_name] = int(strategy_stages.get(stage_name, 0)) + 1
+            agent_outputs = row.get("agent_outputs") if isinstance(row.get("agent_outputs"), dict) else {}
+            for _agent_name, verdict in agent_outputs.items():
+                if not isinstance(verdict, dict):
+                    continue
+                risk_verdict = str(verdict.get("risk_verdict") or "")
+                if risk_verdict:
+                    risk_verdicts[risk_verdict] = int(risk_verdicts.get(risk_verdict, 0)) + 1
+            workflow = row.get("workflow") if isinstance(row.get("workflow"), dict) else {}
+            wf_stage = str(workflow.get("current_stage") or "")
+            if wf_stage:
+                workflow_stages[wf_stage] = int(workflow_stages.get(wf_stage, 0)) + 1
+            wf_status = str(workflow.get("status") or "")
+            if wf_status:
+                workflow_statuses[wf_status] = int(workflow_statuses.get(wf_status, 0)) + 1
             g_status = str(guard.get("status") or "")
             g_reason = str(guard.get("reason") or "")
             if g_status == "rejected":
@@ -278,6 +475,11 @@ class DecisionTraceStore:
             "summary": summary,
             "top_guard_reasons": _top(guard_reasons),
             "top_hold_reason_tags": _top(hold_reason_tags),
+            "top_regimes": _top(regimes),
+            "top_risk_verdicts": _top(risk_verdicts),
+            "top_strategy_stages": _top(strategy_stages),
+            "top_workflow_stages": _top(workflow_stages),
+            "top_workflow_statuses": _top(workflow_statuses),
             "top_execution_failures": _top(execution_details),
             "top_reconciliation_blocks": _top(reconciliation_details),
             "top_symbols": _top(symbol_counts),

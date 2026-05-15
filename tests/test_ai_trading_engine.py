@@ -285,6 +285,64 @@ class TestAITradingEngine(AsyncTestCase):
         assert passed is False
     
     @pytest.mark.asyncio
+    async def test_execute_decision_close_short_passes_short_posside_to_gateway(self, trading_engine):
+        """平空须 posSide=short（曾误归为 long 会导致 OKX 拒单或错平）。"""
+        from src.modules.core.ai_trading_engine import AIDecision, TradeAction
+
+        gw = Mock()
+        gw.close_swap = AsyncMock(return_value={"success": True, "order_id": "ord_close_short"})
+        mc = Mock()
+        mc.execution_gateway = gw
+        mc.get_ai_managed_config = AsyncMock(
+            return_value={"enable_secondary_controller": True, "single_write_owner": "ai_core"}
+        )
+        trading_engine.main_controller = mc
+        trading_engine._save_trade_to_memory = AsyncMock()
+        trading_engine._update_positions = AsyncMock()
+
+        decision = AIDecision(
+            action=TradeAction.CLOSE_SHORT,
+            symbol="BTC/USDT/SWAP",
+            price=50000.0,
+            quantity=0.001,
+            confidence=0.8,
+            reasoning="cover short",
+        )
+        ok = await trading_engine._execute_decision(decision)
+        assert ok is True
+        gw.close_swap.assert_awaited_once()
+        call_args = gw.close_swap.await_args[0]
+        assert call_args[1] == "short"
+
+    @pytest.mark.asyncio
+    async def test_execute_decision_close_long_passes_long_posside_to_gateway(self, trading_engine):
+        from src.modules.core.ai_trading_engine import AIDecision, TradeAction
+
+        gw = Mock()
+        gw.close_swap = AsyncMock(return_value={"success": True, "order_id": "ord_close_long"})
+        mc = Mock()
+        mc.execution_gateway = gw
+        mc.get_ai_managed_config = AsyncMock(
+            return_value={"enable_secondary_controller": True, "single_write_owner": "ai_core"}
+        )
+        trading_engine.main_controller = mc
+        trading_engine._save_trade_to_memory = AsyncMock()
+        trading_engine._update_positions = AsyncMock()
+
+        decision = AIDecision(
+            action=TradeAction.CLOSE_LONG,
+            symbol="BTC/USDT/SWAP",
+            price=50000.0,
+            quantity=0.001,
+            confidence=0.8,
+            reasoning="close long",
+        )
+        ok = await trading_engine._execute_decision(decision)
+        assert ok is True
+        gw.close_swap.assert_awaited_once()
+        assert gw.close_swap.await_args[0][1] == "long"
+
+    @pytest.mark.asyncio
     async def test_execute_decision_success(self, trading_engine):
         """测试执行决策成功"""
         from src.modules.core.ai_trading_engine import AIDecision, TradeAction

@@ -69,12 +69,8 @@ backup_configs() {
     local CONFIG_BACKUP_DIR="$BACKUP_DIR/config"
     mkdir -p "$CONFIG_BACKUP_DIR"
     
-    # 备份应用配置
+    # 备份应用配置与依赖清单（裸机：仓库根路径）
     cp -r /app/config "$CONFIG_BACKUP_DIR/config-$DATE"
-    
-    # 备份Docker配置
-    cp /app/docker-compose.yml "$CONFIG_BACKUP_DIR/docker-compose-$DATE.yml"
-    cp /app/Dockerfile "$CONFIG_BACKUP_DIR/Dockerfile-$DATE"
     cp /app/requirements.txt "$CONFIG_BACKUP_DIR/requirements-$DATE.txt"
     
     log "配置文件备份完成"

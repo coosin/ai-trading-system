@@ -50,6 +50,11 @@ def main() -> int:
     n = sub.add_parser("network", help="Run production network baseline checks")
     n.add_argument("--apply", action="store_true")
     n.add_argument("--check-only", action="store_true")
+    n.add_argument(
+        "--quick",
+        action="store_true",
+        help="透传 --quick：缩短探针轮次/超时（与本机同网络栈；失败仍 exit 2）",
+    )
 
     g = sub.add_parser("trading-gates", help="Run microstructure gate regression tests")
     g.add_argument("--kexpr", default="microstructure")
@@ -80,7 +85,9 @@ def main() -> int:
         )
     return _run(
         "production_network_baseline.py",
-        (["--apply"] if args.apply else []) + (["--check-only"] if args.check_only else []),
+        (["--apply"] if args.apply else [])
+        + (["--check-only"] if args.check_only else [])
+        + (["--quick"] if getattr(args, "quick", False) else []),
     )
 
 

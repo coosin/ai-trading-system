@@ -146,7 +146,7 @@
   - `AICoreDecisionEngine` 新增同向集中度门控 `max_same_direction_ratio`（默认 `0.7`），按“开仓后投影占比”判定是否拒绝。
   - 新增“满仓高置信替换最差仓”执行路径：
     - 当开仓在执行网关返回“风控红线/持仓数上限”时，若新信号置信度达到阈值（`replace_worst_min_confidence`），尝试先平质量最低持仓，再重试开仓。
-  - 同向门控与替换链路顺序已调整：满足“满仓 + 高置信 + 启用替换”时，不在同向门控提前终止，允许进入替换链路。
+  - 更新说明（2026-05-14）：该替换路径现已收口为 `ExecutionGateway` 单点实现，配置入口为 `ai_brain.policy.*`；`AICoreDecisionEngine` 不再读取 `replace_worst_*` 配置，也不再因“满仓 + 高置信 + 启用替换”绕过同向集中度门控。
 
 - **止损与开仓风险参数同步：**
   - `min_confidence_to_trade` / `ai_core_min_confidence_to_open` 调整至 `0.65`，并引入 `ai_core_min_confidence_floor` 防止运行时过度放松。
@@ -396,7 +396,7 @@
 
 - **配置**：业务主配置仅为 `config/config.yaml`（及可选同目录 `local.*`）；`ConfigManager` 不再加载 `openclaw.yml`、`default.yml`、按节分散的旧 JSON 树。
 - **删除**：根目录 `openclaw-trading.json*` 备份；`data/config` 下旧 `default.yml`、`*.json` 测试碎片等；该目录保留 `.gitkeep` 供可选本机 `local.*`。
-- **Docker**：恢复/提供根目录 `docker-compose.yml`，默认 `MODE`/`TRADING_MODE`/`SYSTEM_MODE` 为 **simulation**（部署实盘前请在 `.env` 显式覆盖）；挂载 `./config:/app/config`。
+- **部署**：根目录 **已移除** `docker-compose.yml` / `Dockerfile`；以裸机 `python -m src.main`、systemd 或 `scripts/start-openclaw-trading.sh` 为主；`MODE`/`TRADING_MODE`/`SYSTEM_MODE` 请在 `.env` 显式配置。
 - **测试**：Pytest 9 要求异步 fixture 使用 `pytest_asyncio.fixture`；`NaturalLanguageInterface` 单测改为 `IsolatedAsyncioTestCase`。
 - **工具**：`src/web/app.py` 改为读取主 YAML；新增 `scripts/network_connectivity_smoke.py`。
 - **文档**：补回 `docs/ENGINEERING.md`、`docs/CHANGELOG.md`、`docs/memory/MEMORY_LIBRARY_GUIDE.md`；更新 `OPERATIONS`、`DEVELOPMENT`、`README` 索引；`status.sh` / `check-dual-system.sh` 改为检查 `config/config.yaml`。

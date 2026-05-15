@@ -50,7 +50,7 @@ try:
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.routing import APIRoute
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-    from pydantic import BaseModel, Field, confloat, conint, validator
+    from pydantic import BaseModel, Field, confloat, conint, field_validator
     from jose import JWTError, jwt
     from passlib.context import CryptContext
 
@@ -236,13 +236,15 @@ if HAS_FASTAPI:
         price: Optional[confloat(gt=0)] = None
         stop_price: Optional[confloat(gt=0)] = None
 
-        @validator("side")
+        @field_validator("side")
+        @classmethod
         def validate_side(cls, v):
             if v.lower() not in ["buy", "sell"]:
                 raise ValueError("side必须是buy或sell")
             return v.lower()
 
-        @validator("order_type")
+        @field_validator("order_type")
+        @classmethod
         def validate_order_type(cls, v):
             valid_types = ["market", "limit", "stop", "stop_limit"]
             if v.lower() not in valid_types:
@@ -1779,6 +1781,14 @@ class APIServer:
             return out
 
         # 策略管理路由 - 支持 /api/v1/strategies（真实 StrategyManager）
+        def _strategy_activation_gate_or_none(sm: Any, strategy_id: str) -> Optional[Dict[str, Any]]:
+            if not sm or not hasattr(sm, "get_strategy_activation_gate"):
+                return None
+            try:
+                return sm.get_strategy_activation_gate(strategy_id)
+            except Exception:
+                return None
+
         @api_v1_router.get("/strategies", tags=["strategies"])
         async def get_strategies():
             """获取所有策略（来自 StrategyManager）"""
@@ -1878,16 +1888,26 @@ class APIServer:
             if not mc or not getattr(mc, "strategy_manager", None):
                 raise HTTPException(status_code=503, detail="策略管理器未初始化")
             sm = mc.strategy_manager
+            requested_enabled = bool(strategy_data.get("enabled", True))
             if not strategy_data.get("strategy_id"):
                 strategy_data = {**strategy_data, "strategy_id": f"api_{datetime.now().strftime('%Y%m%d%H%M%S')}"}
-            cfg = await sm.load_strategy_config(strategy_data)
+            cfg = await sm.load_strategy_config({**strategy_data, "enabled": False if requested_enabled else bool(strategy_data.get("enabled", False))})
             if not cfg:
                 raise HTTPException(status_code=400, detail="策略配置无效：需含 name、strategy_type")
+            gate = _strategy_activation_gate_or_none(sm, cfg.strategy_id)
+            if requested_enabled:
+                if gate and not gate.get("eligible"):
+                    async with sm._lock:
+                        sm.strategy_configs.pop(cfg.strategy_id, None)
+                        sm.performance_metrics.pop(cfg.strategy_id, None)
+                    raise HTTPException(status_code=400, detail=f"策略未达到启用门槛: {','.join(gate.get('reasons') or [])}")
+                cfg.enabled = True
             return {
                 "id": cfg.strategy_id,
                 "name": cfg.name,
                 "status": "inactive" if not cfg.enabled else "active",
                 "message": "策略已加载",
+                "activation_gate": gate,
             }
 
         @api_v1_router.put("/strategies/{id}", tags=["strategies"])
@@ -1905,7 +1925,12 @@ class APIServer:
             if "description" in strategy_data:
                 cfg.description = str(strategy_data["description"])
             if "enabled" in strategy_data:
-                cfg.enabled = bool(strategy_data["enabled"])
+                requested_enabled = bool(strategy_data["enabled"])
+                if requested_enabled:
+                    gate = _strategy_activation_gate_or_none(sm, id)
+                    if gate and not gate.get("eligible"):
+                        raise HTTPException(status_code=400, detail=f"策略未达到启用门槛: {','.join(gate.get('reasons') or [])}")
+                cfg.enabled = requested_enabled
             if "parameters" in strategy_data and isinstance(strategy_data["parameters"], dict):
                 cfg.parameters = {**cfg.parameters, **strategy_data["parameters"]}
             if "symbols" in strategy_data and isinstance(strategy_data["symbols"], list):
@@ -1934,8 +1959,11 @@ class APIServer:
             sm = mc.strategy_manager
             if id not in sm.strategy_configs:
                 raise HTTPException(status_code=404, detail="策略不存在")
+            gate = _strategy_activation_gate_or_none(sm, id)
+            if gate and not gate.get("eligible"):
+                raise HTTPException(status_code=400, detail=f"策略未达到启用门槛: {','.join(gate.get('reasons') or [])}")
             sm.strategy_configs[id].enabled = True
-            return {"status": "success", "message": "策略已激活"}
+            return {"status": "success", "message": "策略已激活", "activation_gate": gate}
 
         @api_v1_router.post("/strategies/{id}/deactivate", tags=["strategies"])
         async def deactivate_strategy(id: str):
@@ -2807,32 +2835,37 @@ class APIServer:
             days: int = 7,
             symbol: Optional[str] = None,
             top_n: int = 20,
-            timeout_sec: float = 8.0,
+            timeout_sec: float = 35.0,
         ):
             """
             一键差异报告（摘要 + TOP 偏差列表），便于快速人工排查。
             """
+            _ex_to = 2.5
+            _tmo = float(timeout_sec or 35.0)
+            _want = max(50, int(top_n or 20) * 6)
+            _cap = max(8, int((_tmo - 4.0) / max(0.9, _ex_to)))
+            _max_checks = min(_want, _cap)
             try:
                 raw = await asyncio.wait_for(
                     reconcile_trades_with_exchange(
                         days=days,
                         symbol=symbol,
                         limit=max(20, int(top_n or 20)),
-                        max_exchange_checks=max(50, int(top_n or 20) * 6),
-                        exchange_call_timeout_sec=2.5,
+                        max_exchange_checks=_max_checks,
+                        exchange_call_timeout_sec=_ex_to,
                         exclude_bootstrap=True,
                         exclude_estimated_pnl=True,
                         include_time_window_fallback=True,
                         fallback_time_window_sec=240,
                         max_fallback_candidates_per_symbol=50,
                     ),
-                    timeout=float(timeout_sec or 8.0),
+                    timeout=_tmo,
                 )
             except asyncio.TimeoutError:
                 return {
                     "success": False,
                     "message": "trade_reconcile_report_timeout",
-                    "details": f"timeout_sec={float(timeout_sec or 8.0)}",
+                    "details": f"timeout_sec={_tmo}",
                     "timestamp": datetime.now().isoformat(),
                 }
             if not isinstance(raw, dict) or not raw.get("success"):

@@ -14,7 +14,7 @@ import ssl
 import time
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from functools import wraps
@@ -25,6 +25,14 @@ import aiohttp
 from .exchange_base import ExchangeBase, MarketData, OrderBook, Order, Balance, ExchangeInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utcnow_iso_z() -> str:
+    return _utcnow().isoformat().replace("+00:00", "Z")
 
 
 def _okx_ssl_cafile_path() -> str:
@@ -166,6 +174,7 @@ class OKXExchange(ExchangeBase):
         self._payload_last_flush_ts: float = 0.0
         self._ticker_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_TICKER_CACHE_TTL", "5") or "5")
         self._klines_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_KLINES_CACHE_TTL", "8") or "8")
+        self._klines_stale_max_s: float = float(os.getenv("OPENCLAW_OKX_KLINES_STALE_MAX", "120") or "120")
         self._balance_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_BALANCE_CACHE_TTL", "12") or "12")
         self._positions_cache_ttl_s: float = float(os.getenv("OPENCLAW_OKX_POSITIONS_CACHE_TTL", "15") or "15")
         self._ticker_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -319,6 +328,22 @@ class OKXExchange(ExchangeBase):
                 self._last_recover_warn_ts = now
             await self._attempt_network_recovery(reason)
 
+    @staticmethod
+    def _is_transport_reset_error(exc: BaseException) -> bool:
+        detail = f"{type(exc).__name__}: {exc}".lower()
+        markers = (
+            "server disconnected",
+            "connection reset",
+            "broken pipe",
+            "connection closed",
+            "disconnect",
+            "transferencodingerror",
+            "payload is not completed",
+            "incomplete chunked read",
+            "clientpayloaderror",
+        )
+        return any(marker in detail for marker in markers)
+
     async def _attempt_network_recovery(self, reason: str) -> None:
         now = time.time()
         if now - self._last_recover_ts < self._recover_cooldown_s:
@@ -411,21 +436,33 @@ class OKXExchange(ExchangeBase):
             return False
         return ep.startswith("/api/v5/trade/") or ep.startswith("/api/v5/account/")
 
-    def _get_headers(self, method: str, endpoint: str, body: str = "") -> Dict[str, str]:
+    @staticmethod
+    def _endpoint_requires_auth(endpoint: str) -> bool:
+        ep = str(endpoint or "")
+        return not (
+            ep.startswith("/api/v5/public/")
+            or ep.startswith("/api/v5/market/")
+        )
+
+    def _get_headers(self, method: str, endpoint: str, body: str = "", *, auth_required: bool = True) -> Dict[str, str]:
         """获取请求头"""
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if not auth_required:
+            return headers
         # 使用 UTC 时间戳（ISO 8601 格式），并叠加服务器时钟偏移量。
         from datetime import datetime, timezone
         ts_ms = (time.time() * 1000.0) + float(getattr(self, "_server_time_offset_ms", 0.0) or 0.0)
         timestamp = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
         signature = self._generate_signature(timestamp, method, endpoint, body)
         
-        headers = {
+        headers.update({
             "OK-ACCESS-KEY": self.api_key,
             "OK-ACCESS-SIGN": signature,
             "OK-ACCESS-TIMESTAMP": timestamp,
             "OK-ACCESS-PASSPHRASE": self.api_passphrase or "",
-            "Content-Type": "application/json",
-        }
+        })
         if self._should_use_simulated_header(endpoint):
             headers["x-simulated-trading"] = "1"
         return headers
@@ -619,11 +656,26 @@ class OKXExchange(ExchangeBase):
                 fields.add(key)
                 fields.update(self._flatten_fields(v, key))
         elif isinstance(payload, list):
-            for idx, item in enumerate(payload[:3]):
+            # Nested row payloads such as candles are positional arrays where indices 3/4/5
+            # are semantically important. Sampling only the first 3 slots causes false
+            # "missing field" warnings, so keep a slightly wider window here.
+            for idx, item in enumerate(payload[:8]):
                 key = f"{prefix}[{idx}]" if prefix else str(idx)
                 fields.add(key)
                 fields.update(self._flatten_fields(item, key))
         return fields
+
+    def _missing_expected_fields(self, channel: str, observed: set) -> List[str]:
+        def _matches_expected(expected_field: str) -> bool:
+            return any(
+                f == expected_field
+                or f.endswith(f".{expected_field}")
+                or f.endswith(f"[{expected_field}]")
+                for f in observed
+            )
+
+        expected = self._payload_expected_fields.get(channel, [])
+        return [e for e in expected if not _matches_expected(e)]
 
     async def _record_payload_sample(self, endpoint: str, data: Any) -> None:
         if not self._payload_recorder_enabled:
@@ -639,7 +691,7 @@ class OKXExchange(ExchangeBase):
         await self._flush_payload_matrix(force=False)
 
     def _build_payload_matrix_markdown(self) -> str:
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        now = _utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         lines = [
             "# OKX Payload Field Matrix",
             "",
@@ -653,10 +705,7 @@ class OKXExchange(ExchangeBase):
         ]
         for channel in sorted(self._payload_channel_fields.keys()):
             observed = self._payload_channel_fields.get(channel, set())
-            expected = self._payload_expected_fields.get(channel, [])
-            missing = [
-                e for e in expected if not any(f == e or f.endswith(f".{e}") for f in observed)
-            ]
+            missing = self._missing_expected_fields(channel, observed)
             lines.append(
                 f"| {channel} | {self._payload_channel_samples.get(channel, 0)} | "
                 f"{len(observed)} | {len(missing)} |"
@@ -664,11 +713,8 @@ class OKXExchange(ExchangeBase):
         lines.extend(["", "## Detailed Fields", ""])
         for channel in sorted(self._payload_channel_fields.keys()):
             lines.append(f"### {channel}")
-            expected = self._payload_expected_fields.get(channel, [])
             observed = sorted(self._payload_channel_fields.get(channel, set()))
-            missing = [
-                e for e in expected if not any(f == e or f.endswith(f".{e}") for f in observed)
-            ]
+            missing = self._missing_expected_fields(channel, set(observed))
             lines.append(f"- missing_expected: {', '.join(missing) if missing else 'none'}")
             lines.append("- observed_fields:")
             for field in observed[:300]:
@@ -683,9 +729,7 @@ class OKXExchange(ExchangeBase):
             observed = self._payload_channel_fields.get(channel, set())
             if not observed:
                 continue
-            missing = [
-                e for e in expected if not any(f == e or f.endswith(f".{e}") for f in observed)
-            ]
+            missing = self._missing_expected_fields(channel, observed)
             if missing:
                 logger.warning(
                     "OKX payload字段缺口: channel=%s missing=%s",
@@ -706,7 +750,7 @@ class OKXExchange(ExchangeBase):
             json_path = self._payload_output_dir / "okx_payload_field_matrix.json"
             md_path.write_text(self._build_payload_matrix_markdown(), encoding="utf-8")
             payload = {
-                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "generated_at": _utcnow_iso_z(),
                 "sample_limit_per_channel": self._payload_sample_limit,
                 "channels": {
                     ch: {
@@ -911,7 +955,8 @@ class OKXExchange(ExchangeBase):
             body_str = json.dumps(body, separators=(',', ':')) if body else ""
 
             request_path = self._build_request_path(endpoint, params if str(method).upper() == "GET" else None)
-            headers = self._get_headers(method, request_path, body_str)
+            auth_required = self._endpoint_requires_auth(endpoint)
+            headers = self._get_headers(method, request_path, body_str, auth_required=auth_required)
             request_params = params
             if str(method).upper() == "GET" and request_path != endpoint:
                 # Ensure signature query and actual query are byte-consistent.
@@ -921,7 +966,10 @@ class OKXExchange(ExchangeBase):
             
             logger.debug(f"📤 OKX请求: {method} {endpoint}")
             logger.debug(f"📤 Body: {body_str}")
-            logger.debug(f"📤 Headers: OK-ACCESS-KEY={headers.get('OK-ACCESS-KEY')[:8]}..., TIMESTAMP={headers.get('OK-ACCESS-TIMESTAMP')}")
+            if auth_required and headers.get("OK-ACCESS-KEY"):
+                logger.debug(f"📤 Headers: OK-ACCESS-KEY={headers.get('OK-ACCESS-KEY')[:8]}..., TIMESTAMP={headers.get('OK-ACCESS-TIMESTAMP')}")
+            else:
+                logger.debug("📤 Headers: public-request (unsigned)")
             
             max_retries = int(profile.get("max_retries", self._request_max_retries) or self._request_max_retries)
             retry_delay = float(profile.get("retry_delay", 1.0) or 1.0)
@@ -1127,16 +1175,7 @@ class OKXExchange(ExchangeBase):
                     err_s = str(e)
                     el = err_s.lower()
                     # 半开连接、隧道被掐断：先换连接器再重试（直连/走代理均可能触发）
-                    if attempt < max_retries and any(
-                        x in el
-                        for x in (
-                            "server disconnected",
-                            "connection reset",
-                            "broken pipe",
-                            "connection closed",
-                            "disconnect",
-                        )
-                    ):
+                    if attempt < max_retries and self._is_transport_reset_error(e):
                         await self._rebuild_session(f"{type(e).__name__}: {err_s[:200]}")
                         await asyncio.sleep(min(1.0, retry_delay))
                         retry_delay *= retry_backoff
@@ -1448,22 +1487,36 @@ class OKXExchange(ExchangeBase):
         async def _do_fetch() -> List[Dict[str, Any]]:
             endpoint = "/api/v5/market/candles"
             params = {"instId": okx_symbol, "bar": okx_interval, "limit": int(limit)}
-            data = await self._make_request("GET", endpoint, params)
-            out: List[Dict[str, Any]] = []
-            for candle in data or []:
-                out.append(
-                    {
-                        "timestamp": int(candle[0]),
-                        "open": float(candle[1]),
-                        "high": float(candle[2]),
-                        "low": float(candle[3]),
-                        "close": float(candle[4]),
-                        "volume": float(candle[5]),
-                        "quote_volume": float(candle[7]),
-                    }
-                )
-            self._klines_cache[cache_key] = (time.time(), list(out))
-            return out
+            try:
+                data = await self._make_request("GET", endpoint, params)
+                out: List[Dict[str, Any]] = []
+                for candle in data or []:
+                    out.append(
+                        {
+                            "timestamp": int(candle[0]),
+                            "open": float(candle[1]),
+                            "high": float(candle[2]),
+                            "low": float(candle[3]),
+                            "close": float(candle[4]),
+                            "volume": float(candle[5]),
+                            "quote_volume": float(candle[7]),
+                        }
+                    )
+                self._klines_cache[cache_key] = (time.time(), list(out))
+                return out
+            except Exception:
+                if cached:
+                    age = max(0.0, time.time() - float(cached[0]))
+                    if age <= float(self._klines_stale_max_s):
+                        logger.warning(
+                            "⚠️ 使用OKX K线缓存降级返回: %s %s limit=%s age=%.1fs",
+                            okx_symbol,
+                            okx_interval,
+                            int(limit),
+                            age,
+                        )
+                        return list(cached[1])
+                raise
 
         task = asyncio.create_task(_do_fetch())
         self._klines_inflight[cache_key] = task
@@ -2051,6 +2104,10 @@ class OKXExchange(ExchangeBase):
             return info
         except Exception as e:
             logger.error(f"获取OKX交易所信息失败: {e}")
+            if cached_info is not None:
+                age = max(0.0, now - float(cached_ts))
+                logger.warning("⚠️ 使用OKX交易所信息缓存降级返回（age=%.1fs）", age)
+                return cached_info
             # 返回默认信息
             info = ExchangeInfo(
                 exchange_id="okx",
@@ -2130,6 +2187,10 @@ class OKXExchange(ExchangeBase):
                 }
         except Exception as e:
             logger.warning(f"获取OKX合约交易对信息失败: {okx_inst_id} - {e}")
+            if cached:
+                age = max(0.0, now - float(cached[0]))
+                logger.warning("⚠️ 使用OKX合约信息缓存降级返回: %s age=%.1fs", okx_inst_id, age)
+                return dict(cached[1])
 
         self._instrument_cache[okx_inst_id] = (now, payload)
         return payload

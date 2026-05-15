@@ -5,6 +5,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections import Counter
@@ -39,6 +40,89 @@ def _load_runtime_json(filename: str) -> Dict[str, Any]:
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
+
+
+def _load_recent_capacity_block_from_runtime() -> Optional[Dict[str, Any]]:
+    try:
+        runtime_dir = Path(__file__).resolve().parents[3] / "data" / "runtime"
+        payload = json.loads((runtime_dir / "execution_gateway_recent_events.json").read_text(encoding="utf-8"))
+        events = payload.get("recent_events") if isinstance(payload, dict) else None
+        if not isinstance(events, list):
+            return None
+        for evt in reversed(events):
+            if not isinstance(evt, dict):
+                continue
+            if evt.get("success") is not False:
+                continue
+            if str(evt.get("op") or "").lower() != "open":
+                continue
+            if str(evt.get("error_code") or "").upper() != "RISK_REDLINE_DENIED":
+                continue
+            detail = str(evt.get("detail") or "")
+            reason = str(evt.get("reason") or "")
+            if "max_positions" not in detail.lower() and "持仓数" not in detail and "max_positions" not in reason.lower():
+                continue
+            out = dict(evt)
+            out["source"] = "runtime_recent_events"
+            return out
+    except Exception:
+        return None
+    return None
+
+
+def _load_recent_capacity_block_from_app_log() -> Optional[Dict[str, Any]]:
+    try:
+        log_path = Path(__file__).resolve().parents[3] / "logs" / "app.log"
+        ts_pat = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+-\s+")
+        detail_pat = re.compile(r"(风控红线拦截：持仓数 .*?(?:；候选释放槽位: .*?)?)$")
+        chunk_size = 256 * 1024
+        with log_path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            offset = size
+            carry = b""
+            while offset > 0:
+                read_size = min(chunk_size, offset)
+                offset -= read_size
+                fh.seek(offset)
+                chunk = fh.read(read_size)
+                text = (chunk + carry).decode("utf-8", errors="replace")
+                lines = text.splitlines()
+                if offset > 0 and lines:
+                    carry = lines[0].encode("utf-8", errors="ignore")
+                    lines = lines[1:]
+                else:
+                    carry = b""
+                for line in reversed(lines):
+                    if "风控红线拦截：持仓数" not in line:
+                        continue
+                    m_ts = ts_pat.search(line)
+                    m_detail = detail_pat.search(line)
+                    detail = m_detail.group(1).strip() if m_detail else line.strip()
+                    if "max_positions" not in detail.lower() and "持仓数" not in detail:
+                        continue
+                    return {
+                        "ts": m_ts.group(1).replace(" ", "T") + "Z" if m_ts else "-",
+                        "symbol": "?",
+                        "detail": detail,
+                        "source": "app_log",
+                    }
+    except Exception:
+        return None
+    return None
+
+
+def _summarize_trace_workflow_focus(traces: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(traces, dict):
+        return {"top_stage": None, "top_status": None}
+    top_stages = traces.get("top_workflow_stages") if isinstance(traces.get("top_workflow_stages"), list) else []
+    top_statuses = traces.get("top_workflow_statuses") if isinstance(traces.get("top_workflow_statuses"), list) else []
+    top_stage = top_stages[0] if top_stages else None
+    top_status = top_statuses[0] if top_statuses else None
+    return {
+        "top_stage": top_stage if isinstance(top_stage, dict) else None,
+        "top_status": top_status if isinstance(top_status, dict) else None,
+    }
 
 
 def init_module_control_api(app, main_controller):
@@ -931,6 +1015,12 @@ def init_module_control_api(app, main_controller):
             "analysis_require_not_degraded_for_open",
             "open_allow_snapshot_timeout_fallback",
             "open_requires_full_snapshot",
+            "open_attempt_klines_recovery_fetch",
+            "open_klines_recovery_fetch_timeout_s",
+            "open_klines_recovery_fetch_limit",
+            "open_klines_recovery_min_bars",
+            "open_allow_klines_missing_evidence_fallback",
+            "open_klines_missing_evidence_qty_mult",
             "min_rr_to_trade",
             "max_spread_bps_to_trade",
             "max_abs_depth_imbalance_to_trade",
@@ -1052,6 +1142,8 @@ def init_module_control_api(app, main_controller):
                         "analysis_require_not_degraded_for_open",
                         "open_allow_snapshot_timeout_fallback",
                         "open_requires_full_snapshot",
+                        "open_attempt_klines_recovery_fetch",
+                        "open_allow_klines_missing_evidence_fallback",
                         "ai_autonomy_minimal_gates_enabled",
                         "ai_autonomy_allow_neutral_with_trend",
                         "ai_autonomy_require_trend_alignment",
@@ -2085,6 +2177,87 @@ def init_module_control_api(app, main_controller):
             return {"success": False, "message": "任务不存在", "job_id": job_id}
         return {"success": True, "job": job, "timestamp": datetime.now().isoformat()}
 
+    @router.get("/strategy/research-profile/{strategy_id}")
+    async def get_strategy_research_profile(strategy_id: str):
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        sm = main_controller.strategy_manager
+        if not hasattr(sm, "get_strategy_research_profile"):
+            return {"success": False, "message": "当前策略管理器不支持研究画像"}
+        return {"success": True, "data": sm.get_strategy_research_profile(strategy_id), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/strategy/research-profile/{strategy_id}/experiment-card")
+    async def save_strategy_experiment_card_api(strategy_id: str, payload: Dict[str, Any] = Body(default_factory=dict)):
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        sm = main_controller.strategy_manager
+        if not hasattr(sm, "save_strategy_experiment_card"):
+            return {"success": False, "message": "当前策略管理器不支持实验卡"}
+        hypothesis = str((payload or {}).get("hypothesis") or "").strip()
+        if not hypothesis:
+            return {"success": False, "message": "hypothesis 不能为空"}
+        ok = sm.save_strategy_experiment_card(
+            strategy_id,
+            hypothesis=hypothesis,
+            experiment_card=dict((payload or {}).get("experiment_card") or {}),
+        )
+        return {"success": bool(ok), "strategy_id": strategy_id, "timestamp": datetime.now().isoformat()}
+
+    @router.post("/strategy/research-profile/{strategy_id}/peer-review")
+    async def save_strategy_peer_review_api(strategy_id: str, payload: Dict[str, Any] = Body(default_factory=dict)):
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        sm = main_controller.strategy_manager
+        if not hasattr(sm, "record_strategy_peer_review"):
+            return {"success": False, "message": "当前策略管理器不支持同伴评审"}
+        ok = sm.record_strategy_peer_review(
+            strategy_id,
+            answers=dict((payload or {}).get("answers") or {}),
+            action_items=list((payload or {}).get("action_items") or []),
+            status=str((payload or {}).get("status") or "completed"),
+        )
+        return {
+            "success": bool(ok),
+            "message": "missing required peer review answers" if not ok else "peer review saved",
+            "strategy_id": strategy_id,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    @router.post("/strategy/research-profile/{strategy_id}/failure-case")
+    async def save_strategy_failure_case_api(strategy_id: str, payload: Dict[str, Any] = Body(default_factory=dict)):
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        sm = main_controller.strategy_manager
+        if not hasattr(sm, "record_strategy_failure_case"):
+            return {"success": False, "message": "当前策略管理器不支持失败案例"}
+        title = str((payload or {}).get("title") or "").strip()
+        summary = str((payload or {}).get("summary") or "").strip()
+        if not title or not summary:
+            return {"success": False, "message": "title 和 summary 不能为空"}
+        ok = sm.record_strategy_failure_case(
+            strategy_id,
+            title=title,
+            case_type=str((payload or {}).get("case_type") or "execution_failure"),
+            summary=summary,
+            trigger=str((payload or {}).get("trigger") or ""),
+            action_taken=str((payload or {}).get("action_taken") or ""),
+            metadata=dict((payload or {}).get("metadata") or {}),
+        )
+        return {"success": bool(ok), "strategy_id": strategy_id, "timestamp": datetime.now().isoformat()}
+
+    @router.post("/strategy/research-profile/{strategy_id}/parameter-sensitivity")
+    async def save_strategy_parameter_sensitivity_api(strategy_id: str, payload: Dict[str, Any] = Body(default_factory=dict)):
+        if not main_controller or not hasattr(main_controller, "strategy_manager") or not main_controller.strategy_manager:
+            return {"success": False, "message": "策略管理器未初始化"}
+        sm = main_controller.strategy_manager
+        if not hasattr(sm, "save_strategy_parameter_sensitivity"):
+            return {"success": False, "message": "当前策略管理器不支持参数敏感性摘要"}
+        ok = sm.save_strategy_parameter_sensitivity(
+            strategy_id,
+            parameter_sensitivity=dict((payload or {}).get("parameter_sensitivity") or {}),
+        )
+        return {"success": bool(ok), "strategy_id": strategy_id, "timestamp": datetime.now().isoformat()}
+
     @router.get("/memory/daily-summary")
     async def get_memory_daily_summary(limit: int = 6):
         """
@@ -3020,12 +3193,25 @@ def init_module_control_api(app, main_controller):
             out["ai_core_error"] = str(e)
         try:
             if core and hasattr(core, "get_opportunity_cost_summary"):
-                budget = _remaining(1.2)
+                # 与 _remaining 解耦：前置同步路径若较慢，共享 total_budget 会把子预算压到 0.25s，导致稳定 Timeout。
+                _diag_sl = max(2.0, min(30.0, float(timeout_sec or 8.0)))
+                budget = max(5.5, min(14.0, _diag_sl * 0.52))
                 out["opportunity_cost"] = await asyncio.wait_for(
                     core.get_opportunity_cost_summary(lookback=120),
                     timeout=budget,
                 )
+                _oc = out.get("opportunity_cost")
+                if isinstance(_oc, dict):
+                    _oc = dict(_oc)
+                    _oc["diagnosis_wait_budget_sec"] = round(float(budget), 4)
+                    out["opportunity_cost"] = _oc
         except asyncio.TimeoutError:
+            try:
+                _diag_sl = max(2.0, min(30.0, float(timeout_sec or 8.0)))
+                _b = max(5.5, min(14.0, _diag_sl * 0.52))
+                out["opportunity_cost_budget_sec"] = round(float(_b), 4)
+            except Exception:
+                pass
             out["opportunity_cost_error"] = "opportunity_cost_timeout"
         except Exception as e:
             out["opportunity_cost_error"] = str(e)
@@ -3190,8 +3376,72 @@ def init_module_control_api(app, main_controller):
             out["ai_learning_engine"] = le.get_status() if (le and hasattr(le, "get_status")) else None
             if isinstance(out.get("ai_learning_engine"), dict):
                 out["trace_learning_feedback"] = (out.get("ai_learning_engine") or {}).get("trace_feedback")
+                out["learning_analytics"] = (out.get("ai_learning_engine") or {}).get("learning_analytics")
+                out["weekly_research_review"] = (out.get("ai_learning_engine") or {}).get("weekly_review")
         except Exception as e:
             out["ai_learning_engine_error"] = str(e)
+
+        # 4.1) Market structure / agent orchestration / controlled tuning
+        try:
+            ms_rows: List[Dict[str, Any]] = []
+            mi = getattr(mc, "market_intelligence", None) or getattr(mc, "market_intelligence_engine", None)
+            symbols = []
+            try:
+                symbols = list(getattr(mc, "symbols", []) or [])
+            except Exception:
+                symbols = []
+            if mi and hasattr(mi, "get_cached_symbol_view"):
+                for sym in symbols[:12]:
+                    try:
+                        row = mi.get_cached_symbol_view(sym) or {}
+                    except Exception:
+                        row = {}
+                    if isinstance(row, dict) and row:
+                        row = dict(row)
+                        row.setdefault("symbol", sym)
+                        ms_rows.append(row)
+            mse = getattr(mc, "market_structure_engine", None)
+            if mse and hasattr(mse, "summarize"):
+                out["market_structure"] = mse.summarize(ms_rows)
+            else:
+                out["market_structure"] = {"sample_size": 0, "samples": []}
+        except Exception as e:
+            out["market_structure_error"] = str(e)
+
+        try:
+            orch = getattr(mc, "agent_orchestrator", None)
+            out["agent_orchestration"] = orch.get_status() if (orch and hasattr(orch, "get_status")) else None
+        except Exception as e:
+            out["agent_orchestration_error"] = str(e)
+
+        try:
+            sm = getattr(mc, "strategy_manager", None)
+            out["market_structure_governance"] = (
+                sm.get_market_structure_governance_status()
+                if (sm and hasattr(sm, "get_market_structure_governance_status"))
+                else None
+            )
+        except Exception as e:
+            out["market_structure_governance_error"] = str(e)
+
+        try:
+            gov = getattr(mc, "tuning_governance", None)
+            out["tuning_governance"] = gov.get_status() if (gov and hasattr(gov, "get_status")) else None
+        except Exception as e:
+            out["tuning_governance_error"] = str(e)
+
+        try:
+            mg = getattr(mc, "memory_gateway", None)
+            out["memory_architecture"] = (
+                mg.get_layered_memory_overview() if (mg and hasattr(mg, "get_layered_memory_overview")) else None
+            )
+        except Exception as e:
+            out["memory_architecture_error"] = str(e)
+        try:
+            fs = getattr(mc, "feature_store_lite", None)
+            out["feature_store_lite"] = fs.get_summary() if (fs and hasattr(fs, "get_summary")) else None
+        except Exception as e:
+            out["feature_store_lite_error"] = str(e)
 
         # 5) TradeHistory 统计（用于盈利/亏损结构评估）
         try:
@@ -3477,6 +3727,8 @@ def init_module_control_api(app, main_controller):
         try:
             core = getattr(mc, "ai_core", None)
             gw = getattr(mc, "execution_gateway", None)
+            dts = getattr(mc, "decision_trace_store", None)
+            trace_analysis = dts.analyze_recent(limit=80) if (dts and hasattr(dts, "analyze_recent")) else {}
             hints: List[str] = []
             if core and hasattr(core, "get_status"):
                 st = core.get_status() or {}
@@ -3487,6 +3739,18 @@ def init_module_control_api(app, main_controller):
             if gw and hasattr(gw, "get_policy_metrics"):
                 pm = gw.get_policy_metrics() or {}
                 hints.append("execution 脊柱: " + ", ".join([f"{k}={pm.get(k)}" for k in ("open_ok","open_fail","close_ok","close_fail")]))
+            eg = out.get("execution_gateway") if isinstance(out.get("execution_gateway"), dict) else {}
+            rwp = eg.get("replace_worst_policy") if isinstance(eg.get("replace_worst_policy"), dict) else {}
+            if rwp:
+                hints.append(
+                    "replace_worst policy: "
+                    + ", ".join(
+                        [
+                            f"enabled={bool(rwp.get('enable_replace_worst_on_full_positions', False))}",
+                            f"min_conf={float(rwp.get('replace_worst_min_confidence', 0.75) or 0.75):.2f}",
+                        ]
+                    )
+                )
             rec = out.get("execution_reconciliation") if isinstance(out.get("execution_reconciliation"), dict) else {}
             if rec:
                 sm = rec.get("summary") if isinstance(rec.get("summary"), dict) else {}
@@ -3501,6 +3765,11 @@ def init_module_control_api(app, main_controller):
                         ]
                     )
                 )
+            wf_focus = _summarize_trace_workflow_focus(trace_analysis)
+            if isinstance(wf_focus.get("top_stage"), dict) or isinstance(wf_focus.get("top_status"), dict):
+                stage_key = str(((wf_focus.get("top_stage") or {}).get("key")) or "-")
+                status_key = str(((wf_focus.get("top_status") or {}).get("key")) or "-")
+                hints.append(f"decision workflow 卡点: stage={stage_key}, status={status_key}")
             rcp = out.get("execution_reconciliation_protection") if isinstance(out.get("execution_reconciliation_protection"), dict) else {}
             if rcp:
                 sl = rcp.get("symbol_locks") if isinstance(rcp.get("symbol_locks"), dict) else {}
@@ -3526,6 +3795,48 @@ def init_module_control_api(app, main_controller):
 
             limits = await resolve_position_limits(config_manager=getattr(mc, "config_manager", None))
             out["position_limits_snapshot"] = limits.to_dict()
+            hints = out.get("diagnosis_hints") if isinstance(out.get("diagnosis_hints"), list) else []
+            eg = out.get("execution_gateway") if isinstance(out.get("execution_gateway"), dict) else {}
+            rwp = eg.get("replace_worst_policy") if isinstance(eg.get("replace_worst_policy"), dict) else {}
+            if hints and rwp and not bool(rwp.get("enable_replace_worst_on_full_positions", False)):
+                lim = out["position_limits_snapshot"] if isinstance(out.get("position_limits_snapshot"), dict) else {}
+                hard_cap = int(lim.get("hard_max_positions", 0) or 0)
+                oneway_cap = int(lim.get("max_positions_oneway", 0) or 0)
+                cap = hard_cap or oneway_cap
+                if cap > 0:
+                    hints.append(
+                        f"full position behavior: replace_worst disabled, reaching max_positions={cap} will hard-block new opens until a slot is freed"
+                    )
+                    events = (eg.get("recent_events") or []) if isinstance(eg.get("recent_events"), list) else []
+                    recent_capacity_blocks = []
+                    for evt in events:
+                        if not isinstance(evt, dict):
+                            continue
+                        if evt.get("success") is not False:
+                            continue
+                        if str(evt.get("op") or "").lower() != "open":
+                            continue
+                        if str(evt.get("error_code") or "").upper() != "RISK_REDLINE_DENIED":
+                            continue
+                        detail = str(evt.get("detail") or "")
+                        reason = str(evt.get("reason") or "")
+                        if "max_positions" not in detail.lower() and "持仓数" not in detail and "max_positions" not in reason.lower():
+                            continue
+                        recent_capacity_blocks.append(evt)
+                    latest = recent_capacity_blocks[-1] if recent_capacity_blocks else None
+                    if latest is None and not events:
+                        latest = _load_recent_capacity_block_from_runtime()
+                    if latest is None and not events:
+                        latest = _load_recent_capacity_block_from_app_log()
+                    if latest:
+                        symbol = str(latest.get("symbol") or "?")
+                        ts = str(latest.get("ts") or "-")
+                        source = str(latest.get("source") or "recent_events")
+                        source_suffix = "" if source == "recent_events" else f", source={source}"
+                        hints.insert(
+                            0,
+                            f"recent capacity block: ts={ts}, symbol={symbol}, open was rejected by max_positions redline while replace_worst was disabled{source_suffix}",
+                        )
         except Exception as e:
             out["position_limits_snapshot_error"] = str(e)
 
@@ -3959,6 +4270,7 @@ def init_module_control_api(app, main_controller):
             store = getattr(mc, "decision_trace_store", None)
             traces = store.analyze_recent(limit=int(trace_limit or 120)) if (store and hasattr(store, "analyze_recent")) else {}
             summary = traces.get("summary", {}) if isinstance(traces, dict) else {}
+            workflow_focus = _summarize_trace_workflow_focus(traces)
             recent = traces.get("recent", []) if isinstance(traces, dict) else []
 
             watch = _load_runtime_json("realtime_watch.latest.json")
@@ -4383,6 +4695,27 @@ def init_module_control_api(app, main_controller):
                         "recommendation": "先修正持仓漂移，再谈收益优化，否则收益统计和止盈止损判断都不可信。",
                     }
                 )
+            top_stage = workflow_focus.get("top_stage") if isinstance(workflow_focus, dict) else None
+            top_status = workflow_focus.get("top_status") if isinstance(workflow_focus, dict) else None
+            if (
+                isinstance(top_stage, dict)
+                and str(top_stage.get("key") or "") == "reconciliation"
+                and isinstance(top_status, dict)
+                and str(top_status.get("key") or "") in {"blocked", "reconcile_blocked"}
+            ):
+                optimization_hints.append(
+                    {
+                        "priority": "high",
+                        "area": "execution_workflow",
+                        "issue": "近期决策主要卡在 reconciliation 阶段",
+                        "evidence": {
+                            "top_workflow_stage": top_stage,
+                            "top_workflow_status": top_status,
+                            "decision_trace_summary": summary,
+                        },
+                        "recommendation": "优先修复持仓同步、孤儿订单和对账保护触发根因，再调整策略阈值。",
+                    }
+                )
 
             out = {
                 "loop_health": {
@@ -4396,6 +4729,7 @@ def init_module_control_api(app, main_controller):
                 },
                 "signal_and_guard": {
                     "decision_traces_summary": summary,
+                    "workflow_focus": workflow_focus,
                     "top_reject_reasons": top_reject_reasons,
                     "top_reject_symbols": top_reject_symbols,
                     "top_reject_stages": top_reject_stages,
@@ -4546,6 +4880,254 @@ def init_module_control_api(app, main_controller):
             "learning_status": le.get_status() if hasattr(le, "get_status") else {},
             "timestamp": datetime.now().isoformat(),
         }
+
+    @router.post("/commander/learning/weekly-review")
+    async def commander_learning_weekly_review(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """生成并返回本周研究复盘与学习分析摘要。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        mc = main_controller
+        le = getattr(mc, "ai_learning_engine", None)
+        if not le or not hasattr(le, "generate_weekly_research_review"):
+            return {"success": False, "message": "ai_learning_engine 未就绪", "timestamp": datetime.now().isoformat()}
+        try:
+            force = bool((payload or {}).get("force", False))
+            review = await le.generate_weekly_research_review(force=force)
+            status = le.get_status() if hasattr(le, "get_status") else {}
+            return {
+                "success": True,
+                "data": {
+                    "weekly_review": review,
+                    "learning_analytics": (status or {}).get("learning_analytics"),
+                    "retrieval_deck": (status or {}).get("retrieval_deck"),
+                    "self_review": (status or {}).get("self_review"),
+                    "tuning_governance": (status or {}).get("tuning_governance"),
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/learning/retrieval-deck")
+    async def commander_learning_retrieval_deck(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """生成主动回忆题卡。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        mc = main_controller
+        le = getattr(mc, "ai_learning_engine", None)
+        if not le or not hasattr(le, "generate_retrieval_practice_deck"):
+            return {"success": False, "message": "ai_learning_engine 未就绪", "timestamp": datetime.now().isoformat()}
+        try:
+            limit = int((payload or {}).get("limit", 10) or 10)
+            deck = await le.generate_retrieval_practice_deck(limit=limit)
+            return {"success": True, "data": deck, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.post("/commander/agents/advisory-snapshot")
+    async def commander_agents_advisory_snapshot(payload: Dict[str, Any] = Body(default_factory=dict)):
+        """返回 market/research/risk/execution 四类 advisory agent 的当前判定。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        mc = main_controller
+        orch = getattr(mc, "agent_orchestrator", None)
+        if not orch or not hasattr(orch, "evaluate_advisory_snapshot"):
+            return {"success": False, "message": "agent_orchestrator 未就绪", "timestamp": datetime.now().isoformat()}
+        symbol = str((payload or {}).get("symbol") or "BTC/USDT")
+        market_snapshot = dict((payload or {}).get("market_snapshot") or {})
+        semantic_context = dict((payload or {}).get("semantic_context") or {})
+        strategy_id = str((payload or {}).get("strategy_id") or "")
+        sm = getattr(mc, "strategy_manager", None)
+        governance = sm.get_strategy_governance_profile(strategy_id) if (sm and strategy_id and hasattr(sm, "get_strategy_governance_profile")) else {}
+        research_profile = sm.get_strategy_research_profile(strategy_id) if (sm and strategy_id and hasattr(sm, "get_strategy_research_profile")) else {}
+        data = orch.evaluate_advisory_snapshot(
+            symbol=symbol,
+            market_snapshot=market_snapshot,
+            semantic_context=semantic_context,
+            governance=governance,
+            research_profile=research_profile,
+            decision_confidence=float((payload or {}).get("decision_confidence", 0.0) or 0.0),
+            trace_id=str((payload or {}).get("trace_id") or ""),
+        )
+        return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+
+    @router.get("/market-structure/multi-source-snapshot")
+    async def market_structure_multi_source_snapshot(symbol: str = "BTC/USDT"):
+        """聚合 data hub / market intelligence / proactive scanner 后输出统一市场结构快照。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        mc = main_controller
+        base: Dict[str, Any] = {"symbol": symbol}
+        try:
+            hub = getattr(mc, "data_source_hub", None)
+            if hub and hasattr(hub, "get_unified_snapshot"):
+                snap = await hub.get_unified_snapshot(symbol)
+                if isinstance(snap, dict):
+                    base.update(
+                        {
+                            "spread_bps": ((snap.get("microstructure") or {}).get("spread_bps")),
+                            "depth_imbalance": ((snap.get("microstructure") or {}).get("depth_imbalance")),
+                            "funding_rate": ((snap.get("derivatives") or {}).get("funding_rate")),
+                            "open_interest": ((snap.get("derivatives") or {}).get("open_interest")),
+                            "basis_bps": ((snap.get("derivatives") or {}).get("basis_bps")),
+                            "stablecoin_supply_change": ((snap.get("flows") or {}).get("stablecoin_supply_change")),
+                            "exchange_netflow": ((snap.get("flows") or {}).get("exchange_netflow")),
+                            "large_wallet_flow": ((snap.get("flows") or {}).get("large_wallet_flow")),
+                            "quality_score": ((snap.get("quality") or {}).get("score")),
+                        }
+                    )
+        except Exception:
+            pass
+        try:
+            mi = getattr(mc, "market_intelligence", None)
+            if mi and hasattr(mi, "get_cached_symbol_view"):
+                view = mi.get_cached_symbol_view(symbol) or {}
+                if isinstance(view, dict):
+                    for key in ("trend", "confidence", "spread_bps", "depth_imbalance", "quality_score"):
+                        if base.get(key) in (None, "", 0, 0.0):
+                            base[key] = view.get(key)
+        except Exception:
+            pass
+        try:
+            scanner = getattr(getattr(mc, "proactive_ai", None), "market_scanner", None)
+            if scanner and hasattr(scanner, "get_market_state"):
+                mstate = scanner.get_market_state() or {}
+                if isinstance(mstate, dict):
+                    flows = mstate.get("flows") if isinstance(mstate.get("flows"), dict) else {}
+                    deriv = mstate.get("derivatives") if isinstance(mstate.get("derivatives"), dict) else {}
+                    base.setdefault("stablecoin_supply_change", flows.get("stablecoin_supply_change"))
+                    base.setdefault("exchange_netflow", flows.get("exchange_netflow"))
+                    base.setdefault("large_wallet_flow", flows.get("large_wallet_flow"))
+                    base.setdefault("basis_bps", deriv.get("basis_bps"))
+        except Exception:
+            pass
+        try:
+            fs = getattr(mc, "feature_store_lite", None)
+            if fs and hasattr(fs, "append_raw_market_event"):
+                fs.append_raw_market_event(symbol, dict(base))
+        except Exception:
+            pass
+        mse = getattr(mc, "market_structure_engine", None)
+        if not mse or not hasattr(mse, "analyze_symbol"):
+            return {"success": False, "message": "market_structure_engine 未就绪", "timestamp": datetime.now().isoformat()}
+        snap = mse.analyze_symbol(symbol, base).to_dict()
+        governance_update = None
+        try:
+            sm = getattr(mc, "strategy_manager", None)
+            if sm and hasattr(sm, "record_market_structure_snapshot"):
+                governance_update = sm.record_market_structure_snapshot(symbol, snap, apply_now=True)
+        except Exception:
+            governance_update = None
+        return {
+            "success": True,
+            "data": {
+                "symbol": symbol,
+                "market_structure": snap,
+                "source_snapshot": base,
+                "governance_update": governance_update,
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    @router.get("/commander/research-cockpit")
+    async def commander_research_cockpit(symbol: str = "BTC/USDT"):
+        """研究/学习/治理/市场结构的聚合驾驶舱接口。"""
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        mc = main_controller
+        out: Dict[str, Any] = {"symbol": symbol}
+
+        try:
+            structure = await market_structure_multi_source_snapshot(symbol=symbol)
+            out["market_structure"] = structure.get("data") if isinstance(structure, dict) else None
+        except Exception as e:
+            out["market_structure_error"] = str(e)
+
+        try:
+            fs = getattr(mc, "feature_store_lite", None)
+            out["feature_store"] = {
+                "summary": fs.get_summary() if (fs and hasattr(fs, "get_summary")) else None,
+                "raw_market_events": fs.get_recent("raw_market_events", 12) if (fs and hasattr(fs, "get_recent")) else [],
+                "derived_features": fs.get_recent("derived_features", 12) if (fs and hasattr(fs, "get_recent")) else [],
+                "decision_contexts": fs.get_recent("decision_context_snapshots", 12) if (fs and hasattr(fs, "get_recent")) else [],
+                "research_labels": fs.get_recent("research_labels", 12) if (fs and hasattr(fs, "get_recent")) else [],
+                "execution_outcomes": fs.get_recent("execution_outcomes", 12) if (fs and hasattr(fs, "get_recent")) else [],
+            }
+        except Exception as e:
+            out["feature_store_error"] = str(e)
+
+        try:
+            le = getattr(mc, "ai_learning_engine", None)
+            status = le.get_status() if (le and hasattr(le, "get_status")) else {}
+            out["learning"] = {
+                "weekly_review": (status or {}).get("weekly_review"),
+                "analytics": (status or {}).get("learning_analytics"),
+                "retrieval_deck": (status or {}).get("retrieval_deck"),
+                "self_review": (status or {}).get("self_review"),
+            }
+        except Exception as e:
+            out["learning_error"] = str(e)
+
+        try:
+            sm = getattr(mc, "strategy_manager", None)
+            strategy_rows: List[Dict[str, Any]] = []
+            stage_counts: Dict[str, int] = {}
+            review_done = 0
+            total = 0
+            failure_case_total = 0
+            if sm and getattr(sm, "strategy_configs", None):
+                for sid, cfg in list((sm.strategy_configs or {}).items())[:100]:
+                    gov = sm.get_strategy_governance_profile(sid) if hasattr(sm, "get_strategy_governance_profile") else {}
+                    rp = sm.get_strategy_research_profile(sid) if hasattr(sm, "get_strategy_research_profile") else {}
+                    stage = str(gov.get("stage") or "unknown")
+                    stage_counts[stage] = int(stage_counts.get(stage, 0)) + 1
+                    total += 1
+                    if rp.get("review_completion_status") == "completed":
+                        review_done += 1
+                    failure_case_total += len(rp.get("failure_cases") or [])
+                    strategy_rows.append(
+                        {
+                            "strategy_id": sid,
+                            "name": getattr(cfg, "name", sid),
+                            "stage": stage,
+                            "oos_status": gov.get("oos_status"),
+                            "live_drift_status": gov.get("live_drift_status"),
+                            "market_structure_overlay_status": ((gov.get("market_structure_overlay") or {}).get("status") if isinstance(gov.get("market_structure_overlay"), dict) else None),
+                            "effective_cap_multiplier": gov.get("effective_cap_multiplier"),
+                            "review_completion_status": rp.get("review_completion_status"),
+                            "last_review_type": rp.get("last_review_type"),
+                            "hypothesis": rp.get("hypothesis"),
+                            "failure_case_count": len(rp.get("failure_cases") or []),
+                            "parameter_sensitivity_summary": ((rp.get("parameter_sensitivity") or {}).get("summary") if isinstance(rp.get("parameter_sensitivity"), dict) else None),
+                        }
+                    )
+            out["research"] = {
+                "strategy_rows": strategy_rows[:40],
+                "funnel": {"total": total, "by_stage": stage_counts},
+                "review_completion_rate": round((review_done / total), 4) if total else 0.0,
+                "failure_case_total": failure_case_total,
+                "market_structure_governance": (sm.get_market_structure_governance_status() if (sm and hasattr(sm, "get_market_structure_governance_status")) else None),
+            }
+        except Exception as e:
+            out["research_error"] = str(e)
+
+        try:
+            orch = getattr(mc, "agent_orchestrator", None)
+            if orch and hasattr(orch, "evaluate_advisory_snapshot"):
+                ms = ((out.get("market_structure") or {}).get("source_snapshot")) if isinstance(out.get("market_structure"), dict) else {}
+                out["agent_panel"] = orch.evaluate_advisory_snapshot(
+                    symbol=symbol,
+                    market_snapshot=ms or {"symbol": symbol},
+                    semantic_context=((out.get("market_structure") or {}).get("market_structure")) if isinstance(out.get("market_structure"), dict) else {},
+                    governance={},
+                    research_profile={},
+                    decision_confidence=float((((out.get("market_structure") or {}).get("market_structure")) or {}).get("confidence", 0.0) or 0.0),
+                    trace_id="research-cockpit",
+                )
+        except Exception as e:
+            out["agent_panel_error"] = str(e)
+
+        return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
 
     @router.post("/commander/account-sync/run")
     async def commander_account_sync_run(payload: Dict[str, Any] = Body(default_factory=dict)):

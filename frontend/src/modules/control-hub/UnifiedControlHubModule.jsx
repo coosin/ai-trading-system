@@ -4,6 +4,7 @@ import DataAnalysisSection from './sections/DataAnalysisSection';
 import TradingSection from './sections/TradingSection';
 import RiskOpsSection from './sections/RiskOpsSection';
 import AiStrategySection from './sections/AiStrategySection';
+import ResearchCockpitSection from './sections/ResearchCockpitSection';
 import CommandDocsSection from './sections/CommandDocsSection';
 import { useControlHubData } from './state/useControlHubData';
 
@@ -13,6 +14,7 @@ const TABS = [
   { id: 'trading', label: '交易执行' },
   { id: 'risk', label: '风控告警' },
   { id: 'ai', label: 'AI与策略' },
+  { id: 'research', label: '研究驾驶舱' },
   { id: 'ops', label: '指挥与文档' },
 ];
 
@@ -145,6 +147,7 @@ export default function UnifiedControlHubModule() {
         )}
         {tab === 'risk' && <RiskOpsSection state={state} />}
         {tab === 'ai' && <AiStrategySection state={state} />}
+        {tab === 'research' && <ResearchCockpitSection state={state} actions={actions} loading={loading} updatedAt={updatedAt} />}
         {tab === 'ops' && (
           <CommandDocsSection
             commandInput={commandInput}

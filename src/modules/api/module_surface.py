@@ -49,6 +49,7 @@ def build_static_route_catalog() -> List[Dict[str, Any]]:
     for method, path, note in [
         ("GET", f"{MODULES_PREFIX}/commander/snapshot", "司令部快照"),
         ("GET", f"{MODULES_PREFIX}/commander/capabilities", "能力 + 子专家清单"),
+        ("GET", f"{MODULES_PREFIX}/commander/research-cockpit", "研究/学习驾驶舱聚合视图"),
         ("POST", f"{MODULES_PREFIX}/commander/dispatch", "统一对话/指令，source 区分渠道"),
         ("POST", f"{MODULES_PREFIX}/commander/chores", "日常任务"),
         ("GET", f"{MODULES_PREFIX}/commander/audit", "链路审查"),
@@ -108,6 +109,7 @@ def build_static_route_catalog() -> List[Dict[str, Any]]:
     rows.append(r("GET", f"{MODULES_PREFIX}/skills/catalog", impl, "skills", "已注册技能名"))
     rows.append(r("POST", f"{MODULES_PREFIX}/skills/invoke", impl, "skills", "按 skill_name 调用"))
     rows.append(r("GET", f"{MODULES_PREFIX}/data/hub/unified-snapshot", impl, "data", "统一数据源快照"))
+    rows.append(r("GET", f"{MODULES_PREFIX}/market-structure/multi-source-snapshot", impl, "market_structure", "多源市场结构聚合"))
     rows.append(r("GET", f"{MODULES_PREFIX}/surface/registry", impl, "surface", "API 总注册表"))
     rows.append(r("GET", f"{MODULES_PREFIX}/surface/channels", impl, "surface", "渠道契约"))
 

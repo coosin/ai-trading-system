@@ -51,12 +51,35 @@ class TestDockerLoopbackProxyUseGatewayHost:
 
 class TestProxyUrlForDataSources:
     def test_prefers_http_proxy_env(self):
-        with patch.dict(os.environ, {"HTTP_PROXY": "http://192.168.1.2:7890"}, clear=False):
+        base = _env_without_proxy_rewrite_flags()
+        # 实现顺序：HTTPS* → HTTP* → OPENCLAW_*；须清空其它代理键，避免全量套件/CI 残留污染
+        for k in (
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "OPENCLAW_HTTPS_PROXY",
+            "OPENCLAW_HTTP_PROXY",
+            "ALL_PROXY",
+            "all_proxy",
+        ):
+            base.pop(k, None)
+        base["HTTP_PROXY"] = "http://192.168.1.2:7890"
+        with patch.dict(os.environ, base, clear=True):
             assert proxy_url_for_data_sources(None) == "http://192.168.1.2:7890"
 
     def test_empty_when_no_env_and_no_config(self):
         base = _env_without_proxy_rewrite_flags()
-        for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        for k in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "OPENCLAW_HTTP_PROXY",
+            "OPENCLAW_HTTPS_PROXY",
+            "ALL_PROXY",
+            "all_proxy",
+        ):
             base.pop(k, None)
         with patch.dict(os.environ, base, clear=True):
             assert proxy_url_for_data_sources(None) == ""

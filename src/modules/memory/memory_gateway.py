@@ -578,6 +578,56 @@ class MemoryGateway:
             metadata={"lesson_type": lesson_type, "context": context, "source": "memory_gateway"},
         )
 
+    async def save_knowledge_document(
+        self,
+        title: str,
+        content: str,
+        *,
+        knowledge_type: str = "governance_rule",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        body = f"{title}\n\n{content}".strip()
+        md = dict(metadata or {})
+        md.update({"knowledge_type": knowledge_type, "title": title, "source": "memory_gateway"})
+        return await self.store(
+            content=body,
+            category="knowledge_document",
+            importance=0.9,
+            metadata=md,
+        )
+
+    def get_layered_memory_overview(self) -> Dict[str, Any]:
+        mems = getattr(self.memory_backend, "_memories", {}) or {}
+        semantic_layers = {
+            "short_term_context": 0,
+            "working_memory": 0,
+            "long_term_experience": 0,
+            "knowledge_base": 0,
+        }
+        kind_counts: Dict[str, int] = {}
+        for _id, entry in mems.items():
+            layer = getattr(entry, "layer", None)
+            layer_value = getattr(layer, "value", str(layer or ""))
+            md = dict(getattr(entry, "metadata", {}) or {})
+            kind = str(md.get("kind") or md.get("knowledge_type") or "").strip().lower()
+            if layer_value == "core":
+                semantic_layers["knowledge_base"] += 1
+            elif layer_value == "experience":
+                semantic_layers["long_term_experience"] += 1
+            elif layer_value == "working":
+                if kind in {"daily_summary", "weekly_summary"}:
+                    semantic_layers["working_memory"] += 1
+                else:
+                    semantic_layers["short_term_context"] += 1
+            elif layer_value == "history":
+                semantic_layers["long_term_experience"] += 1
+            if kind:
+                kind_counts[kind] = int(kind_counts.get(kind, 0)) + 1
+        return {
+            "semantic_layers": semantic_layers,
+            "kind_counts": kind_counts,
+        }
+
     async def consolidate_memories(self) -> None:
         if hasattr(self.memory_backend, "cleanup_expired"):
             try:
@@ -793,10 +843,20 @@ class MemoryGateway:
             "conversation": MemoryCategory.CONVERSATION,
             "trade_record": MemoryCategory.TRADE_RECORD,
             "trading_rule": MemoryCategory.TRADING_RULE,
+            "knowledge_document": MemoryCategory.TRADING_RULE,
             "market_observation": MemoryCategory.MARKET_OBSERVATION,
+            "market_regime_case": MemoryCategory.MARKET_OBSERVATION,
             "risk_event": MemoryCategory.RISK_EVENT,
+            "execution_incident": MemoryCategory.RISK_EVENT,
             "user_preference": MemoryCategory.USER_PREFERENCE,
             "decision": MemoryCategory.LESSON_LEARNED,
+            "agent_misjudgment_case": MemoryCategory.LESSON_LEARNED,
+            "strategy_drift_case": MemoryCategory.LESSON_LEARNED,
+            "tuning_attempt": MemoryCategory.LESSON_LEARNED,
+            "tuning_result": MemoryCategory.LESSON_LEARNED,
+            "approved_rule_change": MemoryCategory.LESSON_LEARNED,
+            "rejected_rule_change": MemoryCategory.LESSON_LEARNED,
+            "weekly_lesson": MemoryCategory.LESSON_LEARNED,
             "system_state": MemoryCategory.DAILY_SUMMARY,
             "daily_summary": MemoryCategory.DAILY_SUMMARY,
             "lesson_learned": MemoryCategory.LESSON_LEARNED,
@@ -805,9 +865,23 @@ class MemoryGateway:
 
     def _map_layer(self, category: str) -> MemoryLayer:
         key = (category or "").strip().lower()
-        if key in {"trading_rule", "user_preference"}:
+        if key in {"trading_rule", "user_preference", "knowledge_document"}:
             return MemoryLayer.CORE
-        if key in {"decision", "lesson_learned", "trade_record", "risk_event"}:
+        if key in {
+            "decision",
+            "lesson_learned",
+            "trade_record",
+            "risk_event",
+            "market_regime_case",
+            "execution_incident",
+            "strategy_drift_case",
+            "agent_misjudgment_case",
+            "tuning_attempt",
+            "tuning_result",
+            "approved_rule_change",
+            "rejected_rule_change",
+            "weekly_lesson",
+        }:
             return MemoryLayer.EXPERIENCE
         if key in {"daily_summary"}:
             return MemoryLayer.WORKING

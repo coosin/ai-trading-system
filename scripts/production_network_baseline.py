@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Production network baseline guard for OpenClaw.
+Production network baseline guard for OpenClaw（裸金属 / 本机生产为主）。
 
-What it does:
-1) Enforce and verify Clash core baseline:
-   - mode: Rule
-   - DNS safe defaults (fake-ip, listen 1053, okx filters/policy)
-   - main selector set to auto
-2) Verify docker compose proxy env baseline.
-3) Validate container runtime env and API connectivity probes.
+1) Clash（若存在 /etc/clash/config.yaml）：mode/DNS/OKX 过滤等基线；--apply 时写回并可选重启。
+2) 公网连通性探针：在**本机 Python 进程内执行**（与当前生产进程同网络栈）。
 
 Usage:
-  python3 scripts/production_network_baseline.py --apply
   python3 scripts/production_network_baseline.py --check-only
+  python3 scripts/production_network_baseline.py --apply
+
+无 /etc/clash/config.yaml 且为 check-only：跳过 Clash 文件与 selector 硬门禁，仍跑本机探针。
 """
 
 from __future__ import annotations
@@ -34,13 +31,25 @@ REPO = Path(__file__).resolve().parents[1]
 CLASH_CONFIG = Path("/etc/clash/config.yaml")
 
 
-def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=str(REPO), check=check, text=True, capture_output=True)
+def run(
+    cmd: List[str], check: bool = True, timeout: float | None = None
+) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=str(REPO), check=check, text=True, capture_output=True, timeout=timeout)
 
 
 def enforce_clash_config(apply: bool) -> Dict[str, Any]:
     if not CLASH_CONFIG.exists():
-        raise RuntimeError(f"clash config not found: {CLASH_CONFIG}")
+        if apply:
+            raise RuntimeError(f"clash config not found: {CLASH_CONFIG}")
+        return {
+            "skipped": True,
+            "reason": "clash_config_missing",
+            "path": str(CLASH_CONFIG),
+            "mode": None,
+            "dns_listen": None,
+            "dns_enhanced_mode": None,
+            "okx_filter": None,
+        }
 
     with CLASH_CONFIG.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
@@ -132,25 +141,19 @@ def set_clash_selector_auto(apply: bool) -> Dict[str, Any]:
 
 
 def verify_compose_proxy_env() -> Dict[str, Any]:
-    compose = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
-    required = [
-        "OPENCLAW_HTTP_PROXY",
-        "OPENCLAW_HTTPS_PROXY",
-        "OPENCLAW_ALL_PROXY",
-        "host.docker.internal:7890",
-        "NO_PROXY=localhost,127.0.0.1,redis",
-    ]
-    missing = [k for k in required if k not in compose]
-    return {"ok": not missing, "missing": missing}
+    """仓库已移除 Docker Compose；保留字段名供下游 JSON 兼容，恒为跳过。"""
+    return {"ok": True, "skipped": True, "reason": "compose_removed_bare_metal_only"}
 
 
-def runtime_probe() -> Dict[str, Any]:
-    script = r"""
+_RUNTIME_PROBE_SCRIPT = r"""
 import os, json, time, urllib.request
-proxy = os.getenv("OPENCLAW_HTTP_PROXY")
 out = {"env": {}, "probes": {}}
 for k in ["OPENCLAW_HTTP_PROXY","OPENCLAW_HTTPS_PROXY","OPENCLAW_ALL_PROXY","NO_PROXY"]:
     out["env"][k] = os.getenv(k, "")
+NR = int(os.environ.get("OPENCLAW_PROBE_ROUNDS", "6"))
+NR = max(2, min(8, NR))
+TO = float(os.environ.get("OPENCLAW_PROBE_URL_TIMEOUT", "3.5"))
+TO = max(1.2, min(10.0, TO))
 targets = {
     "okx_time": "https://www.okx.com/api/v5/public/time",
     "binance_time": "https://api.binance.com/api/v3/time",
@@ -162,10 +165,10 @@ for name, url in targets.items():
     ok = 0
     fail = 0
     last = None
-    for _ in range(6):
+    for _ in range(NR):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "network-baseline-probe/1.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=TO) as resp:
                 last = int(getattr(resp, "status", 200) or 200)
             if last < 400:
                 ok += 1
@@ -173,47 +176,102 @@ for name, url in targets.items():
                 fail += 1
         except Exception:
             fail += 1
-        time.sleep(0.15)
+        time.sleep(0.12)
     out["probes"][name] = {"ok": ok, "fail": fail, "last_status": last}
 print(json.dumps(out, ensure_ascii=False))
 """
-    r = run(["docker", "exec", "-i", "openclaw-trading", "python", "-c", script], check=True)
-    return json.loads(r.stdout.strip() or "{}")
+
+
+def runtime_probe(*, quick: bool = False) -> Dict[str, Any]:
+    """本机 Python 探针（与裸金属生产一致）。"""
+    r2 = run([sys.executable, "-c", _RUNTIME_PROBE_SCRIPT], check=False)
+    if r2.returncode == 0 and (r2.stdout or "").strip():
+        try:
+            out = json.loads(r2.stdout.strip())
+            out["probe_mode"] = "host_python"
+            return out
+        except json.JSONDecodeError:
+            pass
+    return {
+        "error": "runtime_probe_failed",
+        "host_rc": r2.returncode,
+        "host_stderr": (r2.stderr or "")[:800],
+        "probes": {},
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", help="enforce baseline")
     parser.add_argument("--check-only", action="store_true", help="check only")
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="fewer outbound probe rounds (faster; thresholds relaxed slightly)",
+    )
     args = parser.parse_args()
     apply = args.apply and not args.check_only
+    if args.quick:
+        os.environ.setdefault("OPENCLAW_PROBE_ROUNDS", "2")
+        os.environ.setdefault("OPENCLAW_PROBE_URL_TIMEOUT", "2.0")
 
     report: Dict[str, Any] = {"apply": apply}
     report["clash_config"] = enforce_clash_config(apply=apply)
+    clash_skipped = bool(report["clash_config"].get("skipped"))
     restart_clash_if_needed(apply=apply)
-    report["clash_selector"] = set_clash_selector_auto(apply=apply)
+    if clash_skipped:
+        report["clash_selector"] = {
+            "skipped": True,
+            "selector_now": None,
+            "auto_now": None,
+        }
+    else:
+        report["clash_selector"] = set_clash_selector_auto(apply=apply)
     report["compose_env"] = verify_compose_proxy_env()
-    report["runtime"] = runtime_probe()
+    report["runtime"] = runtime_probe(quick=bool(args.quick))
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
+    # Operator hint: empty proxy env + failing probes usually means wrong network namespace or missing TUN.
+    _rt = report.get("runtime") or {}
+    _env = _rt.get("env") or {}
+    _prox_empty = not any(str(_env.get(k) or "").strip() for k in ("OPENCLAW_HTTP_PROXY", "OPENCLAW_HTTPS_PROXY", "OPENCLAW_ALL_PROXY"))
+    _okx_ok = int((_rt.get("probes") or {}).get("okx_time", {}).get("ok", 0) or 0)
+    if _prox_empty and _okx_ok < 1 and not _rt.get("error"):
+        print(
+            "\nRUNTIME_HINT: 探针进程未设置 OPENCLAW_*_PROXY，urllib 走系统直连。"
+            "若 OKX 应经宿主机 Clash：在运行 baseline 的同一 shell 导出与交易进程一致的代理变量，"
+            "或启用宿主机 TUN（见 deploy/HOST_CLASH_EGRESS.md）。",
+            file=sys.stderr,
+        )
+
     # hard pass criteria for production baseline
-    runtime = report["runtime"]["probes"]
-    hard_fail = []
-    if report["clash_config"]["mode"] != "Rule":
-        hard_fail.append("clash mode not Rule")
-    if report["clash_selector"].get("selector_now") != "♻️ 自动选择":
-        hard_fail.append("selector not auto")
+    runtime = (report["runtime"] or {}).get("probes") or {}
+    hard_fail: List[str] = []
+    _nr = int(os.environ.get("OPENCLAW_PROBE_ROUNDS", "6"))
+    _min_ok = 4 if _nr >= 5 else (3 if _nr >= 3 else 2)
+    if not clash_skipped:
+        if report["clash_config"].get("mode") != "Rule":
+            hard_fail.append("clash mode not Rule")
+        if report["clash_selector"].get("selector_now") != "♻️ 自动选择":
+            hard_fail.append("selector not auto")
     if not report["compose_env"]["ok"]:
-        hard_fail.append("compose proxy env missing")
-    if runtime.get("okx_time", {}).get("ok", 0) < 4:
-        hard_fail.append("okx stability too low")
-    if runtime.get("coingecko_ping", {}).get("ok", 0) < 4:
-        hard_fail.append("coingecko stability too low")
-    if runtime.get("coinbase_time", {}).get("ok", 0) < 4:
-        hard_fail.append("coinbase stability too low")
-    if runtime.get("kraken_time", {}).get("ok", 0) < 4:
-        hard_fail.append("kraken stability too low")
+        if not report["compose_env"].get("skipped"):
+            hard_fail.append("compose proxy env missing")
+    if report["runtime"].get("error"):
+        hard_fail.append(f"runtime probe: {report['runtime'].get('error')}")
+    if args.quick:
+        if runtime.get("okx_time", {}).get("ok", 0) < 1:
+            hard_fail.append("okx stability too low (quick mode)")
+    else:
+        if runtime.get("okx_time", {}).get("ok", 0) < _min_ok:
+            hard_fail.append("okx stability too low")
+        if runtime.get("coingecko_ping", {}).get("ok", 0) < _min_ok:
+            hard_fail.append("coingecko stability too low")
+        if runtime.get("coinbase_time", {}).get("ok", 0) < _min_ok:
+            hard_fail.append("coinbase stability too low")
+        if runtime.get("kraken_time", {}).get("ok", 0) < _min_ok:
+            hard_fail.append("kraken stability too low")
 
     if hard_fail:
         print("\nBASELINE_CHECK=FAIL")

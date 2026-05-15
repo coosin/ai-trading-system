@@ -57,8 +57,6 @@
 - `microstructure_enable_funding_oi_gates`：是否启用 funding/OI 微结构门控
 - `microstructure_max_abs_funding_rate_to_trade`：资金费率绝对值上限（超限拒绝开仓）
 - `microstructure_min_open_interest_to_trade`：最小持仓量阈值（低流动性拒绝开仓）
-- `enable_replace_worst_on_full_positions`：满仓时是否允许“平最差仓再开新仓”
-- `replace_worst_min_confidence`：触发满仓替换的最小新信号置信度
 
 验证：
 
@@ -67,6 +65,23 @@
 - `GET /api/v1/modules/commander/trading-diagnosis`：新增 `opportunity_cost`，用于评估门控错失收益成本。
 
 > 重要（2026-05-06）：`analysis_hard_gate` 依赖 `decision.market_analysis.quality_score/confidence`。当前版本已修复并确保多源融合/情报载荷会写入该字段；若看到日志反复 `q=none c=none`，优先排查是否有旧进程/旧代码仍在跑。
+
+### 满仓替仓配置（ExecutionGateway 单点）
+
+配置位置：`config/config.yaml` → `ai_brain.policy`
+
+- `enable_replace_worst_on_full_positions`：满仓时是否允许由 `ExecutionGateway` 执行“平最差仓再开新仓”
+- `replace_worst_min_confidence`：触发满仓替换的最小新信号置信度
+
+说明：
+
+- 这两个键不再属于 `ai_core_runtime`，`AICoreDecisionEngine` 也不再直接读取它们。
+- `ai_core` 仍会先执行自己的本地门控；只有进入执行网关并命中“持仓数上限”时，网关才会判断是否做替仓。
+
+验证：
+
+- `GET /api/v1/modules/commander/trading-diagnosis`：看 `data.execution_gateway.recent_events` 是否出现 `replace_worst_on_full_positions` / `*_replace_worst_retry`。
+- `logs/app.log`：检索 `slot_release_recycled_symbol`、`replace_worst_on_full_positions`、`风控红线拦截：持仓数`。
 
 ### 1.2.2 微结构开仓门控（ai_trading 兼容链路）
 
@@ -268,6 +283,7 @@
 - 运行态验证：`trading-diagnosis.data.ai_learning_engine.running == true`
 - 有效性验证：`total_lessons` 与 `reports_generated` 应随新增真实平仓样本持续增长（不是只看 running）
 - 轨迹反馈验证：`trading-diagnosis.data.trace_learning_feedback` 应能看到最近 `guard_rejected / execution_failed / reconciliation_blocked` 的聚合反馈
+- workflow 验证：`trading-diagnosis.data.signal_and_guard.workflow_focus` 应能指出最近主卡点；若为 `reconciliation / reconcile_blocked`，先修执行治理，不要先放宽策略门槛
 - 闭环验证（需要写接口 token）：调用
   - `POST /api/v1/modules/commander/learning/seed-and-run`
   - 再看 `trading-diagnosis.data.ai_learning_engine.total_lessons/reports_generated` 是否递增
@@ -295,4 +311,3 @@
   - `db_bootstrap`：补录/种子样本，不应直接作为实盘离场质量结论；
   - 非 `db_bootstrap`：真实执行样本（优先用于 SLTP 与开平仓逻辑判断）。
 - 若 `execution_attribution` 中存在 `ALREADY_CLOSED_NO_POSITION`，该类属于 benign failure（终态噪声），不应与真实失败混算。
-

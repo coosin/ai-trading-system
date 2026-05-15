@@ -57,6 +57,9 @@ from src.modules.strategies.strategy_evaluator import StrategyEvaluator
 from src.modules.core.dynamic_position_manager import DynamicPositionManager, DynamicPositionConfig
 from src.modules.core.trading_limits import resolve_position_limits
 from src.modules.core.exchange_sync_ledger import append_exchange_truth
+from src.modules.market_structure import MarketStructureEngine
+from src.modules.agents import AgentOrchestrator
+from src.modules.core.tuning_governance import TuningGovernance
 
 
 def _snapshot_pid_bookkeeping(process_pid: int) -> Dict[str, Any]:
@@ -445,6 +448,10 @@ class MainController:
         self.execution_verifier = None           # 执行验证器
         self.execution_gateway = None            # 单一执行出口 (S1)
         self.dynamic_symbol_selector = None      # 动态币种筛选器
+        self.market_structure_engine = None
+        self.agent_orchestrator = None
+        self.tuning_governance = None
+        self.feature_store_lite = None
 
         # 默认配置
         self.auto_restart_modules = True
@@ -897,6 +904,11 @@ class MainController:
             working_days = 3
         working_days = max(1, min(14, working_days))
 
+        try:
+            working_cap = int(mem_startup.get("working_json_max_files", 800) or 800)
+        except Exception:
+            working_cap = 800
+
         experience_cap: Optional[int]
         if "experience_json_max_files" not in mem_startup:
             experience_cap = 1200
@@ -913,6 +925,7 @@ class MainController:
         optimized_memory = await get_memory_system(
             workspace_path=workspace_path,
             working_days_recent=working_days,
+            working_json_max_files=working_cap,
             experience_json_max_files=experience_cap,
         )
         logger.info("✅ 优化记忆系统初始化完成（唯一后端）")
@@ -930,6 +943,16 @@ class MainController:
         self.hierarchical_memory = self.memory_gateway
         self.memory_optimizer = optimized_memory
         logger.info("✅ 记忆系统已统一：MemoryGateway + OptimizedMemorySystem")
+        self.market_structure_engine = MarketStructureEngine()
+        self.agent_orchestrator = AgentOrchestrator()
+        self.tuning_governance = TuningGovernance(self.config_manager)
+        try:
+            from src.modules.core.feature_store_lite import FeatureStoreLite
+
+            self.feature_store_lite = FeatureStoreLite()
+        except Exception:
+            self.feature_store_lite = None
+        logger.info("✅ 市场结构引擎 / Agent 编排器 / 受控调优治理 / FeatureStoreLite 已初始化")
         
         # 初始化统一交易历史服务（新增）
         try:

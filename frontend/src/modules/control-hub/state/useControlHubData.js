@@ -93,6 +93,10 @@ export function useControlHubData() {
     pluginsStatus: null,
     opportunities: [],
     profitAnalytics: null,
+    researchCockpit: null,
+    marketStructureCockpit: null,
+    retrievalDeck: null,
+    weeklyReview: null,
   });
 
   const showNotice = useCallback((message, type = 'success') => {
@@ -175,7 +179,7 @@ export function useControlHubData() {
     markLoading('medium', true);
     markError('medium', null);
     try {
-      const [snapshot, quality, aiAnalysis, fusion, fusionSources, fusionHistory, riskStatus, riskMetrics, alerts, alertsHistory, marketMonitor, riskMonitor] =
+      const [snapshot, quality, aiAnalysis, fusion, fusionSources, fusionHistory, riskStatus, riskMetrics, alerts, alertsHistory, marketMonitor, riskMonitor, marketStructureCockpit] =
         await Promise.all([
           api.dataHub.getUnifiedSnapshot(symbol).catch(() => null),
           api.dataHub.getQualityAdvice(symbol).catch(() => null),
@@ -189,6 +193,7 @@ export function useControlHubData() {
           api.monitoring.getAlertsHistory().catch(() => null),
           api.monitoring.getMarketData().catch(() => null),
           api.monitoring.getRisk().catch(() => null),
+          api.modules.getMarketStructureMultiSourceSnapshot(symbol).catch(() => null),
         ]);
       updateSlice({
         dataHubSnapshot: unwrap(snapshot),
@@ -207,6 +212,7 @@ export function useControlHubData() {
             : [],
         marketMonitor: unwrap(marketMonitor),
         riskMonitor: unwrap(riskMonitor),
+        marketStructureCockpit: unwrap(marketStructureCockpit),
       });
       markUpdated('medium');
     } catch (error) {
@@ -220,7 +226,7 @@ export function useControlHubData() {
     markLoading('slow', true);
     markError('slow', null);
     try {
-      const [acceptance, accountDiagnostics, executionSpine, tradeHistory, strategies, strategyOpt, researchJobs, productionAudit, memorySummary, commanderSnapshot, commanderAudit, commanderCapabilities, hostingMode, hostingGuard, automationProfile, riskRedlines, toolContract, governanceAudit, aiGuards, stopLossStats, tradeEvents, surfaceRegistry, dataIntegrationHealth, pluginsStatus, opportunities, profitAnalytics] =
+      const [acceptance, accountDiagnostics, executionSpine, tradeHistory, strategies, strategyOpt, researchJobs, productionAudit, memorySummary, commanderSnapshot, commanderAudit, commanderCapabilities, hostingMode, hostingGuard, automationProfile, riskRedlines, toolContract, governanceAudit, aiGuards, stopLossStats, tradeEvents, surfaceRegistry, dataIntegrationHealth, pluginsStatus, opportunities, profitAnalytics, researchCockpit, weeklyReview, retrievalDeck] =
         await Promise.all([
           api.system.getAcceptance().catch(() => null),
           api.modules.getAccountDiagnostics().catch(() => null),
@@ -248,6 +254,9 @@ export function useControlHubData() {
           api.modules.getPluginsStatus().catch(() => null),
           api.request('/monitoring/proactive-ai/opportunities').catch(() => null),
           api.trading.getAnalyticsSummary({ days: 30, accurate_only: true, exclude_bootstrap: true }).catch(() => null),
+          api.modules.getCommanderResearchCockpit(symbol).catch(() => null),
+          api.modules.getLearningWeeklyReview().catch(() => null),
+          api.modules.getLearningRetrievalDeck({ limit: 8 }).catch(() => null),
         ]);
       updateSlice({
         acceptance: unwrap(acceptance),
@@ -280,6 +289,9 @@ export function useControlHubData() {
             ? opportunities.data
             : [],
         profitAnalytics: unwrap(profitAnalytics),
+        researchCockpit: unwrap(researchCockpit),
+        weeklyReview: unwrap(weeklyReview),
+        retrievalDeck: unwrap(retrievalDeck),
       });
       markUpdated('slow');
     } catch (error) {

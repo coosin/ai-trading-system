@@ -65,6 +65,27 @@ class StrategyStatus(Enum):
     ERROR = "error"  # 错误
 
 
+class StrategyLifecycleStage(Enum):
+    PROPOSAL = "proposal"
+    RESEARCHING = "researching"
+    BACKTESTING = "backtesting"
+    OOS_VALIDATING = "oos_validating"
+    PAPER_RUNNING = "paper_running"
+    LIMITED_LIVE = "limited_live"
+    SCALED_LIVE = "scaled_live"
+    DEGRADED = "degraded"
+    PAUSED = "paused"
+    RETIRED = "retired"
+
+
+_DEPLOYMENT_TO_LIFECYCLE = {
+    "paper": StrategyLifecycleStage.PAPER_RUNNING,
+    "shadow": StrategyLifecycleStage.LIMITED_LIVE,
+    "small": StrategyLifecycleStage.LIMITED_LIVE,
+    "full": StrategyLifecycleStage.SCALED_LIVE,
+}
+
+
 class SignalType(Enum):
     """信号类型"""
 
@@ -102,6 +123,9 @@ class StrategyConfig:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    stage: StrategyLifecycleStage = StrategyLifecycleStage.RESEARCHING
+    oos_status: str = "unknown"
+    live_drift_status: str = "unknown"
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -120,6 +144,9 @@ class StrategyConfig:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "metadata": self.metadata,
+            "stage": self.stage.value,
+            "oos_status": self.oos_status,
+            "live_drift_status": self.live_drift_status,
         }
 
 
@@ -141,6 +168,7 @@ class StrategyInstance:
     max_drawdown: float = 0.0
     instance: Optional[Any] = None  # 策略类实例
     metadata: Dict[str, Any] = field(default_factory=dict)
+    lifecycle_stage: StrategyLifecycleStage = StrategyLifecycleStage.RESEARCHING
 
 
 @dataclass
@@ -202,6 +230,9 @@ class StrategyPerformance:
     end_date: Optional[datetime] = None
     last_updated: datetime = field(default_factory=datetime.now)
     market_regime: Optional[MarketRegime] = None
+    lifecycle_stage: StrategyLifecycleStage = StrategyLifecycleStage.RESEARCHING
+    oos_status: str = "unknown"
+    live_drift_status: str = "unknown"
 
 
 class BaseStrategy:
@@ -600,6 +631,13 @@ class StrategyManager:
             "demote_max_drawdown": 0.35,
             "demote_min_score": 0.2,
         }
+        self._market_structure_runtime_config: Dict[str, Any] = {
+            "observe_cap_multiplier": 0.5,
+            "observe_conflict_threshold": 0.55,
+            "restore_min_confidence": 0.55,
+            "restore_stable_cycles": 2,
+        }
+        self._latest_market_structure_snapshots: Dict[str, Dict[str, Any]] = {}
         self._last_trade_feedback_opt_at: Optional[datetime] = None
 
         logger.info("策略管理器初始化完成")
@@ -713,6 +751,9 @@ class StrategyManager:
                     md["deployment"] = {"stage": "full", "cap_multiplier": 1.0}
                 else:
                     md["deployment"] = {"stage": "shadow", "cap_multiplier": 0.25}
+            lifecycle_stage = self._infer_lifecycle_stage(config_data, md)
+            oos_status = self._infer_oos_status(md)
+            live_drift_status = self._infer_live_drift_status(md)
 
             # 创建配置
             config = StrategyConfig(
@@ -728,6 +769,9 @@ class StrategyManager:
                 timeframe=config_data.get("timeframe", "1h"),
                 initial_capital=config_data.get("initial_capital", 10000.0),
                 metadata=md,
+                stage=lifecycle_stage,
+                oos_status=oos_status,
+                live_drift_status=live_drift_status,
             )
 
             # 保存配置
@@ -1065,7 +1109,7 @@ class StrategyManager:
                             signal.instance_id = instance.instance_id
                             signal.signal_id = f"signal_{uuid.uuid4().hex[:8]}"
                             stage = self._get_deployment_stage(instance.config)
-                            mult = self._deployment_cap_multiplier(stage)
+                            mult = self._get_effective_cap_multiplier(instance.config)
                             base_conf = max(0.0, min(1.0, float(signal.confidence or 0.0) * mult))
                             # Soft quality weighting: never hard-drop signals, only smooth confidence.
                             if quality_score is not None:
@@ -1923,6 +1967,9 @@ class StrategyManager:
                 # 定期策略池瘦身：限制总量并淘汰低分策略
                 await self._prune_low_score_strategies()
 
+                # 用最新市场结构快照做自动降权 / 观察 / 恢复
+                await self._auto_apply_market_structure_governance()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -2231,6 +2278,520 @@ class StrategyManager:
             "full": 1.0,
         }.get(stage, 1.0)
 
+    def _get_effective_cap_multiplier(self, config: StrategyConfig) -> float:
+        md = config.metadata if isinstance(config.metadata, dict) else {}
+        gov = md.get("governance", {}) if isinstance(md.get("governance"), dict) else {}
+        overlay = gov.get("market_structure_overlay", {}) if isinstance(gov.get("market_structure_overlay"), dict) else {}
+        eff = overlay.get("effective_cap_multiplier")
+        if eff is not None:
+            try:
+                return max(0.0, min(1.0, float(eff)))
+            except Exception:
+                pass
+        return self._deployment_cap_multiplier(self._get_deployment_stage(config))
+
+    def _record_deployment_action(
+        self,
+        config: StrategyConfig,
+        *,
+        action: str,
+        symbol: str,
+        reason: str,
+        market_structure: Optional[Dict[str, Any]] = None,
+        from_stage: Optional[str] = None,
+        to_stage: Optional[str] = None,
+    ) -> None:
+        md = config.metadata if isinstance(config.metadata, dict) else {}
+        gov = md.get("governance", {}) if isinstance(md.get("governance"), dict) else {}
+        rows = gov.get("deployment_actions", []) if isinstance(gov.get("deployment_actions"), list) else []
+        rows.append(
+            {
+                "action": str(action or "hold"),
+                "symbol": str(symbol or ""),
+                "reason": str(reason or ""),
+                "from_stage": from_stage,
+                "to_stage": to_stage,
+                "market_structure": dict(market_structure or {}),
+                "recorded_at": datetime.now().isoformat(),
+            }
+        )
+        gov["deployment_actions"] = rows[-50:]
+        md["governance"] = gov
+        config.metadata = md
+        config.updated_at = datetime.now()
+
+    def _infer_lifecycle_stage(self, config_data: Dict[str, Any], metadata: Dict[str, Any]) -> StrategyLifecycleStage:
+        raw = str(config_data.get("stage") or metadata.get("stage") or "").strip().lower()
+        if raw:
+            for item in StrategyLifecycleStage:
+                if raw == item.value:
+                    return item
+        dep = metadata.get("deployment", {}) if isinstance(metadata.get("deployment"), dict) else {}
+        dep_stage = str(dep.get("stage") or "").strip().lower()
+        return _DEPLOYMENT_TO_LIFECYCLE.get(dep_stage, StrategyLifecycleStage.RESEARCHING)
+
+    def _infer_oos_status(self, metadata: Dict[str, Any]) -> str:
+        research = metadata.get("research", {}) if isinstance(metadata.get("research"), dict) else {}
+        test = research.get("test", {}) if isinstance(research.get("test"), dict) else {}
+        if not test:
+            return "unknown"
+        passed = test.get("passed")
+        if passed is True:
+            return "passed"
+        if passed is False:
+            return "failed"
+        return "available"
+
+    def _infer_live_drift_status(self, metadata: Dict[str, Any]) -> str:
+        return str(metadata.get("live_drift_status") or "unknown")
+
+    def get_strategy_governance_profile(self, strategy_id: str) -> Dict[str, Any]:
+        cfg = self.strategy_configs.get(strategy_id)
+        if cfg is None:
+            return {
+                "strategy_id": strategy_id,
+                "stage": StrategyLifecycleStage.RESEARCHING.value,
+                "oos_status": "unknown",
+                "live_drift_status": "unknown",
+                "deployment_stage": "unknown",
+            }
+        md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+        dep = md.get("deployment", {}) if isinstance(md.get("deployment"), dict) else {}
+        gov = md.get("governance", {}) if isinstance(md.get("governance"), dict) else {}
+        overlay = gov.get("market_structure_overlay", {}) if isinstance(gov.get("market_structure_overlay"), dict) else {}
+        actions = gov.get("deployment_actions", []) if isinstance(gov.get("deployment_actions"), list) else []
+        return {
+            "strategy_id": strategy_id,
+            "stage": cfg.stage.value if hasattr(cfg.stage, "value") else str(cfg.stage),
+            "oos_status": str(cfg.oos_status or "unknown"),
+            "live_drift_status": str(cfg.live_drift_status or "unknown"),
+            "deployment_stage": str(dep.get("stage") or "unknown"),
+            "cap_multiplier": dep.get("cap_multiplier"),
+            "effective_cap_multiplier": self._get_effective_cap_multiplier(cfg),
+            "market_structure_overlay": overlay,
+            "last_deployment_action": actions[-1] if actions else None,
+            "updated_at": cfg.updated_at.isoformat() if isinstance(cfg.updated_at, datetime) else None,
+        }
+
+    def get_strategy_research_profile(self, strategy_id: str) -> Dict[str, Any]:
+        cfg = self.strategy_configs.get(strategy_id)
+        if cfg is None:
+            return {
+                "strategy_id": strategy_id,
+                "hypothesis": "",
+                "experiment_card": {},
+                "review_status": "unknown",
+                "review_completion_status": "missing",
+                "failure_cases": [],
+                "parameter_sensitivity": {},
+            }
+        md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+        research = md.get("research", {}) if isinstance(md.get("research"), dict) else {}
+        experiment = research.get("experiment_card", {}) if isinstance(research.get("experiment_card"), dict) else {}
+        review = research.get("review", {}) if isinstance(research.get("review"), dict) else {}
+        failure_cases = research.get("failure_cases", []) if isinstance(research.get("failure_cases"), list) else []
+        parameter_sensitivity = research.get("parameter_sensitivity", {}) if isinstance(research.get("parameter_sensitivity"), dict) else {}
+        return {
+            "strategy_id": strategy_id,
+            "hypothesis": str(experiment.get("hypothesis") or research.get("hypothesis") or ""),
+            "experiment_card": experiment,
+            "review_status": str(review.get("status") or "unknown"),
+            "review_completion_status": "completed" if review else "missing",
+            "last_review_type": str(review.get("review_type") or ""),
+            "last_reviewed_at": review.get("reviewed_at"),
+            "action_items": list(review.get("action_items") or []),
+            "peer_review_answers": dict(review.get("answers") or {}),
+            "failure_cases": failure_cases[:20],
+            "parameter_sensitivity": parameter_sensitivity,
+        }
+
+    def save_strategy_experiment_card(
+        self,
+        strategy_id: str,
+        *,
+        hypothesis: str,
+        experiment_card: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        cfg = self.strategy_configs.get(strategy_id)
+        if cfg is None:
+            return False
+        md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+        research = md.get("research", {}) if isinstance(md.get("research"), dict) else {}
+        card = dict(experiment_card or {})
+        card.setdefault("hypothesis", str(hypothesis or "").strip())
+        card.setdefault("created_at", datetime.now().isoformat())
+        research["hypothesis"] = str(hypothesis or "").strip()
+        research["experiment_card"] = card
+        md["research"] = research
+        cfg.metadata = md
+        cfg.updated_at = datetime.now()
+        return True
+
+    def record_strategy_review(
+        self,
+        strategy_id: str,
+        *,
+        review_type: str,
+        answers: Optional[Dict[str, Any]] = None,
+        action_items: Optional[List[str]] = None,
+        status: str = "completed",
+    ) -> bool:
+        cfg = self.strategy_configs.get(strategy_id)
+        if cfg is None:
+            return False
+        md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+        research = md.get("research", {}) if isinstance(md.get("research"), dict) else {}
+        review = research.get("review", {}) if isinstance(research.get("review"), dict) else {}
+        review.update(
+            {
+                "review_type": str(review_type or "weekly"),
+                "answers": dict(answers or {}),
+                "action_items": list(action_items or []),
+                "status": str(status or "completed"),
+                "reviewed_at": datetime.now().isoformat(),
+            }
+        )
+        research["review"] = review
+        md["research"] = research
+        cfg.metadata = md
+        cfg.updated_at = datetime.now()
+        return True
+
+    def record_strategy_peer_review(
+        self,
+        strategy_id: str,
+        *,
+        answers: Optional[Dict[str, Any]] = None,
+        action_items: Optional[List[str]] = None,
+        status: str = "completed",
+    ) -> bool:
+        required = [
+            "what_edge",
+            "why_not_immediately_gone",
+            "net_after_cost",
+            "failure_shape",
+            "kill_signal",
+        ]
+        ans = dict(answers or {})
+        missing = [k for k in required if not str(ans.get(k) or "").strip()]
+        if missing:
+            return False
+        return self.record_strategy_review(
+            strategy_id,
+            review_type="peer_review_5q",
+            answers=ans,
+            action_items=action_items,
+            status=status,
+        )
+
+    def record_strategy_failure_case(
+        self,
+        strategy_id: str,
+        *,
+        title: str,
+        case_type: str,
+        summary: str,
+        trigger: str = "",
+        action_taken: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        cfg = self.strategy_configs.get(strategy_id)
+        if cfg is None:
+            return False
+        md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+        research = md.get("research", {}) if isinstance(md.get("research"), dict) else {}
+        rows = research.get("failure_cases", []) if isinstance(research.get("failure_cases"), list) else []
+        rows.append(
+            {
+                "title": str(title or "").strip(),
+                "case_type": str(case_type or "execution_failure").strip(),
+                "summary": str(summary or "").strip(),
+                "trigger": str(trigger or "").strip(),
+                "action_taken": str(action_taken or "").strip(),
+                "metadata": dict(metadata or {}),
+                "recorded_at": datetime.now().isoformat(),
+            }
+        )
+        research["failure_cases"] = rows[-50:]
+        md["research"] = research
+        cfg.metadata = md
+        cfg.updated_at = datetime.now()
+        return True
+
+    def save_strategy_parameter_sensitivity(
+        self,
+        strategy_id: str,
+        *,
+        parameter_sensitivity: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        cfg = self.strategy_configs.get(strategy_id)
+        if cfg is None:
+            return False
+        md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+        research = md.get("research", {}) if isinstance(md.get("research"), dict) else {}
+        research["parameter_sensitivity"] = dict(parameter_sensitivity or {})
+        md["research"] = research
+        cfg.metadata = md
+        cfg.updated_at = datetime.now()
+        return True
+
+    def get_strategy_activation_gate(self, strategy_id: str) -> Dict[str, Any]:
+        cfg = self.strategy_configs.get(strategy_id)
+        if cfg is None:
+            return {
+                "strategy_id": strategy_id,
+                "eligible": False,
+                "reasons": ["strategy_not_found"],
+                "stage": "unknown",
+            }
+        gov = self.get_strategy_governance_profile(strategy_id)
+        rp = self.get_strategy_research_profile(strategy_id)
+        reasons: List[str] = []
+        if not str(rp.get("hypothesis") or "").strip():
+            reasons.append("missing_hypothesis")
+        exp = rp.get("experiment_card") if isinstance(rp.get("experiment_card"), dict) else {}
+        if not exp:
+            reasons.append("missing_experiment_card")
+        cost_model = exp.get("cost_model") if isinstance(exp.get("cost_model"), dict) else {}
+        if not cost_model:
+            reasons.append("missing_cost_model")
+        answers = rp.get("peer_review_answers") if isinstance(rp.get("peer_review_answers"), dict) else {}
+        required = [
+            "what_edge",
+            "why_not_immediately_gone",
+            "net_after_cost",
+            "failure_shape",
+            "kill_signal",
+        ]
+        missing_answers = [k for k in required if not str(answers.get(k) or "").strip()]
+        if missing_answers:
+            reasons.append("missing_peer_review_5q")
+        if str(gov.get("oos_status") or "unknown").lower() != "passed":
+            reasons.append("oos_not_passed")
+        if str(gov.get("live_drift_status") or "unknown").lower() == "degraded":
+            reasons.append("live_drift_degraded")
+        return {
+            "strategy_id": strategy_id,
+            "eligible": len(reasons) == 0,
+            "reasons": reasons,
+            "stage": gov.get("stage"),
+            "oos_status": gov.get("oos_status"),
+            "live_drift_status": gov.get("live_drift_status"),
+            "market_structure_overlay_status": ((gov.get("market_structure_overlay") or {}).get("status") if isinstance(gov.get("market_structure_overlay"), dict) else None),
+            "review_completion_status": rp.get("review_completion_status"),
+        }
+
+    def set_strategy_governance_state(
+        self,
+        strategy_id: str,
+        *,
+        stage: Optional[StrategyLifecycleStage] = None,
+        oos_status: Optional[str] = None,
+        live_drift_status: Optional[str] = None,
+        reason: str = "",
+    ) -> bool:
+        cfg = self.strategy_configs.get(strategy_id)
+        if cfg is None:
+            return False
+        md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+        gov = md.get("governance", {}) if isinstance(md.get("governance"), dict) else {}
+        if stage is not None:
+            cfg.stage = stage
+            gov["stage"] = stage.value
+        if oos_status is not None:
+            cfg.oos_status = str(oos_status)
+            gov["oos_status"] = str(oos_status)
+        if live_drift_status is not None:
+            cfg.live_drift_status = str(live_drift_status)
+            gov["live_drift_status"] = str(live_drift_status)
+        if reason:
+            gov["last_reason"] = str(reason)
+            gov["updated_at"] = datetime.now().isoformat()
+        md["governance"] = gov
+        cfg.metadata = md
+        cfg.updated_at = datetime.now()
+        return True
+
+    def record_market_structure_snapshot(
+        self,
+        symbol: str,
+        snapshot: Optional[Dict[str, Any]] = None,
+        *,
+        apply_now: bool = True,
+    ) -> Dict[str, Any]:
+        sym = str(symbol or "unknown")
+        snap = dict(snapshot or {})
+        snap["symbol"] = sym
+        snap["recorded_at"] = datetime.now().isoformat()
+        self._latest_market_structure_snapshots[sym] = snap
+        if apply_now:
+            return self.apply_market_structure_governance(sym, snap)
+        return {"symbol": sym, "updated": True, "applied": False}
+
+    def apply_market_structure_governance(
+        self,
+        symbol: str,
+        market_structure: Optional[Dict[str, Any]] = None,
+        *,
+        strategy_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        sym = str(symbol or "unknown")
+        snap = dict(market_structure or self._latest_market_structure_snapshots.get(sym) or {})
+        posture = str(snap.get("risk_posture") or "unknown").lower()
+        liquidity = str(snap.get("liquidity_state") or "unknown").lower()
+        regime = str(snap.get("regime_label") or "unknown").lower()
+        confidence = float(snap.get("confidence") or 0.0)
+        conflict = float(snap.get("signal_conflict_score") or 0.0)
+        observe_mult = float(self._market_structure_runtime_config.get("observe_cap_multiplier", 0.5) or 0.5)
+        observe_threshold = float(self._market_structure_runtime_config.get("observe_conflict_threshold", 0.55) or 0.55)
+        restore_conf = float(self._market_structure_runtime_config.get("restore_min_confidence", 0.55) or 0.55)
+        restore_cycles = int(self._market_structure_runtime_config.get("restore_stable_cycles", 2) or 2)
+
+        matched: List[str] = []
+        actions: List[Dict[str, Any]] = []
+        candidates = strategy_ids or list(self.strategy_configs.keys())
+        for sid in candidates:
+            cfg = self.strategy_configs.get(sid)
+            if cfg is None or sid.startswith(("default_", "combined_")):
+                continue
+            if strategy_ids is None:
+                symbols = [str(x) for x in (cfg.symbols or []) if str(x).strip()]
+                if symbols and sym not in symbols:
+                    continue
+            matched.append(sid)
+            md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+            gov = md.get("governance", {}) if isinstance(md.get("governance"), dict) else {}
+            overlay = gov.get("market_structure_overlay", {}) if isinstance(gov.get("market_structure_overlay"), dict) else {}
+            current_stage = self._get_deployment_stage(cfg)
+            base_stage = str(overlay.get("base_stage") or current_stage)
+            stable_cycles = int(overlay.get("stable_cycles", 0) or 0)
+            base_mult = self._deployment_cap_multiplier(current_stage)
+            target_stage = current_stage
+            effective_mult = base_mult
+            status = "neutral"
+            action = "hold"
+            reason = f"regime={regime} posture={posture} liquidity={liquidity}"
+
+            if posture == "capital_preservation" or liquidity == "stressed":
+                status = "downweighted"
+                action = "downweight"
+                stable_cycles = 0
+                if current_stage == "full":
+                    target_stage = "shadow"
+                elif current_stage == "small":
+                    target_stage = "shadow"
+                elif current_stage == "shadow":
+                    target_stage = "paper"
+                effective_mult = self._deployment_cap_multiplier(target_stage)
+            elif posture in {"defensive", "cautious"} or liquidity == "fragile" or conflict >= observe_threshold:
+                status = "observing"
+                action = "observe"
+                stable_cycles = 0
+                effective_mult = round(max(0.0, min(base_mult, base_mult * observe_mult)), 4)
+            elif posture in {"balanced", "offensive"} and liquidity == "healthy" and confidence >= restore_conf:
+                stable_cycles += 1
+                if overlay.get("status") in {"downweighted", "observing"} and stable_cycles >= restore_cycles:
+                    status = "recovered"
+                    action = "recover"
+                    target_stage = base_stage if base_stage in {"paper", "shadow", "small", "full"} else current_stage
+                    effective_mult = self._deployment_cap_multiplier(target_stage)
+                else:
+                    status = str(overlay.get("status") or "neutral")
+            else:
+                status = str(overlay.get("status") or "neutral")
+
+            if action == "downweight" and target_stage != current_stage:
+                self._set_deployment_stage(cfg, target_stage, reason=f"market_structure:{reason}")
+            elif action == "recover" and target_stage != current_stage:
+                self._set_deployment_stage(cfg, target_stage, reason=f"market_structure_recover:{reason}")
+
+            gov["market_structure_overlay"] = {
+                "symbol": sym,
+                "status": status,
+                "action": action,
+                "base_stage": base_stage if overlay.get("base_stage") else current_stage,
+                "current_stage": self._get_deployment_stage(cfg),
+                "effective_cap_multiplier": effective_mult,
+                "stable_cycles": stable_cycles,
+                "reason": reason,
+                "confidence": round(confidence, 4),
+                "signal_conflict_score": round(conflict, 4),
+                "updated_at": datetime.now().isoformat(),
+            }
+            md["governance"] = gov
+            cfg.metadata = md
+            cfg.updated_at = datetime.now()
+            if action != "hold":
+                self._record_deployment_action(
+                    cfg,
+                    action=action,
+                    symbol=sym,
+                    reason=reason,
+                    market_structure=snap,
+                    from_stage=current_stage,
+                    to_stage=self._get_deployment_stage(cfg),
+                )
+            actions.append(
+                {
+                    "strategy_id": sid,
+                    "action": action,
+                    "status": status,
+                    "from_stage": current_stage,
+                    "to_stage": self._get_deployment_stage(cfg),
+                    "effective_cap_multiplier": effective_mult,
+                }
+            )
+
+        return {
+            "symbol": sym,
+            "matched_strategies": matched,
+            "market_structure": {
+                "regime_label": regime,
+                "risk_posture": posture,
+                "liquidity_state": liquidity,
+                "confidence": round(confidence, 4),
+                "signal_conflict_score": round(conflict, 4),
+            },
+            "actions": actions,
+            "applied_at": datetime.now().isoformat(),
+        }
+
+    async def _auto_apply_market_structure_governance(self) -> None:
+        for symbol, snapshot in list(self._latest_market_structure_snapshots.items()):
+            try:
+                self.apply_market_structure_governance(symbol, snapshot)
+            except Exception as e:
+                logger.debug("market structure governance apply failed for %s: %s", symbol, e)
+
+    def get_market_structure_governance_status(self) -> Dict[str, Any]:
+        status_counts: Dict[str, int] = {}
+        rows: List[Dict[str, Any]] = []
+        for sid, cfg in self.strategy_configs.items():
+            md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
+            gov = md.get("governance", {}) if isinstance(md.get("governance"), dict) else {}
+            overlay = gov.get("market_structure_overlay", {}) if isinstance(gov.get("market_structure_overlay"), dict) else {}
+            if not overlay:
+                continue
+            status = str(overlay.get("status") or "neutral")
+            status_counts[status] = int(status_counts.get(status, 0)) + 1
+            rows.append(
+                {
+                    "strategy_id": sid,
+                    "symbol": overlay.get("symbol"),
+                    "status": status,
+                    "action": overlay.get("action"),
+                    "current_stage": overlay.get("current_stage"),
+                    "effective_cap_multiplier": overlay.get("effective_cap_multiplier"),
+                    "reason": overlay.get("reason"),
+                    "updated_at": overlay.get("updated_at"),
+                }
+            )
+        return {
+            "tracked_symbols": sorted(self._latest_market_structure_snapshots.keys()),
+            "status_counts": status_counts,
+            "strategies": rows[:50],
+        }
+
     async def _auto_manage_deployment_stages(self) -> None:
         """自动分层发布：paper/shadow/small/full，按回测+实盘表现升降级。"""
         promote_score = float(self._deployment_runtime_config.get("promote_min_score", 0.95) or 0.95)
@@ -2277,6 +2838,7 @@ class StrategyManager:
             "last_daily_optimization_date": self._last_daily_optimization_date,
             "last_pool_prune_at": self._last_pool_prune_at.isoformat() if self._last_pool_prune_at else None,
             "deployment_stage_counts": stage_counts,
+            "market_structure_governance": self.get_market_structure_governance_status(),
         }
 
     def update_optimization_runtime_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:

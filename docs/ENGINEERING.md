@@ -54,17 +54,15 @@
 
 ---
 
-## 3. Docker 与卷
+## 3. 目录与持久化（裸机）
 
-根目录 `docker-compose.yml`（若存在）典型约定：
+业务进程直接使用仓库根下路径（`ConfigManager` 亦识别历史上容器内的 `/app/...` 作为可选扫描路径，与裸机布局兼容）：
 
-- `./config` → `/app/config`：保证容器内与宿主机主配置一致。  
-- `./src` → `/app/src`：开发时改代码可 `restart` 生效。  
-- `./scripts` → `/app/scripts`（只读）：容器内可跑 `startup_acceptance.py`、网络基线等；宿主机全栈巡检见 `scripts/verify_full_stack_network.sh`。  
-- `./tests` → `/app/tests`（只读）：便于在容器内对齐本机测试树。  
-- `./data`、`./logs`、`./workspace`、`./backups`：持久化与产物。
+- **`config/`**：主业务 YAML；本机覆盖 `local.*` 勿提交 Git。  
+- **`src/`、`scripts/`、`tests/`**：源码与运维脚本。  
+- **`data/`、`logs/`、`workspace/`、`backups/`**：持久化与产物。
 
-镜像构建见 `Dockerfile`；启动命令 `start_production.sh` → `python3 src/main.py`。宿主机经 Clash 出站与容器代理约定见 `deploy/HOST_CLASH_EGRESS.md`。
+启动入口见根目录 `start_production.sh`、`python -m src.main` 或 `scripts/start-openclaw-trading.sh`。宿主机经 Clash 出站与代理约定见 `deploy/HOST_CLASH_EGRESS.md`。
 
 ---
 

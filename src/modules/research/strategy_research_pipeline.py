@@ -11,6 +11,7 @@ Strategy research pipeline:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 from dataclasses import dataclass
@@ -54,6 +55,73 @@ class StrategyResearchPipeline:
         self.promote_small_score = 1.10
         self.redevelop_below_score = 0.35
         self.discard_below_score = 0.10
+
+    def _build_experiment_card(
+        self,
+        *,
+        dsl: Dict[str, Any],
+        train_metrics: Dict[str, Any],
+        test_metrics: Dict[str, Any],
+        decision: str,
+    ) -> Dict[str, Any]:
+        return {
+            "hypothesis": f"{dsl.get('name', 'strategy')} can generalize from train to OOS with bounded drawdown",
+            "setup": {
+                "symbol": dsl.get("symbol", "BTC/USDT"),
+                "timeframe": dsl.get("timeframe", "1h"),
+                "entry_count": len(dsl.get("entry", []) or []),
+                "exit_count": len(dsl.get("exit", []) or []),
+            },
+            "cost_model": {"slippage_bps": 6, "fees_bps": 8},
+            "train_summary": train_metrics,
+            "oos_summary": test_metrics,
+            "decision": decision,
+            "created_at": datetime.now().isoformat(),
+        }
+
+    def _build_review_answers(
+        self,
+        *,
+        dsl: Dict[str, Any],
+        test_metrics: Dict[str, Any],
+        decision: str,
+    ) -> Dict[str, Any]:
+        return {
+            "what_edge": f"{dsl.get('name', 'strategy')} captures {dsl.get('entry', [{}])[0].get('type', 'pattern')} behavior",
+            "why_not_immediately_gone": "requires matching regime, execution discipline, and risk gating",
+            "net_after_cost": f"pnl={test_metrics.get('pnl', 0)} sharpe={test_metrics.get('sharpe', 0)}",
+            "failure_shape": f"drawdown={test_metrics.get('max_drawdown', 0)} trades={test_metrics.get('trades', 0)}",
+            "kill_signal": "OOS fail / live drift degraded / execution slippage worsening",
+            "decision": decision,
+        }
+
+    def _build_parameter_sensitivity(
+        self,
+        *,
+        dsl: Dict[str, Any],
+        train_metrics: Dict[str, Any],
+        test_metrics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        train_sharpe = float(train_metrics.get("sharpe", 0.0) or 0.0)
+        test_sharpe = float(test_metrics.get("sharpe", 0.0) or 0.0)
+        train_pnl = float(train_metrics.get("pnl", 0.0) or 0.0)
+        test_pnl = float(test_metrics.get("pnl", 0.0) or 0.0)
+        drift = round(test_sharpe - train_sharpe, 4)
+        pnl_drift = round(test_pnl - train_pnl, 4)
+        return {
+            "summary": "stable" if abs(drift) <= 0.35 and abs(pnl_drift) <= max(1.0, abs(train_pnl) * 0.35) else "fragile",
+            "train_vs_oos": {
+                "sharpe_delta": drift,
+                "pnl_delta": pnl_drift,
+                "trade_count_delta": int(test_metrics.get("trades", 0) or 0) - int(train_metrics.get("trades", 0) or 0),
+            },
+            "core_parameters": dict(dsl.get("parameters") or {}),
+            "notes": [
+                f"entry_rules={len(dsl.get('entry', []) or [])}",
+                f"exit_rules={len(dsl.get('exit', []) or [])}",
+                f"timeframe={dsl.get('timeframe', '1h')}",
+            ],
+        }
 
     async def run_cycle(self, symbols: List[str], timeframe: str = "1h", lookback_days: int = 30) -> Dict[str, Any]:
         # load config (best-effort)
@@ -586,6 +654,55 @@ class StrategyResearchPipeline:
         cfg = await strategy_manager.load_strategy_config(config_data)
         if not cfg:
             return None
+        experiment_card = self._build_experiment_card(
+            dsl=dsl,
+            train_metrics=train_metrics,
+            test_metrics=test_metrics,
+            decision=gov_decision,
+        )
+        review_answers = self._build_review_answers(
+            dsl=dsl,
+            test_metrics=test_metrics,
+            decision=gov_decision,
+        )
+        parameter_sensitivity = self._build_parameter_sensitivity(
+            dsl=dsl,
+            train_metrics=train_metrics,
+            test_metrics=test_metrics,
+        )
+        try:
+            strategy_manager.save_strategy_experiment_card(
+                strategy_id,
+                hypothesis=str(experiment_card.get("hypothesis") or ""),
+                experiment_card=experiment_card,
+            )
+            strategy_manager.record_strategy_review(
+                strategy_id,
+                review_type="research_pipeline_publish",
+                answers=review_answers,
+                action_items=[
+                    "monitor live drift",
+                    "track cost after deployment",
+                    "revisit if regime changes",
+                ],
+                status="completed" if gov_decision == "publish" else "review_required",
+            )
+            strategy_manager.save_strategy_parameter_sensitivity(
+                strategy_id,
+                parameter_sensitivity=parameter_sensitivity,
+            )
+            if gov_decision != "publish":
+                strategy_manager.record_strategy_failure_case(
+                    strategy_id,
+                    title=f"{strategy_id} OOS review required",
+                    case_type="oos_failure",
+                    summary="OOS / governance gate did not pass publish threshold",
+                    trigger=f"decision={gov_decision}",
+                    action_taken="kept in review_required state",
+                    metadata={"test_metrics": dict(test_metrics or {})},
+                )
+        except Exception:
+            pass
 
         # Auto-activate newly published strategy so research output can
         # immediately enter live signal generation instead of staying dormant.
@@ -633,6 +750,64 @@ class StrategyResearchPipeline:
                 )
             except Exception:
                 pass
+            try:
+                await self.main_controller.memory_gateway.save_knowledge_document(
+                    title=f"Strategy Research Decision {strategy_id}",
+                    content=(
+                        f"version={version}\n"
+                        f"decision={gov_decision}\n"
+                        f"score={research_score}\n"
+                        f"deployment_stage={deployment_stage}\n"
+                        f"test_metrics={json.dumps(test_metrics, ensure_ascii=False)}"
+                    ),
+                    knowledge_type="strategy_research_decision",
+                    metadata={"strategy_id": strategy_id, "version": version},
+                )
+            except Exception:
+                pass
+            try:
+                await self.main_controller.memory_gateway.save_knowledge_document(
+                    title=f"Experiment Card {strategy_id}",
+                    content=json.dumps(experiment_card, ensure_ascii=False, indent=2),
+                    knowledge_type="strategy_experiment_card",
+                    metadata={"strategy_id": strategy_id, "version": version},
+                )
+            except Exception:
+                pass
+        try:
+            fs = getattr(self.main_controller, "feature_store_lite", None)
+            if fs and hasattr(fs, "append_research_label"):
+                fs.append_research_label(
+                    strategy_id,
+                    {
+                        "stage": "published" if gov_decision == "publish" else "review_required",
+                        "oos_status": "passed" if gov_decision == "publish" else "review_required",
+                        "decision": gov_decision,
+                        "score": research_score,
+                        "test_metrics": dict(test_metrics or {}),
+                    },
+                )
+        except Exception:
+            pass
+
+        try:
+            from src.modules.core.strategy_manager import StrategyLifecycleStage
+
+            if activated and deployment_stage == "full":
+                stage = StrategyLifecycleStage.SCALED_LIVE
+            elif activated:
+                stage = StrategyLifecycleStage.LIMITED_LIVE
+            else:
+                stage = StrategyLifecycleStage.OOS_VALIDATING
+            strategy_manager.set_strategy_governance_state(
+                strategy_id,
+                stage=stage,
+                oos_status="passed" if gov_decision == "publish" else "review_required",
+                live_drift_status="unknown",
+                reason="research_pipeline_publish",
+            )
+        except Exception:
+            pass
 
         return {
             "strategy_id": strategy_id,
@@ -643,4 +818,3 @@ class StrategyResearchPipeline:
             "score": research_score,
             "decision": gov_decision,
         }
-

@@ -15,7 +15,7 @@
 |------|----------|
 | 绑定网卡 / 接管本机 TCP 出站 | 宿主机 **TUN 虚拟网卡** + 系统路由表（`auto-route`） |
 | 域名 / IP / GEOIP 分流 | 代理内核 **routing / rules** |
-| Docker 内业务进程 | **方案 A**：容器仍设 `HTTP_PROXY` 指向 `host.docker.internal:端口`；**方案 B**：`network_mode: host` 让容器继承宿主机已劫持的路由（注意端口冲突与安全面） |
+| 本机业务进程（Python 交易 API） | **环境变量**：`HTTP_PROXY`/`HTTPS_PROXY` 指向 **`http://127.0.0.1:端口`**（与 mihomo **mixed-port** 一致）；保持 **`NO_PROXY=localhost,127.0.0.1,redis`**；**`host.docker.internal` 仅历史上用于旧容器场景，裸机勿用** |
 
 本仓库 `config/config.yaml` 里的 `proxy` 段 = **应用进程**对 HTTP 客户端的补充（`NO_PROXY` 合并等）；**与宿主机 TUN 互补，不替代 TUN。**
 
@@ -39,7 +39,7 @@ tun:
   dns-hijack:
     - "any:53"
 
-# 入站：本机 HTTP/SOCKS 混合端口，给 Docker 里只认环境变量的程序用
+# 入站：本机 HTTP/SOCKS 混合端口，给只认环境变量的程序用
 mixed-port: 7890
 
 # 下面必须有：proxy-providers / proxies、rules 等，此处省略
@@ -63,21 +63,22 @@ mixed-port: 7890
 
 ---
 
-## 4. 与本项目 Docker Compose 的配合
+## 4. 与本项目裸机进程的配合
 
-1. 宿主机 Clash 监听 **7890**（或你自定义的 mixed-port）。
-2. Compose 中交易容器已通过 `extra_hosts: host.docker.internal:host-gateway`，`config/proxy.global_proxy.host` 默认 **`host.docker.internal`**，即 **容器 → 宿主机 Clash**。
-3. **`network_mode: host` 与 `networks:`**：本仓库用根目录 **`docker-compose.hostnet.yml`**（`networks: !reset null` 等）与基座 **合并**，让交易服务走宿主机网络栈且 **Redis 仍为 compose 桥接**。推荐：
+1. 宿主机 Clash 监听 **7890**（或你自定义的 mixed-port）；建议 mixed-port 监听 **`0.0.0.0`**，避免仅 `127.0.0.1` 时与其它组件的入站策略冲突。  
+2. 交易进程在 **本机 Python** 中运行：在 `.env` 或 systemd 中设置 **`OPENCLAW_HTTP_PROXY`/`OPENCLAW_HTTPS_PROXY`** 或标准 **`HTTP_PROXY`/`HTTPS_PROXY`** 为 **`http://127.0.0.1:7890`**（端口与 Clash 一致）。  
+3. **`REDIS_HOST`**：本机 Redis 填 **`127.0.0.1`**；远端填实际主机名。  
+4. **TUN 与显式 HTTP 代理可同时存在**：TUN 管系统路由，Python HTTP 客户端仍可按环境变量走 mixed-port，便于验收与排障。
 
-   ```bash
-   docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --force-recreate trading-system
-   ```
+### 4.1 OKX DNS 异常（169.254.x.x / 198.18.x.x）
 
-   **勿**用裸 `docker run --network host` 替代整套 compose（易丢卷、`.env`、`depends_on`、Redis 约定）。一键：`./scripts/recover_trading_hostnet.sh`。
-
-4. **Clash / mihomo 的 mixed-port 若只监听 `127.0.0.1`**：bridge 容器通过 `host.docker.internal`（宿主机在 docker 网上的地址）去连 **经常失败**——目标端口在回环上，对「从容器来的」连接不可达。处理：让入站监听 **`0.0.0.0:7890`**（或等价），或改用 **`docker-compose.hostnet.yml`**，在进程内直接使用 **`http://127.0.0.1:7890`**。
-
-5. **bridge + 显式 HTTP 代理**（代理对 docker 网可达时）：与宿主机 TUN **可同时存在**——TUN 管宿主机进程，容器内 HTTP 库走 `HTTP_PROXY`，便于验收与排障。
+- **`www.okx.com` → `169.254.0.2` 等链路本地地址**：多为 **DNS 污染/劫持**（部分运营商递归对 OKX 返回假 IP），表现为 **TCP 443 超时**、TLS 失败。  
+  **处理**：在 Clash/mihomo 的 `dns.nameserver-policy` 中为 `+.okx.com` / `+.okex.com` 指定 **1.1.1.1**（或 DoH），并在 `fake-ip-filter` 中包含上述域名；仓库内 **`scripts/production_network_baseline.py --apply`** 可对 `/etc/clash/config.yaml` 做基线合并（**需 root + 重启 clash**）。  
+- **`198.18.0.0/15`（fake-ip）**：若 OKX 仍解析进该段且连接失败，说明 **fake-ip 与路由/规则不一致**；优先保证 `fake-ip-filter` 含 `+.okx.com`，或在 `rules` 中对 OKX 使用 **DIRECT/REAL-IP** 与真实出口一致。  
+- **自检**：`python3 scripts/network_connectivity_smoke.py` 会在异常解析时打印 `[HINT]`；探针未设置 `OPENCLAW_HTTP_PROXY` 时走**直连 DNS**，与「仅 TUN、未注入环境变量」的 shell 可能不一致，应以**交易进程实际环境**为准。  
+- **A/B：`fake-ip-filter` / DNS 模块**：可用 **`scripts/clash_dns_fake_ip_filter_experiment.py`**（`show` / `backup` / `strip-okx` / `strip-all-filter` / `disable-dns` / `enable-dns` / `set-enhanced-mode <fake-ip|redir-host|normal>` / `restore`）在备份后临时改动，重启 Clash 再跑 smoke 对比。  
+  **注意**：`argparse` 要求 **`--config` 写在子命令前面**，例如 `sudo python3 scripts/clash_dns_fake_ip_filter_experiment.py --config /etc/clash/config.yaml strip-okx`；写成 `strip-okx --config ...` 会落到默认路径并报错。  
+  **A/B 对比**：每轮改 Clash 后执行 `python3 scripts/network_connectivity_smoke.py --https-okx`（必要时保存终端输出）即可对照 DNS/TCP/HTTPS 结果。
 
 ---
 
@@ -99,4 +100,4 @@ mixed-port: 7890
 
 ## 7. 与「仅 HTTP 代理」对比：可重复基准
 
-开启 TUN 前后、或改 compose 前后，用同一脚本各跑一次并 `--compare` 两次 JSON，可看 **DNS/TCP/HTTPS 中位数延迟** 与 **是否仍依赖 HTTP 代理更快**。详见 **`docs/OPERATIONS.md`** §3.5 与仓库 **`scripts/proxy_mode_network_benchmark.py`**。
+开启 TUN 前后、或调整本机代理环境前后，用同一脚本各跑一次并 `--compare` 两次 JSON，可看 **DNS/TCP/HTTPS 中位数延迟** 与 **是否仍依赖 HTTP 代理更快**。详见 **`docs/OPERATIONS.md`** §3.6 与仓库 **`scripts/proxy_mode_network_benchmark.py`**。

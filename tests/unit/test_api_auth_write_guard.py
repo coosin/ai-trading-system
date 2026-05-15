@@ -13,12 +13,13 @@ def _build_guarded_api() -> APIServer:
     api = APIServer(config_manager=None, main_controller=None, host="127.0.0.1", port=8000)
     api.trusted_hosts = ["testserver", "127.0.0.1", "localhost"]
     api.app = FastAPI()
-    asyncio.run(api._add_middleware())
-    asyncio.run(api._setup_routes())
 
     @api.app.post("/api/v1/modules/demo")
     async def protected_write():
         return {"ok": True}
+
+    asyncio.run(api._add_middleware())
+    asyncio.run(api._setup_routes())
 
     return api
 

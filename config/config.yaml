@@ -10,7 +10,7 @@ system:
   log_level: INFO
   environment: production
 llm:
-  # 主模型：DeepSeek（OpenAI 兼容）为主，Astron 作为末级备用
+  # 主模型：DeepSeek 为主，千帆 / Astron 作为回退
   default_model: deepseek-v4-flash
   # 自动轮询策略：优先MiMo Pro，失败后降级，支持自动恢复
   auto_polling:
@@ -21,7 +21,30 @@ llm:
     max_failures_before_switch: 2
     cooldown_after_switch: 30
   models:
-  # 0. DeepSeek V4 Flash — 生产默认主模型（低延迟）
+  # 0. 千帆 Code Latest — 可用备用（OpenAI 兼容）
+  - provider: openai
+    model_id: qianfan-code-latest
+    display_name: Baidu Qianfan Code Latest
+    api_key_env: BAIDU_QIANFAN_API_KEY
+    base_url: https://qianfan.baidubce.com/v2/coding
+    temperature: 0.35
+    max_tokens: 16384
+    timeout: 60.0
+    max_retries: 3
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 200000
+    supports_vision: false
+    supports_reasoning: true
+    enabled: true
+    priority: 140
+    region: cn
+    notes: Usable fallback via Baidu Qianfan official OpenAI-compatible endpoint
+    fallback_models:
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - astron-code-latest
+  # 1. DeepSeek V4 Flash — 生产默认主模型（低延迟）
   - provider: openai
     model_id: deepseek-v4-flash
     display_name: DeepSeek V4 Flash
@@ -42,8 +65,9 @@ llm:
     notes: Production primary via DeepSeek OpenAI-compatible endpoint
     fallback_models:
     - deepseek-v4-pro
+    - qianfan-code-latest
     - astron-code-latest
-  # 1. DeepSeek V4 Pro — 高推理质量回退 / 重点任务优先
+  # 2. DeepSeek V4 Pro — 高推理质量回退 / 重点任务优先
   - provider: openai
     model_id: deepseek-v4-pro
     display_name: DeepSeek V4 Pro
@@ -63,9 +87,10 @@ llm:
     region: global
     notes: Deep reasoning fallback / preferred for complex decisions
     fallback_models:
+    - qianfan-code-latest
     - deepseek-v4-flash
     - astron-code-latest
-  # 2. 讯飞 Astron Code Latest — 末级备用
+  # 3. 讯飞 Astron Code Latest — 末级备用
   - provider: openai
     model_id: astron-code-latest
     display_name: iFlytek Astron Code Latest
@@ -86,46 +111,56 @@ llm:
     notes: Final fallback via iFlytek MaaS coding OpenAI-compatible endpoint
     fallback_models: []
   task_model_mapping:
-    # 默认优先 DeepSeek Flash；高推理任务优先 Pro；Astron 为末级备用
+    # 默认优先 DeepSeek；千帆保留在回退链；Astron 为末级备用
     general:
     - deepseek-v4-pro
     - deepseek-v4-flash
+    - qianfan-code-latest
     - astron-code-latest
     market_analysis:
     - deepseek-v4-pro
     - deepseek-v4-flash
+    - qianfan-code-latest
     - astron-code-latest
     strategy_generation:
     - deepseek-v4-pro
     - deepseek-v4-flash
+    - qianfan-code-latest
     - astron-code-latest
     signal_generation:
     - deepseek-v4-flash
     - deepseek-v4-pro
+    - qianfan-code-latest
     - astron-code-latest
     risk_assessment:
     - deepseek-v4-pro
     - deepseek-v4-flash
+    - qianfan-code-latest
     - astron-code-latest
     news_analysis:
     - deepseek-v4-flash
     - deepseek-v4-pro
+    - qianfan-code-latest
     - astron-code-latest
     code_generation:
     - deepseek-v4-pro
     - deepseek-v4-flash
+    - qianfan-code-latest
     - astron-code-latest
     natural_language:
     - deepseek-v4-flash
     - deepseek-v4-pro
+    - qianfan-code-latest
     - astron-code-latest
     decision_making:
     - deepseek-v4-flash
     - deepseek-v4-pro
+    - qianfan-code-latest
     - astron-code-latest
     reasoning:
     - deepseek-v4-pro
     - deepseek-v4-flash
+    - qianfan-code-latest
     - astron-code-latest
 trading:
   # 默认关注列表（动态选币开启时仍作 always_include 候选）
@@ -438,6 +473,7 @@ logging:
 proxy:
   enabled: true
   # 网卡级强制分流：在「服务器宿主机」Clash/mihomo 上开 TUN + rules（见 deploy/HOST_CLASH_EGRESS.md）。
+  # 验收脚本：scripts/network_connectivity_smoke.py；Clash DNS/OKX 基线：scripts/production_network_baseline.py
   # 此处 egress_model=process_env 表示应用内 HTTP 客户端与 NO_PROXY 合并；与宿主机 TUN 互补。
   egress_model: process_env
   apply_to_process_env: true
@@ -445,7 +481,7 @@ proxy:
   force_override_env: false
   merge_no_proxy_from_config: true
   use_global_proxy: true
-  # OKX 专用：HTTP 代理经 Clash CONNECT 频繁断开时，可将 ignore_env_proxy 设为 true（OKX REST 直连，需容器出口可达 www.okx.com）
+  # OKX 专用：HTTP 代理经 Clash CONNECT 频繁断开时，可将 ignore_env_proxy 设为 true（OKX REST 直连，需本机出口可达 www.okx.com）
   okx:
     proxy_only: true
     ignore_env_proxy: false
@@ -519,15 +555,26 @@ ai_core_runtime:
   ai_core_min_confidence_to_open: 0.60
   ai_core_min_confidence_floor: 0.60
   max_same_direction_ratio: 0.7
-  # 盈利优化：满仓替换最差仓位曾造成系统性亏损；默认关闭（与运行时热更新对齐）
-  enable_replace_worst_on_full_positions: false
   # 快照超时且缺 K 线时允许“有价降级放行”；保留其余硬门控，避免网络抖动把交易机会全部挡掉
   open_allow_snapshot_timeout_fallback: true
+  # 统一快照常因 budget 不含 K 线 → 先尝试直连 hub 拉 1H K 线补齐证据（提高可成交性）
+  open_attempt_klines_recovery_fetch: true
+  open_klines_recovery_fetch_timeout_s: 1.35
+  open_klines_recovery_fetch_limit: 80
+  open_klines_recovery_min_bars: 20
+  # 仍缺 K 线时：仅当错误子集为 klines_missing / ticker 价兜底 且成交价已确认，则放行并缩量（默认 0.62）
+  open_allow_klines_missing_evidence_fallback: true
+  open_klines_missing_evidence_qty_mult: 0.62
   # Batch1 tune (2026-05-04): small-step relaxation; keep >1.0 to avoid quality collapse.
   min_rr_to_trade: 1.6
   # 当交易所/数据链路降级时，进一步收缩开仓仓位，降低回撤尾部
   degraded_data_quantity_factor: 0.55
   exchange_reachability_degraded_quantity_factor: 0.5
+  # 交易所公网探针：略增超时减轻「慢代理误判不可达」；提高缓存 TTL 降低 burst 下重复握手（经 HTTP CONNECT 代理时更明显）
+  exchange_reachability_probe_timeout_sec: 1.6
+  exchange_reachability_cache_ttl_sec: 18.0
+  # LLM 决策路径（_ai_analyze_and_decide）传入 generate 的最大重试轮数；与 OPENCLAW_LLM_CB_* 熔断配合
+  llm_decision_max_retries: 2
   # 连亏冷却：更早触发、更长冷却，优先保护资金曲线
   loss_streak_trigger: 2
   loss_streak_cooldown_sec: 3600
@@ -631,6 +678,9 @@ ai_brain:
   policy:
     allow_system_open: false
     gateway_sets_leverage: false
+    # 满仓替仓只由 ExecutionGateway 处理；ai_core 不再直接读取这两个键。
+    enable_replace_worst_on_full_positions: false
+    replace_worst_min_confidence: 0.75
 paths:
   base_path: /app
   data_path: /app/data

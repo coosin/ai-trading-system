@@ -1310,6 +1310,64 @@ class StopLossTakeProfitManager:
                 continue
         return None
 
+    def _find_active_order_by_coord(self, symbol: str, side: str) -> Optional["StopLossTakeProfitOrder"]:
+        """
+        查找同一标的/方向的 ACTIVE 单。
+        解决 legacy `BTC/USDT|long` 与 canonical `pos:BTC-USDT-SWAP|long` 键不一致时的重复建单。
+        """
+        want_core = self._strip_swap_market_suffix(symbol).upper()
+        want_side = str(side or "").strip().lower()
+        if not want_core or want_side not in ("long", "short"):
+            return None
+        for order in self.orders.values():
+            try:
+                if order.status != StopLossTakeProfitStatus.ACTIVE:
+                    continue
+                if str(order.side or "").strip().lower() != want_side:
+                    continue
+                order_core = self._strip_swap_market_suffix(order.symbol).upper()
+                if order_core == want_core:
+                    return order
+            except Exception:
+                continue
+        return None
+
+    async def _dedupe_active_orders_by_coord(
+        self,
+        keep_order: "StopLossTakeProfitOrder",
+        *,
+        trigger_reason: str = "deduped_by_exchange_sync",
+    ) -> int:
+        """
+        同一标的/方向只保留一条 ACTIVE 单。
+        优先保留已对齐到交易所 instId/canonical key 的订单，其余标记为 CANCELLED。
+        """
+        keep_id = str(getattr(keep_order, "order_id", "") or "")
+        coord = self._normalize_coord_key(keep_order)
+        cancelled = 0
+        for oid, order in list(self.orders.items()):
+            try:
+                if oid == keep_id:
+                    continue
+                if order.status != StopLossTakeProfitStatus.ACTIVE:
+                    continue
+                if self._normalize_coord_key(order) != coord:
+                    continue
+                order.status = StopLossTakeProfitStatus.CANCELLED
+                order.trigger_reason = trigger_reason
+                order.updated_at = datetime.now()
+                meta = dict(order.metadata or {})
+                meta["deduped_to_order_id"] = keep_id
+                meta["deduped_at"] = datetime.now().isoformat()
+                order.metadata = meta
+                for vk in self._order_index_keys_to_clear(order):
+                    if self.order_index.get(vk) == oid:
+                        del self.order_index[vk]
+                cancelled += 1
+            except Exception:
+                continue
+        return cancelled
+
     async def _heal_active_order_index_from_position(
         self, order: "StopLossTakeProfitOrder", p: Dict[str, Any]
     ) -> None:
@@ -1372,6 +1430,7 @@ class StopLossTakeProfitManager:
         refreshed = 0
         stale_cancelled = 0
         stale_healed = 0
+        coord_dedup_cancelled = 0
         live_index_keys = set()
         raw_row_count = len(positions or [])
 
@@ -1450,12 +1509,26 @@ class StopLossTakeProfitManager:
                     existing = self.orders.get(oid)
                     if existing and existing.status == StopLossTakeProfitStatus.ACTIVE:
                         try:
+                            await self._heal_active_order_index_from_position(existing, p)
+                            coord_dedup_cancelled += await self._dedupe_active_orders_by_coord(existing)
                             if self._refresh_active_order_from_exchange_position(existing, p, sym, side):
                                 refreshed += 1
                         except Exception as e:
                             logger.debug("sync_open_positions: 刷新本地跟踪失败 %s: %s", canonical, e)
                         skipped += 1
                         continue
+
+                existing = self._find_active_order_by_coord(sym, side)
+                if existing:
+                    try:
+                        await self._heal_active_order_index_from_position(existing, p)
+                        coord_dedup_cancelled += await self._dedupe_active_orders_by_coord(existing)
+                        if self._refresh_active_order_from_exchange_position(existing, p, sym, side):
+                            refreshed += 1
+                    except Exception as e:
+                        logger.debug("sync_open_positions: 同 coord 跟踪升级失败 %s: %s", canonical, e)
+                    skipped += 1
+                    continue
 
                 if entry <= 0:
                     try:
@@ -1490,11 +1563,11 @@ class StopLossTakeProfitManager:
             except Exception as e:
                 logger.warning(f"sync_open_positions: 处理单条持仓失败: {e}")
 
-        if stale_cancelled > 0 or refreshed > 0 or stale_healed > 0:
+        if stale_cancelled > 0 or refreshed > 0 or stale_healed > 0 or coord_dedup_cancelled > 0:
             await self._save_orders()
         logger.info(
             f"📌 交易所持仓→止盈止损跟踪: 新建 {synced}，已存在跳过 {skipped}（其中已对齐刷新 {refreshed}），"
-            f"清理陈旧 {stale_cancelled}，index 自愈 {stale_healed}，"
+            f"清理陈旧 {stale_cancelled}，index 自愈 {stale_healed}，同 coord 去重 {coord_dedup_cancelled}，"
             f"live_keys={len(live_index_keys)} live_norm_keys={len(live_norm)} raw_rows={raw_row_count}"
         )
         return {
@@ -1503,6 +1576,7 @@ class StopLossTakeProfitManager:
             "refreshed": refreshed,
             "stale_cancelled": stale_cancelled,
             "stale_healed": stale_healed,
+            "coord_dedup_cancelled": coord_dedup_cancelled,
             "live_index_keys": sorted(live_index_keys),
             "live_norm_key_count": len(live_norm),
             "raw_row_count": raw_row_count,

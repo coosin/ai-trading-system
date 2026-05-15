@@ -612,7 +612,7 @@ class ConfigManager:
             if prefix == "TRADING_":
                 global _TRADING_PREFIX_DEPRECATION_LOGGED
                 if not _TRADING_PREFIX_DEPRECATION_LOGGED:
-                    logger.warning(
+                    logger.info(
                         "环境变量前缀 TRADING_ 已弃用，建议迁移到 OPENCLAW__section__key 形式。"
                     )
                     _TRADING_PREFIX_DEPRECATION_LOGGED = True

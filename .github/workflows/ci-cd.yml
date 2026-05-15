@@ -36,11 +36,6 @@ jobs:
           if command -v pytest &> /dev/null; then
             pytest
           fi
-      - name: Build Docker image
-        run: |
-          if [ -f Dockerfile ]; then
-            docker build -t openclaw-trading:${{ github.sha }} .
-          fi
 
   deploy:
     needs: build

@@ -42,22 +42,23 @@ echo "   - 技能包已存在，需要验证是否正确加载"
 
 echo ""
 echo "=" * 70
-echo "🚀 重启容器测试优化效果"
+echo "🚀 请重启本机交易进程以使配置生效"
 echo ""
+echo "示例（按你的托管方式选一）："
+echo "  systemctl restart openclaw-trading.service   # 若已配置 systemd"
+echo "  bash scripts/stop-openclaw-trading.sh && bash scripts/start-openclaw-trading.sh"
+echo ""
+read -r -p "是否现在执行 stop + start 脚本? [y/N] " ans
+if [[ "${ans,,}" == "y" ]]; then
+  bash "$(dirname "$0")/scripts/stop-openclaw-trading.sh" 2>/dev/null || true
+  sleep 2
+  bash "$(dirname "$0")/scripts/start-openclaw-trading.sh" 2>/dev/null || echo "启动脚本失败，请手动检查"
+else
+  echo "已跳过自动重启"
+fi
 
-# 重启容器
-echo "执行: docker restart openclaw-trading"
-docker restart openclaw-trading
-
 echo ""
-echo "✅ 容器重启完成"
-echo ""
-echo "⏳ 等待20秒让系统完全启动..."
-sleep 20
-
-echo ""
-echo "📊 容器状态:"
-docker ps | grep openclaw-trading
+echo "📊 建议检查: curl -s http://127.0.0.1:8000/api/v1/system/health"
 
 echo ""
 echo "=" * 70
@@ -93,7 +94,7 @@ echo "   - 人格文件是否被加载"
 echo "   - 主动关怀是否工作"
 echo ""
 echo "🔍 如果测试发现问题，可以:"
-echo "   1. 检查容器日志: docker logs openclaw-trading"
+echo "   1. 查看日志: tail -n 120 logs/app.log"
 echo "   2. 查看人格文件加载日志"
 echo "   3. 调试具体问题"
 echo ""

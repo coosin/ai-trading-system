@@ -26,13 +26,15 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 
 RE_ENDPOINT = re.compile(
     r"(?<![A-Za-z0-9_])(/(?:api|openapi\.json|docs|redoc|ws)\S*)"
 )
 RE_CODE_TICK = re.compile(r"`([^`]+)`")
+# Third-party REST bases accidentally captured as "/api" + ".vendor.com/..."
+RE_EXTERNAL_API_HOST_PATH = re.compile(r"^/api\.[^/]+/")
 
 
 def _repo_root() -> Path:
@@ -75,6 +77,9 @@ def _extract_endpoints_from_markdown(text: str) -> set[str]:
     for raw in RE_ENDPOINT.findall(text):
         p = _normalize_path(raw)
         if not p.startswith("/"):
+            continue
+        if RE_EXTERNAL_API_HOST_PATH.match(p):
+            # e.g. /api.deepseek.com/v1/chat/completions — not this service's OpenAPI
             continue
         if p.startswith("/docs/"):
             # markdown links like /docs/API_REFERENCE.md are repo paths, not HTTP endpoints
@@ -131,6 +136,16 @@ class CheckResult:
         return not self.missing_endpoints and not self.missing_files
 
 
+def _strip_shell_invocation_prefix(token: str) -> str:
+    """`bash scripts/foo.sh` -> `scripts/foo.sh` for path existence checks."""
+    s = token.strip()
+    lowered = s.lower()
+    for prefix in ("bash ", "sh ", "source "):
+        if lowered.startswith(prefix):
+            return s[len(prefix) :].strip()
+    return s
+
+
 def _iter_markdown_files(repo: Path) -> Iterable[Path]:
     yield repo / "README.md"
     docs = repo / "docs"
@@ -157,10 +172,12 @@ def _scan_missing_local_references(repo: Path, md_path: Path, md_text: str) -> l
         "src/modules/api/backtest_api.py",
         "src/modules/api/enhanced_api.py",
         "src/modules/api/risk_api.py",
+        # Gitignored local overlay; template is config/config.local.example.yaml
+        "config/local.yaml",
     }
 
     for token in RE_CODE_TICK.findall(md_text):
-        s = token.strip()
+        s = _strip_shell_invocation_prefix(token.strip())
         if not s:
             continue
         if s in ignore_tokens:

@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +117,38 @@ class AILearningEngine:
             "top_guard_reason": None,
             "top_execution_failure": None,
             "top_reconciliation_block": None,
+            "top_workflow_stage": None,
+            "top_workflow_status": None,
             "recommendations": [],
             "updated_at": None,
+        }
+        self._self_review_summary: Dict[str, Any] = {
+            "lesson_summary": None,
+            "mistake_tags": [],
+            "self_review_score": None,
+            "updated_at": None,
+        }
+        self._last_tuning_summary: Dict[str, Any] = {
+            "applied": [],
+            "pending": [],
+            "rejected": [],
+            "updated_at": None,
+        }
+        self._weekly_review_summary: Dict[str, Any] = {
+            "week_key": None,
+            "review_markdown": None,
+            "generated_at": None,
+        }
+        self._learning_analytics_summary: Dict[str, Any] = {
+            "study_modules": {},
+            "retrieval_accuracy": 0.0,
+            "research_conversion_rate": 0.0,
+            "review_completion_score": 0.0,
+            "updated_at": None,
+        }
+        self._retrieval_deck_summary: Dict[str, Any] = {
+            "generated_at": None,
+            "cards": [],
         }
         
         logger.info("✅ AI学习引擎初始化完成")
@@ -189,6 +220,9 @@ class AILearningEngine:
                 await self._generate_learning_report()
 
                 await self._optimize_decision_rules()
+                await self._update_strategy_learning_governance()
+                await self.generate_weekly_research_review()
+                await self.generate_retrieval_practice_deck()
 
                 logger.info("✅ AI学习周期完成")
 
@@ -268,6 +302,8 @@ class AILearningEngine:
                     "top_guard_reason": None,
                     "top_execution_failure": None,
                     "top_reconciliation_block": None,
+                    "top_workflow_stage": None,
+                    "top_workflow_status": None,
                     "recommendations": [],
                     "updated_at": datetime.now().isoformat(),
                 }
@@ -276,6 +312,8 @@ class AILearningEngine:
             top_guard = ((analysis.get("top_guard_reasons") or [None])[0] if isinstance(analysis.get("top_guard_reasons"), list) and (analysis.get("top_guard_reasons") or []) else None)
             top_exec = ((analysis.get("top_execution_failures") or [None])[0] if isinstance(analysis.get("top_execution_failures"), list) and (analysis.get("top_execution_failures") or []) else None)
             top_rec = ((analysis.get("top_reconciliation_blocks") or [None])[0] if isinstance(analysis.get("top_reconciliation_blocks"), list) and (analysis.get("top_reconciliation_blocks") or []) else None)
+            top_stage = ((analysis.get("top_workflow_stages") or [None])[0] if isinstance(analysis.get("top_workflow_stages"), list) and (analysis.get("top_workflow_stages") or []) else None)
+            top_status = ((analysis.get("top_workflow_statuses") or [None])[0] if isinstance(analysis.get("top_workflow_statuses"), list) and (analysis.get("top_workflow_statuses") or []) else None)
 
             recommendations: List[str] = []
             guard_rejected = int(sm.get("guard_rejected", 0) or 0)
@@ -293,6 +331,10 @@ class AILearningEngine:
                 recommendations.append("连亏冷静期是主要拒绝原因，说明近期策略环境不稳定，应先降频而不是强行提高开仓率。")
             if isinstance(top_rec, dict) and "side_mismatch" in str(top_rec.get("key") or ""):
                 recommendations.append("对账保护主要拦截 side_mismatch，说明 AI 依赖的本地持仓状态仍需进一步稳固。")
+            if isinstance(top_stage, dict) and str(top_stage.get("key") or "") == "reconciliation":
+                recommendations.append("近期决策经常停在 reconciliation 阶段，优先修复本地持仓同步和孤儿订单清理，再考虑放宽策略动作。")
+            if isinstance(top_status, dict) and str(top_status.get("key") or "") in {"reconcile_blocked", "blocked"}:
+                recommendations.append("workflow 主要卡在 blocked/reconcile_blocked，说明当前问题偏执行治理而不是策略信号不足。")
 
             self._trace_feedback_summary = {
                 "sample_size": sample_size,
@@ -302,9 +344,18 @@ class AILearningEngine:
                 "top_guard_reason": top_guard,
                 "top_execution_failure": top_exec,
                 "top_reconciliation_block": top_rec,
+                "top_workflow_stage": top_stage,
+                "top_workflow_status": top_status,
                 "recommendations": recommendations[:6],
                 "updated_at": datetime.now().isoformat(),
             }
+            self._self_review_summary = {
+                "lesson_summary": self._build_trace_lesson_summary(sample_size, top_guard, top_exec, top_rec, top_stage, top_status),
+                "mistake_tags": self._build_trace_mistake_tags(top_guard, top_exec, top_rec, top_stage, top_status),
+                "self_review_score": round(max(0.0, 1.0 - ((guard_rejected + execution_failed + reconciliation_blocked) / max(sample_size, 1))), 4),
+                "updated_at": datetime.now().isoformat(),
+            }
+            await self._persist_trace_learning_snapshot()
         except Exception as e:
             logger.error(f"分析 decision traces 失败: {e}")
     
@@ -613,6 +664,63 @@ class AILearningEngine:
                 self.lessons = self.lessons[:self.config["max_lessons_kept"]]
         
         logger.info(f"💡 新经验: [{lesson.lesson_type.value}] {lesson.title}")
+
+    def _build_trace_lesson_summary(
+        self,
+        sample_size: int,
+        top_guard: Optional[Dict[str, Any]],
+        top_exec: Optional[Dict[str, Any]],
+        top_rec: Optional[Dict[str, Any]],
+        top_stage: Optional[Dict[str, Any]],
+        top_status: Optional[Dict[str, Any]],
+    ) -> str:
+        parts = [f"最近 {sample_size} 条决策样本已复盘"]
+        if isinstance(top_guard, dict) and top_guard.get("key"):
+            parts.append(f"主要门控原因是 {top_guard.get('key')}")
+        if isinstance(top_exec, dict) and top_exec.get("key"):
+            parts.append(f"主要执行失败是 {top_exec.get('key')}")
+        if isinstance(top_rec, dict) and top_rec.get("key"):
+            parts.append(f"主要对账阻断是 {top_rec.get('key')}")
+        if isinstance(top_stage, dict) and top_stage.get("key"):
+            parts.append(f"主要停留阶段是 {top_stage.get('key')}")
+        if isinstance(top_status, dict) and top_status.get("key"):
+            parts.append(f"主要 workflow 状态是 {top_status.get('key')}")
+        return "；".join(parts)
+
+    def _build_trace_mistake_tags(
+        self,
+        top_guard: Optional[Dict[str, Any]],
+        top_exec: Optional[Dict[str, Any]],
+        top_rec: Optional[Dict[str, Any]],
+        top_stage: Optional[Dict[str, Any]],
+        top_status: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        tags: List[str] = []
+        for item in (top_guard, top_exec, top_rec, top_stage, top_status):
+            if isinstance(item, dict):
+                key = str(item.get("key") or "").strip()
+                if key:
+                    tags.append(key)
+        return tags[:8]
+
+    async def _persist_trace_learning_snapshot(self) -> None:
+        mm = self.memory_manager
+        if mm is None or not hasattr(mm, "add_memory"):
+            return
+        summary = str((self._self_review_summary or {}).get("lesson_summary") or "").strip()
+        if not summary:
+            return
+        await mm.add_memory(
+            memory_type="weekly_lesson",
+            content=summary,
+            source_module="ai_learning_engine",
+            importance=0.78,
+            metadata={
+                "kind": "trace_learning_snapshot",
+                "mistake_tags": list((self._self_review_summary or {}).get("mistake_tags") or []),
+                "self_review_score": (self._self_review_summary or {}).get("self_review_score"),
+            },
+        )
     
     async def _generate_learning_report(self) -> Optional[LearningReport]:
         """生成学习报告"""
@@ -669,6 +777,7 @@ class AILearningEngine:
             )
             
             self.learning_reports.append(report)
+            self._learning_analytics_summary = self._build_learning_analytics(report)
             
             if self.memory_manager and hasattr(self.memory_manager, 'enhanced_memory'):
                 self.memory_manager.enhanced_memory.save_strategy_optimization(
@@ -681,6 +790,33 @@ class AILearningEngine:
                 )
             
             logger.info(f"📝 学习报告已生成: 胜率={report.win_rate:.1%}, 盈亏={report.total_pnl:+.2f}")
+            if self.memory_manager and hasattr(self.memory_manager, "add_memory"):
+                await self.memory_manager.add_memory(
+                    memory_type="weekly_lesson",
+                    content="\n".join(report.key_insights + report.recommendations[:3]),
+                    source_module="ai_learning_engine",
+                    importance=0.8,
+                    metadata={
+                        "kind": "learning_report",
+                        "period_start": period_start.isoformat(),
+                        "period_end": now.isoformat(),
+                        "total_trades": report.total_trades,
+                        "win_rate": report.win_rate,
+                        "total_pnl": report.total_pnl,
+                    },
+                )
+            if self.memory_manager and hasattr(self.memory_manager, "save_knowledge_document"):
+                await self.memory_manager.save_knowledge_document(
+                    title=f"Learning Report {now.strftime('%Y-%m-%d %H:%M')}",
+                    content="\n".join(report.key_insights + report.recommendations + report.next_steps),
+                    knowledge_type="learning_report",
+                    metadata={
+                        "period_start": period_start.isoformat(),
+                        "period_end": now.isoformat(),
+                        "win_rate": report.win_rate,
+                        "total_pnl": report.total_pnl,
+                    },
+                )
             
             return report
             
@@ -721,71 +857,92 @@ class AILearningEngine:
                     "expected_impact": "提高胜率"
                 })
 
-            # 写回策略：优先写到 ConfigManager（可热更新+持久化），其次再落到记忆里做审计。
-            applied: List[Dict[str, Any]] = []
+            suggestions: List[Dict[str, Any]] = []
             cm = self.config_manager
-            if optimizations and cm is not None and hasattr(cm, "set_config"):
-                try:
-                    # --- 风险教训：降低进场频率/减少噪音单、略微降低仓位预算 ---
-                    if len(risk_lessons) >= 3:
-                        cur = await cm.get_config("ai_core_runtime", {}) if hasattr(cm, "get_config") else {}
-                        try:
-                            cur_open_c = float((cur or {}).get("ai_core_min_confidence_to_open", 0.72) or 0.72)
-                        except Exception:
-                            cur_open_c = 0.72
-                        new_open_c = min(0.86, max(0.65, cur_open_c + 0.02))
-                        await cm.set_config("ai_core_runtime", "ai_core_min_confidence_to_open", float(new_open_c))
-                        applied.append(
-                            {
-                                "section": "ai_core_runtime",
-                                "key": "ai_core_min_confidence_to_open",
-                                "old": cur_open_c,
-                                "new": new_open_c,
-                                "reason": f"risk_lessons={len(risk_lessons)}",
-                            }
-                        )
+            cur = await cm.get_config("ai_core_runtime", {}) if (cm is not None and hasattr(cm, "get_config")) else {}
+            if len(risk_lessons) >= 3:
+                cur_open_c = float((cur or {}).get("ai_core_min_confidence_to_open", 0.72) or 0.72)
+                cur_mf = float((cur or {}).get("default_max_margin_fraction", 0.30) or 0.30)
+                suggestions.extend(
+                    [
+                        {
+                            "section": "ai_core_runtime",
+                            "key": "ai_core_min_confidence_to_open",
+                            "old": cur_open_c,
+                            "new": min(0.86, max(0.65, cur_open_c + 0.02)),
+                            "reason": f"risk_lessons={len(risk_lessons)}",
+                            "expected_impact": "降低低质量开仓",
+                        },
+                        {
+                            "section": "ai_core_runtime",
+                            "key": "default_max_margin_fraction",
+                            "old": cur_mf,
+                            "new": min(0.55, max(0.08, cur_mf * 0.90)),
+                            "reason": f"risk_lessons={len(risk_lessons)}",
+                            "expected_impact": "降低保证金暴露",
+                        },
+                    ]
+                )
+            if len(timing_lessons) >= 3:
+                cur_rr = float((cur or {}).get("min_rr_to_trade", 1.2) or 1.2)
+                cur_edge = float((cur or {}).get("edge_min_net_reward_pct", 0.003) or 0.003)
+                suggestions.extend(
+                    [
+                        {
+                            "section": "ai_core_runtime",
+                            "key": "min_rr_to_trade",
+                            "old": cur_rr,
+                            "new": min(2.10, max(0.9, cur_rr + 0.05)),
+                            "reason": f"timing_lessons={len(timing_lessons)}",
+                            "expected_impact": "提高盈亏比要求",
+                        },
+                        {
+                            "section": "ai_core_runtime",
+                            "key": "edge_min_net_reward_pct",
+                            "old": cur_edge,
+                            "new": min(0.012, max(0.0015, cur_edge + 0.001)),
+                            "reason": f"timing_lessons={len(timing_lessons)}",
+                            "expected_impact": "提高净边际门槛",
+                        },
+                    ]
+                )
 
-                        # 降低可用保证金比例（保守且有边界）
-                        try:
-                            cur_mf = float((cur or {}).get("default_max_margin_fraction", 0.30) or 0.30)
-                        except Exception:
-                            cur_mf = 0.30
-                        new_mf = min(0.55, max(0.08, cur_mf * 0.90))
-                        await cm.set_config("ai_core_runtime", "default_max_margin_fraction", float(new_mf))
-                        applied.append(
-                            {
-                                "section": "ai_core_runtime",
-                                "key": "default_max_margin_fraction",
-                                "old": cur_mf,
-                                "new": new_mf,
-                                "reason": f"risk_lessons={len(risk_lessons)}",
-                            }
-                        )
+            gov = getattr(getattr(self, "main_controller", None), "tuning_governance", None)
+            result = {"applied": [], "pending": [], "rejected": []}
+            if suggestions and gov is not None and hasattr(gov, "evaluate_and_apply"):
+                result = await gov.evaluate_and_apply(suggestions, source="ai_learning_engine")
+            elif suggestions:
+                result["pending"] = list(suggestions)
+            self._last_tuning_summary = {
+                **result,
+                "updated_at": datetime.now().isoformat(),
+            }
 
-                    # --- 时机教训：提高净边际/盈亏比门槛，减少“挣得少、亏得多”的单子 ---
-                    if len(timing_lessons) >= 3:
-                        cur = await cm.get_config("ai_core_runtime", {}) if hasattr(cm, "get_config") else {}
-                        try:
-                            cur_rr = float((cur or {}).get("min_rr_to_trade", 1.2) or 1.2)
-                        except Exception:
-                            cur_rr = 1.2
-                        new_rr = min(2.10, max(0.9, cur_rr + 0.05))
-                        await cm.set_config("ai_core_runtime", "min_rr_to_trade", float(new_rr))
-                        applied.append(
-                            {"section": "ai_core_runtime", "key": "min_rr_to_trade", "old": cur_rr, "new": new_rr, "reason": f"timing_lessons={len(timing_lessons)}"}
-                        )
-
-                        try:
-                            cur_edge = float((cur or {}).get("edge_min_net_reward_pct", 0.003) or 0.003)
-                        except Exception:
-                            cur_edge = 0.003
-                        new_edge = min(0.012, max(0.0015, cur_edge + 0.001))
-                        await cm.set_config("ai_core_runtime", "edge_min_net_reward_pct", float(new_edge))
-                        applied.append(
-                            {"section": "ai_core_runtime", "key": "edge_min_net_reward_pct", "old": cur_edge, "new": new_edge, "reason": f"timing_lessons={len(timing_lessons)}"}
-                        )
-                except Exception as e:
-                    logger.error(f"写回配置失败（将仅记录优化建议）: {e}")
+            if self.memory_manager and hasattr(self.memory_manager, "add_memory"):
+                for item in result.get("applied", []):
+                    await self.memory_manager.add_memory(
+                        memory_type="approved_rule_change",
+                        content=f"{item.get('section')}.{item.get('key')} -> {item.get('new')}",
+                        source_module="ai_learning_engine",
+                        importance=0.82,
+                        metadata={"kind": "approved_rule_change", **item},
+                    )
+                for item in result.get("rejected", []):
+                    await self.memory_manager.add_memory(
+                        memory_type="rejected_rule_change",
+                        content=f"{item.get('section')}.{item.get('key')} rejected",
+                        source_module="ai_learning_engine",
+                        importance=0.76,
+                        metadata={"kind": "rejected_rule_change", **item},
+                    )
+                for item in result.get("pending", []):
+                    await self.memory_manager.add_memory(
+                        memory_type="tuning_attempt",
+                        content=f"{item.get('section')}.{item.get('key')} pending review",
+                        source_module="ai_learning_engine",
+                        importance=0.7,
+                        metadata={"kind": "tuning_attempt", **item},
+                    )
 
             if optimizations and self.memory_manager and getattr(self.memory_manager, "enhanced_memory", None):
                 try:
@@ -802,10 +959,280 @@ class AILearningEngine:
                     pass
 
             if optimizations:
-                logger.info("🔧 决策规则优化: %s项 applied=%s", len(optimizations), len(applied))
+                logger.info(
+                    "🔧 受控调优建议: total=%s applied=%s pending=%s rejected=%s",
+                    len(suggestions),
+                    len(result.get("applied", [])),
+                    len(result.get("pending", [])),
+                    len(result.get("rejected", [])),
+                )
                 
         except Exception as e:
             logger.error(f"优化决策规则失败: {e}")
+
+    async def _update_strategy_learning_governance(self) -> None:
+        mc = getattr(self, "main_controller", None)
+        sm = getattr(mc, "strategy_manager", None) if mc else None
+        if sm is None or not hasattr(sm, "set_strategy_governance_state"):
+            return
+        recent_lessons = [
+            l for l in self.lessons
+            if l.timestamp >= datetime.now() - timedelta(days=7)
+        ]
+        if not recent_lessons:
+            return
+        grouped: Dict[str, Dict[str, float]] = defaultdict(lambda: {"positive": 0.0, "negative": 0.0, "count": 0.0})
+        for lesson in recent_lessons:
+            strategy = str((lesson.context or {}).get("strategy") or "").strip()
+            if not strategy:
+                continue
+            bucket = grouped[strategy]
+            bucket["count"] += 1.0
+            if float(lesson.impact_score or 0.0) >= 0:
+                bucket["positive"] += 1.0
+            else:
+                bucket["negative"] += 1.0
+        for strategy_id, stats in grouped.items():
+            total = max(1.0, stats["count"])
+            neg_ratio = stats["negative"] / total
+            pos_ratio = stats["positive"] / total
+            if neg_ratio >= 0.6 and stats["negative"] >= 2:
+                try:
+                    from src.modules.core.strategy_manager import StrategyLifecycleStage
+
+                    sm.set_strategy_governance_state(
+                        strategy_id,
+                        stage=StrategyLifecycleStage.DEGRADED,
+                        live_drift_status="degraded",
+                        reason=f"learning_engine_negative_ratio={neg_ratio:.2f}",
+                    )
+                except Exception:
+                    continue
+            elif pos_ratio >= 0.6 and stats["positive"] >= 2:
+                sm.set_strategy_governance_state(
+                    strategy_id,
+                    live_drift_status="healthy",
+                    reason=f"learning_engine_positive_ratio={pos_ratio:.2f}",
+                )
+
+    def _build_learning_analytics(self, report: LearningReport) -> Dict[str, Any]:
+        lessons = list(report.lessons_learned or [])
+        positive = len([l for l in lessons if float(l.impact_score or 0.0) > 0])
+        total = max(1, len(lessons))
+        retrieval_accuracy = round(float(positive) / float(total), 4)
+        review_completion_score = 1.0 if lessons else 0.0
+        research_conversion_rate = 0.0
+        try:
+            mc = getattr(self, "main_controller", None)
+            sm = getattr(mc, "strategy_manager", None) if mc else None
+            if sm is not None:
+                profiles = [
+                    sm.get_strategy_governance_profile(sid)
+                    for sid in list(getattr(sm, "strategy_configs", {}).keys())
+                    if hasattr(sm, "get_strategy_governance_profile")
+                ]
+                liveish = [
+                    p for p in profiles
+                    if str(p.get("stage") or "") in {"limited_live", "scaled_live"}
+                ]
+                research_conversion_rate = round(float(len(liveish)) / float(max(1, len(profiles))), 4)
+        except Exception:
+            research_conversion_rate = 0.0
+        study_modules = {
+            "market_microstructure": len([l for l in lessons if l.lesson_type in {LessonType.TIMING_LESSON, LessonType.MARKET_INSIGHT}]),
+            "strategy_logic": len([l for l in lessons if l.lesson_type in {LessonType.SUCCESS_PATTERN, LessonType.FAILURE_PATTERN}]),
+            "risk_management": len([l for l in lessons if l.lesson_type == LessonType.RISK_LESSON]),
+            "execution_engineering": int((self._trace_feedback_summary or {}).get("execution_failed", 0) or 0),
+            "research_governance": int((self._trace_feedback_summary or {}).get("reconciliation_blocked", 0) or 0),
+        }
+        return {
+            "study_modules": study_modules,
+            "retrieval_accuracy": retrieval_accuracy,
+            "research_conversion_rate": research_conversion_rate,
+            "review_completion_score": review_completion_score,
+            "updated_at": datetime.now().isoformat(),
+        }
+
+    async def generate_weekly_research_review(self, force: bool = False) -> Optional[Dict[str, Any]]:
+        now = datetime.now()
+        year, week, _ = now.isocalendar()
+        week_key = f"{year}-W{int(week):02d}"
+        if (not force) and self._weekly_review_summary.get("week_key") == week_key:
+            return dict(self._weekly_review_summary)
+        report = self.learning_reports[-1] if self.learning_reports else None
+        analytics = dict(self._learning_analytics_summary or {})
+        review_markdown = self._render_weekly_review_template(
+            week_key=week_key,
+            report=report,
+            analytics=analytics,
+        )
+        self._weekly_review_summary = {
+            "week_key": week_key,
+            "review_markdown": review_markdown,
+            "workflow_focus": {
+                "top_workflow_stage": (self._trace_feedback_summary or {}).get("top_workflow_stage"),
+                "top_workflow_status": (self._trace_feedback_summary or {}).get("top_workflow_status"),
+                "top_reconciliation_block": (self._trace_feedback_summary or {}).get("top_reconciliation_block"),
+            },
+            "generated_at": now.isoformat(),
+        }
+        mm = self.memory_manager
+        if mm is not None and hasattr(mm, "save_knowledge_document"):
+            await mm.save_knowledge_document(
+                title=f"Weekly Research Review {week_key}",
+                content=review_markdown,
+                knowledge_type="weekly_research_review",
+                metadata={
+                    "week_key": week_key,
+                    "generated_at": now.isoformat(),
+                    "workflow_focus": (self._weekly_review_summary or {}).get("workflow_focus"),
+                },
+            )
+        return dict(self._weekly_review_summary)
+
+    async def generate_retrieval_practice_deck(self, limit: int = 10) -> Dict[str, Any]:
+        cards: List[Dict[str, Any]] = []
+        seen = set()
+        for lesson in sorted(self.lessons, key=lambda x: x.timestamp, reverse=True):
+            question = f"{lesson.title} 这条经验最重要的交易含义是什么？"
+            answer = lesson.content
+            if question in seen:
+                continue
+            seen.add(question)
+            cards.append(
+                {
+                    "question": question,
+                    "answer": answer,
+                    "lesson_type": lesson.lesson_type.value,
+                    "strategy": str((lesson.context or {}).get("strategy") or ""),
+                }
+            )
+            if len(cards) >= max(3, min(int(limit or 10), 20)):
+                break
+        if len(cards) < 3:
+            cards.extend(
+                [
+                    {
+                        "question": "这个策略赚的是什么钱？",
+                        "answer": "回答结构来源、参与者行为和适用 regime，而不是只说指标。",
+                        "lesson_type": "research_governance",
+                        "strategy": "",
+                    },
+                    {
+                        "question": "如果要砍掉它，最先看到什么信号？",
+                        "answer": "先看 OOS 失效、live drift 恶化、执行成本上升。",
+                        "lesson_type": "research_governance",
+                        "strategy": "",
+                    },
+                    {
+                        "question": "近期最常见的执行问题是什么？",
+                        "answer": str((self._self_review_summary or {}).get("lesson_summary") or "检查 execution_failed 与 reconciliation_blocked。"),
+                        "lesson_type": "execution_review",
+                        "strategy": "",
+                    },
+                ]
+            )
+        deck = {
+            "generated_at": datetime.now().isoformat(),
+            "cards": cards[: max(3, min(int(limit or 10), 20))],
+        }
+        self._retrieval_deck_summary = deck
+        mm = self.memory_manager
+        if mm is not None and hasattr(mm, "save_knowledge_document"):
+            await mm.save_knowledge_document(
+                title=f"Retrieval Practice Deck {datetime.now().strftime('%Y-%m-%d')}",
+                content=json.dumps(deck, ensure_ascii=False, indent=2),
+                knowledge_type="retrieval_practice_deck",
+                metadata={"card_count": len(deck["cards"])},
+            )
+        return dict(deck)
+
+    def _render_weekly_review_template(
+        self,
+        *,
+        week_key: str,
+        report: Optional[LearningReport],
+        analytics: Dict[str, Any],
+    ) -> str:
+        template = self._load_weekly_review_template()
+        lines = template.splitlines()
+        latest = report or LearningReport(
+            period_start=datetime.now() - timedelta(days=7),
+            period_end=datetime.now(),
+            total_trades=0,
+            winning_trades=0,
+            losing_trades=0,
+            win_rate=0.0,
+            total_pnl=0.0,
+            lessons_learned=[],
+            key_insights=[],
+            recommendations=[],
+            next_steps=[],
+        )
+        best = [l.title for l in latest.lessons_learned if float(l.impact_score or 0.0) > 0][:3]
+        worst = [l.title for l in latest.lessons_learned if float(l.impact_score or 0.0) < 0][:3]
+        top_mistakes = list((self._self_review_summary or {}).get("mistake_tags") or [])[:3]
+        recs = list(latest.recommendations or [])[:3]
+        next_steps = list(latest.next_steps or [])[:3]
+        top_exec = (self._trace_feedback_summary or {}).get("top_execution_failure")
+        top_exec_label = top_exec.get("key") if isinstance(top_exec, dict) else "暂无"
+        top_workflow_stage = (self._trace_feedback_summary or {}).get("top_workflow_stage")
+        top_workflow_status = (self._trace_feedback_summary or {}).get("top_workflow_status")
+        top_reconciliation_block = (self._trace_feedback_summary or {}).get("top_reconciliation_block")
+        workflow_stage_label = top_workflow_stage.get("key") if isinstance(top_workflow_stage, dict) else "暂无"
+        workflow_status_label = top_workflow_status.get("key") if isinstance(top_workflow_status, dict) else "暂无"
+        top_reconciliation_label = top_reconciliation_block.get("key") if isinstance(top_reconciliation_block, dict) else "暂无"
+        applied_items = list((self._last_tuning_summary or {}).get("applied") or [])
+        applied_labels = [
+            f"{item.get('section')}.{item.get('key')}"
+            for item in applied_items
+            if isinstance(item, dict) and item.get("section") and item.get("key")
+        ]
+        mapping = {
+            "- 本周重点主题：": f"- 本周重点主题：周研究复盘 {week_key}",
+            "- 本周已完成：": f"- 本周已完成：学习报告 {len(self.learning_reports)} 份，经验 {len(self.lessons)} 条",
+            "- 本周未完成：": f"- 本周未完成：待人工复核调优 {len((self._last_tuning_summary or {}).get('pending') or [])} 项",
+            "- 本周新增概念：": f"- 本周新增概念：{', '.join([k for k, v in (analytics.get('study_modules') or {}).items() if v]) or '暂无'}",
+            "- 本周主动回忆正确率：": f"- 本周主动回忆正确率：{float(analytics.get('retrieval_accuracy', 0.0) or 0.0):.1%}",
+            "- 本周最容易混淆的三个点：": f"- 本周最容易混淆的三个点：{', '.join(top_mistakes) or '暂无'}",
+            "- 下周要重复复习的内容：": f"- 下周要重复复习的内容：{', '.join(top_mistakes or ['risk_review', 'execution_review'])}",
+            "- 新提出假设：": f"- 新提出假设：研究转部署转化率 {float(analytics.get('research_conversion_rate', 0.0) or 0.0):.1%}",
+            "- 被证伪假设：": f"- 被证伪假设：{', '.join(worst) or '暂无'}",
+            "- 继续保留假设：": f"- 继续保留假设：{', '.join(best) or '暂无'}",
+            "- 最值得扩样验证的方向：": f"- 最值得扩样验证的方向：{recs[0] if recs else '扩样验证高胜率模式'}",
+            "- 最佳交易 3 笔及原因：": f"- 最佳交易 3 笔及原因：{'; '.join(best) or '暂无'}",
+            "- 最差交易 3 笔及原因：": f"- 最差交易 3 笔及原因：{'; '.join(worst) or '暂无'}",
+            "- 可以避免的亏损：": f"- 可以避免的亏损：{', '.join(top_mistakes) or '暂无'}",
+            "- 执行偏差：": f"- 执行偏差：{top_exec_label or '暂无'}",
+            "- 决策 workflow 卡点：": f"- 决策 workflow 卡点：stage={workflow_stage_label} / status={workflow_status_label}",
+            "- 本周最大风险暴露：": f"- 本周最大风险暴露：亏损交易 {latest.losing_trades} 笔 / 总交易 {latest.total_trades} 笔",
+            "- 本周主要对账阻断：": f"- 本周主要对账阻断：{top_reconciliation_label}",
+            "- 哪些策略相关性过高：": f"- 哪些策略相关性过高：{recs[1] if len(recs) > 1 else '待补充分组相关性监控'}",
+            "- 哪些仓位不该持有：": f"- 哪些仓位不该持有：{recs[2] if len(recs) > 2 else '高冲突/低置信度仓位'}",
+            "- 哪些规则该收紧：": f"- 哪些规则该收紧：{', '.join(applied_labels[:2]) if applied_labels else 'min_rr / confidence / margin'}",
+            "- 停止做什么：": f"- 停止做什么：{top_mistakes[0] if top_mistakes else '低质量重复开仓'}",
+            "- 继续做什么：": f"- 继续做什么：{best[0] if best else '保留高质量 setup'}",
+            "- 新增做什么：": f"- 新增做什么：{next_steps[0] if next_steps else '补充 OOS 与实盘偏差复核'}",
+            "- 谁负责：": "- 谁负责：AI 学习引擎 / 研究治理 / 人工最终审批",
+        }
+        out: List[str] = []
+        for line in lines:
+            out.append(mapping.get(line, line))
+        return "\n".join(out).strip()
+
+    def _load_weekly_review_template(self) -> str:
+        path = Path(__file__).resolve().parents[3] / "docs" / "templates" / "WEEKLY_RESEARCH_REVIEW.md"
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+        return (
+            "# 每周研究复盘模板\n\n"
+            "## 1. 本周目标\n\n"
+            "- 本周重点主题：\n- 本周已完成：\n- 本周未完成：\n"
+        )
     
     def get_relevant_lessons(self, context: Dict[str, Any], limit: int = 5) -> List[TradingLesson]:
         """获取相关的经验"""
@@ -851,6 +1278,11 @@ class AILearningEngine:
                 for l in self.lessons[-5:]
             ],
             "trace_feedback": dict(self._trace_feedback_summary),
+            "self_review": dict(self._self_review_summary),
+            "tuning_governance": dict(self._last_tuning_summary),
+            "weekly_review": dict(self._weekly_review_summary),
+            "learning_analytics": dict(self._learning_analytics_summary),
+            "retrieval_deck": dict(self._retrieval_deck_summary),
             "config": self.config
         }
 

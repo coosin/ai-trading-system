@@ -121,7 +121,7 @@
           "account"
         ],
         "summary": "Legacy Positions",
-        "description": "兼容老前端：GET /api/v1/positions\n- 返回 positions 列表（与 OKXExchange.get_positions 对齐）\n- 失败时返回 ok=false + message",
+        "description": "兼容老前端：GET /api/v1/positions\n- 返回 positions 列表（与 OKXExchange.get_positions 对齐）\n- 失败时返回 ok=false + message\n- 补充 CCXT 风格别名：contracts≈size、notional≈notional_value（避免监控/前端读缺省字段误判为 0）",
         "operationId": "legacy_positions_api_v1_positions_get",
         "responses": {
           "200": {
@@ -1351,7 +1351,7 @@
           "trades"
         ],
         "summary": "Get Trades",
-        "description": "获取交易历史（真实数据）\n\n参数：\n- range: 时间范围 (24h, 7d, 30d, 90d)\n- symbol: 交易对过滤 (如 BTC/USDT)\n- side: 方向过滤 (buy/sell)\n- limit: 返回数量限制\n- offset: 分页偏移",
+        "description": "获取交易历史（真实数据）\n\n参数：\n- range: 时间范围 (24h, 7d, 30d, 90d)\n- symbol: 交易对过滤 (如 BTC/USDT)\n- side: 方向过滤 (buy/sell)\n- limit: 返回数量限制\n- offset: 分页偏移\n- accurate_only: 仅返回可用于真实收益分析的记录（等价 realized_only+exclude_bootstrap）",
         "operationId": "get_trades_api_v1_trades_get",
         "parameters": [
           {
@@ -1414,6 +1414,526 @@
               "type": "integer",
               "default": 0,
               "title": "Offset"
+            }
+          },
+          {
+            "name": "realized_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Realized Only"
+            }
+          },
+          {
+            "name": "exclude_bootstrap",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Exclude Bootstrap"
+            }
+          },
+          {
+            "name": "exclude_estimated_pnl",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Exclude Estimated Pnl"
+            }
+          },
+          {
+            "name": "accurate_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Accurate Only"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/trades/recent": {
+      "get": {
+        "tags": [
+          "api",
+          "api-v1",
+          "trades"
+        ],
+        "summary": "Get Trades Recent",
+        "operationId": "get_trades_recent_api_v1_trades_recent_get",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "side",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Side"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "realized_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Realized Only"
+            }
+          },
+          {
+            "name": "exclude_bootstrap",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Exclude Bootstrap"
+            }
+          },
+          {
+            "name": "exclude_estimated_pnl",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Exclude Estimated Pnl"
+            }
+          },
+          {
+            "name": "accurate_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Accurate Only"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/trades/history": {
+      "get": {
+        "tags": [
+          "api",
+          "api-v1",
+          "trades"
+        ],
+        "summary": "Get Trades History",
+        "operationId": "get_trades_history_api_v1_trades_history_get",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "30d",
+              "title": "Range"
+            }
+          },
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "side",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Side"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "realized_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Realized Only"
+            }
+          },
+          {
+            "name": "exclude_bootstrap",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Exclude Bootstrap"
+            }
+          },
+          {
+            "name": "exclude_estimated_pnl",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Exclude Estimated Pnl"
+            }
+          },
+          {
+            "name": "accurate_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Accurate Only"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/trades/reconcile": {
+      "get": {
+        "tags": [
+          "api",
+          "api-v1",
+          "trades"
+        ],
+        "summary": "Reconcile Trades With Exchange",
+        "description": "对账系统平仓记录与交易所成交事实（按 order_id + symbol）。",
+        "operationId": "reconcile_trades_with_exchange_api_v1_trades_reconcile_get",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 7,
+              "title": "Days"
+            }
+          },
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 200,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "max_exchange_checks",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 120,
+              "title": "Max Exchange Checks"
+            }
+          },
+          {
+            "name": "exchange_call_timeout_sec",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "default": 2.5,
+              "title": "Exchange Call Timeout Sec"
+            }
+          },
+          {
+            "name": "exclude_bootstrap",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Exclude Bootstrap"
+            }
+          },
+          {
+            "name": "exclude_estimated_pnl",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Exclude Estimated Pnl"
+            }
+          },
+          {
+            "name": "include_time_window_fallback",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Include Time Window Fallback"
+            }
+          },
+          {
+            "name": "fallback_time_window_sec",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 240,
+              "title": "Fallback Time Window Sec"
+            }
+          },
+          {
+            "name": "max_fallback_candidates_per_symbol",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 30,
+              "title": "Max Fallback Candidates Per Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/trades/reconcile/report": {
+      "get": {
+        "tags": [
+          "api",
+          "api-v1",
+          "trades"
+        ],
+        "summary": "Reconcile Trades Report",
+        "description": "一键差异报告（摘要 + TOP 偏差列表），便于快速人工排查。",
+        "operationId": "reconcile_trades_report_api_v1_trades_reconcile_report_get",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 7,
+              "title": "Days"
+            }
+          },
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "top_n",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "title": "Top N"
+            }
+          },
+          {
+            "name": "timeout_sec",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "default": 35.0,
+              "title": "Timeout Sec"
             }
           }
         ],
@@ -1478,6 +1998,106 @@
               "type": "boolean",
               "default": true,
               "title": "Exclude Bootstrap"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/trades/analytics/summary": {
+      "get": {
+        "tags": [
+          "api",
+          "api-v1",
+          "trades"
+        ],
+        "summary": "Trades Analytics Summary",
+        "description": "盈利分析摘要（真实PnL优先）：按策略/按市场状态(regime)/按时段等聚合。\n用于回答“盈利来自哪里、亏损来自哪里、下一步怎么最大化收益”。",
+        "operationId": "trades_analytics_summary_api_v1_trades_analytics_summary_get",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 30,
+              "title": "Days"
+            }
+          },
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "exclude_bootstrap",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Exclude Bootstrap"
+            }
+          },
+          {
+            "name": "accurate_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Accurate Only"
+            }
+          },
+          {
+            "name": "exclude_low_fidelity",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Exclude Low Fidelity"
+            }
+          },
+          {
+            "name": "group_top_n",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 12,
+              "title": "Group Top N"
             }
           }
         ],
@@ -5300,6 +5920,26 @@
               "default": 20,
               "title": "Limit Events"
             }
+          },
+          {
+            "name": "include_deep",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Include Deep"
+            }
+          },
+          {
+            "name": "timeout_sec",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "default": 8.0,
+              "title": "Timeout Sec"
+            }
           }
         ],
         "responses": {
@@ -5341,6 +5981,48 @@
               "type": "integer",
               "default": 50,
               "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/modules/commander/closed-loop-summary": {
+      "get": {
+        "tags": [
+          "modules"
+        ],
+        "summary": "Commander Closed Loop Summary",
+        "description": "交易闭环摘要：\n- 信号/门控/执行/持仓/退出/收益 的一页式诊断\n- 优先面向运行中系统的优化排查，而不是纯历史报表",
+        "operationId": "commander_closed_loop_summary_api_v1_modules_commander_closed-loop-summary_get",
+        "parameters": [
+          {
+            "name": "trace_limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 120,
+              "title": "Trace Limit"
             }
           }
         ],

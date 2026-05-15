@@ -9,7 +9,8 @@
 - Python: `3.12`（与当前 `.venv` 和生产环境一致）
 - 包管理: `pip` + `requirements.txt`
 - API 框架: FastAPI
-- 推荐本地运行入口: `python -m src.main`（完整系统）  
+- 推荐后台/值守入口: `bash scripts/start-openclaw-trading.sh`
+- 推荐前台调试入口: `python -m src.main`
 
 ---
 
@@ -46,6 +47,8 @@ python -m src.main
 bash scripts/start-openclaw-trading.sh
 bash scripts/stop-openclaw-trading.sh
 ```
+
+长期托管时不要直接把 `python -m src.main` 写进 service/supervisor 配置；统一复用启动脚本，确保 `.env` 加载、PID 镜像和日志轮转逻辑生效。
 
 ### 3.3 API-only 启动（仅接口调试）
 
@@ -125,24 +128,7 @@ PYTHONPATH=/home/cool/ai-trading-system .venv/bin/pytest -q tests
 
 ---
 
-## 6. Docker 开发（可选）
-
-Docker 仍受支持，但不再是唯一默认路径：
-
-```bash
-docker compose build trading-system
-docker compose up -d
-docker compose logs -f trading-system
-```
-
-使用 Docker 时，优先参考：
-
-- `docs/OPERATIONS.md`
-- `deploy/HOST_CLASH_EGRESS.md`
-
----
-
-## 7. 文档与接口一致性要求
+## 6. 文档与接口一致性要求
 
 - API 权威来源：运行时 `GET /openapi.json`
 - 文档快照：`docs/API_OPENAPI_FULL.json`
@@ -164,9 +150,8 @@ python3 scripts/check_docs_runtime_consistency.py --runtime
 
 ---
 
-## 8. 常见坑（本地化迁移后）
+## 7. 常见坑（本地化迁移后）
 
 - 不要把 `host.docker.internal` 用在裸机模式。
 - 配置代理时请保持 `NO_PROXY=localhost,127.0.0.1,redis`。
 - 若脚本启动失败，先检查 `.venv` 是否存在，以及 `PYTHONPATH` 是否指向仓库根目录。
-

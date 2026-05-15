@@ -2150,9 +2150,9 @@ class AITradingEngine:
             logger.info(f"🚀 执行交易: {decision.action.value} {decision.symbol} "
                        f"@ {decision.price}, 数量={decision.quantity}")
             
-            # 确定仓位方向
+            # 确定仓位方向（OKX posSide：开/平哪一侧仓位；勿将 CLOSE_SHORT 与 OPEN_LONG 混为 long）
             is_close = decision.action in [TradeAction.CLOSE_LONG, TradeAction.CLOSE_SHORT]
-            if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT]:
+            if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG]:
                 pos_side = "long"
             elif decision.action in [TradeAction.OPEN_SHORT, TradeAction.CLOSE_SHORT]:
                 pos_side = "short"
@@ -2450,7 +2450,13 @@ class AITradingEngine:
                 return
             
             is_open = decision.action in [TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT]
-            side = "long" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "short"
+            side = (
+                "long"
+                if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG]
+                else "short"
+                if decision.action in [TradeAction.OPEN_SHORT, TradeAction.CLOSE_SHORT]
+                else "long"
+            )
             
             if is_open:
                 await memory.add_memory(
@@ -2561,7 +2567,13 @@ class AITradingEngine:
                 logger.warning("止损管理器未初始化，无法创建止损止盈订单")
                 return False
             
-            side = "long" if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT] else "short"
+            side = (
+                "long"
+                if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG]
+                else "short"
+                if decision.action in [TradeAction.OPEN_SHORT, TradeAction.CLOSE_SHORT]
+                else "long"
+            )
             
             from .stop_loss_take_profit import StopLossConfig, TakeProfitConfig, StopType, TakeProfitType
             

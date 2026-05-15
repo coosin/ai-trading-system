@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# 交易环境维护：清理旧轮转日志、抓取残留、源码 __pycache__、重复/测试虚拟环境、构建缓存。
-# 不删除：当前 app.log、最近审计、backups/、data/ 内业务数据、frontend/node_modules。
+# 交易环境维护：清理旧轮转日志、巡检/监控产物、抓取残留、源码 __pycache__、重复/测试虚拟环境、构建缓存。
+# 不删除：当前 app.log、最近审计、backups/、data/ 内业务数据、frontend/node_modules、openclaw-trading.pid。
 # 环境变量：
 #   OPENCLAW_REMOVE_DOTVENV=1  若存在 venv/ 则删除重复的 .venv/（与 setup_environment / DEVELOPMENT 一致）
 #   OPENCLAW_REMOVE_TEST_VENV=1 删除 .venv_test/（可由 run_full_test_suite.sh 再生）
 #   OPENCLAW_PIP_CACHE_PURGE=1   对当前用户执行 pip cache purge
-#   OPENCLAW_DOCKER_BUILDER_PRUNE=1  docker builder prune -f
+#   HEALTH_LOG_KEEP_DAYS=14      删除 logs/health 下超过天数的历史日志
+#   LIVE_MONITOR_KEEP_DAYS=7     删除 runtime/live_stability_monitor.* 历史产物
+#   REALTIME_WATCH_MAX_MB=512    runtime/realtime_watch.jsonl 超过阈值时 gzip 归档并截断
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,7 +18,10 @@ TRADING_LOG_KEEP="${TRADING_LOG_KEEP:-12}"
 OPENCLAW_REMOVE_DOTVENV="${OPENCLAW_REMOVE_DOTVENV:-0}"
 OPENCLAW_REMOVE_TEST_VENV="${OPENCLAW_REMOVE_TEST_VENV:-0}"
 OPENCLAW_PIP_CACHE_PURGE="${OPENCLAW_PIP_CACHE_PURGE:-0}"
-OPENCLAW_DOCKER_BUILDER_PRUNE="${OPENCLAW_DOCKER_BUILDER_PRUNE:-0}"
+HEALTH_LOG_KEEP_DAYS="${HEALTH_LOG_KEEP_DAYS:-14}"
+LIVE_MONITOR_KEEP_DAYS="${LIVE_MONITOR_KEEP_DAYS:-7}"
+REALTIME_WATCH_MAX_MB="${REALTIME_WATCH_MAX_MB:-512}"
+RUNTIME_DIR="$ROOT/runtime"
 
 echo "[cleanup] ROOT=$ROOT"
 
@@ -35,6 +40,36 @@ if [[ -d "$LOGDIR" ]]; then
   if [[ -d "$LOGDIR/audit" ]]; then
     find "$LOGDIR/audit" -maxdepth 1 -type f -name 'audit_*.jsonl' -mtime +"$AUDIT_KEEP_DAYS" -print -delete 2>/dev/null || true
     echo "[cleanup] audit jsonl older than ${AUDIT_KEEP_DAYS}d removed (if any)"
+  fi
+
+  # 3b) health suite logs
+  if [[ -d "$LOGDIR/health" ]]; then
+    find "$LOGDIR/health" -maxdepth 1 -type f \( -name 'full_system_audit_*.log' -o -name 'live_stability_monitor_*.log' \) -mtime +"$HEALTH_LOG_KEEP_DAYS" -print -delete 2>/dev/null || true
+    echo "[cleanup] health logs older than ${HEALTH_LOG_KEEP_DAYS}d removed (if any)"
+  fi
+fi
+
+# 3c) runtime monitor artifacts
+if [[ -d "$RUNTIME_DIR" ]]; then
+  find "$RUNTIME_DIR" -maxdepth 1 -type f \( -name 'live_stability_monitor.*.jsonl' -o -name 'live_stability_monitor.*.summary.json' \) -mtime +"$LIVE_MONITOR_KEEP_DAYS" -print -delete 2>/dev/null || true
+  echo "[cleanup] live stability monitor artifacts older than ${LIVE_MONITOR_KEEP_DAYS}d removed (if any)"
+
+  # large continuous watch file: keep one compressed archive then truncate current file
+  REALTIME_WATCH="$RUNTIME_DIR/realtime_watch.jsonl"
+  if [[ -f "$REALTIME_WATCH" ]]; then
+    max_bytes=$((REALTIME_WATCH_MAX_MB * 1024 * 1024))
+    sz=$(stat -c%s "$REALTIME_WATCH" 2>/dev/null || stat -f%z "$REALTIME_WATCH" 2>/dev/null || echo 0)
+    if ((sz > max_bytes)); then
+      ts=$(date +%Y%m%d_%H%M%S)
+      gzip -c "$REALTIME_WATCH" >"$RUNTIME_DIR/realtime_watch.jsonl.$ts.gz" || true
+      : >"$REALTIME_WATCH"
+      echo "[cleanup] rotated large realtime_watch.jsonl -> realtime_watch.jsonl.$ts.gz"
+    fi
+  fi
+
+  if ls "$RUNTIME_DIR"/realtime_watch.jsonl.*.gz >/dev/null 2>&1; then
+    find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'realtime_watch.jsonl.*.gz' -mtime +"$LIVE_MONITOR_KEEP_DAYS" -print -delete 2>/dev/null || true
+    echo "[cleanup] archived realtime_watch gzip older than ${LIVE_MONITOR_KEEP_DAYS}d removed (if any)"
   fi
 fi
 
@@ -64,12 +99,6 @@ if [[ "$OPENCLAW_PIP_CACHE_PURGE" == "1" ]]; then
     pip cache purge 2>/dev/null || python3 -m pip cache purge 2>/dev/null || true
     echo "[cleanup] pip cache purge attempted"
   fi
-fi
-
-# 4e) Docker buildkit 悬空缓存（不删在用镜像）
-if [[ "$OPENCLAW_DOCKER_BUILDER_PRUNE" == "1" ]] && command -v docker >/dev/null 2>&1; then
-  docker builder prune -f 2>/dev/null || true
-  echo "[cleanup] docker builder prune -f done"
 fi
 
 # 5) 可选：压缩超大 app.log（>80MB 时 gzip 归档一份并截断）

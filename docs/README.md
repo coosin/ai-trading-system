@@ -2,10 +2,7 @@
 
 本目录为**正式文档集**。根目录 [README.md](../README.md) 仅保留简介与快速开始。
 
-当前仓库默认维护两种运行模式：
-
-- **本地化运行（当前主路径）**：`.venv` + `python -m src.main`
-- **Docker 运行（兼容路径）**：`docker compose ...`
+当前仓库以**本地化运行**为主路径：`scripts/start-openclaw-trading.sh`（或调用同一脚本的 systemd）。`python -m src.main` 仅保留给前台调试，不建议作为长期托管入口。
 
 涉及地址/代理的说明请优先看 `docs/OPERATIONS.md` 的“运行模式选择”章节。
 
@@ -19,7 +16,13 @@
 | [**API_REFERENCE.md**](./API_REFERENCE.md) | API 主文档：REST/WebSocket、鉴权、对接建议；含 **API 基址**（`OPENCLAW_API_BASE`）、**`surface/registry`** 的 `read_pipeline` / `api_base_env` 规范 |
 | [**TRADING_TUNING_GUIDE.md**](./TRADING_TUNING_GUIDE.md) | 交易参数调优：开平仓门控、仓位、SLTP、学习闭环 |
 | [**TRADING_DEBUG_PLAYBOOK.md**](./TRADING_DEBUG_PLAYBOOK.md) | 交易调试手册：开平仓排障、诊断路径、复测流程 |
+| [**RESEARCH_EDUCATION_UPGRADE_BLUEPRINT_2026.md**](./RESEARCH_EDUCATION_UPGRADE_BLUEPRINT_2026.md) | 研究与教育升级蓝图：把学习科学方法嵌入交易研发、复盘和治理流程 |
+| [**OPENCLAW_AGENTIC_CRYPTO_UPGRADE_PLAN_2026.md**](./OPENCLAW_AGENTIC_CRYPTO_UPGRADE_PLAN_2026.md) | 面向 AI 智能体、流式数据与加密市场结构的 OpenClaw 定制升级方案 |
 | [**CHANGELOG.md**](./CHANGELOG.md) | 变更记录 |
+
+配套模板：
+
+- [**templates/WEEKLY_RESEARCH_REVIEW.md**](./templates/WEEKLY_RESEARCH_REVIEW.md)：每周研究复盘模板，现已纳入 `workflow_focus` / 对账阻断复盘位
 
 ## 2) 专题文档（按需）
 
@@ -31,7 +34,7 @@
 | [**MCP_BASELINE.md**](./MCP_BASELINE.md) | MCP 基线与落地建议 |
 | [**OKX_SOURCE_REFERENCE_MAP.md**](./OKX_SOURCE_REFERENCE_MAP.md) | OKX 字段/端点映射 |
 | [**memory/MEMORY_LIBRARY_GUIDE.md**](./memory/MEMORY_LIBRARY_GUIDE.md) | Memory 模块配置与运维要点 |
-| [**../deploy/HOST_CLASH_EGRESS.md**](../deploy/HOST_CLASH_EGRESS.md) | 宿主机 Clash 出站与容器代理规范 |
+| [**../deploy/HOST_CLASH_EGRESS.md**](../deploy/HOST_CLASH_EGRESS.md) | 宿主机 Clash 出站与应用进程代理约定 |
 
 ## 3) 历史归档（只读）
 

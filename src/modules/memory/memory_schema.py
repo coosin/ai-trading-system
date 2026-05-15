@@ -24,6 +24,16 @@ C_USER_PREFERENCE = "user_preference"
 C_SYSTEM_STATE = "system_state"
 C_DAILY_SUMMARY = "daily_summary"
 C_LESSON_LEARNED = "lesson_learned"
+C_MARKET_REGIME_CASE = "market_regime_case"
+C_EXECUTION_INCIDENT = "execution_incident"
+C_STRATEGY_DRIFT_CASE = "strategy_drift_case"
+C_AGENT_MISJUDGMENT_CASE = "agent_misjudgment_case"
+C_TUNING_ATTEMPT = "tuning_attempt"
+C_TUNING_RESULT = "tuning_result"
+C_APPROVED_RULE_CHANGE = "approved_rule_change"
+C_REJECTED_RULE_CHANGE = "rejected_rule_change"
+C_WEEKLY_LESSON = "weekly_lesson"
+C_KNOWLEDGE_DOCUMENT = "knowledge_document"
 
 
 def now_iso() -> str:
@@ -145,4 +155,3 @@ def attach_idempotency(metadata: Dict[str, Any], key: Optional[str]) -> Dict[str
         metadata = dict(metadata)
         metadata["idempotency_key"] = key
     return metadata
-

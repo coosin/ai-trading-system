@@ -272,6 +272,8 @@ Python 侧建议调用 **`default_openclaw_api_base()`** / **`openclaw_api_url("
     - `data.execution_safe_recovery`：已自动执行的安全恢复动作（仅刷新/保护，不直接撤单或强平）
     - `data.decision_traces`：最近决策轨迹样本
     - `data.trace_learning_feedback`：学习引擎基于轨迹的反馈摘要
+    - `data.signal_and_guard.workflow_focus`：最近 decision traces 的主卡点（`top_workflow_stage` / `top_workflow_status`）
+    - `data.diagnosis_hints`：现会追加 `decision workflow 卡点` 摘要，便于值守时快速判断问题是策略、执行还是 reconciliation
   - 支持 `limit_events` 参数控制 `execution_gateway.recent_events` 窗口大小。
 
 - **`GET /api/v1/modules/commander/decision-traces`**
@@ -279,6 +281,7 @@ Python 侧建议调用 **`default_openclaw_api_base()`** / **`openclaw_api_url("
   - 用途：
     - 查看 `guard_rejected` / `execution_failed` / `reconciliation_blocked` 分布
     - 查看 `top_guard_reasons` / `top_execution_failures` / `top_reconciliation_blocks`
+    - 查看 `top_workflow_stages` / `top_workflow_statuses`，判断当前主阻塞点是不是 `reconciliation -> reconcile_blocked`
     - 提取最近轨迹样本用于排障或验收
 
 - **`GET /api/v1/modules/commander/decision-traces/{trace_id}`**

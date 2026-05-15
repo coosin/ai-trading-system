@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenClaw Live Stability Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cool/ai-trading-system
+EnvironmentFile=-/home/cool/ai-trading-system/.env
+ExecStart=/home/cool/ai-trading-system/scripts/run_scheduled_health_suite.sh monitor
+SuccessExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

@@ -311,6 +311,7 @@ class TradeHistoryService:
                     tr.metadata["pnl_estimated"] = False
             if changed:
                 self._invalidate_stats_cache()
+                await self._rewrite_backup_jsonl()
         if self.db_storage:
             suffix = f"\n[truth_sync:{datetime.now().isoformat()}]"
             rows_updated = await self.db_storage.update_trade_truth_by_order_id(
@@ -993,6 +994,16 @@ class TradeHistoryService:
                 await f.write(line + '\n')
         except Exception as e:
             logger.warning(f"备份到JSONL失败: {e}")
+
+    async def _rewrite_backup_jsonl(self) -> None:
+        """用当前缓存重建 JSONL 备份，供真值回填后保持账本一致。"""
+        try:
+            lines = [json.dumps(asdict(trade), ensure_ascii=False) for trade in self._cache]
+            payload = ("\n".join(lines) + "\n") if lines else ""
+            async with aiofiles.open(self.backup_file, 'w', encoding='utf-8') as f:
+                await f.write(payload)
+        except Exception as e:
+            logger.warning(f"重写JSONL备份失败: {e}")
     
     def _invalidate_stats_cache(self):
         """使统计缓存失效"""

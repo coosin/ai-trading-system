@@ -104,6 +104,8 @@
 - `data.execution_reconciliation`
 - `data.execution_reconciliation_protection`
 - `data.execution_safe_recovery`
+- `data.signal_and_guard.workflow_focus`
+- `data.diagnosis_hints`（是否出现 `decision workflow 卡点`）
 - `data.analysis_pipeline_assessment.market_analysis`
 - `data.decision_contract_integrity`
 - `data.strategy_distribution_30d`
@@ -112,6 +114,12 @@
 
 - `GET /api/v1/modules/commander/decision-traces`
 - `GET /api/v1/modules/commander/decision-traces/{trace_id}`
+
+优先观察：
+
+- `top_workflow_stages`
+- `top_workflow_statuses`
+- `top_reconciliation_blocks`
 
 ### 4.3 学习闭环联调
 

@@ -4,15 +4,15 @@ from src.modules.memory.memory_gateway import MemoryGateway
 
 
 class _FakeEntry:
-    def __init__(self, entry_id, content, importance, metadata, created_at, access_count=0):
+    def __init__(self, entry_id, content, importance, metadata, created_at, access_count=0, category=None, layer=None):
         self.id = entry_id
         self.content = content
         self.importance = importance
         self.metadata = metadata
         self.created_at = created_at
         self.access_count = access_count
-        self.category = "conversation"
-        self.layer = "working"
+        self.category = category
+        self.layer = layer
         self.tags = set()
 
 
@@ -34,6 +34,8 @@ class _FakeBackend:
             metadata=metadata or {},
             created_at=self._dt.now(),
             access_count=0,
+            category=category,
+            layer=layer,
         )
         return entry_id
 
@@ -115,3 +117,17 @@ async def test_memory_gateway_add_memory_accepts_legacy_kwargs(tmp_path):
     assert recalled[0].importance == 0.9
     assert recalled[0].metadata.get("priority") == "high"
     assert recalled[0].metadata.get("tags") == ["ai_strategy", "auto_generated"]
+
+
+@pytest.mark.asyncio
+async def test_memory_gateway_layered_overview(tmp_path):
+    backend = _FakeBackend()
+    gateway = await MemoryGateway.create(backend, str(tmp_path))
+
+    await gateway.add_memory("knowledge_document", "rule doc", metadata={"knowledge_type": "risk_rule"})
+    await gateway.add_memory("weekly_lesson", "weekly insight", metadata={"kind": "weekly_lesson"})
+    await gateway.add_memory("daily_summary", "today summary", metadata={"kind": "daily_summary"})
+
+    overview = gateway.get_layered_memory_overview()
+    assert overview["semantic_layers"]["knowledge_base"] >= 1
+    assert overview["semantic_layers"]["long_term_experience"] >= 1

@@ -4,18 +4,15 @@
 
 测什么：
   - DNS、TCP:443、HTTPS OKX public/time（各跑多轮取中位数）
-  - 同一 HTTPS 用「尊重环境 HTTP(S)_PROXY」与「强制不走 HTTP 代理」各测一轮（对比 TUN 下是否应关容器内 HTTP_PROXY）
+  - 同一 HTTPS 用「尊重环境 HTTP(S)_PROXY」与「强制不走 HTTP 代理」各测一轮（对比 TUN 下是否应关闭进程内 HTTP_PROXY）
   - 可选：交易 API /market/ticker 是否 exchange 还是 fallback
 
 怎么用（宿主机上，每种代理拓扑各跑一次，换 --label）：
   # 旧：仅 bridge + HTTP_PROXY（典型老配置）
   python3 scripts/proxy_mode_network_benchmark.py --label old_bridge_http_proxy --runs 7 --out /tmp/net_old.json
 
-  # 新：宿主机开 TUN 后，宿主机上测（无容器）
+  # 新：宿主机开 TUN 后复测
   python3 scripts/proxy_mode_network_benchmark.py --label host_tun_on --runs 7 --out /tmp/net_tun_host.json
-
-  # 新：容器内（与交易进程一致的环境）
-  docker exec openclaw-trading python3 /app/scripts/proxy_mode_network_benchmark.py --label in_container --runs 5 --out /tmp/net_in_ct.json
 
   # 对比改善幅度
   python3 scripts/proxy_mode_network_benchmark.py --compare /tmp/net_old.json /tmp/net_tun_host.json

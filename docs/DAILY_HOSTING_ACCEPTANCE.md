@@ -89,7 +89,60 @@ curl -s 'http://localhost:8000/api/v1/trade/events?limit=20'
 
 ---
 
-## 4) 失败时处理（固定动作）
+## 4) workflow 卡点验收（新增，推荐每日执行）
+
+### 4.1 先看总诊断里的 `workflow_focus`
+
+```bash
+curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/trading-diagnosis'
+```
+
+重点观察：
+
+- `data.signal_and_guard.workflow_focus.top_stage`
+- `data.signal_and_guard.workflow_focus.top_status`
+- `data.diagnosis_hints`
+
+通过标准：
+
+- 能明确看出最近主卡点属于哪一段 workflow
+- 如果出现 `decision workflow 卡点`，提示内容与当前故障面一致
+
+### 4.2 再看 `decision-traces` 是否与总诊断一致
+
+```bash
+curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/decision-traces'
+```
+
+重点观察：
+
+- `top_workflow_stages`
+- `top_workflow_statuses`
+- `top_reconciliation_blocks`
+
+通过标准：
+
+- `decision-traces` 聚合结果与 `trading-diagnosis.data.signal_and_guard.workflow_focus` 一致
+- 如果主卡点是 `reconciliation -> reconcile_blocked`，应能同时看到具体阻断原因，例如 `orphan_order_guard`
+
+### 4.3 值守分流规则
+
+看到不同卡点时，默认按下面顺序处理：
+
+- `analysis` / `intent`
+  - 先找研究输入、市场结构、提示词/证据链异常
+- `guard`
+  - 先找风控阈值、仓位限制、门控冲突
+- `execution:open` / `execution:close`
+  - 先找交易所可达性、滑点、下单失败、价格保护
+- `reconciliation`
+  - 先找本地持仓同步、孤儿订单、对账保护锁、状态漂移
+
+不要在 `reconciliation` 卡点还没解除时，直接去放宽策略阈值。
+
+---
+
+## 5) 失败时处理（固定动作）
 
 任一关键项失败时，按顺序处理：
 
@@ -122,7 +175,7 @@ python3 scripts/network_connectivity_smoke.py
 
 ---
 
-## 5) 每日最小执行模板（建议直接照抄）
+## 6) 每日最小执行模板（建议直接照抄）
 
 ```bash
 BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
@@ -130,6 +183,8 @@ python3 scripts/verify.py trading --base-url "$BASE_URL"
 curl -s "$BASE_URL/api/v1/modules/commander/hosting-mode"
 curl -s "$BASE_URL/api/v1/modules/commander/risk-redlines"
 curl -s "$BASE_URL/api/v1/modules/commander/account-diagnostics"
+curl -s "$BASE_URL/api/v1/modules/commander/trading-diagnosis"
+curl -s "$BASE_URL/api/v1/modules/commander/decision-traces"
 curl -s "$BASE_URL/api/v1/trade/events?limit=20"
 ```
 

@@ -25,20 +25,39 @@ This directory was aggressively cleaned and consolidated.
   - Proxy mode benchmark checks.
 - `startup_acceptance.py`
   - Startup acceptance checks.
+- `full_system_audit.py`
+  - One-shot full-system audit using project `.venv`.
+- `live_stability_monitor.py`
+  - Continuous live stability observation for health drift / disconnects / LLM fallback growth.
+- `health_suite_summary.py`
+  - Aggregates the latest audit/monitor artifacts into a markdown summary.
+- `health_suite_status.py`
+  - Emits a compact `GREEN` / `YELLOW` / `RED` JSON status for automation and quick checks.
+- `run_scheduled_health_suite.sh`
+  - Wrapper for scheduled `audit` / `monitor` runs; writes outputs to `logs/health/` and `runtime/`.
 
 ## Kept Operational Shell Scripts
 
-- `deploy_production_stack.sh`
 - `run_full_test_suite.sh`
 - `verify_full_stack_network.sh`
-- `verify_okx_container.sh`
 - `check_trading_host_health.sh`
 - `cleanup_trading_workspace.sh`
-- `diagnose_container_net.sh`
-- `recover_trading_hostnet.sh`
 - `start-openclaw-trading.sh`
 - `stop-openclaw-trading.sh`
 - `openclaw_auth_selfcheck.sh`
+
+## Cleanup Notes
+
+- `cleanup_trading_workspace.sh` now also prunes:
+  - `logs/health/full_system_audit_*.log`
+  - `logs/health/live_stability_monitor_*.log`
+  - `runtime/live_stability_monitor.*.jsonl`
+  - `runtime/live_stability_monitor.*.summary.json`
+- It can rotate oversized `runtime/realtime_watch.jsonl` into `gzip` archives.
+- Useful env vars:
+  - `HEALTH_LOG_KEEP_DAYS`
+  - `LIVE_MONITOR_KEEP_DAYS`
+  - `REALTIME_WATCH_MAX_MB`
 
 ## Removed in Cleanup
 
@@ -46,4 +65,3 @@ This directory was aggressively cleaned and consolidated.
 - One-off migration/archive scripts (`memory_*`, `migrate_sltp_legacy_pending.py`).
 - Dangerous code mutators (`clean_system.py`, `code_cleaner.py`, `optimize_system.py`).
 - Old-path or secret-bearing scripts (`health_check.sh`, `daily_backup.sh`, `update_clash_subscriptions.sh`).
-

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run OpenClaw full-system audit every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+AccuracySec=30s
+Persistent=true
+Unit=openclaw-health-audit.service
+
+[Install]
+WantedBy=timers.target

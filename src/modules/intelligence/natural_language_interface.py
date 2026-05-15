@@ -38,6 +38,7 @@ except ImportError as e:
     logging.warning(f"技能包模块导入失败: {e}")
 
 logger = logging.getLogger(__name__)
+_PERSONALITY_MISSING_LOGGED = False
 
 
 class NaturalLanguageInterface:
@@ -243,7 +244,10 @@ class NaturalLanguageInterface:
             logger.info(f"✅ 系统提示词已更新，长度: {len(self.system_prompt)} 字符")
         else:
             self.system_prompt = "你是一个专业的量化交易助手，名叫小智。你专业、友善、有同理心。"
-            logger.warning("⚠️ 未找到人格文件，使用默认提示词")
+            global _PERSONALITY_MISSING_LOGGED
+            if not _PERSONALITY_MISSING_LOGGED:
+                logger.info("未找到人格文件，使用默认提示词")
+                _PERSONALITY_MISSING_LOGGED = True
     
     def _get_personality_prompt(self) -> str:
         return self.system_prompt

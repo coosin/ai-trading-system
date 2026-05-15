@@ -15,8 +15,12 @@ Single narrow exit for live swap orders (S1 execution spine).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import os
+from pathlib import Path
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -37,6 +41,27 @@ _AUXILIARY_WRITE_SOURCES: Set[str] = {
     "stop_loss_take_profit",
     "manual",
 }
+
+
+def _default_recent_events_path() -> str:
+    p = (os.getenv("OPENCLAW_EXECUTION_GATEWAY_RECENT_EVENTS_JSON") or "").strip()
+    if p:
+        return p
+    root = Path(__file__).resolve().parents[3]
+    return str(root / "data" / "runtime" / "execution_gateway_recent_events.json")
+
+
+def _normalize_position_slot_symbol(raw: Any) -> str:
+    s = str(raw or "").strip().upper()
+    if not s:
+        return ""
+    s = s.replace("-SWAP", "").replace("/SWAP", "")
+    s = s.replace("-", "/")
+    if "/USDT" in s:
+        return s.split("/USDT")[0] + "/USDT"
+    if s.endswith("USDT") and "/" not in s:
+        return s[:-4] + "/USDT"
+    return s
 
 
 @dataclass
@@ -117,6 +142,49 @@ class ExecutionGateway:
             "close_ok": 0,
             "close_fail": 0,
         }
+        self._recent_events_persist_path: Optional[str] = None
+        disabled = str(os.getenv("OPENCLAW_EXECUTION_GATEWAY_RECENT_EVENTS_PERSIST", "1")).strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        if not disabled:
+            self._recent_events_persist_path = _default_recent_events_path()
+            self._load_recent_events_from_disk()
+
+    def _load_recent_events_from_disk(self) -> None:
+        if not self._recent_events_persist_path:
+            return
+        fp = Path(self._recent_events_persist_path)
+        if not fp.is_file():
+            return
+        try:
+            payload = json.loads(fp.read_text(encoding="utf-8"))
+            items = payload.get("recent_events") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                return
+            cleaned = [row for row in items if isinstance(row, dict)]
+            self._snapshot.recent_events = cleaned[-self._recent_events_limit :]
+        except Exception as e:
+            logger.warning("execution_gateway recent events load failed: %s", e)
+
+    def _persist_recent_events_to_disk(self) -> None:
+        if not self._recent_events_persist_path:
+            return
+        try:
+            fp = Path(self._recent_events_persist_path)
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "recent_events": list(self._snapshot.recent_events[-self._recent_events_limit :]),
+            }
+            fd, tmp_name = tempfile.mkstemp(prefix=".eg_recent_", suffix=".tmp", dir=str(fp.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                json.dump(payload, tmp, ensure_ascii=False)
+            os.replace(tmp_name, str(fp))
+        except Exception as e:
+            logger.warning("execution_gateway recent events persist failed: %s", e)
 
     def _metric_inc(self, key: str) -> None:
         self._policy_metrics[key] = int(self._policy_metrics.get(key, 0)) + 1
@@ -168,6 +236,7 @@ class ExecutionGateway:
 
             self._snapshot.recent_events.append(e)
             self._snapshot.recent_events = self._snapshot.recent_events[-self._recent_events_limit :]
+            self._persist_recent_events_to_disk()
         except Exception:
             pass
 
@@ -284,6 +353,46 @@ class ExecutionGateway:
                 pass
         return "semi_auto"
 
+    def _ai_brain_policy_sync(self) -> Dict[str, Any]:
+        mc = self._mc
+        try:
+            cm = getattr(mc, "config_manager", None) if mc else None
+            if cm and hasattr(cm, "get_config_sync"):
+                out = cm.get_config_sync("ai_brain", {}) or {}
+                if isinstance(out, dict):
+                    return out
+        except Exception:
+            pass
+        return {}
+
+    def _allow_replace_worst_on_full_positions(self) -> bool:
+        pol = self._ai_brain_policy_sync()
+        try:
+            if isinstance(pol.get("policy"), dict):
+                v = pol.get("policy", {}).get("enable_replace_worst_on_full_positions")
+                if v is not None:
+                    return bool(v)
+            v = pol.get("enable_replace_worst_on_full_positions")
+            if v is not None:
+                return bool(v)
+        except Exception:
+            pass
+        return True
+
+    def _replace_worst_min_confidence(self) -> float:
+        pol = self._ai_brain_policy_sync()
+        try:
+            if isinstance(pol.get("policy"), dict):
+                v = pol.get("policy", {}).get("replace_worst_min_confidence")
+                if v is not None:
+                    return float(v)
+            v = pol.get("replace_worst_min_confidence")
+            if v is not None:
+                return float(v)
+        except Exception:
+            pass
+        return 0.75
+
     def _risk_redlines(self) -> Dict[str, Any]:
         mc = self._mc
         if mc and hasattr(mc, "get_risk_redlines"):
@@ -326,6 +435,9 @@ class ExecutionGateway:
             if max_positions > 0 and hasattr(ex, "get_positions"):
                 ps = await ex.get_positions()
                 non_zero = 0
+                target_slot = _normalize_position_slot_symbol(symbol)
+                has_target_slot = False
+                live_positions: List[Dict[str, Any]] = []
                 for p in ps or []:
                     if not isinstance(p, dict):
                         continue
@@ -335,8 +447,22 @@ class ExecutionGateway:
                         v = 0.0
                     if abs(v) > 1e-12:
                         non_zero += 1
-                if non_zero >= max_positions:
-                    return f"风控红线拦截：持仓数 {non_zero} 已达到上限 {max_positions}"
+                        live_positions.append(p)
+                        if target_slot and _normalize_position_slot_symbol(p.get("symbol") or p.get("instId")) == target_slot:
+                            has_target_slot = True
+                if non_zero >= max_positions and not has_target_slot:
+                    release_candidates = self._build_slot_release_candidates(live_positions)
+                    extra = ""
+                    if release_candidates:
+                        preview = ", ".join(
+                            f"{str(x.get('symbol') or '')}({str(x.get('side') or '')})"
+                            for x in release_candidates[:2]
+                        )
+                        if preview:
+                            extra = f"；候选释放槽位: {preview}"
+                        if context is not None and isinstance(context, dict):
+                            context["slot_release_candidates"] = release_candidates
+                    return f"风控红线拦截：持仓数 {non_zero} 已达到上限 {max_positions}{extra}"
         except Exception:
             pass
         return None
@@ -346,6 +472,168 @@ class ExecutionGateway:
         if src in _AUXILIARY_WRITE_SOURCES:
             return True
         return src == swo
+
+    def _build_slot_release_candidates(self, positions: List[Dict[str, Any]], *, limit: int = 3) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        recent_sltp: Dict[str, int] = {}
+        try:
+            slm = getattr(self._mc, "stop_loss_manager", None) if self._mc else None
+            stats = slm.get_stats() if slm and hasattr(slm, "get_stats") else {}
+            for ev in list((stats or {}).get("sr_recent_events") or []):
+                sym = _normalize_position_slot_symbol(ev.get("symbol"))
+                if sym:
+                    recent_sltp[sym] = int(recent_sltp.get(sym, 0)) + 1
+        except Exception:
+            recent_sltp = {}
+
+        for p in positions or []:
+            if not isinstance(p, dict):
+                continue
+            slot_symbol = _normalize_position_slot_symbol(p.get("symbol") or p.get("instId"))
+            if not slot_symbol:
+                continue
+            try:
+                size = abs(float(p.get("size", p.get("pos", 0)) or 0.0))
+            except Exception:
+                size = 0.0
+            if size <= 1e-12:
+                continue
+            side = str(p.get("side") or "").strip().lower()
+            pnl = float(p.get("unrealized_pnl", p.get("upl", 0.0)) or 0.0)
+            pnl_ratio = float(p.get("unrealized_pnl_ratio", 0.0) or 0.0)
+            notional = float(p.get("notional_value", p.get("notional", 0.0)) or 0.0)
+            event_hits = int(recent_sltp.get(slot_symbol, 0) or 0)
+
+            release_score = 0.0
+            if abs(pnl_ratio) <= 0.02:
+                release_score += 0.45
+            elif abs(pnl_ratio) <= 0.05:
+                release_score += 0.25
+            if pnl <= 0:
+                release_score += 0.2
+            if notional <= 75:
+                release_score += 0.15
+            elif notional <= 250:
+                release_score += 0.08
+            if event_hits > 0:
+                release_score += min(0.2, 0.08 * event_hits)
+
+            items.append(
+                {
+                    "symbol": slot_symbol,
+                    "side": side or "unknown",
+                    "unrealized_pnl": round(pnl, 6),
+                    "unrealized_pnl_ratio": round(pnl_ratio, 6),
+                    "notional_value": round(notional, 6),
+                    "recent_sltp_events": event_hits,
+                    "release_score": round(release_score, 4),
+                }
+            )
+
+        items.sort(
+            key=lambda x: (
+                -float(x.get("release_score") or 0.0),
+                abs(float(x.get("unrealized_pnl_ratio") or 0.0)),
+                abs(float(x.get("unrealized_pnl") or 0.0)),
+                float(x.get("notional_value") or 0.0),
+            )
+        )
+        return items[: max(1, int(limit or 1))]
+
+    async def _attempt_replace_worst_on_full_positions(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        size: float,
+        leverage: int,
+        source: str,
+        reason: str,
+        margin_mode: str,
+        price: Optional[float],
+        context: Optional[Dict[str, Any]],
+        swo: str,
+    ) -> Optional[Dict[str, Any]]:
+        ctx = context if isinstance(context, dict) else {}
+        if ctx.get("slot_release_retry"):
+            return None
+        if not self._allow_replace_worst_on_full_positions():
+            return None
+        if str(source or "").strip().lower() != str(swo or "").strip().lower():
+            return None
+        conf = None
+        try:
+            conf = float(ctx.get("confidence"))
+        except Exception:
+            conf = None
+        if conf is None:
+            try:
+                conf = float((self._semantic_context_from_context(ctx) or {}).get("decision_confidence"))
+            except Exception:
+                conf = None
+        if conf is None:
+            return None
+        if conf < self._replace_worst_min_confidence():
+            return None
+
+        semantic = self._semantic_context_from_context(ctx)
+        if str(semantic.get("risk_verdict") or "").lower() == "deny":
+            return None
+        if str(semantic.get("execution_recommendation") or "").lower() == "wait_or_slice":
+            return None
+
+        release_candidates = list(ctx.get("slot_release_candidates") or [])
+        if not release_candidates:
+            return None
+        candidate = release_candidates[0] if isinstance(release_candidates[0], dict) else None
+        if not candidate:
+            return None
+        if float(candidate.get("release_score") or 0.0) < 0.55:
+            return None
+        cand_symbol = str(candidate.get("symbol") or "").strip()
+        cand_side = str(candidate.get("side") or "").strip().lower()
+        if not cand_symbol or not cand_side:
+            return None
+
+        close_ctx = dict(ctx)
+        close_ctx.update(
+            {
+                "slot_release_retry": True,
+                "slot_release_target_symbol": cand_symbol,
+                "slot_release_target_side": cand_side,
+                "slot_release_incoming_symbol": str(symbol),
+                "slot_release_incoming_side": str(side),
+                "slot_release_reason": "replace_worst_on_full_positions",
+            }
+        )
+        close_res = await self.close_swap(
+            cand_symbol,
+            cand_side,
+            None,
+            source,
+            "replace_worst_on_full_positions",
+            context=close_ctx,
+        )
+        close_ok = bool(isinstance(close_res, dict) and close_res.get("success"))
+        if not close_ok:
+            return None
+
+        retry_ctx = dict(ctx)
+        retry_ctx["slot_release_retry"] = True
+        retry_ctx["slot_release_recycled_symbol"] = cand_symbol
+        retry_ctx["slot_release_recycled_side"] = cand_side
+        retry_ctx["slot_release_recycled_score"] = candidate.get("release_score")
+        return await self.open_swap(
+            symbol,
+            side,
+            size,
+            leverage,
+            source,
+            f"{reason}_replace_worst_retry",
+            margin_mode=margin_mode,
+            price=price,
+            context=retry_ctx,
+        )
 
     def _allow_open(self, source: str, swo: str) -> bool:
         """开仓仅允许 SWO 或 manual；强制单链路，杜绝旁路开仓。"""
@@ -442,6 +730,133 @@ class ExecutionGateway:
             return ""
         tid = context.get("trace_id") or context.get("TraceId") or context.get("traceId")
         return str(tid or "").strip()
+
+    @staticmethod
+    def _semantic_context_from_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        ctx = context if isinstance(context, dict) else {}
+        raw = ctx.get("semantic_context")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _record_execution_semantics(
+        self,
+        *,
+        context: Optional[Dict[str, Any]],
+        status: str,
+        detail: str,
+        op: str,
+        symbol: str,
+    ) -> None:
+        dts = self._decision_trace_store()
+        if not dts:
+            return
+        trace_id = self._trace_id_from_context(context)
+        if not trace_id:
+            return
+        semantic = self._semantic_context_from_context(context)
+        extras = {
+            **semantic,
+            "symbol": symbol,
+            "execution_recommendation": semantic.get("execution_recommendation")
+            or ("completed" if status == "success" else "review_execution"),
+        }
+        dts.record_execution_result(
+            trace_id=trace_id,
+            status=status,
+            detail=detail,
+            source="execution_gateway",
+            op=op,
+            extras=extras,
+        )
+        dts.record_agent_verdict(
+            trace_id=trace_id,
+            agent_name="execution_gateway",
+            verdict={
+                "agent_name": "execution_gateway",
+                "summary": f"{op}:{status}",
+                "structured_verdict": {
+                    "execution_status": status,
+                    "execution_detail": detail,
+                    "symbol": symbol,
+                },
+                "confidence": 1.0 if status == "success" else 0.0,
+                "reasons": [detail[:200]],
+                "blocking_flags": [] if status == "success" else ["execution_failed"],
+                "next_action": "reconcile",
+                "trace_id": trace_id,
+            },
+        )
+        try:
+            mc = getattr(self, "main_controller", None)
+            fs = getattr(mc, "feature_store_lite", None) if mc else None
+            if fs and hasattr(fs, "append_execution_outcome"):
+                fs.append_execution_outcome(
+                    trace_id,
+                    {
+                        "status": status,
+                        "detail": detail,
+                        "op": op,
+                        "symbol": symbol,
+                        "execution_recommendation": extras.get("execution_recommendation"),
+                        "regime_label": extras.get("regime_label"),
+                        "risk_posture": extras.get("risk_posture"),
+                    },
+                )
+        except Exception:
+            pass
+
+    def _record_reconciliation_semantics(
+        self,
+        *,
+        context: Optional[Dict[str, Any]],
+        snapshot: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None,
+        detail: Optional[str] = None,
+        symbol: str = "",
+    ) -> None:
+        dts = self._decision_trace_store()
+        if not dts:
+            return
+        trace_id = self._trace_id_from_context(context)
+        if not trace_id:
+            return
+        snap = snapshot if isinstance(snapshot, dict) else {}
+        sev = str(snap.get("severity") or "")
+        summary = snap.get("summary") if isinstance(snap.get("summary"), dict) else {}
+        drifts = snap.get("position_drifts") if isinstance(snap.get("position_drifts"), dict) else {}
+        order_signals = snap.get("order_signals") if isinstance(snap.get("order_signals"), dict) else {}
+        safe_recovery = snap.get("safe_recovery") if isinstance(snap.get("safe_recovery"), dict) else {}
+        resolved_status = str(
+            status
+            or ("success" if bool(snap.get("healthy", False)) else (sev or "warning"))
+        )
+        resolved_detail = str(
+            detail
+            or snap.get("error")
+            or f"reconciliation_{sev or resolved_status}"
+        )[:300]
+        extras = {
+            "symbol": symbol,
+            "reconciliation_healthy": bool(snap.get("healthy", False)),
+            "reconciliation_severity": sev or ("ok" if bool(snap.get("healthy", False)) else "warning"),
+            "reconciliation_summary": summary,
+            "reconciliation_exchange_errors": snap.get("exchange_errors"),
+            "reconciliation_drift_total": summary.get("drift_total"),
+            "reconciliation_stale_open_orders": summary.get("stale_open_orders"),
+            "reconciliation_position_drifts": {
+                "exchange_only_positions": len(drifts.get("exchange_only_positions", []) if isinstance(drifts.get("exchange_only_positions"), list) else []),
+                "local_only_positions": len(drifts.get("local_only_positions", []) if isinstance(drifts.get("local_only_positions"), list) else []),
+                "side_mismatch_positions": len(drifts.get("side_mismatch_positions", []) if isinstance(drifts.get("side_mismatch_positions"), list) else []),
+                "size_mismatch_positions": len(drifts.get("size_mismatch_positions", []) if isinstance(drifts.get("size_mismatch_positions"), list) else []),
+            },
+            "reconciliation_open_orders_without_position": len(order_signals.get("open_orders_without_position", []) if isinstance(order_signals.get("open_orders_without_position"), list) else []),
+            "reconciliation_safe_recovery_policy": safe_recovery.get("policy"),
+        }
+        dts.record_reconciliation_result(
+            trace_id=trace_id,
+            status=resolved_status,
+            detail=resolved_detail,
+            extras=extras,
+        )
 
     @staticmethod
     def _extract_market_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -591,6 +1006,20 @@ class ExecutionGateway:
             out["fee_rate_est"] = None
         return out
 
+    async def _enrich_open_result_with_exchange_fills(
+        self, ex: Any, symbol: str, res: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        开仓回报通常只有 ordId，补抓 fills 回填均价/手续费。
+        注意：开仓本身不应写 realizedPnl，因此仅保留价格/费用等执行真值。
+        """
+        out = await self._enrich_close_result_with_exchange_fills(ex, symbol, res)
+        if not isinstance(out, dict):
+            return res
+        out["pnl"] = 0.0
+        out["realizedPnl"] = 0.0
+        return out
+
     async def close_swap(
         self,
         symbol: str,
@@ -613,14 +1042,14 @@ class ExecutionGateway:
             self._metric_inc("close_policy_denied")
             msg = f"force_close_denied_non_manual source={source}"
             logger.error("ExecutionGateway.close_swap: %s", msg)
-            self._record_order(source, "close", False, msg, symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
+            self._record_order(source, "close", False, msg, symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context, record_execution_trace=False)
             return {"success": False, "error": msg}
 
         if not force and not self._allow_discretionary(source, swo):
             self._metric_inc("close_policy_denied")
             msg = f"policy_denied source={source} swo={swo}"
             logger.error("ExecutionGateway.close_swap: %s", msg)
-            self._record_order(source, "close", False, msg, symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
+            self._record_order(source, "close", False, msg, symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context, record_execution_trace=False)
             return {"success": False, "error": msg}
 
         ex = self._exchange()
@@ -654,7 +1083,7 @@ class ExecutionGateway:
                     )
             except Exception:
                 pass
-            self._record_order(source, "close", False, "no_exchange")
+            self._record_order(source, "close", False, "no_exchange", record_execution_trace=False)
             return {"success": False, "error": "no_exchange"}
 
         key = self._close_idempotent_key(symbol, side, size, context)
@@ -689,6 +1118,24 @@ class ExecutionGateway:
 
         async with self._symbol_lock(symbol):
             try:
+                try:
+                    rec = await self._reconciler.build_snapshot(recent_events=list(self._snapshot.recent_events))
+                    self._reconciliation_protection.ingest_reconciliation(rec)
+                    self._record_reconciliation_semantics(
+                        context=context,
+                        snapshot=rec,
+                        symbol=symbol,
+                    )
+                except Exception as e:
+                    self._record_reconciliation_semantics(
+                        context=context,
+                        snapshot={"healthy": False, "severity": "warning", "error": f"reconciliation_error:{type(e).__name__}"},
+                        status="error",
+                        detail=f"reconciliation_error:{type(e).__name__}",
+                        symbol=symbol,
+                    )
+                    logger.debug("ExecutionGateway.close_swap: reconciliation snapshot skipped: %s", e)
+
                 before_size: Optional[float] = None
                 normalized_symbol = str(symbol or "").replace("-SWAP", "/USDT/SWAP")
                 try:
@@ -723,6 +1170,13 @@ class ExecutionGateway:
                 ok = bool(isinstance(res, dict) and res.get("success"))
                 detail = str(res.get("error") if isinstance(res, dict) else res)[:500]
                 self._record_order(source, "close", ok, detail or "ok", symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
+                self._record_execution_semantics(
+                    context=context,
+                    status="success" if ok else "failed",
+                    detail=detail or "ok",
+                    op="close",
+                    symbol=symbol,
+                )
                 if ok:
                     post_check: Dict[str, Any] = {"status": "not_checked"}
                     try:
@@ -1133,11 +1587,31 @@ class ExecutionGateway:
                 leverage=leverage,
                 reason=reason,
                 context=context,
+                record_execution_trace=False,
             )
             return {"success": False, "error": msg}
 
         redline_err = await self._open_blocked_by_redlines(symbol=symbol, size=size, source=source, context=context)
         if redline_err:
+            replaced = None
+            try:
+                if "持仓数" in str(redline_err or "") and "已达到上限" in str(redline_err or ""):
+                    replaced = await self._attempt_replace_worst_on_full_positions(
+                        symbol=symbol,
+                        side=side,
+                        size=float(size),
+                        leverage=int(leverage),
+                        source=source,
+                        reason=reason,
+                        margin_mode=margin_mode,
+                        price=price,
+                        context=context,
+                        swo=swo,
+                    )
+            except Exception as e:
+                logger.debug("ExecutionGateway.replace_worst_on_full_positions skipped: %s", e)
+            if isinstance(replaced, dict) and replaced.get("success"):
+                return replaced
             self._metric_inc("open_policy_denied")
             self._record_order(
                 source,
@@ -1150,6 +1624,7 @@ class ExecutionGateway:
                 leverage=leverage,
                 reason=reason,
                 context=context,
+                record_execution_trace=False,
             )
             return {"success": False, "error": redline_err}
 
@@ -1157,7 +1632,7 @@ class ExecutionGateway:
             self._metric_inc("open_policy_denied")
             msg = f"open_policy_denied source={source} swo={swo}"
             logger.error("ExecutionGateway.open_swap: %s", msg)
-            self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context)
+            self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context, record_execution_trace=False)
             # trade event fanout (best-effort)
             try:
                 hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
@@ -1190,22 +1665,26 @@ class ExecutionGateway:
             left = int(max(1.0, self._open_symbol_cooldown_until.get(str(symbol).upper(), 0.0) - time.time()))
             msg = f"open_cooldown_active:{left}s"
             logger.warning("ExecutionGateway.open_swap: cooldown deny symbol=%s source=%s left=%ss", symbol, source, left)
-            self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context)
+            self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context, record_execution_trace=False)
             return {"success": False, "error": msg}
 
         try:
             rec = await self._reconciler.build_snapshot(recent_events=list(self._snapshot.recent_events))
             self._reconciliation_protection.ingest_reconciliation(rec)
+            self._record_reconciliation_semantics(
+                context=context,
+                snapshot=rec,
+                symbol=symbol,
+            )
             protect_err = self._reconciliation_protection.allow_open(symbol)
             if protect_err:
-                dts = self._decision_trace_store()
-                if dts:
-                    dts.record_reconciliation_result(
-                        trace_id=self._trace_id_from_context(context) or "",
-                        status="blocked",
-                        detail=protect_err,
-                        extras={"symbol": symbol},
-                    )
+                self._record_reconciliation_semantics(
+                    context=context,
+                    snapshot=rec,
+                    status="blocked",
+                    detail=protect_err,
+                    symbol=symbol,
+                )
                 self._metric_inc("open_policy_denied")
                 logger.warning("ExecutionGateway.open_swap: reconciliation protection deny symbol=%s err=%s", symbol, protect_err)
                 self._record_order(
@@ -1219,9 +1698,17 @@ class ExecutionGateway:
                     leverage=leverage,
                     reason=reason,
                     context=context,
+                    record_execution_trace=False,
                 )
                 return {"success": False, "error": protect_err}
         except Exception as e:
+            self._record_reconciliation_semantics(
+                context=context,
+                snapshot={"healthy": False, "severity": "warning", "error": f"reconciliation_error:{type(e).__name__}"},
+                status="error",
+                detail=f"reconciliation_error:{type(e).__name__}",
+                symbol=symbol,
+            )
             logger.debug("ExecutionGateway.open_swap: reconciliation protection skipped: %s", e)
 
         ex = self._exchange()
@@ -1253,7 +1740,7 @@ class ExecutionGateway:
             except Exception:
                 pass
             self._metric_inc("open_fail")
-            self._record_order(source, "open", False, "no_exchange")
+            self._record_order(source, "open", False, "no_exchange", record_execution_trace=False)
             return {"success": False, "error": "no_exchange"}
 
         lev = int(leverage) if leverage else 20
@@ -1473,9 +1960,20 @@ class ExecutionGateway:
                 ok = bool(isinstance(res, dict) and res.get("success"))
                 detail = str(res.get("error") if isinstance(res, dict) else res)[:500]
                 self._record_order(source, "open", ok, detail or "ok", symbol=symbol, side=side, size=size, leverage=lev, reason=reason, context=context)
+                self._record_execution_semantics(
+                    context=context,
+                    status="success" if ok else "failed",
+                    detail=detail or "ok",
+                    op="open",
+                    symbol=symbol,
+                )
                 if ok:
                     self._mark_symbol_open_success(symbol)
                     self._metric_inc("open_ok")
+                    try:
+                        res = await self._enrich_open_result_with_exchange_fills(ex, symbol, res)
+                    except Exception:
+                        pass
                     logger.info(
                         "ExecutionGateway: open_swap ok symbol=%s side=%s source=%s reason=%s",
                         symbol,
@@ -1640,6 +2138,7 @@ class ExecutionGateway:
         leverage: Optional[int] = None,
         reason: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
+        record_execution_trace: bool = True,
     ) -> None:
         self._snapshot.last_order_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self._snapshot.last_order_source = source
@@ -1687,7 +2186,7 @@ class ExecutionGateway:
                 }
             )
             dts = self._decision_trace_store()
-            if dts and trace_id:
+            if dts and trace_id and bool(record_execution_trace):
                 dts.record_execution_result(
                     trace_id=trace_id,
                     status="success" if bool(success) else "failed",
@@ -1716,6 +2215,10 @@ class ExecutionGateway:
         self._snapshot.exchange_connected = ex is not None
         out = self._snapshot.to_dict()
         out["policy_metrics"] = dict(self._policy_metrics)
+        out["replace_worst_policy"] = {
+            "enable_replace_worst_on_full_positions": bool(self._allow_replace_worst_on_full_positions()),
+            "replace_worst_min_confidence": float(self._replace_worst_min_confidence()),
+        }
         now = time.time()
         cooldown_symbols: Dict[str, int] = {}
         for sym, until in list(self._open_symbol_cooldown_until.items()):

@@ -23,10 +23,22 @@ LOCK_FILE="/tmp/${APP_NAME}.lock"
 PY="${APP_DIR}/.venv/bin/python"
 export APP_DIR_FOR_OPENCLAW="${APP_DIR}"
 NOHUP_LOG_FILE="${LOG_DIR}/nohup.out.log"
+APP_LOG_FILE="${LOG_DIR}/app.log"
 NOHUP_MAX_MB="${OPENCLAW_NOHUP_MAX_MB:-50}"
 NOHUP_MAX_BACKUPS="${OPENCLAW_NOHUP_MAX_BACKUPS:-7}"
 HEALTH_URL="${OPENCLAW_HEALTH_URL:-http://127.0.0.1:8000/api/v1/system/health}"
 HEALTH_WAIT_SECONDS="${OPENCLAW_HEALTH_WAIT_SECONDS:-60}"
+HEALTH_PORT="${OPENCLAW_HEALTH_PORT:-8000}"
+ENV_FILE="${APP_DIR}/.env"
+
+load_env_file() {
+  if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+  fi
+}
 
 rotate_nohup_log_if_needed() {
   local file="$1"
@@ -63,14 +75,41 @@ rotate_nohup_log_if_needed() {
   fi
 }
 
+rotate_log_on_start() {
+  local file="$1"
+  local max_backups="$2"
+  if [[ ! -f "$file" ]]; then
+    return 0
+  fi
+
+  local ts
+  ts="$(date +%Y%m%d_%H%M%S)"
+  local rotated="${file}.${ts}"
+  mv "$file" "$rotated"
+  echo "Rotated startup log: ${rotated}"
+
+  local rotated_list
+  rotated_list="$(ls -1t "${file}".* 2>/dev/null || true)"
+  if [[ -n "$rotated_list" ]]; then
+    local idx=0
+    while IFS= read -r f; do
+      idx=$((idx + 1))
+      if [[ "$idx" -gt "$max_backups" ]]; then
+        rm -f "$f"
+      fi
+    done <<< "$rotated_list"
+  fi
+}
+
 write_pid_everywhere() {
   local NEW_PID="$1"
   mkdir -p "${RUNTIME_DIR}"
   echo "${NEW_PID}" > "${PID_FILE}"
   echo "${NEW_PID}" > "${RUNTIME_DIR}/${PID_BASENAME}"
   if [[ -n "${HOME_RUNTIME}" ]]; then
-    mkdir -p "${HOME_RUNTIME}"
-    echo "${NEW_PID}" > "${HOME_RUNTIME}/${PID_BASENAME}"
+    if mkdir -p "${HOME_RUNTIME}" 2>/dev/null; then
+      echo "${NEW_PID}" > "${HOME_RUNTIME}/${PID_BASENAME}"
+    fi
   fi
 }
 
@@ -82,9 +121,29 @@ start_detached() {
   fi
 }
 
+port_is_listening() {
+  APP_PORT="$HEALTH_PORT" python3 - <<'PY'
+import os, socket, sys
+port = int(os.environ["APP_PORT"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(1.0)
+try:
+    s.connect(("127.0.0.1", port))
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+sys.exit(0)
+PY
+}
+
 wait_for_health() {
+  local target_pid="$1"
   local waited=0
   while [[ "$waited" -lt "$HEALTH_WAIT_SECONDS" ]]; do
+    if ! kill -0 "$target_pid" >/dev/null 2>&1; then
+      return 2
+    fi
     if command -v curl >/dev/null 2>&1; then
       if curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
         return 0
@@ -93,6 +152,9 @@ wait_for_health() {
     sleep 1
     waited=$((waited + 1))
   done
+  if kill -0 "$target_pid" >/dev/null 2>&1 && port_is_listening; then
+    return 3
+  fi
   return 1
 }
 
@@ -145,6 +207,7 @@ if [[ "${1:-}" == "repair-pid" ]]; then
 fi
 
 cd "$APP_DIR"
+load_env_file
 
 if [[ ! -x "$PY" ]]; then
   echo "ERROR: venv missing at $PY — run: cd $APP_DIR && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
@@ -153,10 +216,11 @@ fi
 
 mkdir -p "$LOG_DIR" "${RUNTIME_DIR}"
 if [[ -n "${HOME_RUNTIME}" ]]; then
-  mkdir -p "${HOME_RUNTIME}"
+  mkdir -p "${HOME_RUNTIME}" 2>/dev/null || true
 fi
 
 rotate_nohup_log_if_needed "$NOHUP_LOG_FILE" "$NOHUP_MAX_MB" "$NOHUP_MAX_BACKUPS"
+rotate_log_on_start "$APP_LOG_FILE" "$NOHUP_MAX_BACKUPS"
 
 PIDS="$(running_pids)"
 if [[ -n "${PIDS}" ]]; then
@@ -179,11 +243,23 @@ PIDS="$(running_pids)"
 if [[ -n "${PIDS}" ]]; then
   NEW_PID="$(echo "${PIDS}" | awk '{print $1}')"
   write_pid_everywhere "${NEW_PID}"
-  if wait_for_health; then
+  if wait_for_health "${NEW_PID}"; then
     echo "SUCCESS: OpenClaw Trading System started (PID: $NEW_PID)"
     echo "Log file: $LOG_DIR/app.log"
     echo "Nohup output: $LOG_DIR/nohup.out.log"
     echo "API docs: http://localhost:8000/docs"
+    exit 0
+  fi
+  WAIT_RC=$?
+  if [[ "$WAIT_RC" -eq 2 ]]; then
+    echo "FAILED: process exited before health endpoint became ready (PID: $NEW_PID)"
+    echo "Check nohup output: tail -50 $NOHUP_LOG_FILE"
+    exit 1
+  fi
+  if [[ "$WAIT_RC" -eq 3 ]]; then
+    echo "WARN: process is listening on port ${HEALTH_PORT}, but health endpoint was not ready within ${HEALTH_WAIT_SECONDS}s (PID: $NEW_PID)"
+    echo "Log file: $LOG_DIR/app.log"
+    echo "Nohup output: $LOG_DIR/nohup.out.log"
     exit 0
   fi
   echo "FAILED: process started but health endpoint did not become ready within ${HEALTH_WAIT_SECONDS}s"

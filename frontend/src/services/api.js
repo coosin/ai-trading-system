@@ -131,6 +131,16 @@ export const api = {
       request(`/modules/strategy/research-jobs?limit=${Number(limit) || 20}`),
     getStrategyResearchJob: (jobId) =>
       request(`/modules/strategy/research-jobs/${encodeURIComponent(jobId)}`),
+    getStrategyResearchProfile: (strategyId) =>
+      request(`/modules/strategy/research-profile/${encodeURIComponent(strategyId)}`),
+    saveStrategyExperimentCard: (strategyId, data = {}) =>
+      request(`/modules/strategy/research-profile/${encodeURIComponent(strategyId)}/experiment-card`, { method: 'POST', body: JSON.stringify(data || {}) }),
+    saveStrategyPeerReview: (strategyId, data = {}) =>
+      request(`/modules/strategy/research-profile/${encodeURIComponent(strategyId)}/peer-review`, { method: 'POST', body: JSON.stringify(data || {}) }),
+    saveStrategyFailureCase: (strategyId, data = {}) =>
+      request(`/modules/strategy/research-profile/${encodeURIComponent(strategyId)}/failure-case`, { method: 'POST', body: JSON.stringify(data || {}) }),
+    saveStrategyParameterSensitivity: (strategyId, data = {}) =>
+      request(`/modules/strategy/research-profile/${encodeURIComponent(strategyId)}/parameter-sensitivity`, { method: 'POST', body: JSON.stringify(data || {}) }),
     getExecutionProductionAudit: () =>
       request('/modules/execution/production-audit'),
     getMemoryDailySummary: (limit = 6) =>
@@ -163,6 +173,8 @@ export const api = {
     runAccountSync: (reason = 'ui') =>
       request('/modules/commander/account-sync/run', { method: 'POST', body: JSON.stringify({ reason }) }),
     getCommanderCapabilities: () => request('/modules/commander/capabilities'),
+    getCommanderResearchCockpit: (symbol = 'BTC/USDT') =>
+      request(`/modules/commander/research-cockpit?symbol=${encodeURIComponent(symbol)}`),
     getCommanderAudit: (enrich = false) => request(`/modules/commander/audit?enrich=${enrich ? 'true' : 'false'}`),
     getCommanderHostingMode: () => request('/modules/commander/hosting-mode'),
     setCommanderHostingMode: (mode) =>
@@ -188,6 +200,12 @@ export const api = {
     getSurfaceRegistry: () => request('/modules/surface/registry'),
     getDataIntegrationHealth: () => request('/modules/data/integration/health'),
     getPluginsStatus: () => request('/modules/plugins/status'),
+    getMarketStructureMultiSourceSnapshot: (symbol = 'BTC/USDT') =>
+      request(`/modules/market-structure/multi-source-snapshot?symbol=${encodeURIComponent(symbol)}`),
+    getLearningWeeklyReview: (body = {}) =>
+      request('/modules/commander/learning/weekly-review', { method: 'POST', body: JSON.stringify(body || {}) }),
+    getLearningRetrievalDeck: (body = {}) =>
+      request('/modules/commander/learning/retrieval-deck', { method: 'POST', body: JSON.stringify(body || {}) }),
   },
   monitoring: {
     /** 若后端未实现则返回 404，总控会降级为空列表 */
@@ -220,4 +238,3 @@ export const api = {
     getAll: () => request('/exchanges'),
   },
 };
-

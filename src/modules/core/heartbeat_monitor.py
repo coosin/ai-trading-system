@@ -11,6 +11,18 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _format_trace_workflow_focus(summary: Dict[str, Any]) -> str:
+    if not isinstance(summary, dict):
+        return ""
+    top_stage = ((summary.get("top_workflow_stages") or [None])[0] if isinstance(summary.get("top_workflow_stages"), list) and (summary.get("top_workflow_stages") or []) else None)
+    top_status = ((summary.get("top_workflow_statuses") or [None])[0] if isinstance(summary.get("top_workflow_statuses"), list) and (summary.get("top_workflow_statuses") or []) else None)
+    stage_key = str((top_stage or {}).get("key") or "").strip() if isinstance(top_stage, dict) else ""
+    status_key = str((top_status or {}).get("key") or "").strip() if isinstance(top_status, dict) else ""
+    if not stage_key and not status_key:
+        return ""
+    return f"workflow_focus stage={stage_key or '-'} status={status_key or '-'}"
+
+
 class HeartbeatMonitor:
 
     async def initialize(self) -> bool:
@@ -134,6 +146,11 @@ class HeartbeatMonitor:
         except Exception as e:
             out["execution_gateway_error"] = str(e)
         try:
+            dts = getattr(mc, "decision_trace_store", None)
+            out["decision_traces_summary"] = dts.analyze_recent(limit=80) if (dts and hasattr(dts, "analyze_recent")) else None
+        except Exception as e:
+            out["decision_traces_summary_error"] = str(e)
+        try:
             sltp = getattr(mc, "stop_loss_manager", None)
             out["sltp"] = sltp.get_stats() if (sltp and hasattr(sltp, "get_stats")) else None
         except Exception as e:
@@ -176,6 +193,8 @@ class HeartbeatMonitor:
         )
         if not isinstance(safe_rec, dict):
             safe_rec = {}
+        trace_summary = diag.get("decision_traces_summary") if isinstance(diag.get("decision_traces_summary"), dict) else {}
+        workflow_focus = _format_trace_workflow_focus(trace_summary)
 
         # --- 1) 即时告警：执行失败增量 / SR 分批止盈失败增量 ---
         if self.trading_diagnosis_alerts_enabled:
@@ -236,13 +255,18 @@ class HeartbeatMonitor:
                     and _cooldown_ok("trading_diag_reconciliation")
                 ):
                     self._last_notice_at["trading_diag_reconciliation"] = now
-                    await self._send_notification(
-                        "⚠️ 交易状态对账异常",
+                    rec_msg = (
                         f"检测到本地/交易所状态漂移。\n"
                         f"- severity={rec.get('severity')}\n"
                         f"- drift_total={rec_drift_total}\n"
                         f"- stale_open_orders={int(rec_summary.get('stale_open_orders', 0) or 0)}\n"
-                        f"建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_reconciliation。",
+                    )
+                    if workflow_focus:
+                        rec_msg += f"- {workflow_focus}\n"
+                    rec_msg += "建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_reconciliation。"
+                    await self._send_notification(
+                        "⚠️ 交易状态对账异常",
+                        rec_msg,
                         priority="high" if str(rec.get("severity")) == "critical" else "medium",
                     )
 
@@ -253,12 +277,17 @@ class HeartbeatMonitor:
                     and _cooldown_ok("trading_diag_reconciliation_protection")
                 ):
                     self._last_notice_at["trading_diag_reconciliation_protection"] = now
-                    await self._send_notification(
-                        "🛡️ 对账保护已生效",
+                    rcp_msg = (
                         f"检测到对账保护正在阻断新开仓。\n"
                         f"- global_lock={bool(rcp.get('global_lock_active', False))}\n"
                         f"- symbol_locks={len(symbol_locks)}\n"
-                        f"建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_reconciliation_protection。",
+                    )
+                    if workflow_focus:
+                        rcp_msg += f"- {workflow_focus}\n"
+                    rcp_msg += "建议：查看 /api/v1/modules/commander/trading-diagnosis 的 execution_reconciliation_protection。"
+                    await self._send_notification(
+                        "🛡️ 对账保护已生效",
+                        rcp_msg,
                         priority="medium",
                     )
 

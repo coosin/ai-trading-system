@@ -4,11 +4,15 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _default_path() -> str:
@@ -32,7 +36,7 @@ class AICoreCheckpointStore:
             fp = Path(self._path)
             fp.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "updated_at": _utcnow_iso(),
                 "state": state,
             }
             fd, tmp_name = tempfile.mkstemp(prefix=".ai_core_ckpt_", suffix=".tmp", dir=str(fp.parent))
@@ -57,4 +61,3 @@ class AICoreCheckpointStore:
         except Exception as e:
             logger.warning("ai_core checkpoint load failed: %s", e)
             return None
-
