@@ -6,11 +6,10 @@
 
 ## 0. 运行模式选择（先确认）
 
-当前系统同时支持 Docker 与裸机运行。若延续旧容器化参数到裸机场景，最常见冲突是代理地址与回环地址。
+当前系统以**裸机运行**为主。若延续旧容器化参数到裸机场景，最常见冲突是代理地址与回环地址。
 
-- **Docker 模式**：继续使用本手册后续 `docker compose` 流程。
-- **裸机模式**（当前常用）：
-  - 建议从项目根运行：`python3 run_api.py`（或由 systemd/supervisor 托管）
+- **裸机模式**（默认）：
+  - 建议从项目根运行：`bash scripts/start-openclaw-trading.sh`（长期托管优先）或 `python3 run_api.py`（前台/临时）；systemd 应复用同一启动脚本，避免绕过 `.env`、PID 与日志轮转
   - 对外基址统一为：`http://127.0.0.1:8000`（本机）或实际监听地址；**脚本与巡检**建议在 `.env` 或 shell 中设置 **`OPENCLAW_API_BASE`**（优先于历史变量 `ACCEPTANCE_BASE`、`BASE_URL`），与 `src/utils/openclaw_api_client.py` 及 `GET /api/v1/modules/surface/registry` 返回的 **`api_base_env`** 对齐。
   - 若配置了代理，请确认 `NO_PROXY=127.0.0.1,localhost,redis`
   - 禁止把 `host.docker.internal` 写入裸机代理/上游地址
@@ -107,59 +106,66 @@ curl -s http://127.0.0.1:8000/api/v1/system/health
 
 ---
 
-## 1. Docker 部署
+## 1. 裸机部署
 
 ### 1.1 首次与更新
 
 ```bash
-cp .env.example .env   # 编辑密钥与 MODE / TRADING_MODE
-# 主调参仅使用仓库内 config/config.yaml；compose 已挂载 ./config:/app/config
-docker compose build trading-system
-docker compose up -d
+cp .env.example .env   # 编辑密钥与 MODE / TRADING_MODE；REDIS_HOST 指向本机或实际 Redis 主机
+# 主调参仅使用仓库内 config/config.yaml
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+bash scripts/start-openclaw-trading.sh
+# 前台调试可用：python -m src.main
+# 历史入口：./start_production.sh live_trading
 ```
 
-若 **bridge 容器 DNS/出网全挂**（与宿主机 Clash 不一致），用宿主机网络跑交易服务（Redis 仍桥接并映射 `6379` 到宿主机）：
+代理与 Clash：**HTTP(S)** 建议写 `http://127.0.0.1:${CLASH_MIXED_PORT:-7890}`；不稳定时不要设 `ALL_PROXY` / `OPENCLAW_ALL_PROXY`。详见 `.env.example` 与 **`deploy/HOST_CLASH_EGRESS.md`**。
+
+全栈网络与健康链（**需 API 已在 8000 监听**）：仓库根执行 `bash scripts/verify_full_stack_network.sh`，以终端输出 **`VERIFY_FULL_STACK=PASS`** 为准。应用侧快照：`GET http://localhost:8000/api/v1/system/acceptance`；轮询脚本：`python3 scripts/startup_acceptance.py`（基址优先 **`OPENCLAW_API_BASE`**，其次 `ACCEPTANCE_BASE` / `BASE_URL`）。
+
+### 1.2 重载配置 / 代码
+
+修改 `config/config.yaml` 或 `src/` 后：**重启交易进程**（systemd `restart`、或 `bash scripts/stop-openclaw-trading.sh && bash scripts/start-openclaw-trading.sh`）。
+
+### 1.3 推荐 systemd 托管
+
+建议主服务与 health suite 一起安装：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --force-recreate trading-system
-# 或：./scripts/recover_trading_hostnet.sh
-# 或：HOSTNET=1 ./scripts/deploy_production_stack.sh
+sudo cp deploy/systemd/openclaw-trading.service /etc/systemd/system/
+sudo cp deploy/systemd/openclaw-health-audit.service /etc/systemd/system/
+sudo cp deploy/systemd/openclaw-health-audit.timer /etc/systemd/system/
+sudo cp deploy/systemd/openclaw-live-stability-monitor.service /etc/systemd/system/
+sudo cp deploy/systemd/openclaw-live-stability-monitor.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now openclaw-trading.service
+sudo systemctl enable --now openclaw-health-audit.timer
+sudo systemctl enable --now openclaw-live-stability-monitor.timer
 ```
 
-`docker-compose.hostnet.yml` 处理 **网络栈 + Redis**，并注入 `OPENCLAW_DOCKER_NETWORK_HOST=1`（不把 `127.0.0.1` 误改成 `host.docker.internal`）。**默认**将 `HTTP_PROXY`/`HTTPS_PROXY`/`OPENCLAW_HTTP(S)_PROXY` 设为 `http://127.0.0.1:${CLASH_MIXED_PORT:-7890}`，并**清空** `ALL_PROXY` / `OPENCLAW_ALL_PROXY`（避免 SOCKS5 全失败拖慢请求）。覆盖：`.env` 中 `OPENCLAW_HOST_HTTP_PROXY` 或 `CLASH_MIXED_PORT`。
-
-一键（含健康等待与 OKX 抽检）:
+核对：
 
 ```bash
-./scripts/deploy_production_stack.sh
+systemctl status openclaw-trading.service --no-pager
+systemctl list-timers --all 'openclaw-*' --no-pager
 ```
 
-全栈网络与健康链（Compose 已起、脚本会进容器抽检）：仓库根执行 `bash scripts/verify_full_stack_network.sh`，以终端输出 **`VERIFY_FULL_STACK=PASS`** 为准。应用侧快照：`GET http://localhost:8000/api/v1/system/acceptance`；轮询脚本：`python3 scripts/startup_acceptance.py`（基址优先 **`OPENCLAW_API_BASE`**，其次 `ACCEPTANCE_BASE` / `BASE_URL`）。宿主机 Clash/TUN 与 `host.docker.internal` 说明见 **`deploy/HOST_CLASH_EGRESS.md`**。
+### 1.4 服务与端口
 
-### 1.2 仅重载代码（卷挂载）
-
-修改 `src/` 后：
-
-```bash
-docker compose restart trading-system
-```
-
-### 1.3 服务与端口
-
-- **trading-system**: `8000` → API / 静态前端  
-- **redis**: `6379`（内部网络 `redis:6379`）  
-- **健康检查**: 容器内 `curl http://localhost:8000/api/v1/system/health`  
-- **配置卷**: `./config` → `/app/config`（修改 `config.yaml` 后 `docker compose restart trading-system` 即可，无需重建镜像）
+- **API**：默认 `0.0.0.0:8000`（本机常用 `http://127.0.0.1:8000`）  
+- **Redis**：由 `.env` 的 `REDIS_HOST` / `REDIS_PORT` 指定（本机常见 `127.0.0.1:6379`）  
+- **健康检查**：`curl -s http://127.0.0.1:8000/api/v1/system/health`
 
 ---
 
 ## 2. 启动到运行态检查清单
 
-1. `docker ps` — `openclaw-trading` 为 `healthy`  
+1. 进程存活：`pgrep -af "src.main|uvicorn"` 或 `systemctl status`（若已托管）  
 2. `curl -s http://localhost:8000/api/v1/system/health`  
 3. `curl -s http://localhost:8000/api/v1/exchanges` — OKX `is_connected`  
 4. `curl -s "http://localhost:8000/api/v1/modules/commander/audit?enrich=true"` — 司令部与第三方诊断  
-5. 日志: `docker logs openclaw-trading --tail 80` — 无持续 Traceback  
+5. 日志: `tail -n 80 logs/app.log` — 无持续 Traceback  
 
 > 日常托管建议直接按 `docs/DAILY_HOSTING_ACCEPTANCE.md` 执行“3~5 步”快验收。
 
@@ -343,12 +349,13 @@ curl -s http://localhost:8000/api/v1/modules/commander/tool-contract
 curl -s http://localhost:8000/api/v1/modules/surface/channels
 curl -s http://localhost:8000/api/v1/modules/surface/registry
 curl -s 'http://localhost:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
+curl -s 'http://localhost:8000/api/v1/modules/commander/closed-loop-summary?trace_limit=120'
 curl -s -X POST http://localhost:8000/api/v1/modules/commander/dispatch \
   -H 'Content-Type: application/json' \
   -d '{"message":"系统巡检","source":"openclaw","timeout_sec":8}'
 ```
 
-完整流程见：`docs/OPENCLAW_INTEGRATION_GUIDE.md`。
+上表 bash 已含 **交易闭环一页式摘要**（`closed-loop-summary`，只读，可选 `trace_limit`）。响应字段释义与完整对接清单见 **[OPENCLAW_INTEGRATION_GUIDE.md](./OPENCLAW_INTEGRATION_GUIDE.md)**（建议优先阅读 §2）。
 
 补充：若 `dispatch` 在高峰期超时，建议直接使用脚本：
 
@@ -362,7 +369,7 @@ python3 scripts/commander_dispatch_client.py "系统巡检" --source openclaw
 
 ### 3.1 目标
 
-- 容器访问外网经 **宿主机 Clash**：`host.docker.internal:7890`（见 `docker-compose.yml` `extra_hosts`；详细步骤与排障见 **`deploy/HOST_CLASH_EGRESS.md`**；仅 Docker 模式使用）  
+- 本机进程经 **宿主机 Clash**：常见 `http://127.0.0.1:7890`（详细步骤与排障见 **`deploy/HOST_CLASH_EGRESS.md`**）  
 - **OKX** 使用 `https://www.okx.com`，TLS 校验开启  
 - DNS：避免将 OKX 解析到异常池；Clash 建议 **Rule** 模式、`fake-ip-filter` 含 `+.okx.com`
 
@@ -370,19 +377,19 @@ python3 scripts/commander_dispatch_client.py "系统巡检" --source openclaw
 
 ```bash
 python3 scripts/network_connectivity_smoke.py
-python3 scripts/network_connectivity_smoke.py --redis   # 需能访问 REDIS_HOST（如 compose 内 redis）
+python3 scripts/network_connectivity_smoke.py --redis   # 需能访问 REDIS_HOST（见 .env）
 python3 scripts/production_network_baseline.py --check-only
 python3 scripts/production_network_baseline.py --apply   # 按脚本设计写回配置时
 python3 scripts/proxy_mode_network_benchmark.py --label my_run --runs 7 --out /tmp/net.json  # TUN/代理拓扑对比
 ```
 
+**裸金属生产（默认）**：`production_network_baseline.py` 的公网探针在**本机 Python** 执行，与交易进程同出口。
+
 期望检查输出含 **`BASELINE_CHECK=PASS`**（以脚本实际提示为准）。
 
-### 3.3 容器内代理环境
+### 3.3 进程内代理环境
 
-Compose 已注入 `HTTP(S)_PROXY` / `OPENCLAW_*_PROXY` 与 `NO_PROXY=localhost,127.0.0.1,redis`。若自定义，请保持 **Redis 与 localhost 不走代理**，否则健康检查与内网会失败。
-
-裸机模式同样建议保持 `NO_PROXY=localhost,127.0.0.1,redis`，并避免将本机 API 地址配置为 `host.docker.internal`。
+建议在 shell、systemd 或 `.env` 中导出 `HTTP(S)_PROXY` / `OPENCLAW_*_PROXY`，并保持 **`NO_PROXY=localhost,127.0.0.1,redis`**，避免 Redis 与本地健康检查走代理失败。不要将本机 API 配成 `host.docker.internal`（该名仅历史上用于容器访问宿主机）。
 
 ### 3.4 OKX 余额/持仓与进程内同步
 
@@ -394,24 +401,23 @@ Compose 已注入 `HTTP(S)_PROXY` / `OPENCLAW_*_PROXY` 与 `NO_PROXY=localhost,1
 
 ### 3.5 OKX REST 超时 / `Server disconnected` / 余额始终 0
 
-1. **主配置必须存在**：仓库内须有 **`config/config.yaml`**（挂载到容器 `/app/config`）。若该文件缺失，`ConfigManager` 无法合并业务段，控制面可能显示「配置为空」，OKX 密钥环境变量也可能未与 `exchanges.okx` 对齐。从 Git 恢复：`git checkout HEAD -- config/config.yaml`。本机覆盖用 **`config/local.yaml`**（勿提交）。
+1. **主配置必须存在**：仓库内须有 **`config/config.yaml`**。若该文件缺失，`ConfigManager` 无法合并业务段，控制面可能显示「配置为空」，OKX 密钥环境变量也可能未与 `exchanges.okx` 对齐。从 Git 恢复：`git checkout HEAD -- config/config.yaml`。本机覆盖用 **`config/local.yaml`**（勿提交）。
 2. **密钥**：`.env` 中 `OKX_API_KEY`、`OKX_SECRET`、`OKX_PASSPHRASE` 须与 `config.yaml` 里 `exchanges.okx.*_env` 一致；缺密钥时 REST 会失败或返回空数据，界面表现为余额 0、无持仓。
 3. **代理**：经宿主机 Clash **HTTP** 端口做 `CONNECT` 时，偶发连接被掐断。可二选一：  
-   - 在 **`config/config.yaml`** 的 `proxy.okx` 下设 **`ignore_env_proxy: true`**（或环境变量 **`OPENCLAW_OKX_IGNORE_ENV_PROXY=1`**），让 OKX **仅 REST 直连**（要求容器出口可达 `www.okx.com`）；或  
+   - 在 **`config/config.yaml`** 的 `proxy.okx` 下设 **`ignore_env_proxy: true`**（或环境变量 **`OPENCLAW_OKX_IGNORE_ENV_PROXY=1`**），让 OKX **仅 REST 直连**（要求本机出口可达 `www.okx.com`）；或  
    - 在 Clash 侧为 `+.okx.com` 使用稳定线路，并确认 **`fake-ip-filter`** 包含 OKX 域名（见 3.1）。  
 4. **调参**：可通过 **`OPENCLAW_OKX_TIMEOUT_*`**、**`OPENCLAW_OKX_MAX_RETRIES`** 放宽超时与重试（见根目录 `.env.example`）。
 
 ### 3.6 新代理 + TUN：怎么测「哪种最好」、和旧配置差多少
 
-**旧配置（常见痛点）**：Docker **bridge** + 仅 **`HTTP_PROXY=http://host.docker.internal:7890`**。OKX 等走 **HTTP CONNECT**，易被掐、延迟高，应用里会出现 **`ticker`=`fallback`**、`unified-snapshot` 里 **`exch.*:timeout`**。
+**旧配置（常见痛点）**：经 **HTTP CONNECT** 的全局代理访问 OKX，易被掐、延迟高，应用里会出现 **`ticker`=`fallback`**、`unified-snapshot` 里 **`exch.*:timeout`**。
 
 **新代理推荐拓扑**（与 `deploy/HOST_CLASH_EGRESS.md` 一致）：
 
 1. **宿主机** Clash/mihomo 开 **TUN**（`auto-route`、Rule 分流、`fake-ip-filter` 含 `+.okx.com`）。  
-2. **二选一（按基准脚本结果选优）**：  
-   - **A**：容器仍用 bridge + `HTTP_PROXY`（适合只改代理、不动 compose）。  
-   - **B**：交易容器 **`network_mode: host`**（`docker-compose.hostnet.yml`），`.env` 里代理指 **`127.0.0.1:7890`**，并依赖 **`OPENCLAW_DOCKER_NETWORK_HOST=1`** 避免把环回误改写成 `host.docker.internal`。  
-   - **C**：TUN 已接管宿主机路由时，对 **OKX REST** 试 **`OPENCLAW_OKX_IGNORE_ENV_PROXY=1`**（或 `proxy.okx.ignore_env_proxy: true`），让 HTTPS **不经 HTTP 代理**，由 TUN/直连出口访问 `www.okx.com`（需规则允许）。
+2. **按基准脚本结果选优**：  
+   - **A**：进程内显式 `HTTP_PROXY=http://127.0.0.1:7890`（mixed-port 建议监听 `0.0.0.0`）。  
+   - **B**：TUN 已接管宿主机路由时，对 **OKX REST** 试 **`OPENCLAW_OKX_IGNORE_ENV_PROXY=1`**（或 `proxy.okx.ignore_env_proxy: true`），让 HTTPS **不经 HTTP 代理**，由 TUN/直连出口访问 `www.okx.com`（需规则允许）。
 
 **可重复对比（改善多少用数字说话）**：
 
@@ -423,13 +429,13 @@ python3 scripts/proxy_mode_network_benchmark.py --label after_tun_host --runs 7 
 python3 scripts/proxy_mode_network_benchmark.py --compare /tmp/net_before.json /tmp/net_after.json
 ```
 
-脚本会对比 **DNS/TCP/HTTPS（尊重代理 vs 强制不走 HTTP 代理）** 的中位数延迟；若 **`no_http_proxy` 明显快于 `respect_env_proxy`**，优先采用 **TUN + 减少容器内 HTTP 代理依赖**（上文的 B 或 C）。全链路再跑：
+脚本会对比 **DNS/TCP/HTTPS（尊重代理 vs 强制不走 HTTP 代理）** 的中位数延迟；若 **`no_http_proxy` 明显快于 `respect_env_proxy`**，优先采用 **TUN + 减少进程内 HTTP 代理依赖**（上文的 B）。全链路再跑：
 
 ```bash
 python3 scripts/verify.py trading --base-url http://127.0.0.1:8000
 ```
 
-**最优选择（当前仓库实践结论）**：**宿主机 TUN + 规则正确** 为基座；容器侧若仍大量 **CONNECT 超时**，则 **host 网络或 OKX 忽略环境代理** 二选一或组合，直到 **`/api/v1/market/ticker` 的 `source` 为 `exchange` 且有价格**。
+**最优选择（当前仓库实践结论）**：**宿主机 TUN + 规则正确** 为基座；若仍大量 **CONNECT 超时**，则 **收紧 HTTP 代理依赖或 OKX 忽略环境代理**，直到 **`/api/v1/market/ticker` 的 `source` 为 `exchange` 且有价格**。
 
 ### 3.7 OKX 代理守护（可选）
 
@@ -448,6 +454,77 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now okx-proxy-guard.timer
 ```
 
+### 3.8 系统健康审计 + 稳定性观测（推荐）
+
+仓库新增两层只读巡检：
+
+- `scripts/full_system_audit.py`
+  - 一次性全量体检：健康接口、交易诊断、风险、账户、数据中心、日志扫描、focused pytest
+- `scripts/live_stability_monitor.py`
+  - 持续观测：health 漂移、OKX 可达性、LLM 熔断/回退、断连、门控拒单增长
+
+手动执行：
+
+```bash
+.venv/bin/python scripts/full_system_audit.py
+.venv/bin/python scripts/live_stability_monitor.py --interval-sec 30 --duration-min 60
+```
+
+定时执行包装脚本：
+
+```bash
+./scripts/run_scheduled_health_suite.sh audit
+./scripts/run_scheduled_health_suite.sh monitor
+```
+
+输出位置：
+
+- 审计日志：`logs/health/full_system_audit_*.log`
+- 稳定性观测日志：`logs/health/live_stability_monitor_*.log`
+- 观测明细：`runtime/live_stability_monitor.*.jsonl`
+- 观测汇总：`runtime/live_stability_monitor.*.summary.json`
+- 人类可读摘要：`logs/health/health_suite_summary.md`
+- 短状态摘要：`logs/health/health_suite_status.json`
+
+快速查看当前状态：
+
+```bash
+.venv/bin/python scripts/health_suite_status.py
+cat logs/health/health_suite_status.json
+```
+
+状态约定：
+
+- `GREEN`：审计通过，观测窗口无新增漂移
+- `YELLOW`：当前窗口存在仍在增长的告警、失败审计项或 monitor warning
+- `RED`：观测报错、健康状态漂移、可达性切换，或缺少关键产物
+
+如需 systemd 定时执行，可使用模板：
+
+```bash
+sudo cp deploy/systemd/openclaw-health-audit.service /etc/systemd/system/
+sudo cp deploy/systemd/openclaw-health-audit.timer /etc/systemd/system/
+sudo cp deploy/systemd/openclaw-live-stability-monitor.service /etc/systemd/system/
+sudo cp deploy/systemd/openclaw-live-stability-monitor.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now openclaw-health-audit.timer
+sudo systemctl enable --now openclaw-live-stability-monitor.timer
+```
+
+说明：
+
+- `openclaw-health-audit.timer` 默认每 `15` 分钟跑一次
+- `openclaw-live-stability-monitor.timer` 默认每 `2` 小时跑一次，每次连续观测 `60` 分钟
+- `full_system_audit.py` 对 `recent_disconnects` / `recent_circuit_breaks` 采用“日志累计计数 + monitor growth”联合判定
+- 若日志累计高，但 `disconnect_growth=0` / `circuit_break_growth=0`，audit 会标记为 `stabilized`，不单独拖黄
+- `last_order_success` 优先按 `execution_gateway.recent_events` 的最新订单事件推导；尚无订单事件时记为 `unobserved`
+- 可通过环境变量调整观测窗口：
+
+```bash
+export OPENCLAW_STABILITY_MONITOR_DURATION_MIN=30
+export OPENCLAW_STABILITY_MONITOR_INTERVAL_SEC=20
+```
+
 ---
 
 ## 4. 日常维护
@@ -456,7 +533,7 @@ sudo systemctl enable --now okx-proxy-guard.timer
 
 ```bash
 curl -s http://localhost:8000/api/v1/system/health
-docker logs openclaw-trading --tail 200
+tail -n 200 logs/app.log
 ./scripts/check_trading_host_health.sh
 ./scripts/cleanup_trading_workspace.sh   # 按需；见脚本内环境变量
 ```
@@ -490,8 +567,7 @@ python3 scripts/system_probe_daily_summary.py \
 
 ### 4.3 磁盘与日志
 
-- 挂载目录：`./logs`、`./data`、`./workspace`  
-- Compose 日志驱动 `json-file`，`max-size` / `max-file` 已限制滚动  
+- 工作目录：`./logs`、`./data`、`./workspace`（由应用与 `logging` 配置滚动；可用 `cleanup_trading_workspace.sh` 控日志体积）
 
 ---
 
@@ -500,12 +576,12 @@ python3 scripts/system_probe_daily_summary.py \
 | 现象 | 方向 |
 |------|------|
 | OKX 连接失败 / SSL | 代理、DNS、Clash 规则；`production_network_baseline.py` |
-| 容器完全无外网 / DNS 全挂 | 先试 `docker-compose.hostnet.yml`（上 1.1）；再查 iptables、Clash **mixed-port 是否监听 `0.0.0.0`**（仅 `127.0.0.1` 时 bridge 常连不上代理，见 `deploy/HOST_CLASH_EGRESS.md` §4） |
-| 容器内快速自检 | `docker exec openclaw-trading sh /app/scripts/diagnose_container_net.sh`（含 `ping`/`ip`；改 Dockerfile 后需 **`docker compose build trading-system`**） |
+| 本机无外网 / DNS 全挂 | 查 iptables、Clash **mixed-port 是否监听 `0.0.0.0`**、TUN 与路由；见 `deploy/HOST_CLASH_EGRESS.md` |
+| 网络快检 | `python3 scripts/network_connectivity_smoke.py`；深度基线 `python3 scripts/production_network_baseline.py` |
 | 429 过多（Reddit 等） | `OPENCLAW_THIRD_PARTY_*` 与 `OPENCLAW_REDDIT_SUBREDDIT_PAUSE_SEC` |
-| Redis 错误 | `REDIS_HOST=redis`、服务是否 healthy |
+| Redis 错误 | 核对 `.env` 中 `REDIS_HOST`/`REDIS_PORT` 与本机 `redis-server` 或远端实例 |
 | API 404（司令部 surface） | 路径须为 `/api/v1/modules/surface/...` |
-| 进程锁 | 容器内单实例；异常退出可检查 `/tmp/openclaw-trading.lock` |
+| 进程锁 | 单实例运行；异常退出可检查 `/tmp/openclaw-trading.lock` |
 
 ---
 
@@ -518,4 +594,4 @@ python3 scripts/system_probe_daily_summary.py \
 
 ---
 
-*原分散文档（Clash 基线、维护指南、生产网络说明）已合并为本页要点；细节以脚本与 `docker-compose.yml` 为准。*
+*原分散文档（Clash 基线、维护指南、生产网络说明）已合并为本页要点；细节以脚本与仓库根配置为准。*

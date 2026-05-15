@@ -1,4 +1,4 @@
-.PHONY: help install dev test lint format clean docker-up docker-down docker-build docker-logs verify-trading verify-trading-gates
+.PHONY: help install dev test lint format clean docker-up docker-down docker-build docker-logs verify-trading verify-trading-gates verify-systemd-layout
 
 # 默认目标
 .DEFAULT_GOAL := help
@@ -35,6 +35,7 @@ help:
 	@echo "  $(GREEN)make coverage$(NC)    - 生成测试覆盖率报告"
 	@echo "  $(GREEN)make verify-trading$(NC) - 一键运行交易验收(fullcheck)"
 	@echo "  $(GREEN)make verify-trading-gates$(NC) - 运行微结构门控回归测试"
+	@echo "  $(GREEN)make verify-systemd-layout$(NC) - 校验 systemd unit 仅保留 deploy/systemd 规范路径"
 	@echo "  $(GREEN)make verify-prod$(NC)    - 生产级稳定性验收(P0)"
 	@echo ""
 
@@ -67,7 +68,11 @@ test-unit:
 
 test-integration:
 	@echo "$(BLUE)运行集成测试...$(NC)"
-	pytest -m integration -v
+	@if grep -rq "pytest\.mark\.integration" tests 2>/dev/null; then \
+		pytest -m integration -v; \
+	else \
+		echo "$(YELLOW)当前 tests/ 下无 @pytest.mark.integration 用例，跳过。$(NC)"; \
+	fi
 
 test-e2e:
 	@echo "$(BLUE)运行端到端测试...$(NC)"
@@ -154,6 +159,12 @@ coverage:
 	@echo "$(BLUE)生成测试覆盖率报告...$(NC)"
 	pytest --cov=src --cov-report=html --cov-report=term-missing
 	@echo "$(GREEN)覆盖率报告已生成，打开 htmlcov/index.html 查看$(NC)"
+
+verify-systemd-layout:
+	@echo "$(BLUE)校验 systemd unit 布局...$(NC)"
+	@test -f deploy/systemd/openclaw-trading.service || (echo "$(RED)缺少 deploy/systemd/openclaw-trading.service$(NC)"; exit 1)
+	@test ! -f openclaw-trading.service || (echo "$(RED)禁止在仓库根目录保留 openclaw-trading.service，请只维护 deploy/systemd/openclaw-trading.service$(NC)"; exit 1)
+	@echo "$(GREEN)systemd unit 路径布局通过$(NC)"
 
 # 统一验收入口
 verify-trading:

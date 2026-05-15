@@ -1,0 +1,25 @@
+[Unit]
+Description=OpenClaw Trading System
+After=network-online.target redis-server.service mihomo.service
+Wants=network-online.target redis-server.service mihomo.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=forking
+WorkingDirectory=/home/cool/ai-trading-system
+EnvironmentFile=-/home/cool/ai-trading-system/.env
+ExecStartPre=/usr/local/sbin/openclaw-prestart-cleanup.sh
+ExecStart=/home/cool/ai-trading-system/scripts/start-openclaw-trading.sh
+ExecStop=/home/cool/ai-trading-system/scripts/stop-openclaw-trading.sh
+ExecReload=/home/cool/ai-trading-system/scripts/stop-openclaw-trading.sh
+ExecReload=/home/cool/ai-trading-system/scripts/start-openclaw-trading.sh
+PIDFile=/home/cool/ai-trading-system/runtime/openclaw-trading.pid
+Restart=on-failure
+RestartSec=8
+KillMode=control-group
+TimeoutStartSec=90
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
