@@ -1,12 +1,39 @@
 # 变更记录
 
+## 2026-05-15 — 系统文档按标准域架构重写
+
+- 重写系统级文档入口与核心手册：
+  - `README.md`
+  - `docs/README.md`
+  - `docs/ENGINEERING.md`
+  - `docs/STANDARD_DOMAIN_ARCHITECTURE.md`
+  - `docs/API_REFERENCE.md`
+  - `docs/OPERATIONS.md`
+  - `docs/DEVELOPMENT.md`
+  - `docs/OPENCLAW_INTEGRATION_GUIDE.md`
+  - `docs/MCP_BASELINE.md`
+- 文档统一到当前系统基线：
+  - 标准 API 形态为 `/api/v1/{domain}/...`
+  - `OPENCLAW_API_BASE` 是脚本和外部集成推荐基址
+  - `/api/v1/surface/registry` 是标准发现入口
+  - modules v1 前缀仍作为兼容能力面和深诊断入口
+  - 真实交易写入必须经过 `ExecutionGateway`
+- 同步当前交易门控：
+  - 第 1-5 笔开仓/加仓置信度为 `0.72 / 0.77 / 0.82 / 0.87 / 0.92`
+  - 满仓替弱置信度为 `0.95`
+  - 单写者为 `ai_core`
+- 修正 `src/modules/api/route_catalog.py` 的只读巡检链：
+  - 版本更新到 `2026.05.15`
+  - 标准账户和行情入口改为 `/api/v1/account/snapshot`、`/api/v1/market/snapshot`
+  - 修复重复排序和路径说明不一致问题
+
 ## 2026-05-13 — API 发现、只读链路与脚本基址文档收口
 
 - **代码（此前已合入，本节为文档对齐说明）**
   - `src/modules/api/route_catalog.py`：`read_pipeline_spec()` 推荐只读巡检顺序；`extended_core_routes()` 与 surface **`catalog`** 去重合并。
   - `src/modules/api/module_surface.py`：`GET /api/v1/modules/surface/registry` 增加 **`read_pipeline`**、**`api_base_env`**；`CONTRACT_VERSION` 更新。
   - `src/utils/openclaw_api_client.py`：基址 **`OPENCLAW_API_BASE` > `ACCEPTANCE_BASE` > `BASE_URL` > 默认**。
-  - 脚本：`startup_acceptance.py`、`prod_stability_check.py`、`network_connectivity_smoke.py`（`--include-api`）、`system_probe_daily_summary.py` 等与上述基址一致。
+  - 脚本：`startup_acceptance.py`、`prod_stability_check.py`、`network_connectivity_smoke.py`（`--include-api`）等与上述基址一致；旧人工汇总脚本已迁入标准 API。
   - 测试：`tests/unit/test_route_catalog.py`。
 
 - **文档**
@@ -377,7 +404,7 @@
   - `GET /api/v1/market/symbol/{symbol}` 支持包含 `/` 的 symbol（建议 URL 编码如 `BTC%2FUSDT`）
   - `market/state` 与 `market/symbol` 的超时降级语义（`degraded=true`、缓存回退）
   - 事件流补齐中文别名字段（`type_zh`/`action_zh`/`side_zh`/`detail_zh`/`reason_zh`）
-- **OpenAPI 导出:** 从运行实例 `GET /openapi.json` 导出到 `docs/API_OPENAPI_FULL.json`（权威以该文件与线上 `/docs` 为准）。
+- **OpenAPI 导出:** 从运行实例 `GET /openapi.json` 获取 schema（权威以线上 `/docs` 与运行时 schema 为准）。
 - **仓库卫生:** 扩展 `.gitignore` 以忽略 `logs/_tmp*.json` 与 `*.backup*`/`*.bak_*`，并移除本地备份残留文件，避免误提交。
 
 ## 2026-04-14 — 监控 API 与文档
@@ -399,5 +426,5 @@
 - **部署**：根目录 **已移除** `docker-compose.yml` / `Dockerfile`；以裸机 `python -m src.main`、systemd 或 `scripts/start-openclaw-trading.sh` 为主；`MODE`/`TRADING_MODE`/`SYSTEM_MODE` 请在 `.env` 显式配置。
 - **测试**：Pytest 9 要求异步 fixture 使用 `pytest_asyncio.fixture`；`NaturalLanguageInterface` 单测改为 `IsolatedAsyncioTestCase`。
 - **工具**：`src/web/app.py` 改为读取主 YAML；新增 `scripts/network_connectivity_smoke.py`。
-- **文档**：补回 `docs/ENGINEERING.md`、`docs/CHANGELOG.md`、`docs/memory/MEMORY_LIBRARY_GUIDE.md`；更新 `OPERATIONS`、`DEVELOPMENT`、`README` 索引；`status.sh` / `check-dual-system.sh` 改为检查 `config/config.yaml`。
+- **文档**：补回 `docs/ENGINEERING.md`、`docs/CHANGELOG.md`、`docs/memory/MEMORY_LIBRARY_GUIDE.md`；更新 `OPERATIONS`、`DEVELOPMENT`、`README` 索引；旧双系统检查脚本已退出标准运维链路。
 - **仓库**：新增根 `.gitignore`（含 `config/local.*`、`data/config/local.*` 等）。

@@ -1,142 +1,120 @@
-# OpenClaw Trading — 工程文档
+# OpenClaw 工程架构
 
-本文档描述**当前仓库**的运行架构、配置模型与模块边界；运维与网络见 [OPERATIONS.md](./OPERATIONS.md)，开发流程见 [DEVELOPMENT.md](./DEVELOPMENT.md)。
+本文描述当前仓库的运行架构、配置模型和模块边界。运维见 [OPERATIONS.md](./OPERATIONS.md)，API 见 [API_REFERENCE.md](./API_REFERENCE.md)，标准域规则见 [STANDARD_DOMAIN_ARCHITECTURE.md](./STANDARD_DOMAIN_ARCHITECTURE.md)。
 
----
+## 运行时主链路
 
-## 1. 运行时架构
+```text
+src/main.py
+  -> ConfigManager
+  -> MainController
+  -> APIServer(FastAPI)
+  -> AI / data / risk / execution / memory / learning modules
+```
 
-| 组件 | 路径 / 说明 |
-|------|-------------|
-| 进程入口 | `src/main.py` → `TradingSystem`：初始化 `ConfigManager` → `MainController` → `APIServer`（FastAPI），先起 API 再跑主循环 |
-| HTTP API | `src/modules/api/server.py`（默认监听 `0.0.0.0:8000`；本地常用 `127.0.0.1:8000` 访问）。**发现与只读编排**：`GET /api/v1/modules/surface/registry`（`src/modules/api/module_surface.py`）；推荐只读顺序与扩展顶层路由清单见 `src/modules/api/route_catalog.py`；脚本基址解析见 `src/utils/openclaw_api_client.py`（优先 `OPENCLAW_API_BASE`）。 |
-| 主控制器 | `src/modules/main_controller.py`：装配交易所、风控、记忆、AI 引擎等 |
-| 配置 | `src/modules/core/config_manager.py` |
+核心组件：
 
-高层关系：`main.py` 持有全局 `ConfigManager` 实例；各业务模块通过构造函数或 setter 获得 `config_manager`，使用 `await get_config(section, key)` 读取合并后的配置。
+| 组件 | 路径 | 责任 |
+| --- | --- | --- |
+| 进程入口 | `src/main.py` | 初始化配置、主控制器、API 和主循环 |
+| 主控制器 | `src/modules/main_controller.py` | 装配交易所、AI、风控、记忆、学习、监控 |
+| API 服务 | `src/modules/api/server.py` | FastAPI 应用、兼容路由、标准域挂载 |
+| 标准域注册 | `src/modules/api/standard_registry.py` | `/api/v1/{domain}/...` capability 清单 |
+| 路由目录 | `src/modules/api/route_catalog.py` | 只读巡检链和核心 HTTP catalog |
+| 执行脊柱 | `src/modules/core/execution_gateway.py` | 单写者、交易门禁、下单、对账、审计 |
+| 仓位限制 | `src/modules/core/trading_limits.py` | 统一仓位上限和分层置信度解析 |
+| AI 交易引擎 | `src/modules/core/ai_trading_engine.py` | 决策、仓位计算、入场质量门控 |
 
----
+## API 架构
 
-## 2. 配置模型（单一主文件）
+当前公共接口标准化为 `/api/v1/{domain}/...`：
 
-### 2.1 文件
+- 标准域 API 由 `src/modules/<domain>/api` 模块提供。
+- 标准能力由 `standard_registry.canonical_routes()` 注册。
+- `server.py` 初始化时调用 `attach_standard_domain_apis()` 挂载。
+- modules v1 前缀仍保留为兼容能力面、深诊断和 MCP manifest 来源。
 
-- **主业务配置（必选）**：仓库根目录 `config/config.yaml`（或 `config.yml`）。
-- **本机覆盖（可选，勿提交 Git）**：同目录 `local.yaml` / `local.yml` / `local.json`。模板见 `config/config.local.example.yaml`。
-- **密钥**：根目录 `.env`；运行时可用 `OPENCLAW__段__键__嵌套` 形式覆盖 YAML（亦支持已弃用前缀 `TRADING_`，会打日志提醒迁移）。
+新增公共能力时必须同步 domain API、domain service、standard registry、文档和测试。
 
-### 2.2 加载顺序
+## 配置模型
 
-`ConfigManager` 在**未**指定 `config_dir` 时，会扫描所有存在的目录（见 `DEFAULT_CONFIG_PATHS`），对每个目录依次加载：
+主配置文件：
 
-1. 该目录下的 **`config.yaml`** 或 **`config.yml`**（二选一，yaml 优先文件名）。
-2. 该目录下的 **`local.*`**（按固定文件名列表）。
+- `config/config.yaml`：仓库维护的主配置。
+- `config/local.yaml`：本机覆盖，勿提交。
+- `.env`：密钥、代理、本机环境变量。
 
-多个目录时按 `DEFAULT_CONFIG_PATHS` **顺序**合并；同一 key **后者覆盖前者**。默认顺序为：
+环境变量可用 `OPENCLAW__section__key__nested=value` 覆盖 YAML。旧 `TRADING_` 前缀仅作兼容，不建议新增。
 
-`data/config` → `config` → `/app/data/config` → `/app/config`
+`ConfigManager` 默认扫描顺序：
 
-**建议**：业务主 YAML **只维护一份**在 `config/config.yaml`；`data/config` 仅保留空目录或本机 `local.*`，避免再放第二份 `config.yaml` 造成混淆。
+```text
+data/config -> config -> /app/data/config -> /app/config
+```
 
-### 2.3 非 ConfigManager 的 YAML
+同一 key 后加载者覆盖先加载者。生产建议只维护一份 `config/config.yaml`，不要在 `data/config` 再放业务主配置。
 
-`config/` 下 **`clash_config.yaml`、`subscription.yaml`、`data_sources.yaml`** 等由**独立脚本或模块**读取，**不会**被 `ConfigManager` 自动合并进主配置。
+## 当前交易治理
 
-### 2.4 已移除的旧形态
+交易执行是系统最高风险路径，当前硬规则如下：
 
-以下已从仓库流程中移除，请勿再依赖：
+- `ai_brain.primary_controller=ai_core`。
+- `ai_brain.single_write_owner=ai_core`。
+- `ai_brain.enable_secondary_controller=false`。
+- `ai_brain.policy.allow_system_open=false`。
+- `ai_brain.policy.enable_replace_worst_on_full_positions=true`。
+- `ai_brain.policy.replace_worst_min_confidence=0.95`。
+- `trading.position_limits.symbol_max_margin_ratio=0.2`。
+- `max_same_direction_positions=5`。
+- `max_positions_oneway=5`、`max_positions_hedge=8`、`hard_max_positions=8`。
+- 第 1-5 笔开仓/加仓置信度：`0.72 / 0.77 / 0.82 / 0.87 / 0.92`。
 
-- 根目录 `openclaw-trading.json` 及旧备份 / clobber 文件  
-- `data/config/default.yml`、分散的 `*.json` 业务片段（旧式按文件分节）  
-- `openclaw.yml` / `default.yml` / `production.yml` 多文件叠加载  
+`ai_trading_engine` 可以做入场筛选，但 `ExecutionGateway` 是最终硬门禁。
 
-遗留 **Flask** 小工具 `src/web/app.py`：`GET /config` 仅**只读**返回 `config.yaml`（+ `local.*`）合并视图；`POST /config` 已返回 **410**，请直接改磁盘上的 YAML。
+## 模块边界
 
----
+| 模块 | 边界 |
+| --- | --- |
+| API | 协议适配、参数校验、响应包装；不堆业务决策 |
+| Commander | 跨域聚合、诊断、系统掌控和闭环解释 |
+| Strategy | 策略评分、审批、启停和研究发布状态 |
+| Risk | 风控红线、账户风险、仓位限制 |
+| Execution | 单写者、开平仓、失败记录、执行审计 |
+| Trades | 生命周期、拒单后验、trace 归因 |
+| Memory/Learning | 经验、复盘、课程化教训和调优反馈 |
+| Agents | 智能体 verdict、建议和有效性统计 |
+| Plugins | 插件和技能注册 |
 
-## 3. 目录与持久化（裸机）
+## 持久化与目录
 
-业务进程直接使用仓库根下路径（`ConfigManager` 亦识别历史上容器内的 `/app/...` 作为可选扫描路径，与裸机布局兼容）：
+- `config/`：主配置和本机覆盖模板。
+- `data/`：运行数据、交易记录和本地状态。
+- `logs/`：主日志、健康审计、交易所事实账本。
+- `runtime/`：PID 和运行期短状态。
+- `scripts/`：启动、验收、巡检、迁移脚本。
+- `tests/`：单元、集成和 e2e 测试。
 
-- **`config/`**：主业务 YAML；本机覆盖 `local.*` 勿提交 Git。  
-- **`src/`、`scripts/`、`tests/`**：源码与运维脚本。  
-- **`data/`、`logs/`、`workspace/`、`backups/`**：持久化与产物。
+## 可观测性
 
-启动入口见根目录 `start_production.sh`、`python -m src.main` 或 `scripts/start-openclaw-trading.sh`。宿主机经 Clash 出站与代理约定见 `deploy/HOST_CLASH_EGRESS.md`。
+基础接口：
 
----
+- `/api/v1/system/health`
+- `/api/v1/system/status`
+- `/api/v1/surface/registry`
+- `/api/v1/s1/verify`
+- `/api/v1/execution/spine`
+- `/api/v1/trades/lifecycle`
+- `/metrics`
 
-## 4. 模块索引（摘要）
+日志：
 
-| 领域 | 代表路径 |
-|------|-----------|
-| 配置 / 校验 | `src/modules/core/config_manager.py`，`config_runtime_validate.py` |
-| 主控 / 生命周期 | `src/modules/main_controller.py` |
-| API / WebSocket | `src/modules/api/server.py` |
-| 交易所 | `src/modules/exchanges/` |
-| 记忆 | `src/modules/memory/` |
-| 风控 / SLTP | `src/modules/core/risk_manager.py`，`stop_loss_take_profit.py` |
-| LLM | `src/modules/core/enhanced_llm_manager.py` 等 |
-| 交易监控（订单/行情/风险） | `src/modules/monitoring/trading_monitor.py`，经 `monitoring_api` 暴露 |
-| 增强告警（规则 + Telegram） | `src/modules/monitoring/enhanced_monitoring.py`，由 `MainController` 装配并与 SLTP 等联动 |
+- `logs/app.log`
+- `logs/exchange_sync/exchange_truth.jsonl`
+- `logs/health/health_suite_summary.md`
 
-OpenAPI 以运行实例 **`/openapi.json`** 为准。
+## 已弃用方向
 
-### 4.1 可观测性与进程内一致性
-
-- **健康与指标:** `GET /api/v1/system/health`、`GET /metrics`（及 v1 等价路径）由 `APIServer` 提供；总控聚合见 `control-center` 相关路由。
-- **告警可读路径:** `GET /api/v1/monitoring/alerts` 合并 `TradingMonitor` 与 `EnhancedMonitoringSystem`（字段 `source` 区分）。增强监控实例通过 `set_enhanced_monitoring()` 注册到 `monitoring_api`，避免「Telegram 已报但 REST 列表为空」的割裂。
-- **单一 API 进程:** 生产应只存在一个 `APIServer` 活跃实例（`main.py` 复用 `MainController` 已创建的实例；重复构造会触发保护，调试可设 `OPENCLAW_API_ALLOW_MULTI_INSTANCE=1`）。绑定一致性探针：`GET /api/v1/debug/exchange-binding`。
-- **REST / WebSocket 响应形状:** HTTP JSON 经中间件补齐标准字段（见 `docs/API_REFERENCE.md`）；WebSocket 出站同样补齐，便于前端统一解析。
-
-### 4.2 账户/持仓同步一致性（2026-04-15）
-
-- `MainController.get_exchange()` 采用多级兜底：
-  1. `okx_exchange`
-  2. `self.exchange`
-  3. `ai_trading_engine.exchange`
-- 快照接口 `GET /api/v1/modules/commander/snapshot` 的账户持仓为多级回退：
-  1. `_latest_account_state.positions`
-  2. `ai_trading_engine.positions`（进程内已接管仓位）
-  3. 交易所 `get_positions()`（短超时直拉）
-- 目标：避免出现“交易所有持仓但控制面显示 0”的误判，优先保证控制面可解释与风控一致性。
-
-### 4.3 Market State 稳定性优化（2026-04-16）
-
-- `MarketIntelligenceEngine.get_market_state()` 已调整为“缓存优先 + 缺失补拉”：
-  - 优先复用 `get_cached_symbol_view()` 结果
-  - 仅对缓存缺失标的做实时拉取（受 `market_state_fetch_limit` 限制）
-- `symbols_attempted` 调整为“真实尝试数”，避免与全币池规模混淆。
-- 上游采集超时引入自适应：
-  - `snapshot_timeout_dynamic_s` / `klines_timeout_dynamic_s`
-  - 超时连续发生时放宽，连续稳定时回落
-  - 配置入口：`config/config.yaml -> market_intelligence` 段
-
-### 4.4 OpenClaw 对接契约（2026-04-16）
-
-- 对接优先入口：
-  - 读：`/modules/commander/capabilities`、`/modules/commander/tool-contract`、`/modules/surface/*`
-  - 写：`/modules/commander/dispatch`
-- 建议强制保留 `source=openclaw` 作为调用来源标识，以便治理审计追溯。
-- 对接操作手册：`docs/OPENCLAW_INTEGRATION_GUIDE.md`。
-
-### 4.5 API 鉴权与写保护（2026-04-26）
-
-- `APIServer` 默认开启受保护写接口鉴权（`enforce_auth_on_writes=true`）：
-  - 保护前缀：`/api/v1/modules`、`/api/v1/monitoring`、`/api/v1/commander`、`/api/v1/trade`
-  - 受保护写方法：`POST/PUT/PATCH/DELETE`（`GET/HEAD/OPTIONS` 不受此规则约束）
-- 角色门控：默认 `required_write_roles=["admin"]`，非 admin token 会返回 `403`。
-- WebSocket `/ws` 默认要求 token（query/header 二选一），无效 token 将关闭连接（`1008`）。
-- 新增策略可观测接口：
-  - `GET /api/v1/auth/status`
-  - `GET /api/v1/auth/write-policy`
-
----
-
-## 5. 与 ARCHITECTURE 的关系
-
-根目录 [ARCHITECTURE.md](../ARCHITECTURE.md) 仅保留跳转；**本文件**为工程细节的主入口。
-
----
-
-*文档版本与仓库当前行为同步；若行为变更请更新 [CHANGELOG.md](./CHANGELOG.md)。*
+- 不再新增 Flask 配置写接口。
+- 不再把新增公共能力只挂到 modules v1 前缀下。
+- 不再让脚本绕过 API 和 ExecutionGateway 直接执行交易写入。
+- 不再依赖根目录旧 `openclaw-trading.json` 或多份分散 YAML 作为主配置。

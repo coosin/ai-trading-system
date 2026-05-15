@@ -1,94 +1,85 @@
 # OpenClaw 对接与验收指南
 
-本文说明如何将 **OpenClaw 交易 API** 作为控制面接入：配置、关键只读接口、巡检脚本与上线核对顺序。更细的运维与网络见 **[OPERATIONS.md](./OPERATIONS.md)**；MCP 关系与基线见 **[MCP_BASELINE.md](./MCP_BASELINE.md)**；全量路由说明见 **[API_REFERENCE.md](./API_REFERENCE.md)**。
+本文面向外部控制面、值守机器人、MCP/CLI 工具和 Dashboard。接口细节见 [API_REFERENCE.md](./API_REFERENCE.md)，架构边界见 [STANDARD_DOMAIN_ARCHITECTURE.md](./STANDARD_DOMAIN_ARCHITECTURE.md)。
 
----
+## 对接原则
 
-## 1. 配置
+- 新集成优先使用 `/api/v1/{domain}/...` 标准域接口。
+- 只读巡检顺序不要硬编码，优先读取 `/api/v1/surface/registry` 或兼容 `/api/v1/modules/surface/registry`。
+- 写入能力必须区分策略治理、学习归因和真实交易执行。
+- 真实交易执行必须经过 `ExecutionGateway`，不能绕过单写者和风控门禁。
+- 自动化脚本统一使用 `OPENCLAW_API_BASE`。
 
-- **主配置（必存于仓库）**：`config/config.yaml`。
-- **本机覆盖（勿提交）**：将 `config/config.local.example.yaml` 复制为同目录 **`config/local.yaml`**（或 `local.yml` / `local.json`），填写密钥与覆盖项。详见 **[DEVELOPMENT.md](./DEVELOPMENT.md)**、`config/config.yaml` 顶部注释。
-
----
-
-## 2. 控制面只读探针（上线前建议）
-
-服务监听默认 `http://127.0.0.1:8000`（可按部署修改主机与端口）。
+## 最小只读接入
 
 ```bash
-curl -s http://127.0.0.1:8000/api/v1/modules/commander/capabilities
-curl -s http://127.0.0.1:8000/api/v1/modules/commander/tool-contract
-curl -s http://127.0.0.1:8000/api/v1/modules/surface/channels
-curl -s http://127.0.0.1:8000/api/v1/modules/surface/registry
-curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/snapshot?symbol=BTC/USDT'
+OPENCLAW_API_BASE=${OPENCLAW_API_BASE:-http://127.0.0.1:8000}
+curl -s "$OPENCLAW_API_BASE/api/v1/surface/registry"
+curl -s "$OPENCLAW_API_BASE/api/v1/system/health"
+curl -s "$OPENCLAW_API_BASE/api/v1/system/status"
+curl -s "$OPENCLAW_API_BASE/api/v1/account/snapshot"
+curl -s "$OPENCLAW_API_BASE/api/v1/commander/system-mastery?symbol=BTC/USDT"
+curl -s "$OPENCLAW_API_BASE/api/v1/trades/lifecycle"
 ```
 
-**交易闭环一页式摘要**（决策 trace、执行网关、对账、监控等聚合，便于运行中优化排查；非纯历史报表）：
-
-- 路径：`/api/v1/modules/commander/closed-loop-summary`（GET，可选查询参数 `trace_limit`，默认 120）
+旧控制面如仍依赖 modules 能力，可读取：
 
 ```bash
-curl -s 'http://127.0.0.1:8000/api/v1/modules/commander/closed-loop-summary?trace_limit=120'
+curl -s "$OPENCLAW_API_BASE/api/v1/modules/surface/registry"
+curl -s "$OPENCLAW_API_BASE/api/v1/modules/commander/capabilities"
+curl -s "$OPENCLAW_API_BASE/api/v1/modules/commander/tool-contract"
 ```
 
-运行中建议至少补两类只读探针，不要只接健康接口：
+## 外部系统推荐数据链路
 
-- `GET /api/v1/modules/commander/trading-diagnosis`
-  - 重点读取 `data.signal_and_guard.workflow_focus`
-  - 用于判断系统当前主要卡在 `analysis / guard / execution / reconciliation` 的哪一段
-- `GET /api/v1/modules/commander/decision-traces`
-  - 重点读取 `top_workflow_stages` / `top_workflow_statuses` / `top_reconciliation_blocks`
-  - 用于验证聚合卡点是否与总诊断一致
+1. `system.health`：确认进程和交易所基础绑定。
+2. `surface.registry`：获取能力、推荐巡检顺序和核心路由。
+3. `commander.system-mastery`：获取系统、账户、行情、决策、执行和收益闭环总览。
+4. `account.snapshot`：读取余额与持仓。
+5. `strategy.overview`：读取策略评分、筛选、审批和上线状态。
+6. `execution.spine`：读取单写者、开仓门控和执行脊柱状态。
+7. `trades.lifecycle`：读取开平仓、SLTP、拒单和后验归因。
+8. `agents.effectiveness`、`learning.overview`：读取智能体和学习闭环效果。
 
-如果你的外部控制面、值守机器人或 dashboard 只拉健康状态，不拉这两类 workflow 语义，排障时仍然会退回“系统活着但不知道为什么不交易”的旧状态。
+## 写入能力
 
-可选写入探针（高峰期若 HTTP 超时，可用仓库脚本代替）：
+策略治理写入：
 
 ```bash
-python3 scripts/commander_dispatch_client.py "系统巡检" --source openclaw
+curl -s -X POST "$OPENCLAW_API_BASE/api/v1/strategy/{strategy_id}/approve"
+curl -s -X POST "$OPENCLAW_API_BASE/api/v1/strategy/{strategy_id}/activate"
+curl -s -X POST "$OPENCLAW_API_BASE/api/v1/strategy/{strategy_id}/deactivate"
 ```
 
----
-
-## 3. 健康与稳定性脚本
-
-| 脚本 | 用途 |
-|------|------|
-| `scripts/health_check.sh` | API 健康 JSON + Redis 可用性（环境变量见脚本内注释） |
-| `scripts/prod_stability_check.py` | 生产级稳定性一票验收（健康、交易所、绑定、对账等） |
-| `scripts/trading_exec_fullcheck.py` | 交易执行链路与诊断摘要 |
-| `scripts/verify.py` | 统一入口：`trading` / `network` / `trading-gates` |
-
-示例：
+学习与归因写入：
 
 ```bash
-bash scripts/health_check.sh
-python3 scripts/prod_stability_check.py
-python3 scripts/verify.py trading-gates
+curl -s -X POST "$OPENCLAW_API_BASE/api/v1/learning/backfill-lessons"
+curl -s -X POST "$OPENCLAW_API_BASE/api/v1/trades/backfill-trace-attribution"
 ```
 
----
+交易执行写入不建议外部系统直接调用。若确需自动化执行，必须走系统现有 commander/ExecutionGateway 链路，并保留 `source`、审批状态、trace 和审计记录。
 
-## 4. 网络出站
-
-部署后确认容器/宿主机可访问交易所与依赖服务：
-
-```bash
-python3 scripts/network_connectivity_smoke.py
-python3 scripts/production_network_baseline.py --check-only
-```
-
-详见 **OPERATIONS.md** 第 3 节（代理、OKX、`NO_PROXY` 等）。
-
----
-
-## 5. OpenAPI 与文档一致性
-
-本地可运行（不依赖服务进程）：
+## 上线验收
 
 ```bash
 python3 scripts/check_docs_runtime_consistency.py
-python3 scripts/check_docs_runtime_consistency.py --runtime
+pytest -q tests/unit/test_standard_domain_api.py
+pytest -q tests/e2e/test_api_surface_commander_chain.py
+curl -s "$OPENCLAW_API_BASE/api/v1/s1/verify"
 ```
 
-完整 OpenAPI 快照位于 **`docs/API_OPENAPI_FULL.json`**（可由当前代码生成，供文档检查与外部工具导入）。
+验收通过标准：
+
+- `/api/v1/system/health` 返回健康或可解释降级。
+- `/api/v1/surface/registry` 能列出标准 domains 和 routes。
+- `/api/v1/s1/verify` 不报告单写者或执行脊柱硬门禁失败。
+- `commander.system-mastery` 能给出账户、行情、执行和优化建议。
+- 写接口鉴权策略符合当前部署要求。
+
+## 常见迁移
+
+- `/api/v1/balance`、`/api/v1/positions` 迁移到 `/api/v1/account/snapshot`。
+- `/api/v1/modules/commander/closed-loop-summary` 迁移到 `/api/v1/commander/closed-loop` 和 `/api/v1/trades/lifecycle`。
+- `/api/v1/modules/surface/registry` 可继续作为兼容发现入口，但新系统应优先使用 `/api/v1/surface/registry`。
+

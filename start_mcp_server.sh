@@ -10,6 +10,7 @@ OPENCLAW_DIR="/home/cool/ai-trading-system"
 MCP_ADAPTER_DIR="${OPENCLAW_DIR}/mcp_adapter"
 LOG_DIR="${OPENCLAW_DIR}/logs/collaboration"
 PIDFILE="${LOG_DIR}/mcp_server.pid"
+OPENCLAW_API_BASE="${OPENCLAW_API_BASE:-http://127.0.0.1:8000}"
 
 # 创建目录
 mkdir -p "${MCP_ADAPTER_DIR}" "${LOG_DIR}"
@@ -55,11 +56,11 @@ fi
 
 # 检查 OpenClaw 是否运行
 check_openclaw() {
-    if curl -s http://localhost:18789/api/v1/status > /dev/null 2>&1; then
-        echo "OpenClaw is running"
+    if curl -s "${OPENCLAW_API_BASE}/api/v1/system/health" > /dev/null 2>&1; then
+        echo "OpenClaw API is running (${OPENCLAW_API_BASE})"
         return 0
     else
-        echo "Warning: OpenClaw not responding on port 18789"
+        echo "Warning: OpenClaw API not responding at ${OPENCLAW_API_BASE}"
         return 1
     fi
 }
@@ -67,12 +68,28 @@ check_openclaw() {
 # 启动 HTTP 模式 (备用)
 start_http_mode() {
     echo "Starting OpenClaw MCP server in HTTP mode on port 18888..."
-    nohup python3 "${MCP_ADAPTER_DIR}/openclaw_mcp_server.py" \
-        --mode http \
-        --port 18888 \
-        >> "${LOG_DIR}/mcp_server.log" 2>&1 &
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -f python3 "${MCP_ADAPTER_DIR}/openclaw_mcp_server.py" \
+            --mode http \
+            --port 18888 \
+            --api-base "${OPENCLAW_API_BASE}" \
+            >> "${LOG_DIR}/mcp_server.log" 2>&1 < /dev/null
+        sleep 0.5
+        pgrep -f "openclaw_mcp_server.py --mode http --port 18888" | head -n 1 > "${PIDFILE}"
+    else
+        nohup python3 "${MCP_ADAPTER_DIR}/openclaw_mcp_server.py" \
+            --mode http \
+            --port 18888 \
+            --api-base "${OPENCLAW_API_BASE}" \
+            >> "${LOG_DIR}/mcp_server.log" 2>&1 < /dev/null &
+        echo $! > "${PIDFILE}"
+    fi
 
-    echo $! > "${PIDFILE}"
+    if [ ! -s "${PIDFILE}" ]; then
+        echo "Error: MCP server process did not start"
+        tail -n 80 "${LOG_DIR}/mcp_server.log" || true
+        exit 1
+    fi
     echo "MCP server started with PID $(cat ${PIDFILE})"
 
     # 等待启动
@@ -86,12 +103,14 @@ start_http_mode() {
 
 # 停止
 stop_server() {
+    STOPPED=0
     if [ -f "${PIDFILE}" ]; then
         PID=$(cat "${PIDFILE}")
         if kill -0 "${PID}" 2>/dev/null; then
             echo "Stopping MCP server (PID ${PID})..."
             kill "${PID}"
             rm -f "${PIDFILE}"
+            STOPPED=1
             echo "Stopped"
         else
             echo "MCP server not running"
@@ -99,6 +118,15 @@ stop_server() {
         fi
     else
         echo "PID file not found"
+    fi
+    EXTRA_PIDS=$(pgrep -f "openclaw_mcp_server.py --mode http --port 18888" || true)
+    if [ -n "${EXTRA_PIDS}" ]; then
+        echo "Stopping extra MCP process(es): ${EXTRA_PIDS}"
+        kill ${EXTRA_PIDS} 2>/dev/null || true
+        STOPPED=1
+    fi
+    if [ "${STOPPED}" = "1" ]; then
+        sleep 1
     fi
 }
 

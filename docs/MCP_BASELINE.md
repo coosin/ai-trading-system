@@ -1,59 +1,71 @@
-# OpenClaw Trading — MCP 基础与对标基线
+# OpenClaw MCP 基线
 
-本文档用于统一说明当前系统与 MCP（Model Context Protocol）的关系、落地边界和后续方向。
+本文说明当前系统与 MCP 的关系。OpenClaw 的主系统仍是 FastAPI + 内部模块；MCP 是外部 AI 客户端调用工具的适配层，不是交易执行的绕行入口。
 
----
+## 定位
 
-## 1. MCP 基础概念（面向本仓库）
+- FastAPI 标准域接口是权威控制面。
+- MCP/CLI 工具通过 HTTP fallback adapter 访问标准域和兼容只读接口。
+- 默认 fallback 只允许只读 GET 工具。
+- 写入工具即使出现在 manifest，也必须标记为 guarded write，并由系统鉴权和 ExecutionGateway 门禁处理。
 
-- **MCP 是协议层**：用于让 AI 客户端（Cursor / Claude / VSCode 等）调用外部工具。
-- **本系统定位**：
-  - 现阶段以 `FastAPI + 内部模块` 为主；
-  - 可通过 MCP 客户端访问本系统 API 或外部交易工具；
-  - 后续可补充 OpenClaw 自身 MCP Server（统一暴露行情、账户、风控、执行、复盘能力）。
+## 当前文件与入口
 
----
+- MCP fallback adapter：`mcp_adapter/openclaw_mcp_server.py`。
+- 启动脚本：`start_mcp_server.sh`。
+- 工具发现：`GET /api/v1/modules/surface/mcp-manifest`。
+- 标准 API 发现：`GET /api/v1/surface/registry`。
+- API 基址：`OPENCLAW_API_BASE`。
 
-## 2. 与 OKX Agent Trade Kit 的关系
+启动：
 
-参考来源（2026-04-15）：
+```bash
+OPENCLAW_API_BASE=http://127.0.0.1:8000 ./start_mcp_server.sh restart
+```
 
-- OKX Agent Trade Kit 页面：<https://www.okx.com/zh-hans/agent-tradekit>
-- OKX Agent Trade Kit 仓库：<https://github.com/okx/agent-tradekit>
-- MCP 官方入门：<https://modelcontextprotocol.io/docs/getting-started/intro>
+验收：
 
-结论：
+```bash
+curl -s http://127.0.0.1:18888/health
+curl -s http://127.0.0.1:18888/tools
+curl -s -X POST http://127.0.0.1:18888/call \
+  -H 'Content-Type: application/json' \
+  -d '{"tool":"system_health","params":{}}'
+```
 
-- **OKX Agent Trade Kit 更偏“标准执行底座”**（MCP/CLI 工具化、模块化、快速接入）。
-- **OpenClaw 更偏“智能交易中台”**（数据融合、AI 决策、风险门控、事件流、复盘学习）。
-- 推荐路线：**保留 OpenClaw 智能核心，执行层与 MCP/CLI 标准接口兼容化**。
+## 推荐工具分级
 
----
+只读工具：
 
-## 3. 当前运行态约束（重要）
+- 系统健康、状态、surface registry。
+- 账户快照、行情快照、数据快照。
+- commander system-mastery、closed-loop、trading-workflow。
+- strategy overview、trades lifecycle、agents effectiveness。
 
-- 账户与持仓权威来源仍是交易所接口（OKX）。
-- 控制面快照 (`/api/v1/modules/commander/snapshot`) 在缓存为空时已支持多级回退：
-  1. `_latest_account_state`
-  2. `ai_trading_engine.positions`
-  3. 交易所短超时直拉（2.5s）
-- `account-diagnostics` 超时降级时返回 `hint=account_diagnostics_timeout`，并附带关键事实字段（如 `exchange`、`cached_position_count`），避免误判。
+受保护写工具：
 
----
+- 策略审批、启用、停用。
+- 学习 backfill、trace attribution backfill。
+- 交易执行类工具不得默认开放；如需开放，必须保留人工审批、source、trace、鉴权和 ExecutionGateway 门控。
 
-## 4. 建议的 MCP 工程落地顺序
+## 安全边界
 
-1. **读路径先行**：行情、账户、风控状态、事件流（只读工具）
-2. **写路径分级**：下单/撤单/改仓按模块权限开放
-3. **安全护栏**：read-only 模式、模块白名单、速率限制、二次确认
-4. **一致性校验**：写后强制对账（持仓/余额）并回写事件流
+- MCP 不是交易所密钥持有者；密钥仍由 OpenClaw 运行进程和 `.env` 管理。
+- MCP 不直接连接 OKX 下单。
+- MCP 不绕过 `ai_brain.single_write_owner=ai_core`。
+- MCP 写入必须被 API 鉴权和审计记录覆盖。
+- MCP 工具返回降级状态时必须把 `hint`、`degraded`、`error` 原样传给客户端。
 
----
+## 与 OKX Agent Trade Kit 的关系
 
-## 5. 验收基线（MCP 集成后）
+- OKX Agent Trade Kit 更偏标准化交易工具底座。
+- OpenClaw 更偏智能交易中台：数据融合、AI 决策、风险门控、执行脊柱、复盘学习。
+- 推荐路线是保留 OpenClaw 智能核心，把 MCP/CLI 作为外部工具适配层，而不是替换内部 ExecutionGateway。
 
-- 客户端接入：可在 30 分钟内完成并调用行情只读工具
-- 状态一致性：系统持仓数与交易所非零持仓数一致
-- 超时降级可解释：返回降级标记与可读 hint，不返回空白结构
-- 交易审计可追踪：每次写操作在事件流与审计接口有对应记录
+## 集成验收
+
+- 客户端 30 分钟内可完成只读工具接入。
+- 账户和持仓快照与交易所事实可解释一致。
+- 降级响应不为空白，必须有 hint 或结构化 error。
+- 写入操作有审计、trace、source 和执行后对账。
 
