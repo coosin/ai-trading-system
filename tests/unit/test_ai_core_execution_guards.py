@@ -62,7 +62,7 @@ def _engine(tmp_path: Path) -> AICoreDecisionEngine:
     mc.config_manager = None
     mc.execution_gateway = None
     mc.agent_orchestrator = SimpleNamespace(
-        get_status=lambda: {"mode": "advisory_only", "workflow": "sequential_handoff"}
+        get_status=lambda: {"mode": "execution_governed", "workflow": "sequential_handoff"}
     )
     mc.strategy_manager = None
     mc.market_structure_engine = None
@@ -130,9 +130,35 @@ async def test_execute_decision_degraded_exchange_reduces_qty_and_leverage(tmp_p
     assert called["params"]["quantity"] == 7
     assert called["params"]["leverage"] == 8
     trace = eng.main_controller.decision_trace_store.get_recent(1)[0]
-    assert trace["workflow"]["mode"] == "advisory_only"
+    assert trace["workflow"]["mode"] == "execution_governed"
     assert trace["workflow"]["current_stage"] == "guard:execution_preflight"
     assert trace["workflow"]["status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_execute_decision_high_vol_advisory_only_softens_instead_of_rejecting(tmp_path):
+    eng = _engine(tmp_path)
+    eng.config["auto_adaptive_guards"] = True
+    eng.exchange.probe_public_api = AsyncMock(
+        return_value={"ok": True, "status_text": "reachable", "score": 1.0}
+    )
+    eng._get_technical_indicators = AsyncMock(
+        return_value={"price": 100.0, "ma5_1h": 103.0, "ma20_1h": 100.0}
+    )
+
+    d = _decision()
+    ok = await eng._execute_decision(d)
+
+    assert ok is True
+    assert eng.main_controller.execute_command.await_count == 1
+    assert eng._execution_guards_stats.get("regime_advisory_only_softened", 0) >= 1
+    assert d.quantity < 10
+    assert d.leverage < 10
+    called = eng.main_controller.execute_command.await_args.kwargs
+    semantic = called["params"]["semantic_context"]
+    assert semantic["risk_verdict"] == "caution"
+    assert semantic["execution_recommendation"] == "wait_or_slice"
+    assert semantic["agent_execution_plan"]["should_block"] is False
 
 
 @pytest.mark.asyncio

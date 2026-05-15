@@ -5,6 +5,7 @@
 """
 
 import logging
+import math
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -45,6 +46,161 @@ def _to_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.min
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
+    except Exception:
+        return datetime.min
+
+
+def _trade_series_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ordered = sorted(items, key=lambda row: _parse_timestamp(row.get("timestamp")))
+    pnls = [_to_float(x.get("pnl")) for x in ordered]
+    total_pnl = sum(pnls)
+    gross_profit = sum(p for p in pnls if p > 0)
+    gross_loss = abs(sum(p for p in pnls if p < 0))
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    current_drawdown = 0.0
+    current_dd_duration = 0
+    max_dd_duration = 0
+    win_streak = 0
+    loss_streak = 0
+    best_win_streak = 0
+    best_loss_streak = 0
+    for pnl in pnls:
+        equity += pnl
+        peak = max(peak, equity)
+        drawdown = max(0.0, peak - equity)
+        max_drawdown = max(max_drawdown, drawdown)
+        current_drawdown = drawdown
+        if drawdown > 1e-12:
+            current_dd_duration += 1
+            max_dd_duration = max(max_dd_duration, current_dd_duration)
+        else:
+            current_dd_duration = 0
+        if pnl > 0:
+            win_streak += 1
+            loss_streak = 0
+        elif pnl < 0:
+            loss_streak += 1
+            win_streak = 0
+        else:
+            win_streak = 0
+            loss_streak = 0
+        best_win_streak = max(best_win_streak, win_streak)
+        best_loss_streak = max(best_loss_streak, loss_streak)
+    sharpe_ratio = 0.0
+    total = len(pnls)
+    if total >= 2:
+        mean = total_pnl / total
+        variance = sum((p - mean) ** 2 for p in pnls) / (total - 1)
+        std = math.sqrt(max(variance, 0.0))
+        if std > 1e-12:
+            sharpe_ratio = (mean / std) * math.sqrt(total)
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    return {
+        "total_trades": total,
+        "win_trades": len(wins),
+        "loss_trades": len(losses),
+        "win_rate": (len(wins) / total) if total else 0.0,
+        "total_pnl": total_pnl,
+        "max_drawdown": max_drawdown,
+        "sharpe_ratio": sharpe_ratio,
+        "avg_win": (sum(wins) / len(wins)) if wins else 0.0,
+        "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
+        "profit_factor": (gross_profit / gross_loss) if gross_loss > 1e-12 else (9999.0 if gross_profit > 0 else 0.0),
+        "expectancy": (total_pnl / total) if total else 0.0,
+        "drawdown_duration": max_dd_duration,
+        "current_drawdown": current_drawdown,
+        "win_streak": best_win_streak,
+        "loss_streak": best_loss_streak,
+        "best_trade": max(pnls) if pnls else 0.0,
+        "worst_trade": min(pnls) if pnls else 0.0,
+        "last_update": max((str(x.get("timestamp") or "") for x in ordered), default=None),
+    }
+
+
+def _trade_action(row: Dict[str, Any]) -> str:
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    action = str(row.get("action") or md.get("action") or md.get("trade_phase") or "").strip().lower()
+    if action in {"open", "close", "opened", "closed"}:
+        return "close" if action in {"close", "closed"} else "open"
+    decision_action = str(md.get("decision_action") or "").strip().upper()
+    if decision_action.startswith("OPEN_"):
+        return "open"
+    if decision_action.startswith("CLOSE_"):
+        return "close"
+    return ""
+
+
+def _trade_leg_side(row: Dict[str, Any]) -> str:
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    decision_action = str(md.get("decision_action") or "").strip().upper()
+    if decision_action.endswith("_LONG"):
+        return "long"
+    if decision_action.endswith("_SHORT"):
+        return "short"
+    action = _trade_action(row)
+    side = str(row.get("side") or "").strip().lower()
+    if action == "open":
+        return "long" if side == "buy" else ("short" if side == "sell" else "")
+    if action == "close":
+        return "long" if side == "sell" else ("short" if side == "buy" else "")
+    return ""
+
+
+def _realized_trade_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in items:
+        pnl = _to_float(row.get("pnl"))
+        pnl_pct = _to_float(row.get("pnl_percent"))
+        action = _trade_action(row)
+        status = str(row.get("status") or "").strip().lower()
+        if action == "close" and status in {"filled", "closed"}:
+            out.append(row)
+            continue
+        if abs(pnl) > 1e-12 or abs(pnl_pct) > 1e-12:
+            out.append(row)
+    return out
+
+
+def _average_holding_period_hours(items: List[Dict[str, Any]]) -> float:
+    ordered = sorted(items, key=lambda row: _parse_timestamp(row.get("timestamp")))
+    open_legs: Dict[tuple[str, str], List[datetime]] = {}
+    durations_sec: List[float] = []
+    for row in ordered:
+        action = _trade_action(row)
+        leg_side = _trade_leg_side(row)
+        symbol = str(row.get("symbol") or "").strip().upper()
+        ts = _parse_timestamp(row.get("timestamp"))
+        if not symbol or not leg_side or ts == datetime.min:
+            continue
+        key = (symbol, leg_side)
+        if action == "open":
+            open_legs.setdefault(key, []).append(ts)
+            continue
+        if action != "close":
+            continue
+        queue = open_legs.get(key) or []
+        if not queue:
+            continue
+        opened_at = queue.pop(0)
+        delta = (ts - opened_at).total_seconds()
+        if delta >= 0:
+            durations_sec.append(delta)
+    if not durations_sec:
+        return 0.0
+    return sum(durations_sec) / (len(durations_sec) * 3600.0)
 
 
 async def _load_trade_rows(limit: int = 200, days: int = 30, realized_only: bool = False) -> List[Dict[str, Any]]:
@@ -286,7 +442,7 @@ async def get_strategy_performance():
     if not _trading_monitor:
         raise HTTPException(status_code=503, detail="Monitoring system not initialized")
     
-    rows = await _load_trade_rows(limit=10000, days=90, realized_only=True)
+    rows = await _load_trade_rows(limit=10000, days=90, realized_only=False)
     if rows:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
@@ -301,33 +457,11 @@ async def get_strategy_performance():
             grouped.setdefault(strategy_name, []).append(row)
         result = {}
         for strategy_name, items in grouped.items():
-            pnls = [_to_float(x.get("pnl")) for x in items]
-            wins = [p for p in pnls if p > 0]
-            losses = [p for p in pnls if p < 0]
-            total = len(items)
-            total_pnl = sum(pnls)
-            gross_profit = sum(wins)
-            gross_loss = abs(sum(losses))
+            realized_items = _realized_trade_rows(items)
+            stats = _trade_series_metrics(realized_items)
             result[strategy_name] = {
-                "total_trades": total,
-                "win_trades": len(wins),
-                "loss_trades": len(losses),
-                "win_rate": (len(wins) / total) if total else 0.0,
-                "total_pnl": total_pnl,
-                "max_drawdown": 0.0,
-                "sharpe_ratio": 0.0,
-                "last_update": max(str(x.get("timestamp") or "") for x in items) if items else None,
-                "avg_win": (sum(wins) / len(wins)) if wins else 0.0,
-                "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
-                "profit_factor": (gross_profit / gross_loss) if gross_loss > 1e-12 else (9999.0 if gross_profit > 0 else 0.0),
-                "expectancy": (total_pnl / total) if total else 0.0,
-                "drawdown_duration": 0,
-                "current_drawdown": 0.0,
-                "win_streak": 0,
-                "loss_streak": 0,
-                "best_trade": max(pnls) if pnls else 0.0,
-                "worst_trade": min(pnls) if pnls else 0.0,
-                "avg_holding_period": 0.0,
+                **stats,
+                "avg_holding_period": _average_holding_period_hours(items),
                 "source": "trade_history_service",
             }
         return result

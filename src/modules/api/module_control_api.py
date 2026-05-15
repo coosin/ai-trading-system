@@ -8,8 +8,8 @@ import logging
 import re
 import time
 import uuid
-from collections import Counter
-from datetime import datetime, timedelta
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -122,6 +122,1879 @@ def _summarize_trace_workflow_focus(traces: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "top_stage": top_stage if isinstance(top_stage, dict) else None,
         "top_status": top_status if isinstance(top_status, dict) else None,
+    }
+
+
+async def _get_live_position_count(main_controller: Any) -> int:
+    try:
+        ex = main_controller.get_exchange() if hasattr(main_controller, "get_exchange") else getattr(main_controller, "okx_exchange", None)
+        if ex and hasattr(ex, "get_positions"):
+            rows = await ex.get_positions()
+            return len([r for r in (rows or []) if isinstance(r, dict) and abs(_safe_float(r.get("size") or r.get("pos") or r.get("positionAmt"))) > 1e-12])
+    except Exception:
+        pass
+    try:
+        st = getattr(main_controller, "_latest_account_state", None)
+        rows = st.get("positions") if isinstance(st, dict) else None
+        if isinstance(rows, list):
+            return len([r for r in rows if isinstance(r, dict) and abs(_safe_float(r.get("size") or r.get("pos") or r.get("positionAmt"))) > 1e-12])
+    except Exception:
+        pass
+    return 0
+
+
+async def _get_live_sltp_active_order_count(main_controller: Any) -> int:
+    sltp = getattr(main_controller, "stop_loss_manager", None)
+    if not sltp:
+        return 0
+    try:
+        if hasattr(sltp, "get_all_active_orders"):
+            return len(await sltp.get_all_active_orders())
+    except Exception:
+        pass
+    try:
+        stats = sltp.get_stats() if hasattr(sltp, "get_stats") else {}
+        return _safe_int((stats or {}).get("active_orders", 0))
+    except Exception:
+        return 0
+
+
+async def _build_agent_effectiveness_summary(
+    main_controller: Any,
+    *,
+    trace_limit: int = 120,
+    trade_limit: int = 500,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "summary": {
+            "trace_sample_size": 0,
+            "agent_trace_coverage": 0,
+            "agent_trace_coverage_ratio": 0.0,
+            "full_stack_trace_count": 0,
+            "blocked_trace_count": 0,
+            "executed_trace_count": 0,
+            "trade_linked_trace_count": 0,
+            "realized_trade_linked_trace_count": 0,
+        },
+        "agents": {},
+        "top_issues": [],
+    }
+    if not main_controller:
+        out["summary"]["message"] = "main_controller_unavailable"
+        return out
+
+    store = getattr(main_controller, "decision_trace_store", None)
+    if not store or not hasattr(store, "get_recent"):
+        out["summary"]["message"] = "decision_trace_store_unavailable"
+        return out
+
+    rows = list(store.get_recent(limit=int(trace_limit or 120)) or [])
+    agent_names = [
+        "market_structure_agent",
+        "research_agent",
+        "risk_governor_agent",
+        "execution_coach_agent",
+    ]
+    out["summary"]["trace_sample_size"] = len(rows)
+
+    trade_rows: List[Dict[str, Any]] = []
+    ths = getattr(main_controller, "trade_history_service", None)
+    if ths and hasattr(ths, "get_trade_history"):
+        try:
+            trade_rows = await ths.get_trade_history(limit=max(50, int(trade_limit or 500)))
+        except Exception:
+            trade_rows = []
+
+    open_trace_ids: set[str] = set()
+    realized_trace_ids: set[str] = set()
+    trade_trace_prefixes: Counter[str] = Counter()
+    realized_trace_prefixes: Counter[str] = Counter()
+    realized_trace_examples: List[str] = []
+    realized_by_strategy: Dict[str, Dict[str, float]] = defaultdict(lambda: {"count": 0.0, "pnl": 0.0})
+    for row in trade_rows or []:
+        if not isinstance(row, dict):
+            continue
+        meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+        trace_id = _extract_trade_trace_id(row)
+        if trace_id:
+            open_trace_ids.add(trace_id)
+            trade_trace_prefixes[_trace_namespace(trace_id)] += 1
+            pnl_v = _safe_float(row.get("pnl"))
+            pnl_pct_v = _safe_float(row.get("pnl_percent"))
+            if abs(pnl_v) > 1e-12 or abs(pnl_pct_v) > 1e-12:
+                realized_trace_ids.add(trace_id)
+                realized_trace_prefixes[_trace_namespace(trace_id)] += 1
+                if len(realized_trace_examples) < 8:
+                    realized_trace_examples.append(trace_id)
+        strategy_id = str(meta.get("strategy_id") or row.get("strategy") or "").strip()
+        pnl_v = _safe_float(row.get("pnl"))
+        pnl_pct_v = _safe_float(row.get("pnl_percent"))
+        if strategy_id and (abs(pnl_v) > 1e-12 or abs(pnl_pct_v) > 1e-12):
+            realized_by_strategy[strategy_id]["count"] += 1.0
+            realized_by_strategy[strategy_id]["pnl"] += pnl_v
+
+    per_agent: Dict[str, Dict[str, Any]] = {}
+    agent_trace_coverage = 0
+    full_stack_count = 0
+    blocked_trace_count = 0
+    executed_trace_count = 0
+    linked_trace_count = 0
+    realized_linked_trace_count = 0
+    store_trace_ids: set[str] = set()
+    store_trace_prefixes: Counter[str] = Counter()
+
+    for name in agent_names:
+        per_agent[name] = {
+            "participated": 0,
+            "avg_confidence": 0.0,
+            "blocking_flag_count": 0,
+            "workflow_blocked_count": 0,
+            "guard_rejected_count": 0,
+            "execution_success_count": 0,
+            "trade_linked_count": 0,
+            "realized_trade_linked_count": 0,
+            "next_actions": [],
+            "verdicts": [],
+            "top_symbols": [],
+        }
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        trace_id = str(row.get("trace_id") or "").strip()
+        if trace_id:
+            store_trace_ids.add(trace_id)
+            store_trace_prefixes[_trace_namespace(trace_id)] += 1
+        workflow = row.get("workflow", {}) if isinstance(row.get("workflow"), dict) else {}
+        guard = row.get("guard", {}) if isinstance(row.get("guard"), dict) else {}
+        execution = row.get("execution", {}) if isinstance(row.get("execution"), dict) else {}
+        agent_outputs = row.get("agent_outputs", {}) if isinstance(row.get("agent_outputs"), dict) else {}
+        participating = [name for name in agent_names if isinstance(agent_outputs.get(name), dict)]
+        if participating:
+            agent_trace_coverage += 1
+        if len(participating) == len(agent_names):
+            full_stack_count += 1
+        if str(workflow.get("status") or "").lower() == "blocked":
+            blocked_trace_count += 1
+        if str(execution.get("status") or "").lower() == "success":
+            executed_trace_count += 1
+        if trace_id and trace_id in open_trace_ids:
+            linked_trace_count += 1
+        if trace_id and trace_id in realized_trace_ids:
+            realized_linked_trace_count += 1
+
+        for name in participating:
+            payload = agent_outputs.get(name, {}) if isinstance(agent_outputs.get(name), dict) else {}
+            stat = per_agent[name]
+            stat["participated"] += 1
+            stat["avg_confidence"] += _safe_float(payload.get("confidence"))
+            if payload.get("blocking_flags"):
+                stat["blocking_flag_count"] += 1
+            if str(workflow.get("status") or "").lower() == "blocked":
+                stat["workflow_blocked_count"] += 1
+            if str(guard.get("status") or "").lower() == "rejected":
+                stat["guard_rejected_count"] += 1
+            if str(execution.get("status") or "").lower() == "success":
+                stat["execution_success_count"] += 1
+            if trace_id and trace_id in open_trace_ids:
+                stat["trade_linked_count"] += 1
+            if trace_id and trace_id in realized_trace_ids:
+                stat["realized_trade_linked_count"] += 1
+            stat.setdefault("_next_action_counter", Counter())
+            stat.setdefault("_verdict_counter", Counter())
+            stat.setdefault("_symbol_counter", Counter())
+            stat["_next_action_counter"][str(payload.get("next_action") or "unknown")] += 1
+            structured = payload.get("structured_verdict", {}) if isinstance(payload.get("structured_verdict"), dict) else {}
+            verdict = (
+                structured.get("risk_verdict")
+                or structured.get("execution_recommendation")
+                or structured.get("regime_label")
+                or payload.get("summary")
+                or "unknown"
+            )
+            stat["_verdict_counter"][str(verdict)] += 1
+            stat["_symbol_counter"][str(row.get("symbol") or "UNKNOWN")] += 1
+
+    for name, stat in per_agent.items():
+        participated = int(stat.get("participated", 0) or 0)
+        if participated > 0:
+            stat["avg_confidence"] = round(float(stat.get("avg_confidence", 0.0) or 0.0) / participated, 4)
+        else:
+            stat["avg_confidence"] = 0.0
+        stat["coverage_ratio"] = round(participated / max(1, len(rows)), 4)
+        stat["workflow_blocked_ratio"] = round(
+            float(stat.get("workflow_blocked_count", 0) or 0) / max(1, participated),
+            4,
+        )
+        stat["execution_success_ratio"] = round(
+            float(stat.get("execution_success_count", 0) or 0) / max(1, participated),
+            4,
+        )
+        stat["next_actions"] = [
+            {"key": k, "count": int(v)}
+            for k, v in stat.pop("_next_action_counter", Counter()).most_common(5)
+        ]
+        stat["verdicts"] = [
+            {"key": k, "count": int(v)}
+            for k, v in stat.pop("_verdict_counter", Counter()).most_common(5)
+        ]
+        stat["top_symbols"] = [
+            {"key": k, "count": int(v)}
+            for k, v in stat.pop("_symbol_counter", Counter()).most_common(5)
+        ]
+
+    out["summary"].update(
+        {
+            "agent_trace_coverage": int(agent_trace_coverage),
+            "agent_trace_coverage_ratio": round(agent_trace_coverage / max(1, len(rows)), 4),
+            "full_stack_trace_count": int(full_stack_count),
+            "blocked_trace_count": int(blocked_trace_count),
+            "executed_trace_count": int(executed_trace_count),
+            "trade_linked_trace_count": int(linked_trace_count),
+            "realized_trade_linked_trace_count": int(realized_linked_trace_count),
+        }
+    )
+    out["agents"] = per_agent
+    realized_intersection = realized_trace_ids & store_trace_ids
+    out["attribution_diagnostics"] = {
+        "store_trace_count": len(store_trace_ids),
+        "trade_trace_count": len(open_trace_ids),
+        "realized_trace_count": len(realized_trace_ids),
+        "realized_store_intersection_count": len(realized_intersection),
+        "store_trace_namespaces": [{"key": k, "count": int(v)} for k, v in store_trace_prefixes.most_common(8)],
+        "trade_trace_namespaces": [{"key": k, "count": int(v)} for k, v in trade_trace_prefixes.most_common(8)],
+        "realized_trace_namespaces": [{"key": k, "count": int(v)} for k, v in realized_trace_prefixes.most_common(8)],
+        "realized_trace_examples": realized_trace_examples,
+        "intersection_examples": list(sorted(realized_intersection))[:8],
+        "diagnosis": (
+            "realized_trace_namespace_mismatch"
+            if realized_trace_ids and store_trace_ids and not realized_intersection
+            else "ok" if realized_intersection else "insufficient_trace_data"
+        ),
+    }
+
+    top_issues: List[Dict[str, Any]] = []
+    if len(rows) > 0 and agent_trace_coverage / max(1, len(rows)) < 0.4:
+        top_issues.append(
+            {
+                "priority": "high",
+                "issue": "四智能体覆盖率过低",
+                "evidence": {
+                    "trace_sample_size": len(rows),
+                    "agent_trace_coverage": int(agent_trace_coverage),
+                    "coverage_ratio": round(agent_trace_coverage / max(1, len(rows)), 4),
+                },
+                "recommendation": "优先把 4-agent advisory 链路提升到主决策主路径，否则它们对盈利没有实际控制权。",
+            }
+        )
+    if per_agent["research_agent"]["participated"] > 0 and per_agent["research_agent"]["blocking_flag_count"] >= int(
+        per_agent["research_agent"]["participated"]
+    ):
+        top_issues.append(
+            {
+                "priority": "high",
+                "issue": "research_agent 长期处于研究未完成状态",
+                "evidence": {
+                    "participated": per_agent["research_agent"]["participated"],
+                    "blocking_flag_count": per_agent["research_agent"]["blocking_flag_count"],
+                    "top_verdicts": per_agent["research_agent"]["verdicts"][:3],
+                },
+                "recommendation": "将 research_agent 从实时阻塞角色降级为复盘/评分输入，否则会持续拖低开仓率。",
+            }
+        )
+    if per_agent["execution_coach_agent"]["participated"] > 0:
+        normal_count = next(
+            (int(x.get("count", 0) or 0) for x in per_agent["execution_coach_agent"]["verdicts"] if str(x.get("key") or "") == "normal"),
+            0,
+        )
+        if normal_count == per_agent["execution_coach_agent"]["participated"]:
+            top_issues.append(
+                {
+                    "priority": "medium",
+                    "issue": "execution_coach_agent 输出缺乏区分度",
+                    "evidence": {
+                        "participated": per_agent["execution_coach_agent"]["participated"],
+                        "verdicts": per_agent["execution_coach_agent"]["verdicts"][:3],
+                    },
+                    "recommendation": "增加 wait_or_slice / reduce_size / cancel_chase 等明确执行动作，否则执行教练对盈利提升有限。",
+                }
+            )
+    if realized_linked_trace_count == 0:
+        top_issues.append(
+            {
+                "priority": "high",
+                "issue": "四智能体与真实已实现收益仍缺少可靠闭环归因",
+                "evidence": {
+                    "trade_linked_trace_count": int(linked_trace_count),
+                    "realized_trade_linked_trace_count": int(realized_linked_trace_count),
+                    "attribution_diagnosis": out["attribution_diagnostics"]["diagnosis"],
+                    "realized_trace_namespaces": out["attribution_diagnostics"]["realized_trace_namespaces"][:3],
+                    "store_trace_namespaces": out["attribution_diagnostics"]["store_trace_namespaces"][:3],
+                    "realized_strategy_examples": [
+                        {"strategy_id": k, "count": int(v.get("count", 0) or 0), "pnl": round(float(v.get("pnl", 0.0) or 0.0), 6)}
+                        for k, v in sorted(realized_by_strategy.items(), key=lambda kv: float(kv[1].get("pnl", 0.0)), reverse=True)[:5]
+                    ],
+                },
+                "recommendation": "继续打通 trace_id 从开仓到平仓的收益回写，否则无法证明四智能体是否真正提升盈利。",
+            }
+        )
+    out["top_issues"] = top_issues
+    return out
+
+
+def _trace_namespace(trace_id: str) -> str:
+    tid = str(trace_id or "").strip()
+    if not tid:
+        return "missing"
+    if tid.startswith("sltp:"):
+        return "sltp"
+    if tid.startswith("scanner-"):
+        return "scanner"
+    if tid.startswith("hold-"):
+        return "hold"
+    if tid.startswith("parsed-hold-"):
+        return "parsed_hold"
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", tid):
+        return "uuid"
+    return tid.split(":", 1)[0].split("-", 1)[0] or "other"
+
+
+def _extract_trade_trace_id(row: Dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    gateway = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
+    context = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
+    return str(
+        context.get("trace_id")
+        or md.get("trace_id")
+        or row.get("trace_id")
+        or ""
+    ).strip()
+
+
+def _extract_trade_semantic_context(row: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    direct = md.get("semantic_context")
+    if isinstance(direct, dict):
+        return direct
+    gateway = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
+    context = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
+    payload = context.get("semantic_context")
+    return payload if isinstance(payload, dict) else {}
+
+
+async def _build_trade_lifecycle_summary(
+    main_controller: Any,
+    *,
+    trade_limit: int = 300,
+    recent_limit: int = 20,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "summary": {
+            "sample_size": 0,
+            "opens": 0,
+            "closes": 0,
+            "realized_pnl": 0.0,
+            "fees": 0.0,
+            "net_pnl_plus_fees": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "trace_linked_rows": 0,
+            "avg_hold_hours": 0.0,
+        },
+        "close_reason_top": [],
+        "recent_rows": [],
+        "exit_review": {
+            "take_profit_positive_count": 0,
+            "stop_loss_negative_count": 0,
+            "partial_take_profit_positive_count": 0,
+        },
+    }
+    ths = getattr(main_controller, "trade_history_service", None) if main_controller else None
+    if not ths or not hasattr(ths, "get_trade_history"):
+        out["summary"]["message"] = "trade_history_service_unavailable"
+        return out
+    try:
+        rows = await ths.get_trade_history(limit=max(50, int(trade_limit or 300)))
+    except Exception as e:
+        out["summary"]["message"] = f"trade_history_load_failed:{e}"
+        return out
+
+    close_reason_counter: Counter[str] = Counter()
+    open_legs: Dict[tuple[str, str], List[datetime]] = defaultdict(list)
+    durations_sec: List[float] = []
+    wins = 0
+    losses = 0
+    realized_pnl = 0.0
+    fees = 0.0
+    opens = 0
+    closes = 0
+    trace_linked_rows = 0
+    recent_rows: List[Dict[str, Any]] = []
+    exit_review = {
+        "take_profit_positive_count": 0,
+        "stop_loss_negative_count": 0,
+        "partial_take_profit_positive_count": 0,
+    }
+
+    ordered_rows = list(rows or [])
+    for row in ordered_rows:
+        if not isinstance(row, dict):
+            continue
+        md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        gateway = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
+        op = str(gateway.get("op") or "").lower()
+        fees += _safe_float(row.get("fee"))
+        if _extract_trade_trace_id(row):
+            trace_linked_rows += 1
+        ts_raw = row.get("timestamp")
+        ts = None
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) if ts_raw else None
+        except Exception:
+            ts = None
+        symbol = str(row.get("symbol") or "").upper()
+        side = str(row.get("side") or "").lower()
+        leg_key = (symbol, side)
+        if op == "open":
+            opens += 1
+            if ts is not None and symbol and side:
+                open_legs[leg_key].append(ts)
+        elif op == "close":
+            closes += 1
+            pnl = _safe_float(row.get("pnl"))
+            realized_pnl += pnl
+            if pnl > 1e-9:
+                wins += 1
+            elif pnl < -1e-9:
+                losses += 1
+            reason = str(row.get("reasoning") or gateway.get("reason") or "?")
+            close_reason_counter[reason] += 1
+            low_reason = reason.lower()
+            if "take_profit" in low_reason and pnl > 0:
+                exit_review["take_profit_positive_count"] += 1
+            if "partial_take_profit" in low_reason and pnl > 0:
+                exit_review["partial_take_profit_positive_count"] += 1
+            if "stop_loss" in low_reason and pnl < 0:
+                exit_review["stop_loss_negative_count"] += 1
+            if ts is not None and symbol and side:
+                queue = open_legs.get(leg_key) or []
+                if queue:
+                    opened_at = queue.pop(0)
+                    delta = (ts - opened_at).total_seconds()
+                    if delta >= 0:
+                        durations_sec.append(delta)
+
+    for row in reversed(ordered_rows[-max(1, int(recent_limit or 20)):]):
+        if not isinstance(row, dict):
+            continue
+        md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        gateway = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
+        semantic = _extract_trade_semantic_context(row)
+        recent_rows.append(
+            {
+                "timestamp": row.get("timestamp"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "operation": str(gateway.get("op") or "").lower(),
+                "price": row.get("price"),
+                "quantity": row.get("quantity") or row.get("size"),
+                "pnl": _safe_float(row.get("pnl")),
+                "fee": _safe_float(row.get("fee")),
+                "pnl_percent": _safe_float(row.get("pnl_percent")),
+                "reasoning": row.get("reasoning") or gateway.get("reason"),
+                "trace_id": _extract_trade_trace_id(row) or None,
+                "strategy_id": md.get("strategy_id") or row.get("strategy"),
+                "regime_label": semantic.get("regime_label") or md.get("regime_label"),
+                "risk_verdict": semantic.get("risk_verdict"),
+                "execution_recommendation": semantic.get("execution_recommendation"),
+            }
+        )
+
+    decided = wins + losses
+    avg_hold_hours = (sum(durations_sec) / (len(durations_sec) * 3600.0)) if durations_sec else 0.0
+    out["summary"].update(
+        {
+            "sample_size": len(ordered_rows),
+            "opens": int(opens),
+            "closes": int(closes),
+            "realized_pnl": round(realized_pnl, 6),
+            "fees": round(fees, 6),
+            "net_pnl_plus_fees": round(realized_pnl + fees, 6),
+            "wins": int(wins),
+            "losses": int(losses),
+            "win_rate": round((wins / decided), 4) if decided > 0 else 0.0,
+            "trace_linked_rows": int(trace_linked_rows),
+            "avg_hold_hours": round(avg_hold_hours, 4),
+        }
+    )
+    out["close_reason_top"] = [{"reason": k, "count": int(v)} for k, v in close_reason_counter.most_common(8)]
+    out["recent_rows"] = recent_rows
+    out["exit_review"] = exit_review
+    return out
+
+
+async def _build_closed_loop_summary_data(main_controller: Any, *, trace_limit: int = 120) -> Dict[str, Any]:
+    mc = main_controller
+    store = getattr(mc, "decision_trace_store", None)
+    traces = store.analyze_recent(limit=int(trace_limit or 120)) if (store and hasattr(store, "analyze_recent")) else {}
+    summary = traces.get("summary", {}) if isinstance(traces, dict) else {}
+    workflow_focus = _summarize_trace_workflow_focus(traces)
+    recent = traces.get("recent", []) if isinstance(traces, dict) else []
+
+    watch = _load_runtime_json("realtime_watch.latest.json")
+    analysis = watch.get("analysis", {}) if isinstance(watch.get("analysis"), dict) else {}
+    latest_trade = analysis.get("latest_trade", {}) if isinstance(analysis.get("latest_trade"), dict) else {}
+    best_regime = analysis.get("best_regime", {}) if isinstance(analysis.get("best_regime"), dict) else {}
+    worst_regime = analysis.get("worst_regime", {}) if isinstance(analysis.get("worst_regime"), dict) else {}
+    symbol_summaries = analysis.get("symbol_summaries", []) if isinstance(analysis.get("symbol_summaries"), list) else []
+    ai_core = getattr(mc, "ai_core", None)
+    rejected_rows = list(getattr(ai_core, "_rejected_signals", []) or []) if ai_core is not None else []
+    recent_advisory_rows = [
+        row for row in reversed(rejected_rows[-120:])
+        if isinstance(row, dict) and str(row.get("reason") or "") == "regime_advisory_only_rejected"
+    ]
+    llm_manager = getattr(mc, "enhanced_llm_manager", None) or (getattr(ai_core, "llm", None) if ai_core is not None else None)
+    sltp = getattr(mc, "stop_loss_manager", None)
+    sltp_stats = sltp.get_stats() if (sltp and hasattr(sltp, "get_stats")) else {}
+
+    gateway = getattr(mc, "execution_gateway", None)
+    gateway_snapshot = await gateway.get_snapshot() if (gateway and hasattr(gateway, "get_snapshot")) else {}
+    policy_metrics = gateway_snapshot.get("policy_metrics", {}) if isinstance(gateway_snapshot, dict) else {}
+    reconciliation = gateway_snapshot.get("reconciliation", {}) if isinstance(gateway_snapshot, dict) else {}
+    recon_summary = reconciliation.get("summary", {}) if isinstance(reconciliation, dict) else {}
+
+    monitor_summary = {}
+    try:
+        from src.modules.api.monitoring_api import get_monitoring_summary
+        monitor_summary = await get_monitoring_summary()
+    except Exception:
+        monitor_summary = {}
+
+    reason_counter: Counter[str] = Counter()
+    stage_counter: Counter[str] = Counter()
+    symbol_counter: Counter[str] = Counter()
+    hold_tag_counter: Counter[str] = Counter()
+    hold_symbol_counter: Counter[str] = Counter()
+    hold_regime_counter: Counter[str] = Counter()
+    hold_strategy_counter: Counter[str] = Counter()
+    hold_fallback_reason_counter: Counter[str] = Counter()
+    hold_fallback_model_counter: Counter[str] = Counter()
+    hold_recent_samples: List[Dict[str, Any]] = []
+    hold_fallback_count = 0
+    for row in recent:
+        if not isinstance(row, dict):
+            continue
+        guard = row.get("guard", {}) if isinstance(row.get("guard"), dict) else {}
+        reason = str(guard.get("reason") or row.get("reason") or "unknown")
+        stage = str(guard.get("stage") or row.get("stage") or "unknown")
+        symbol = str(row.get("symbol") or "unknown")
+        reason_counter[reason] += 1
+        stage_counter[stage] += 1
+        symbol_counter[symbol] += 1
+        if reason == "hold_by_ai_decision":
+            guard_extras = guard.get("extras") if isinstance(guard.get("extras"), dict) else {}
+            intent = row.get("intent") if isinstance(row.get("intent"), dict) else {}
+            intent_extras = intent.get("extras") if isinstance(intent.get("extras"), dict) else {}
+            extras = guard_extras or intent_extras
+            hold_tags = extras.get("hold_reason_tags") if isinstance(extras.get("hold_reason_tags"), dict) else {}
+            sr_snapshot = extras.get("sr_snapshot") if isinstance(extras.get("sr_snapshot"), dict) else {}
+            regime = str(extras.get("regime") or extras.get("market_regime") or "unknown")
+            strategy_used = str(intent.get("strategy_used") or extras.get("strategy_used") or "")
+            reasoning_excerpt = str(extras.get("reasoning_excerpt") or intent.get("reasoning") or "")
+            llm_failure_reason = str(extras.get("llm_failure_reason") or "")
+            llm_model_id = str(extras.get("llm_model_id") or "")
+            hold_symbol_counter[symbol] += 1
+            hold_regime_counter[regime] += 1
+            hold_strategy_counter[strategy_used or "unknown"] += 1
+            for tag_name, enabled in hold_tags.items():
+                if bool(enabled):
+                    hold_tag_counter[str(tag_name)] += 1
+            if (
+                bool(hold_tags.get("llm_unavailable_fallback", False))
+                or "llm_unavailable_fallback" in reasoning_excerpt.lower()
+                or "fallback" in strategy_used.lower()
+            ):
+                hold_fallback_count += 1
+                hold_fallback_reason_counter[llm_failure_reason or "unknown"] += 1
+                hold_fallback_model_counter[llm_model_id or "unknown"] += 1
+            if len(hold_recent_samples) < 10:
+                hold_recent_samples.append(
+                    {
+                        "ts": row.get("updated_at") or row.get("created_at"),
+                        "symbol": symbol,
+                        "side": row.get("side"),
+                        "confidence": intent.get("confidence"),
+                        "risk_level": extras.get("risk_level"),
+                        "strategy_used": strategy_used,
+                        "regime": regime,
+                        "reasoning_excerpt": reasoning_excerpt,
+                        "llm_fallback_kind": extras.get("llm_fallback_kind"),
+                        "llm_failure_reason": llm_failure_reason or None,
+                        "llm_error_code": extras.get("llm_error_code"),
+                        "llm_model_id": llm_model_id or None,
+                        "llm_provider": extras.get("llm_provider"),
+                        "llm_latency_ms": extras.get("llm_latency_ms"),
+                        "active_tags": [str(k) for k, enabled in hold_tags.items() if bool(enabled)],
+                        "sr_trigger_present": not bool(hold_tags.get("no_sr_entry_trigger", False)),
+                        "sr_snapshot": sr_snapshot,
+                    }
+                )
+
+    top_reject_reasons = [{"reason": k, "count": int(v)} for k, v in reason_counter.most_common(8)]
+    top_reject_symbols = [{"symbol": k, "count": int(v)} for k, v in symbol_counter.most_common(8)]
+    top_reject_stages = [{"stage": k, "count": int(v)} for k, v in stage_counter.most_common(8)]
+    top_hold_tags = [{"tag": k, "count": int(v)} for k, v in hold_tag_counter.most_common(8)]
+    top_hold_symbols = [{"symbol": k, "count": int(v)} for k, v in hold_symbol_counter.most_common(8)]
+    top_hold_regimes = [{"regime": k, "count": int(v)} for k, v in hold_regime_counter.most_common(8)]
+    top_hold_strategies = [{"strategy_used": k, "count": int(v)} for k, v in hold_strategy_counter.most_common(8)]
+    top_fallback_reasons = [{"reason": k, "count": int(v)} for k, v in hold_fallback_reason_counter.most_common(8)]
+    top_fallback_models = [{"model_id": k, "count": int(v)} for k, v in hold_fallback_model_counter.most_common(8)]
+    hold_total = int(sum(hold_symbol_counter.values()))
+    hold_fallback_ratio = float(hold_fallback_count) / float(hold_total) if hold_total > 0 else 0.0
+    llm_diag: Dict[str, Any] = {}
+    try:
+        if llm_manager is not None:
+            task_map = getattr(llm_manager, "task_model_mapping", {}) or {}
+            decision_model_order: List[str] = []
+            for task_key, model_ids in task_map.items():
+                task_name = str(getattr(task_key, "value", task_key) or "")
+                if task_name == "decision_making" and isinstance(model_ids, list):
+                    decision_model_order = [str(mid) for mid in model_ids]
+                    break
+            raw_unhealthy = getattr(llm_manager, "_unhealthy_until", {}) or {}
+            active_circuit_breaks: List[Dict[str, Any]] = []
+            now_ts = time.time()
+            if isinstance(raw_unhealthy, dict):
+                for model_id, until_ts in raw_unhealthy.items():
+                    remaining = max(0.0, float(until_ts or 0.0) - now_ts)
+                    if remaining > 0:
+                        active_circuit_breaks.append(
+                            {
+                                "model_id": str(model_id),
+                                "seconds_remaining": round(remaining, 1),
+                            }
+                        )
+            usage_rows: List[Dict[str, Any]] = []
+            usage_stats = llm_manager.get_usage_stats() if hasattr(llm_manager, "get_usage_stats") else {}
+            if isinstance(usage_stats, dict):
+                for model_id, stat in usage_stats.items():
+                    total_calls = _safe_int(getattr(stat, "total_calls", 0))
+                    success_calls = _safe_int(getattr(stat, "successful_calls", 0))
+                    success_rate = (float(success_calls) / float(total_calls)) if total_calls > 0 else 0.0
+                    usage_rows.append(
+                        {
+                            "model_id": str(model_id),
+                            "total_calls": total_calls,
+                            "successful_calls": success_calls,
+                            "failed_calls": _safe_int(getattr(stat, "failed_calls", 0)),
+                            "success_rate": round(success_rate, 4),
+                            "avg_latency_ms": round(_safe_float(getattr(stat, "avg_latency_ms", 0.0)), 1),
+                        }
+                    )
+            usage_rows.sort(key=lambda x: (-x["total_calls"], x["model_id"]))
+            llm_diag = {
+                "default_model": str(getattr(llm_manager, "default_model", "") or ""),
+                "decision_model_order": decision_model_order,
+                "active_circuit_breaks": active_circuit_breaks,
+                "usage": usage_rows[:8],
+            }
+    except Exception:
+        llm_diag = {}
+
+    tp_net_edge_suppressed = _safe_int((sltp_stats or {}).get("tp_net_edge_suppressed", analysis.get("tp_net_edge_suppressed", 0)))
+    opportunities_blocked = {
+        "guard_rejected": _safe_int(summary.get("guard_rejected", 0)),
+        "guard_passed": _safe_int(summary.get("guard_passed", 0)),
+        "execution_success": _safe_int(summary.get("execution_success", 0)),
+        "execution_failed": _safe_int(summary.get("execution_failed", 0)),
+        "reconciliation_blocked": _safe_int(summary.get("reconciliation_blocked", 0)),
+        "rr_rejected": _safe_int(analysis.get("rr_rejected", 0)),
+        "sr_timing_rejected": _safe_int(analysis.get("sr_timing_rejected", 0)),
+        "open_evidence_rejected": _safe_int(analysis.get("open_evidence_rejected", 0)),
+        "regime_advisory_only_rejected": _safe_int(analysis.get("regime_advisory_only_rejected", 0)),
+        "tp_net_edge_suppressed": tp_net_edge_suppressed,
+    }
+    tp_suppressed_by_regime_raw = (sltp_stats or {}).get("tp_net_edge_suppressed_by_regime") or analysis.get("tp_net_edge_suppressed_by_regime", {})
+    tp_suppressed_by_reason_raw = (sltp_stats or {}).get("tp_net_edge_suppressed_by_reason") or analysis.get("tp_net_edge_suppressed_by_reason", {})
+    tp_suppressed_by_regime = (
+        {str(k): _safe_int(v) for k, v in tp_suppressed_by_regime_raw.items() if _safe_int(v) > 0}
+        if isinstance(tp_suppressed_by_regime_raw, dict)
+        else {}
+    )
+    tp_suppressed_by_reason = (
+        {str(k): _safe_int(v) for k, v in tp_suppressed_by_reason_raw.items() if _safe_int(v) > 0}
+        if isinstance(tp_suppressed_by_reason_raw, dict)
+        else {}
+    )
+    tp_top_regimes = [{"regime": k, "count": int(v)} for k, v in sorted(tp_suppressed_by_regime.items(), key=lambda kv: int(kv[1]), reverse=True)[:5]]
+    tp_top_reasons = [{"reason": k, "count": int(v)} for k, v in sorted(tp_suppressed_by_reason.items(), key=lambda kv: int(kv[1]), reverse=True)[:5]]
+    tp_recent_events = (
+        (sltp_stats or {}).get("tp_edge_recent_events")
+        if isinstance((sltp_stats or {}).get("tp_edge_recent_events"), list)
+        else analysis.get("tp_edge_recent_events")
+    )
+    tp_recent_samples = list(tp_recent_events or [])[-10:]
+    tp_recent_by_regime: Counter[str] = Counter()
+    tp_recent_by_reason: Counter[str] = Counter()
+    for row in tp_recent_samples:
+        if not isinstance(row, dict):
+            continue
+        tp_recent_by_regime[str(row.get("regime") or "unknown")] += 1
+        tp_recent_by_reason[str(row.get("reason") or "unknown")] += 1
+    tp_recent_top_regimes = [{"regime": k, "count": int(v)} for k, v in tp_recent_by_regime.most_common(5)]
+    tp_recent_top_reasons = [{"reason": k, "count": int(v)} for k, v in tp_recent_by_reason.most_common(5)]
+    advisory_symbol_counts: Counter[str] = Counter()
+    advisory_recent_samples: List[Dict[str, Any]] = []
+    for row in recent_advisory_rows:
+        symbol = str(row.get("symbol") or "unknown")
+        advisory_symbol_counts[symbol] += 1
+        if len(advisory_recent_samples) < 10:
+            extras = row.get("extras") if isinstance(row.get("extras"), dict) else {}
+            advisory_recent_samples.append(
+                {
+                    "ts": row.get("ts"),
+                    "symbol": symbol,
+                    "side": row.get("side"),
+                    "confidence": row.get("confidence"),
+                    "entry_price": row.get("entry_price"),
+                    "regime": str(extras.get("regime") or "unknown"),
+                }
+            )
+    advisory_top_symbols = [{"symbol": k, "count": int(v)} for k, v in advisory_symbol_counts.most_common(5)]
+
+    realized_perf = {
+        "best_regime": best_regime,
+        "worst_regime": worst_regime,
+        "equity": _safe_float(analysis.get("equity")),
+        "position_count": _safe_int(analysis.get("position_count", 0)),
+        "latest_trade": latest_trade,
+    }
+    live_position_count = await _get_live_position_count(mc)
+    live_active_orders = await _get_live_sltp_active_order_count(mc)
+    gateway_equity = _safe_float(analysis.get("equity"))
+    if gateway_equity <= 0:
+        try:
+            acct = await (mc.get_exchange().get_balance() if hasattr(mc, "get_exchange") and mc.get_exchange() else None)
+            if isinstance(acct, dict):
+                gateway_equity = _safe_float(
+                    acct.get("total_equity")
+                    or acct.get("equity")
+                    or acct.get("totalEq")
+                    or ((acct.get("USDT") or {}).get("total") if isinstance(acct.get("USDT"), dict) else 0)
+                )
+        except Exception:
+            pass
+
+    monitoring_gap = {
+        "monitoring_total_trades": _safe_int(monitor_summary.get("total_trades", 0)) if isinstance(monitor_summary, dict) else 0,
+        "strategy_perf_sources": len((monitor_summary.get("strategies") or [])) if isinstance(monitor_summary, dict) else 0,
+        "latest_trade_present_in_runtime_watch": bool(latest_trade),
+    }
+
+    optimization_hints: List[Dict[str, Any]] = []
+    if monitoring_gap["monitoring_total_trades"] == 0 and latest_trade:
+        optimization_hints.append(
+            {
+                "priority": "high",
+                "area": "observability",
+                "issue": "监控口径未接入真实成交闭环",
+                "evidence": {
+                    "monitoring_total_trades": monitoring_gap["monitoring_total_trades"],
+                    "runtime_latest_trade_id": latest_trade.get("trade_id"),
+                },
+                "recommendation": "将 runtime_watch / 历史成交源回填到 monitoring_api 的 trades/strategies 汇总，避免收益面板空白。",
+            }
+        )
+    if worst_regime and _safe_float(worst_regime.get("total_pnl")) < 0:
+        optimization_hints.append(
+            {
+                "priority": "high",
+                "area": "strategy_regime",
+                "issue": "波动 regime 持续亏损",
+                "evidence": {
+                    "regime": worst_regime.get("regime"),
+                    "total_trades": _safe_int(worst_regime.get("total_trades", 0)),
+                    "win_rate": _safe_float(worst_regime.get("win_rate")),
+                    "total_pnl": _safe_float(worst_regime.get("total_pnl")),
+                    "expectancy": _safe_float(worst_regime.get("expectancy")),
+                },
+                "recommendation": "对 volatile regime 降杠杆/降仓位，或直接切换到 advisory-only，直到该 regime 的 expectancy 回正。",
+            }
+        )
+    if opportunities_blocked["regime_advisory_only_rejected"] > 0:
+        optimization_hints.append(
+            {
+                "priority": "medium",
+                "area": "execution_guard",
+                "issue": "volatile regime 已进入 advisory-only 拦截",
+                "evidence": {
+                    "regime_advisory_only_rejected": opportunities_blocked["regime_advisory_only_rejected"],
+                    "top_symbols": advisory_top_symbols,
+                },
+                "recommendation": "继续观察被拦截样本是否集中在 volatile；若后续 expectancy 回正，再逐步恢复小仓试单。",
+            }
+        )
+    tp_recent_suppressed = len(tp_recent_samples)
+    if tp_recent_suppressed >= 10:
+        top_regime = tp_recent_top_regimes[0] if tp_recent_top_regimes else {}
+        optimization_hints.append(
+            {
+                "priority": "medium",
+                "area": "exit_logic",
+                "issue": "近期止盈净收益门槛抑制次数偏高",
+                "evidence": {
+                    "recent_window_count": tp_recent_suppressed,
+                    "top_regimes": tp_recent_top_regimes,
+                    "top_reasons": tp_recent_top_reasons,
+                    "lifetime_total": opportunities_blocked["tp_net_edge_suppressed"],
+                },
+                "recommendation": (
+                    f"优先复核 {top_regime.get('regime', 'top regime')} 的 TP 分层和 min_net 阈值，"
+                    "避免小盈利长期无法兑现，资金占用过久。"
+                ),
+            }
+        )
+    if best_regime and worst_regime and str(best_regime.get("regime")) != str(worst_regime.get("regime")):
+        optimization_hints.append(
+            {
+                "priority": "medium",
+                "area": "capital_allocation",
+                "issue": "不同 regime 收益差异大",
+                "evidence": {
+                    "best_regime": {
+                        "name": best_regime.get("regime"),
+                        "pnl": _safe_float(best_regime.get("total_pnl")),
+                        "win_rate": _safe_float(best_regime.get("win_rate")),
+                    },
+                    "worst_regime": {
+                        "name": worst_regime.get("regime"),
+                        "pnl": _safe_float(worst_regime.get("total_pnl")),
+                        "win_rate": _safe_float(worst_regime.get("win_rate")),
+                    },
+                },
+                "recommendation": "把仓位和开仓预算向正 expectancy regime 倾斜，负 expectancy regime 只保留试探仓。",
+            }
+        )
+    if hold_fallback_count >= 3:
+        optimization_hints.append(
+            {
+                "priority": "high",
+                "area": "llm_availability",
+                "issue": "部分 hold 由 LLM 不可用回退触发",
+                "evidence": {
+                    "fallback_hold_count": hold_fallback_count,
+                    "fallback_hold_ratio": round(hold_fallback_ratio, 4),
+                    "hold_total": hold_total,
+                    "top_fallback_reasons": top_fallback_reasons[:5],
+                    "top_fallback_models": top_fallback_models[:5],
+                    "top_hold_strategies": top_hold_strategies[:5],
+                },
+                "recommendation": "优先排查 LLM 可用性、超时和 provider 降级，否则会把系统性 fallback 误判成策略过于保守。",
+            }
+        )
+    if llm_diag.get("active_circuit_breaks"):
+        top_break = (llm_diag.get("active_circuit_breaks") or [{}])[0]
+        optimization_hints.append(
+            {
+                "priority": "high",
+                "area": "llm_routing",
+                "issue": "决策模型存在活跃熔断",
+                "evidence": {
+                    "default_model": llm_diag.get("default_model"),
+                    "decision_model_order": llm_diag.get("decision_model_order"),
+                    "active_circuit_breaks": llm_diag.get("active_circuit_breaks"),
+                },
+                "recommendation": (
+                    f"优先处理 {top_break.get('model_id', 'primary model')} 的连通性；"
+                    "若短期内仍频繁熔断，可把 decision_making 前置到更稳的模型。"
+                ),
+            }
+        )
+    if _safe_int(recon_summary.get("drift_total", 0)) > 0:
+        optimization_hints.append(
+            {
+                "priority": "high",
+                "area": "execution_reconciliation",
+                "issue": "本地与交易所持仓存在漂移",
+                "evidence": {"reconciliation": recon_summary},
+                "recommendation": "先修正持仓漂移，再谈收益优化，否则收益统计和止盈止损判断都不可信。",
+            }
+        )
+    top_stage = workflow_focus.get("top_stage") if isinstance(workflow_focus, dict) else None
+    top_status = workflow_focus.get("top_status") if isinstance(workflow_focus, dict) else None
+    if (
+        isinstance(top_stage, dict)
+        and str(top_stage.get("key") or "") == "reconciliation"
+        and isinstance(top_status, dict)
+        and str(top_status.get("key") or "") in {"blocked", "reconcile_blocked"}
+    ):
+        optimization_hints.append(
+            {
+                "priority": "high",
+                "area": "execution_workflow",
+                "issue": "近期决策主要卡在 reconciliation 阶段",
+                "evidence": {
+                    "top_workflow_stage": top_stage,
+                    "top_workflow_status": top_status,
+                    "decision_trace_summary": summary,
+                },
+                "recommendation": "优先修复持仓同步、孤儿订单和对账保护触发根因，再调整策略阈值。",
+            }
+        )
+    running_modules = _safe_int(analysis.get("running_modules", 0))
+    if running_modules <= 0 and hasattr(mc, "get_system_status"):
+        try:
+            sys_status = await mc.get_system_status()
+            if isinstance(sys_status, dict):
+                running_modules = _safe_int(sys_status.get("running_modules", 0))
+        except Exception:
+            running_modules = 0
+
+    return {
+        "loop_health": {
+            "verdict": analysis.get("verdict") or ("PASS" if _safe_int(recon_summary.get("drift_total", 0)) == 0 else "WARN"),
+            "risk_level": analysis.get("risk_level") or ("low" if _safe_int(recon_summary.get("drift_total", 0)) == 0 else "medium"),
+            "running_modules": running_modules,
+            "active_alerts": _safe_int(analysis.get("active_alerts", 0)),
+            "active_orders": live_active_orders,
+            "position_count": live_position_count,
+            "equity": gateway_equity,
+            "source": {
+                "active_orders": "stop_loss_manager.get_all_active_orders",
+                "position_count": "exchange.get_positions",
+                "equity": "runtime_watch_or_exchange_balance",
+            },
+        },
+        "agent_effectiveness": await _build_agent_effectiveness_summary(
+            mc,
+            trace_limit=int(trace_limit or 120),
+            trade_limit=max(200, int(trace_limit or 120) * 4),
+        ),
+        "signal_and_guard": {
+            "decision_traces_summary": summary,
+            "workflow_focus": workflow_focus,
+            "top_reject_reasons": top_reject_reasons,
+            "top_reject_symbols": top_reject_symbols,
+            "top_reject_stages": top_reject_stages,
+            "hold_diagnostics": {
+                "top_tags": top_hold_tags,
+                "top_symbols": top_hold_symbols,
+                "top_regimes": top_hold_regimes,
+                "top_strategies": top_hold_strategies,
+                "top_fallback_reasons": top_fallback_reasons,
+                "top_fallback_models": top_fallback_models,
+                "fallback_hold_count": hold_fallback_count,
+                "fallback_hold_ratio": round(hold_fallback_ratio, 4),
+                "hold_total": hold_total,
+                "recent_samples": hold_recent_samples,
+            },
+            "current_symbol_bias": symbol_summaries,
+        },
+        "execution_and_reconciliation": {
+            "policy_metrics": policy_metrics,
+            "reconciliation_summary": recon_summary,
+        },
+        "exit_and_profitability": {
+            "realized_performance": realized_perf,
+            "opportunity_blocks": opportunities_blocked,
+            "regime_advisory_only": {
+                "top_symbols": advisory_top_symbols,
+                "recent_samples": advisory_recent_samples,
+            },
+            "tp_edge_suppression": {
+                "recent_window_count": tp_recent_suppressed,
+                "recent_by_regime": dict(tp_recent_by_regime),
+                "recent_by_reason": dict(tp_recent_by_reason),
+                "recent_top_regimes": tp_recent_top_regimes,
+                "recent_top_reasons": tp_recent_top_reasons,
+                "lifetime_total": opportunities_blocked["tp_net_edge_suppressed"],
+                "by_regime": tp_suppressed_by_regime,
+                "by_reason": tp_suppressed_by_reason,
+                "top_regimes": tp_top_regimes,
+                "top_reasons": tp_top_reasons,
+                "recent_samples": tp_recent_samples,
+            },
+        },
+        "llm_diagnostics": llm_diag,
+        "observability_gaps": monitoring_gap,
+        "optimization_hints": optimization_hints,
+    }
+
+
+async def _build_system_mastery_snapshot(
+    main_controller: Any,
+    *,
+    symbol: str = "BTC/USDT",
+    trace_limit: int = 120,
+    trade_limit: int = 300,
+    recent_trades_limit: int = 20,
+) -> Dict[str, Any]:
+    mc = main_controller
+    closed_loop = await _build_closed_loop_summary_data(mc, trace_limit=int(trace_limit or 120))
+    trade_lifecycle = await _build_trade_lifecycle_summary(
+        mc,
+        trade_limit=int(trade_limit or 300),
+        recent_limit=int(recent_trades_limit or 20),
+    )
+
+    system_status: Dict[str, Any] = {}
+    if mc and hasattr(mc, "get_system_status"):
+        try:
+            system_status = await mc.get_system_status()
+        except Exception as e:
+            system_status = {"error": str(e)}
+
+    commander_snapshot: Dict[str, Any] = {}
+    if mc and hasattr(mc, "build_ai_commander_snapshot"):
+        try:
+            commander_snapshot = await asyncio.wait_for(mc.build_ai_commander_snapshot(symbol=symbol), timeout=8.0)
+        except Exception as e:
+            commander_snapshot = {"error": str(e)}
+
+    unified_market_snapshot: Dict[str, Any] = {}
+    hub = getattr(mc, "data_source_hub", None) if mc else None
+    if hub and hasattr(hub, "get_unified_snapshot"):
+        try:
+            unified_market_snapshot = await asyncio.wait_for(hub.get_unified_snapshot(symbol), timeout=6.0)
+        except Exception as e:
+            unified_market_snapshot = {"error": str(e)}
+
+    learning_status: Dict[str, Any] = {}
+    le = getattr(mc, "ai_learning_engine", None) if mc else None
+    if le and hasattr(le, "get_status"):
+        try:
+            learning_status = le.get_status()
+        except Exception as e:
+            learning_status = {"error": str(e)}
+
+    hold_diag = (((closed_loop.get("signal_and_guard") or {}).get("hold_diagnostics") or {}) if isinstance(closed_loop, dict) else {})
+    workflow_focus = (((closed_loop.get("signal_and_guard") or {}).get("workflow_focus") or {}) if isinstance(closed_loop, dict) else {})
+    trade_summary = (trade_lifecycle.get("summary") or {}) if isinstance(trade_lifecycle, dict) else {}
+    loop_health = (closed_loop.get("loop_health") or {}) if isinstance(closed_loop, dict) else {}
+    top_stage = workflow_focus.get("top_stage") if isinstance(workflow_focus, dict) else None
+    top_status = workflow_focus.get("top_status") if isinstance(workflow_focus, dict) else None
+
+    coverage_gaps: List[Dict[str, Any]] = []
+    if not trade_summary.get("trace_linked_rows"):
+        coverage_gaps.append(
+            {
+                "id": "trade_trace_linkage",
+                "status": "missing_or_weak",
+                "message": "成交与决策 trace_id 关联不足，无法稳定评估开仓判断到平仓结果的全链路表现。",
+            }
+        )
+    coverage_gaps.append(
+        {
+            "id": "rejected_signal_followthrough",
+            "status": "not_fully_persisted",
+            "message": "拒单后行情走势的逐笔跟踪尚未形成稳定持久化字段；当前只能看到拒单原因，不能完整复盘其后走势合理性。",
+        }
+    )
+    coverage_gaps.append(
+        {
+            "id": "exit_timing_quality",
+            "status": "partial",
+            "message": "当前已能看到平仓原因与收益，但“是否过早/过晚”仍主要依赖 reason/TP 抑制统计，缺少统一的时机评分。",
+        }
+    )
+
+    return {
+        "interface": {
+            "name": "commander.system_mastery",
+            "version": "2026.05.16",
+            "transport": "http_json",
+            "path": "/api/v1/modules/commander/system-mastery",
+            "purpose": "单接口掌握系统状态、交易闭环、故障、学习与优化证据。",
+        },
+        "query": {
+            "symbol": symbol,
+            "trace_limit": int(trace_limit or 120),
+            "trade_limit": int(trade_limit or 300),
+            "recent_trades_limit": int(recent_trades_limit or 20),
+        },
+        "overview": {
+            "loop_verdict": loop_health.get("verdict"),
+            "risk_level": loop_health.get("risk_level"),
+            "equity": loop_health.get("equity"),
+            "active_orders": loop_health.get("active_orders"),
+            "position_count": loop_health.get("position_count"),
+            "recent_net_pnl_plus_fees": trade_summary.get("net_pnl_plus_fees"),
+            "recent_win_rate": trade_summary.get("win_rate"),
+            "top_hold_tag": ((hold_diag.get("top_tags") or [{}])[0] if isinstance(hold_diag.get("top_tags"), list) and hold_diag.get("top_tags") else None),
+            "top_workflow_stage": top_stage,
+            "top_workflow_status": top_status,
+        },
+        "system_runtime": system_status,
+        "market_and_account": {
+            "symbol": symbol,
+            "commander_snapshot": commander_snapshot,
+            "unified_market_snapshot": unified_market_snapshot,
+        },
+        "decision_execution_loop": closed_loop,
+        "trade_lifecycle": trade_lifecycle,
+        "learning_and_optimization": {
+            "learning_status": learning_status,
+            "optimization_hints": closed_loop.get("optimization_hints", []) if isinstance(closed_loop, dict) else [],
+        },
+        "coverage_gaps": coverage_gaps,
+    }
+
+
+def _parse_trade_timestamp_utc(raw: Any) -> Optional[datetime]:
+    try:
+        if not raw:
+            return None
+        s = str(raw)
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        ts = datetime.fromisoformat(s)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _trade_gateway_context(row: Dict[str, Any]) -> Dict[str, Any]:
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    gw = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
+    ctx = gw.get("context") if isinstance(gw.get("context"), dict) else {}
+    return {"metadata": md, "gateway": gw, "context": ctx}
+
+
+def _trade_operation(row: Dict[str, Any]) -> str:
+    g = _trade_gateway_context(row)
+    return str(row.get("trade_phase") or row.get("action") or g["gateway"].get("op") or "").strip().lower() or "unknown"
+
+
+def _trade_source(row: Dict[str, Any]) -> str:
+    g = _trade_gateway_context(row)
+    return str(row.get("source") or g["gateway"].get("source") or "unknown").strip() or "unknown"
+
+
+def _trade_reason(row: Dict[str, Any]) -> str:
+    g = _trade_gateway_context(row)
+    return str(row.get("reasoning") or g["gateway"].get("reason") or "unknown").strip() or "unknown"
+
+
+def _trade_strategy(row: Dict[str, Any]) -> str:
+    g = _trade_gateway_context(row)
+    return str(
+        row.get("strategy")
+        or row.get("strategy_id")
+        or g["context"].get("strategy_used")
+        or g["context"].get("strategy_id")
+        or "unknown"
+    ).strip() or "unknown"
+
+
+def _trade_regime(row: Dict[str, Any]) -> str:
+    g = _trade_gateway_context(row)
+    md = g["metadata"]
+    ctx = g["context"]
+    mcx = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+    gp = ctx.get("guard_profile") if isinstance(ctx.get("guard_profile"), dict) else {}
+    sem = ctx.get("semantic_context") if isinstance(ctx.get("semantic_context"), dict) else {}
+    return str(mcx.get("regime") or gp.get("regime") or sem.get("regime_label") or "unknown").strip() or "unknown"
+
+
+def _norm_trade_symbol(symbol: Any) -> str:
+    return str(symbol or "unknown").replace("/SWAP", "").strip() or "unknown"
+
+
+def _compact_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    g = _trade_gateway_context(row)
+    ctx = g["context"]
+    return {
+        "timestamp": row.get("timestamp"),
+        "symbol": row.get("symbol"),
+        "operation": _trade_operation(row),
+        "side": row.get("side"),
+        "quantity": _safe_float(row.get("quantity")),
+        "price": _safe_float(row.get("price")),
+        "pnl": _safe_float(row.get("pnl")),
+        "fee": _safe_float(row.get("fee")),
+        "net": round(_safe_float(row.get("pnl")) + _safe_float(row.get("fee")), 6),
+        "strategy": _trade_strategy(row),
+        "source": _trade_source(row),
+        "reason": _trade_reason(row),
+        "regime": _trade_regime(row),
+        "leverage": row.get("leverage"),
+        "trace_id": ctx.get("trace_id") or g["gateway"].get("trace_id"),
+        "decision_reasoning_excerpt": str(ctx.get("decision_reasoning") or "")[:360],
+    }
+
+
+async def _load_recent_trade_rows_for_window(
+    main_controller: Any,
+    *,
+    start_utc: datetime,
+    end_utc: datetime,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def _add(row: Dict[str, Any]) -> None:
+        if not isinstance(row, dict):
+            return
+        ts = _parse_trade_timestamp_utc(row.get("timestamp"))
+        if not ts or ts < start_utc or ts > end_utc:
+            return
+        key = str(row.get("trade_id") or row.get("order_id") or f"{row.get('timestamp')}|{row.get('symbol')}|{row.get('side')}|{row.get('quantity')}|{row.get('price')}")
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append(row)
+
+    ths = getattr(main_controller, "trade_history_service", None) if main_controller else None
+    if ths and hasattr(ths, "get_trade_history"):
+        try:
+            got = await ths.get_trade_history(start_date=start_utc, end_date=end_utc, limit=max(1, int(limit or 1000)))
+            for row in got or []:
+                _add(row)
+        except Exception:
+            pass
+
+    # Fallback to the durable JSONL file. Some service caches are loaded in ascending windows;
+    # this guarantees recent-order attribution sees the same facts as the audit trail.
+    try:
+        fp = Path(__file__).resolve().parents[3] / "data" / "trade_history" / "trades.jsonl"
+        if fp.is_file():
+            for line in fp.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    _add(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    rows.sort(key=lambda r: str(r.get("timestamp") or ""))
+    return rows[-max(1, int(limit or 1000)) :]
+
+
+async def _build_recent_order_attribution(
+    main_controller: Any,
+    *,
+    hours: float = 4.0,
+    limit: int = 1000,
+) -> Dict[str, Any]:
+    end_utc = datetime.now(timezone.utc)
+    start_utc = end_utc - timedelta(hours=max(0.25, min(float(hours or 4.0), 168.0)))
+    rows = await _load_recent_trade_rows_for_window(
+        main_controller,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        limit=max(50, int(limit or 1000)),
+    )
+
+    def _bucket() -> Dict[str, Any]:
+        return {
+            "rows": 0,
+            "opens": 0,
+            "closes": 0,
+            "pnl": 0.0,
+            "fees": 0.0,
+            "net": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "notional": 0.0,
+        }
+
+    buckets: Dict[str, Dict[str, Dict[str, Any]]] = {
+        "by_source": defaultdict(_bucket),
+        "by_strategy": defaultdict(_bucket),
+        "by_symbol": defaultdict(_bucket),
+        "by_regime": defaultdict(_bucket),
+        "by_open_reason": defaultdict(_bucket),
+        "by_close_reason": defaultdict(_bucket),
+    }
+    summary = _bucket()
+    recent_orders: List[Dict[str, Any]] = []
+
+    for row in rows:
+        op = _trade_operation(row)
+        pnl = _safe_float(row.get("pnl"))
+        fee = _safe_float(row.get("fee"))
+        raw = (row.get("metadata") or {}).get("raw") if isinstance(row.get("metadata"), dict) else {}
+        notional = _safe_float((raw or {}).get("notional_usdt_est")) if isinstance(raw, dict) else 0.0
+        if notional <= 0:
+            notional = abs(_safe_float(row.get("price")) * _safe_float(row.get("quantity")))
+
+        def _acc(name: str, key: str) -> None:
+            b = buckets[name][key or "unknown"]
+            b["rows"] += 1
+            b["opens"] += int(op == "open")
+            b["closes"] += int(op == "close")
+            b["pnl"] += pnl
+            b["fees"] += fee
+            b["net"] += pnl + fee
+            b["wins"] += int(op == "close" and pnl > 0)
+            b["losses"] += int(op == "close" and pnl < 0)
+            b["notional"] += notional
+
+        summary["rows"] += 1
+        summary["opens"] += int(op == "open")
+        summary["closes"] += int(op == "close")
+        summary["pnl"] += pnl
+        summary["fees"] += fee
+        summary["net"] += pnl + fee
+        summary["wins"] += int(op == "close" and pnl > 0)
+        summary["losses"] += int(op == "close" and pnl < 0)
+        summary["notional"] += notional
+
+        _acc("by_source", _trade_source(row))
+        _acc("by_strategy", _trade_strategy(row))
+        _acc("by_symbol", _norm_trade_symbol(row.get("symbol")))
+        _acc("by_regime", _trade_regime(row))
+        if op == "open":
+            _acc("by_open_reason", _trade_reason(row))
+        elif op == "close":
+            _acc("by_close_reason", _trade_reason(row))
+        recent_orders.append(_compact_trade_row(row))
+
+    def _finalize_map(mp: Dict[str, Dict[str, Any]], key_name: str) -> List[Dict[str, Any]]:
+        out = []
+        for key, val in mp.items():
+            row = {key_name: key}
+            row.update(
+                {
+                    k: (round(v, 6) if isinstance(v, float) else v)
+                    for k, v in val.items()
+                }
+            )
+            row["close_win_rate"] = round(float(val["wins"]) / float(val["closes"]), 4) if int(val["closes"]) > 0 else 0.0
+            out.append(row)
+        return sorted(out, key=lambda x: _safe_float(x.get("net")), reverse=True)
+
+    summary_out = {
+        k: (round(v, 6) if isinstance(v, float) else v)
+        for k, v in summary.items()
+    }
+    summary_out["close_win_rate"] = round(float(summary["wins"]) / float(summary["closes"]), 4) if int(summary["closes"]) > 0 else 0.0
+    summary_out["open_fee_drag"] = round(sum(_safe_float(r.get("fee")) for r in rows if _trade_operation(r) == "open"), 6)
+    summary_out["close_net"] = round(sum(_safe_float(r.get("pnl")) + _safe_float(r.get("fee")) for r in rows if _trade_operation(r) == "close"), 6)
+
+    optimization_targets: List[Dict[str, Any]] = []
+    by_symbol = _finalize_map(buckets["by_symbol"], "symbol")
+    by_strategy = _finalize_map(buckets["by_strategy"], "strategy")
+    by_close_reason = _finalize_map(buckets["by_close_reason"], "close_reason")
+    worst_open_symbols = [x for x in by_symbol if int(x.get("opens") or 0) > 0 and _safe_float(x.get("net")) < 0][:5]
+    tiny_tp = [
+        x for x in by_close_reason
+        if str(x.get("close_reason") or "").lower() in {"take_profit", "partial_take_profit", "sr_near_resistance_partial_take_profit", "sr_near_support_partial_take_profit"}
+        and _safe_float(x.get("net")) <= 0
+    ]
+    if worst_open_symbols:
+        optimization_targets.append(
+            {
+                "area": "entry_sizing_and_adds",
+                "priority": "high",
+                "issue": "recent opens are fee-negative and still carrying risk",
+                "evidence": worst_open_symbols,
+                "suggestion": "按 symbol+side 增加连续加仓冷却；只有浮盈或趋势二次确认后允许加仓。",
+            }
+        )
+    if tiny_tp:
+        optimization_targets.append(
+            {
+                "area": "exit_min_net_profit",
+                "priority": "medium",
+                "issue": "take-profit exists but net after fees is non-positive",
+                "evidence": tiny_tp,
+                "suggestion": "按 symbol/notional 提高最小净止盈检查，避免手续费型假盈利。",
+            }
+        )
+    if any(x.get("strategy") == "default_trend_following_ma" and _safe_float(x.get("net")) < 0 and int(x.get("opens") or 0) >= 3 for x in by_strategy):
+        optimization_targets.append(
+            {
+                "area": "strategy_entry_logic",
+                "priority": "medium",
+                "issue": "trend strategy opened multiple positions without realized exits in the window",
+                "evidence": [x for x in by_strategy if x.get("strategy") == "default_trend_following_ma"][:1],
+                "suggestion": "趋势策略增加未平仓风险预算和同向加仓间隔，避免单策略快速堆仓。",
+            }
+        )
+
+    return {
+        "window": {
+            "hours": round(float(hours or 4.0), 4),
+            "start_utc": start_utc.isoformat(),
+            "end_utc": end_utc.isoformat(),
+        },
+        "summary": summary_out,
+        "source_attribution": _finalize_map(buckets["by_source"], "source"),
+        "strategy_attribution": by_strategy,
+        "symbol_attribution": by_symbol,
+        "regime_attribution": _finalize_map(buckets["by_regime"], "regime"),
+        "open_logic": _finalize_map(buckets["by_open_reason"], "open_reason"),
+        "close_logic": by_close_reason,
+        "recent_orders": recent_orders[-80:],
+        "optimization_targets": optimization_targets,
+    }
+
+
+async def _build_trading_workflow_report(
+    main_controller: Any,
+    *,
+    symbol: str = "BTC/USDT",
+    trace_limit: int = 200,
+    trade_limit: int = 1000,
+    recent_trades_limit: int = 40,
+    recent_order_hours: float = 4.0,
+) -> Dict[str, Any]:
+    """Compact read model for the full trading workflow and optimization loop."""
+    mc = main_controller
+    closed_loop = await _build_closed_loop_summary_data(mc, trace_limit=int(trace_limit or 200))
+    trade_lifecycle = await _build_trade_lifecycle_summary(
+        mc,
+        trade_limit=int(trade_limit or 1000),
+        recent_limit=int(recent_trades_limit or 40),
+    )
+
+    system_status: Dict[str, Any] = {}
+    if mc and hasattr(mc, "get_system_status"):
+        try:
+            system_status = await mc.get_system_status()
+        except Exception as e:
+            system_status = {"error": str(e)}
+
+    positions: List[Dict[str, Any]] = []
+    try:
+        ex = mc.get_exchange() if hasattr(mc, "get_exchange") else getattr(mc, "okx_exchange", None)
+        if ex and hasattr(ex, "get_positions"):
+            raw_positions = await ex.get_positions()
+            for row in raw_positions or []:
+                if not isinstance(row, dict):
+                    continue
+                size = _safe_float(row.get("size") or row.get("pos") or row.get("positionAmt"))
+                if abs(size) <= 1e-12:
+                    continue
+                positions.append(
+                    {
+                        "symbol": row.get("symbol") or row.get("instId"),
+                        "side": row.get("side") or row.get("posSide"),
+                        "size": size,
+                        "entry_price": _safe_float(row.get("entry_price") or row.get("avgPx") or row.get("entryPrice")),
+                        "mark_price": _safe_float(row.get("mark_px") or row.get("mark_price") or row.get("markPx")),
+                        "unrealized_pnl": _safe_float(row.get("unrealized_pnl") or row.get("upl") or row.get("unrealizedPnl")),
+                        "notional_value": _safe_float(row.get("notional_value") or row.get("notionalUsd") or row.get("notional")),
+                        "leverage": _safe_float(row.get("leverage") or row.get("lever")),
+                    }
+                )
+    except Exception:
+        positions = []
+
+    active_sltp_orders: List[Dict[str, Any]] = []
+    try:
+        sltp = getattr(mc, "stop_loss_manager", None)
+        if sltp and hasattr(sltp, "get_all_active_orders"):
+            for order in await sltp.get_all_active_orders():
+                if hasattr(order, "to_dict"):
+                    row = order.to_dict()
+                elif isinstance(order, dict):
+                    row = order
+                else:
+                    row = {}
+                active_sltp_orders.append(
+                    {
+                        "order_id": row.get("order_id"),
+                        "symbol": row.get("symbol"),
+                        "side": row.get("side"),
+                        "entry_price": row.get("entry_price"),
+                        "remaining_quantity": row.get("remaining_quantity") or row.get("quantity"),
+                        "stop_loss_price": row.get("stop_loss_price"),
+                        "take_profit_price": row.get("take_profit_price"),
+                        "trailing_stop_activated": row.get("trailing_stop_activated"),
+                        "breakeven_activated": row.get("breakeven_activated"),
+                        "status": row.get("status"),
+                    }
+                )
+    except Exception:
+        active_sltp_orders = []
+
+    market_snapshot: Dict[str, Any] = {}
+    try:
+        hub = getattr(mc, "data_source_hub", None)
+        if hub and hasattr(hub, "get_unified_snapshot"):
+            market_snapshot = await asyncio.wait_for(hub.get_unified_snapshot(symbol), timeout=20.0)
+    except Exception as e:
+        market_snapshot = {"symbol": symbol, "degraded": True, "error": repr(e)}
+
+    gateway_snapshot: Dict[str, Any] = {}
+    recent_events: List[Dict[str, Any]] = []
+    try:
+        gw = getattr(mc, "execution_gateway", None)
+        if gw and hasattr(gw, "get_snapshot"):
+            gateway_snapshot = await gw.get_snapshot()
+        if gw and hasattr(gw, "get_recent_events"):
+            recent_events = await gw.get_recent_events(limit=40)
+    except Exception:
+        gateway_snapshot = {}
+        recent_events = []
+
+    compact_events: List[Dict[str, Any]] = []
+    for evt in recent_events[-40:]:
+        if not isinstance(evt, dict):
+            continue
+        ctx = evt.get("context") if isinstance(evt.get("context"), dict) else {}
+        compact_events.append(
+            {
+                "ts": evt.get("ts"),
+                "op": evt.get("op"),
+                "symbol": evt.get("symbol"),
+                "side": evt.get("side"),
+                "size": evt.get("size"),
+                "leverage": evt.get("leverage"),
+                "source": evt.get("source"),
+                "reason": evt.get("reason"),
+                "success": evt.get("success"),
+                "error_code": evt.get("error_code"),
+                "detail": str(evt.get("detail") or "")[:220],
+                "trace_id": evt.get("trace_id"),
+                "strategy_used": ctx.get("strategy_used") or ctx.get("strategy_id"),
+                "decision_reasoning": str(ctx.get("decision_reasoning") or "")[:360],
+                "sltp_reason": ctx.get("sltp_reason"),
+                "trigger_pnl_percent": ctx.get("trigger_pnl_percent"),
+            }
+        )
+
+    recent_order_attribution = await _build_recent_order_attribution(
+        mc,
+        hours=float(recent_order_hours or 4.0),
+        limit=max(200, int(trade_limit or 1000)),
+    )
+
+    signal_guard = closed_loop.get("signal_and_guard") if isinstance(closed_loop, dict) else {}
+    exit_profit = closed_loop.get("exit_and_profitability") if isinstance(closed_loop, dict) else {}
+    optimization_hints = closed_loop.get("optimization_hints", []) if isinstance(closed_loop, dict) else []
+    agent_effectiveness = closed_loop.get("agent_effectiveness", {}) if isinstance(closed_loop, dict) else {}
+    trade_summary = trade_lifecycle.get("summary", {}) if isinstance(trade_lifecycle, dict) else {}
+    close_reason_top = trade_lifecycle.get("close_reason_top", []) if isinstance(trade_lifecycle, dict) else []
+    opportunity_blocks = (exit_profit.get("opportunity_blocks") or {}) if isinstance(exit_profit, dict) else {}
+    realized_perf = (exit_profit.get("realized_performance") or {}) if isinstance(exit_profit, dict) else {}
+    decision_summary = signal_guard.get("decision_traces_summary") if isinstance(signal_guard, dict) else {}
+    agent_summary = agent_effectiveness.get("summary") if isinstance(agent_effectiveness, dict) else {}
+    trace_sample_size = _safe_int(decision_summary.get("sample_size"))
+    trade_sample_size = _safe_int(trade_summary.get("sample_size"))
+    trace_linked_rows = _safe_int(trade_summary.get("trace_linked_rows"))
+    trace_linkage_ratio = round(float(trace_linked_rows) / float(trade_sample_size), 4) if trade_sample_size > 0 else 0.0
+    guard_rejected = _safe_int(decision_summary.get("guard_rejected"))
+    guard_passed = _safe_int(decision_summary.get("guard_passed"))
+    decision_total = guard_rejected + guard_passed
+    guard_pass_rate = round(float(guard_passed) / float(decision_total), 4) if decision_total > 0 else 0.0
+    exec_events = [e for e in compact_events if str(e.get("op") or "").lower() in {"open", "close"}]
+    exec_success = len([e for e in exec_events if e.get("success") is True])
+    execution_success_ratio = round(float(exec_success) / float(len(exec_events)), 4) if exec_events else 1.0
+    win_rate = _safe_float(trade_summary.get("win_rate"))
+    net_pnl = _safe_float(trade_summary.get("net_pnl_plus_fees"))
+    agent_coverage_ratio = _safe_float((agent_summary or {}).get("agent_trace_coverage_ratio"))
+    tp_suppressed = _safe_int(opportunity_blocks.get("tp_net_edge_suppressed"))
+    tp_suppression_per_trade = round(float(tp_suppressed) / float(trade_sample_size), 4) if trade_sample_size > 0 else 0.0
+
+    data_quality = {}
+    if isinstance(market_snapshot, dict):
+        quality_block = market_snapshot.get("数据质量与作用评分") if isinstance(market_snapshot.get("数据质量与作用评分"), dict) else {}
+        if not quality_block:
+            quality_block = market_snapshot.get("数据质量评估") if isinstance(market_snapshot.get("数据质量评估"), dict) else {}
+        data_quality = {
+            "quality_score": _safe_float(quality_block.get("quality_score") or quality_block.get("score"), 0.0),
+            "confidence": _safe_float(quality_block.get("confidence"), 0.0),
+            "grade": quality_block.get("grade"),
+            "provenance": ((market_snapshot.get("数据来源状态") or {}).get("provenance") if isinstance(market_snapshot.get("数据来源状态"), dict) else None),
+            "degraded": bool(market_snapshot.get("degraded") or market_snapshot.get("error")),
+        }
+
+    workflow_actions: List[Dict[str, Any]] = []
+    worst_regime = realized_perf.get("worst_regime") if isinstance(realized_perf, dict) else {}
+    if isinstance(worst_regime, dict) and _safe_float(worst_regime.get("total_pnl")) < 0:
+        workflow_actions.append(
+            {
+                "priority": "high",
+                "area": "entry_regime_filter",
+                "action": "keep_volatile_small_or_advisory_only",
+                "reason": "volatile regime has negative expectancy",
+                "evidence": {
+                    "regime": worst_regime.get("regime"),
+                    "expectancy": worst_regime.get("expectancy"),
+                    "total_pnl": worst_regime.get("total_pnl"),
+                    "win_rate": worst_regime.get("win_rate"),
+                },
+            }
+        )
+    if _safe_int(opportunity_blocks.get("tp_net_edge_suppressed")) > 500:
+        workflow_actions.append(
+            {
+                "priority": "medium",
+                "area": "exit_logic",
+                "action": "review_min_net_take_profit_thresholds",
+                "reason": "TP edge gate suppresses many small exits",
+                "evidence": {
+                    "tp_net_edge_suppressed": opportunity_blocks.get("tp_net_edge_suppressed"),
+                    "tp_edge_suppression": exit_profit.get("tp_edge_suppression") if isinstance(exit_profit, dict) else {},
+                },
+            }
+        )
+    agent_summary = agent_effectiveness.get("summary") if isinstance(agent_effectiveness, dict) else {}
+    if _safe_float((agent_summary or {}).get("agent_trace_coverage_ratio")) < 0.25:
+        workflow_actions.append(
+            {
+                "priority": "high",
+                "area": "agent_workflow",
+                "action": "promote_4_agent_advisory_to_main_path_observation",
+                "reason": "agent coverage is too low to optimize PnL causally",
+                "evidence": {
+                    "coverage_ratio": (agent_summary or {}).get("agent_trace_coverage_ratio"),
+                    "full_stack_trace_count": (agent_summary or {}).get("full_stack_trace_count"),
+                },
+            }
+        )
+    hold_diag = (signal_guard.get("hold_diagnostics") or {}) if isinstance(signal_guard, dict) else {}
+    if _safe_int(hold_diag.get("fallback_hold_count")) > 0:
+        workflow_actions.append(
+            {
+                "priority": "medium",
+                "area": "llm_routing",
+                "action": "stabilize_decision_model_fallback",
+                "reason": "LLM unavailable fallback is affecting hold decisions",
+                "evidence": {
+                    "fallback_hold_count": hold_diag.get("fallback_hold_count"),
+                    "top_fallback_reasons": hold_diag.get("top_fallback_reasons"),
+                },
+            }
+        )
+
+    kpi_scorecard = {
+        "data_quality": {
+            "score": data_quality.get("quality_score"),
+            "confidence": data_quality.get("confidence"),
+            "grade": data_quality.get("grade"),
+            "provenance": data_quality.get("provenance"),
+            "status": (
+                "unavailable"
+                if bool(data_quality.get("degraded"))
+                else ("ok" if _safe_float(data_quality.get("quality_score")) >= 0.85 else "watch")
+            ),
+            "why_it_matters": "数据质量低时不应放宽开仓门槛，只能降风险或补数据。",
+        },
+        "decision_selectivity": {
+            "sample_size": trace_sample_size,
+            "guard_pass_rate": guard_pass_rate,
+            "guard_rejected": guard_rejected,
+            "guard_passed": guard_passed,
+            "status": "very_strict" if decision_total > 0 and guard_pass_rate < 0.05 else "ok",
+            "why_it_matters": "开仓通过率过低时，要区分是过滤有效还是阈值过紧。",
+        },
+        "execution_quality": {
+            "recent_event_count": len(exec_events),
+            "success_ratio": execution_success_ratio,
+            "reconciliation_healthy": bool(((gateway_snapshot or {}).get("reconciliation") or {}).get("healthy", False)) if isinstance((gateway_snapshot or {}).get("reconciliation"), dict) else None,
+            "status": "ok" if execution_success_ratio >= 0.85 else "watch",
+            "why_it_matters": "执行成功率低时优先修交易所/风控/幂等，不应先调策略参数。",
+        },
+        "exit_quality": {
+            "trade_sample_size": trade_sample_size,
+            "win_rate": win_rate,
+            "net_pnl_plus_fees": net_pnl,
+            "tp_suppressed": tp_suppressed,
+            "tp_suppression_per_trade": tp_suppression_per_trade,
+            "status": "profitable_but_tp_constrained" if net_pnl > 0 and tp_suppression_per_trade > 0.5 else ("ok" if net_pnl >= 0 else "loss_making"),
+            "why_it_matters": "退出逻辑决定盈利兑现和回吐，TP 抑制过高会拖慢资金周转。",
+        },
+        "attribution_quality": {
+            "trace_linkage_ratio": trace_linkage_ratio,
+            "trace_linked_rows": trace_linked_rows,
+            "agent_coverage_ratio": agent_coverage_ratio,
+            "status": "weak" if trace_linkage_ratio < 0.7 or agent_coverage_ratio < 0.25 else "ok",
+            "why_it_matters": "归因不足时，参数优化只能给建议，不能自动强应用。",
+        },
+    }
+
+    parameter_recommendations: List[Dict[str, Any]] = []
+    worst_regime_name = str((worst_regime or {}).get("regime") or "").lower() if isinstance(worst_regime, dict) else ""
+    if worst_regime_name in {"volatile", "high_vol"} and _safe_float((worst_regime or {}).get("expectancy")) < 0:
+        parameter_recommendations.append(
+            {
+                "priority": "high",
+                "parameter_family": "entry.regime_policy_matrix",
+                "target_keys": [
+                    "ai_core.regime_policy_matrix.volatile.qty_mult",
+                    "ai_core.regime_policy_matrix.volatile.leverage_mult",
+                    "strategy_manager.market_regime_strategy_multiplier.*.volatile",
+                ],
+                "recommendation": "keep_or_tighten",
+                "suggested_direction": "decrease_size_and_selection_weight",
+                "evidence": {
+                    "worst_regime": worst_regime,
+                    "current_action": "volatile 已降权，应继续以小仓/观察为主，直到 expectancy 回正。",
+                },
+                "guardrail": "不要因为开仓少而放宽 volatile；只有连续样本 expectancy > 0 且 win_rate > 0.50 后才恢复。",
+            }
+        )
+    if tp_suppression_per_trade > 0.5:
+        parameter_recommendations.append(
+            {
+                "priority": "medium",
+                "parameter_family": "exit.min_net_take_profit",
+                "target_keys": [
+                    "sltp.min_net_take_profit_percent",
+                    "sltp.min_net_take_profit_regime_overrides.normal",
+                    "sltp.min_net_take_profit_regime_overrides.range",
+                    "sltp.min_net_take_profit_regime_overrides.low_vol_grind",
+                ],
+                "recommendation": "watch_after_recent_threshold_reduction",
+                "suggested_direction": "lower_only_for_profitable_low_vol_or_range",
+                "evidence": {
+                    "tp_suppressed": tp_suppressed,
+                    "tp_suppression_per_trade": tp_suppression_per_trade,
+                    "net_pnl_plus_fees": net_pnl,
+                },
+                "guardrail": "high_vol/volatile 的净止盈门槛不要同步下调，避免手续费型假盈利。",
+            }
+        )
+    top_rejects = signal_guard.get("top_reject_reasons") if isinstance(signal_guard, dict) else []
+    top_reject_keys = [str(x.get("reason") or x.get("key") or "") for x in top_rejects if isinstance(x, dict)]
+    if any("risk_reward_low" in x for x in top_reject_keys):
+        parameter_recommendations.append(
+            {
+                "priority": "medium",
+                "parameter_family": "entry.min_rr_to_trade",
+                "target_keys": ["ai_core.min_rr_to_trade", "ai_core.regime_profile_overrides.*.min_rr_mult"],
+                "recommendation": "do_not_blindly_loosen",
+                "suggested_direction": "segment_by_regime_symbol_session_before_change",
+                "evidence": {"top_reject_reasons": top_rejects[:5], "guard_pass_rate": guard_pass_rate, "net_pnl_plus_fees": net_pnl},
+                "guardrail": "如果当前净收益为正且 volatile 亏损，RR 门槛应按 regime 分层，不应全局降低。",
+            }
+        )
+    if any("entry_slippage" in x for x in top_reject_keys):
+        parameter_recommendations.append(
+            {
+                "priority": "medium",
+                "parameter_family": "entry.slippage_and_spread",
+                "target_keys": ["ai_core.max_spread_bps_to_trade", "ai_core.max_entry_slippage_to_trade"],
+                "recommendation": "collect_distribution_before_loosen",
+                "suggested_direction": "loosen_only_for_high_liquidity_symbols",
+                "evidence": {"top_reject_reasons": top_rejects[:5], "execution_success_ratio": execution_success_ratio},
+                "guardrail": "滑点/点差放宽会直接提高成本，必须按 symbol/session 分组。",
+            }
+        )
+    if agent_coverage_ratio < 0.25:
+        parameter_recommendations.append(
+            {
+                "priority": "high",
+                "parameter_family": "observability.agent_coverage",
+                "target_keys": ["decision_trace.agent_outputs", "agent_orchestrator.main_path_coverage"],
+                "recommendation": "improve_data_capture_before_auto_tuning",
+                "suggested_direction": "increase_advisory_snapshot_persistence",
+                "evidence": {"agent_coverage_ratio": agent_coverage_ratio, "trace_sample_size": trace_sample_size},
+                "guardrail": "智能体覆盖率低时，不要把 agent verdict 当作自动调参主依据。",
+            }
+        )
+
+    optimization_readiness = {
+        "ready_for_safe_recommendations": bool(trade_sample_size >= 100 and trace_sample_size >= 100),
+        "ready_for_auto_apply": bool(
+            trade_sample_size >= 300
+            and trace_linkage_ratio >= 0.7
+            and agent_coverage_ratio >= 0.25
+            and execution_success_ratio >= 0.9
+        ),
+        "blocking_gaps": [
+            gap
+            for gap in [
+                {"id": "trade_sample_size", "message": "成交样本不足 300，不建议自动应用参数。"} if trade_sample_size < 300 else None,
+                {"id": "data_quality", "message": "行情/数据质量快照不可用或低于 0.85。"} if bool(data_quality.get("degraded")) or _safe_float(data_quality.get("quality_score")) < 0.85 else None,
+                {"id": "trace_linkage", "message": "成交 trace 归因覆盖不足 70%。"} if trace_linkage_ratio < 0.7 else None,
+                {"id": "agent_coverage", "message": "四智能体覆盖不足 25%，暂不能用于自动调参。"} if agent_coverage_ratio < 0.25 else None,
+                {"id": "execution_success", "message": "执行成功率不足 90%，应先修执行链路。"} if execution_success_ratio < 0.9 else None,
+            ]
+            if gap
+        ],
+        "recommended_read_cycle": [
+            "读取 /api/v1/commander/trading-workflow",
+            "先看 kpi_scorecard.status",
+            "再看 parameter_recommendations.priority=high",
+            "只在 ready_for_auto_apply=true 时允许自动应用；否则只生成建议和观测任务。",
+        ],
+    }
+
+    return {
+        "interface": {
+            "name": "commander.trading_workflow",
+            "version": "2026.05.16",
+            "path": "/api/v1/commander/trading-workflow",
+            "purpose": "Read-only end-to-end trading workflow state, reasons, outcomes, and optimization actions.",
+        },
+        "query": {
+            "symbol": symbol,
+            "trace_limit": int(trace_limit or 200),
+            "trade_limit": int(trade_limit or 1000),
+            "recent_trades_limit": int(recent_trades_limit or 40),
+            "recent_order_hours": float(recent_order_hours or 4.0),
+        },
+        "health": {
+            "system_status": system_status.get("system_status"),
+            "running_modules": system_status.get("running_modules"),
+            "module_count": system_status.get("module_count"),
+            "exchange_connected": (gateway_snapshot or {}).get("exchange_connected"),
+            "single_write_owner": (gateway_snapshot or {}).get("single_write_owner"),
+            "reconciliation": (gateway_snapshot or {}).get("reconciliation"),
+            "loop_health": closed_loop.get("loop_health") if isinstance(closed_loop, dict) else {},
+        },
+        "data_and_market": {
+            "symbol": symbol,
+            "snapshot": market_snapshot,
+        },
+        "current_exposure": {
+            "positions": positions,
+            "active_sltp_orders": active_sltp_orders,
+            "position_count": len(positions),
+            "active_sltp_count": len(active_sltp_orders),
+        },
+        "decision_and_guard": {
+            "summary": signal_guard.get("decision_traces_summary") if isinstance(signal_guard, dict) else {},
+            "workflow_focus": signal_guard.get("workflow_focus") if isinstance(signal_guard, dict) else {},
+            "top_reject_reasons": signal_guard.get("top_reject_reasons") if isinstance(signal_guard, dict) else [],
+            "top_reject_symbols": signal_guard.get("top_reject_symbols") if isinstance(signal_guard, dict) else [],
+            "hold_diagnostics": hold_diag,
+        },
+        "execution": {
+            "policy_metrics": (gateway_snapshot or {}).get("policy_metrics"),
+            "execution_attribution": (gateway_snapshot or {}).get("execution_attribution"),
+            "recent_events": compact_events,
+        },
+        "recent_order_attribution": recent_order_attribution,
+        "exits_and_pnl": {
+            "trade_summary": trade_summary,
+            "close_reason_top": close_reason_top,
+            "exit_review": trade_lifecycle.get("exit_review") if isinstance(trade_lifecycle, dict) else {},
+            "realized_performance": realized_perf,
+            "opportunity_blocks": opportunity_blocks,
+            "tp_edge_suppression": exit_profit.get("tp_edge_suppression") if isinstance(exit_profit, dict) else {},
+        },
+        "learning_and_agents": {
+            "agent_effectiveness": agent_effectiveness,
+            "learning_optimization_hints": optimization_hints,
+        },
+        "optimization_read_model": {
+            "kpi_scorecard": kpi_scorecard,
+            "optimization_readiness": optimization_readiness,
+            "parameter_recommendations": parameter_recommendations,
+            "guardrails": [
+                "执行/对账不健康时，禁止调策略阈值。",
+                "数据质量低时，只允许降风险，不允许放宽开仓。",
+                "volatile/high_vol 负期望时，禁止全局降低 RR 或置信度门槛。",
+                "归因覆盖不足时，参数建议只能人工审核，不能自动应用。",
+            ],
+        },
+        "workflow_actions": workflow_actions,
     }
 
 
@@ -1944,6 +3817,22 @@ def init_module_control_api(app, main_controller):
             health["total_count"] = total
         
         return health
+
+    @router.get("/health")
+    async def get_root_health_alias():
+        """兼容旧探针：/api/v1/modules/health。"""
+        return await get_system_health()
+
+    @router.get("/status")
+    async def get_modules_status_alias():
+        """兼容旧探针：/api/v1/modules/status。"""
+        if not main_controller or not hasattr(main_controller, "get_system_status"):
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            data = await main_controller.get_system_status()
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
     @router.get("/strategy/optimization-status")
     async def get_strategy_optimization_status():
@@ -4154,7 +6043,22 @@ def init_module_control_api(app, main_controller):
         # 8) Decision contract integrity snapshot (strategy/trace attribution health)
         try:
             eg = out.get("execution_gateway") if isinstance(out.get("execution_gateway"), dict) else {}
-            events = (eg.get("recent_events") or []) if isinstance(eg.get("recent_events"), list) else []
+            raw_events = (eg.get("recent_events") or []) if isinstance(eg.get("recent_events"), list) else []
+            start_time = getattr(mc, "start_time", None)
+            runtime_events: List[Dict[str, Any]] = []
+            for e in raw_events:
+                if not isinstance(e, dict):
+                    continue
+                if start_time is None:
+                    runtime_events.append(e)
+                    continue
+                try:
+                    ets = datetime.fromisoformat(str(e.get("ts") or "").replace("Z", "+00:00")).replace(tzinfo=None)
+                    if ets >= start_time:
+                        runtime_events.append(e)
+                except Exception:
+                    continue
+            events = runtime_events if start_time is not None else raw_events
             total = 0
             miss_strategy = 0
             miss_trace = 0
@@ -4208,6 +6112,9 @@ def init_module_control_api(app, main_controller):
             coverage_trace = (1.0 - float(miss_trace) / float(total)) if total > 0 else 1.0
             out["decision_contract_integrity"] = {
                 "sample_size": int(total),
+                "raw_recent_event_count": len(raw_events),
+                "runtime_event_count": len(events),
+                "runtime_window_start": start_time.isoformat() if isinstance(start_time, datetime) else None,
                 "missing_strategy": int(miss_strategy),
                 "missing_trace": int(miss_trace),
                 "missing_both": int(miss_both),
@@ -4216,6 +6123,7 @@ def init_module_control_api(app, main_controller):
                 "by_source": by_source,
                 "samples": samples,
                 "healthy": bool(total == 0 or (coverage_strategy >= 0.95 and coverage_trace >= 0.95)),
+                "note": "no_runtime_execution_events_since_start" if total == 0 and start_time is not None else None,
             }
             if not bool(out["decision_contract_integrity"]["healthy"]):
                 hints = out.get("diagnosis_hints") if isinstance(out.get("diagnosis_hints"), list) else []
@@ -4256,6 +6164,26 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
+    @router.get("/commander/agent-effectiveness")
+    async def commander_agent_effectiveness(trace_limit: int = 120, trade_limit: int = 500):
+        """
+        四智能体有效性摘要：
+        - 覆盖率/阻塞率/执行到达率
+        - 各智能体的 verdict 分布与 next_action 分布
+        - 是否已建立与真实收益的闭环归因
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            data = await _build_agent_effectiveness_summary(
+                main_controller,
+                trace_limit=int(trace_limit or 120),
+                trade_limit=int(trade_limit or 500),
+            )
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
     @router.get("/commander/closed-loop-summary")
     async def commander_closed_loop_summary(trace_limit: int = 120):
         """
@@ -4266,517 +6194,66 @@ def init_module_control_api(app, main_controller):
         if not main_controller:
             return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
         try:
-            mc = main_controller
-            store = getattr(mc, "decision_trace_store", None)
-            traces = store.analyze_recent(limit=int(trace_limit or 120)) if (store and hasattr(store, "analyze_recent")) else {}
-            summary = traces.get("summary", {}) if isinstance(traces, dict) else {}
-            workflow_focus = _summarize_trace_workflow_focus(traces)
-            recent = traces.get("recent", []) if isinstance(traces, dict) else []
+            data = await _build_closed_loop_summary_data(main_controller, trace_limit=int(trace_limit or 120))
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
-            watch = _load_runtime_json("realtime_watch.latest.json")
-            analysis = watch.get("analysis", {}) if isinstance(watch.get("analysis"), dict) else {}
-            latest_trade = analysis.get("latest_trade", {}) if isinstance(analysis.get("latest_trade"), dict) else {}
-            best_regime = analysis.get("best_regime", {}) if isinstance(analysis.get("best_regime"), dict) else {}
-            worst_regime = analysis.get("worst_regime", {}) if isinstance(analysis.get("worst_regime"), dict) else {}
-            symbol_summaries = analysis.get("symbol_summaries", []) if isinstance(analysis.get("symbol_summaries"), list) else []
-            ai_core = getattr(mc, "ai_core", None)
-            rejected_rows = list(getattr(ai_core, "_rejected_signals", []) or []) if ai_core is not None else []
-            recent_advisory_rows = [
-                row for row in reversed(rejected_rows[-120:])
-                if isinstance(row, dict) and str(row.get("reason") or "") == "regime_advisory_only_rejected"
-            ]
-            llm_manager = getattr(mc, "enhanced_llm_manager", None) or (getattr(ai_core, "llm", None) if ai_core is not None else None)
-            sltp = getattr(mc, "stop_loss_manager", None)
-            sltp_stats = sltp.get_stats() if (sltp and hasattr(sltp, "get_stats")) else {}
-
-            gateway = getattr(mc, "execution_gateway", None)
-            gateway_snapshot = await gateway.get_snapshot() if (gateway and hasattr(gateway, "get_snapshot")) else {}
-            policy_metrics = gateway_snapshot.get("policy_metrics", {}) if isinstance(gateway_snapshot, dict) else {}
-            reconciliation = gateway_snapshot.get("reconciliation", {}) if isinstance(gateway_snapshot, dict) else {}
-            recon_summary = reconciliation.get("summary", {}) if isinstance(reconciliation, dict) else {}
-
-            monitor_summary = {}
-            try:
-                from src.modules.api.monitoring_api import get_monitoring_summary
-                monitor_summary = await get_monitoring_summary()
-            except Exception:
-                monitor_summary = {}
-
-            reason_counter: Counter[str] = Counter()
-            stage_counter: Counter[str] = Counter()
-            symbol_counter: Counter[str] = Counter()
-            hold_tag_counter: Counter[str] = Counter()
-            hold_symbol_counter: Counter[str] = Counter()
-            hold_regime_counter: Counter[str] = Counter()
-            hold_strategy_counter: Counter[str] = Counter()
-            hold_fallback_reason_counter: Counter[str] = Counter()
-            hold_fallback_model_counter: Counter[str] = Counter()
-            hold_recent_samples: List[Dict[str, Any]] = []
-            hold_fallback_count = 0
-            for row in recent:
-                if not isinstance(row, dict):
-                    continue
-                guard = row.get("guard", {}) if isinstance(row.get("guard"), dict) else {}
-                reason = str(guard.get("reason") or row.get("reason") or "unknown")
-                stage = str(guard.get("stage") or row.get("stage") or "unknown")
-                symbol = str(row.get("symbol") or "unknown")
-                reason_counter[reason] += 1
-                stage_counter[stage] += 1
-                symbol_counter[symbol] += 1
-                if reason == "hold_by_ai_decision":
-                    guard_extras = guard.get("extras") if isinstance(guard.get("extras"), dict) else {}
-                    intent = row.get("intent") if isinstance(row.get("intent"), dict) else {}
-                    intent_extras = intent.get("extras") if isinstance(intent.get("extras"), dict) else {}
-                    extras = guard_extras or intent_extras
-                    hold_tags = extras.get("hold_reason_tags") if isinstance(extras.get("hold_reason_tags"), dict) else {}
-                    sr_snapshot = extras.get("sr_snapshot") if isinstance(extras.get("sr_snapshot"), dict) else {}
-                    regime = str(extras.get("regime") or extras.get("market_regime") or "unknown")
-                    strategy_used = str(intent.get("strategy_used") or extras.get("strategy_used") or "")
-                    reasoning_excerpt = str(extras.get("reasoning_excerpt") or intent.get("reasoning") or "")
-                    llm_failure_reason = str(extras.get("llm_failure_reason") or "")
-                    llm_model_id = str(extras.get("llm_model_id") or "")
-                    hold_symbol_counter[symbol] += 1
-                    hold_regime_counter[regime] += 1
-                    hold_strategy_counter[strategy_used or "unknown"] += 1
-                    for tag_name, enabled in hold_tags.items():
-                        if bool(enabled):
-                            hold_tag_counter[str(tag_name)] += 1
-                    if (
-                        bool(hold_tags.get("llm_unavailable_fallback", False))
-                        or "llm_unavailable_fallback" in reasoning_excerpt.lower()
-                        or "fallback" in strategy_used.lower()
-                    ):
-                        hold_fallback_count += 1
-                        hold_fallback_reason_counter[llm_failure_reason or "unknown"] += 1
-                        hold_fallback_model_counter[llm_model_id or "unknown"] += 1
-                    if len(hold_recent_samples) < 10:
-                        hold_recent_samples.append(
-                            {
-                                "ts": row.get("updated_at") or row.get("created_at"),
-                                "symbol": symbol,
-                                "side": row.get("side"),
-                                "confidence": intent.get("confidence"),
-                                "risk_level": extras.get("risk_level"),
-                                "strategy_used": strategy_used,
-                                "regime": regime,
-                                "reasoning_excerpt": reasoning_excerpt,
-                                "llm_fallback_kind": extras.get("llm_fallback_kind"),
-                                "llm_failure_reason": llm_failure_reason or None,
-                                "llm_error_code": extras.get("llm_error_code"),
-                                "llm_model_id": llm_model_id or None,
-                                "llm_provider": extras.get("llm_provider"),
-                                "llm_latency_ms": extras.get("llm_latency_ms"),
-                                "active_tags": [str(k) for k, enabled in hold_tags.items() if bool(enabled)],
-                                "sr_trigger_present": not bool(hold_tags.get("no_sr_entry_trigger", False)),
-                                "sr_snapshot": sr_snapshot,
-                            }
-                        )
-
-            top_reject_reasons = [
-                {"reason": k, "count": int(v)}
-                for k, v in reason_counter.most_common(8)
-            ]
-            top_reject_symbols = [
-                {"symbol": k, "count": int(v)}
-                for k, v in symbol_counter.most_common(8)
-            ]
-            top_reject_stages = [
-                {"stage": k, "count": int(v)}
-                for k, v in stage_counter.most_common(8)
-            ]
-            top_hold_tags = [
-                {"tag": k, "count": int(v)}
-                for k, v in hold_tag_counter.most_common(8)
-            ]
-            top_hold_symbols = [
-                {"symbol": k, "count": int(v)}
-                for k, v in hold_symbol_counter.most_common(8)
-            ]
-            top_hold_regimes = [
-                {"regime": k, "count": int(v)}
-                for k, v in hold_regime_counter.most_common(8)
-            ]
-            top_hold_strategies = [
-                {"strategy_used": k, "count": int(v)}
-                for k, v in hold_strategy_counter.most_common(8)
-            ]
-            top_fallback_reasons = [
-                {"reason": k, "count": int(v)}
-                for k, v in hold_fallback_reason_counter.most_common(8)
-            ]
-            top_fallback_models = [
-                {"model_id": k, "count": int(v)}
-                for k, v in hold_fallback_model_counter.most_common(8)
-            ]
-            hold_total = int(sum(hold_symbol_counter.values()))
-            hold_fallback_ratio = float(hold_fallback_count) / float(hold_total) if hold_total > 0 else 0.0
-            llm_diag: Dict[str, Any] = {}
-            try:
-                if llm_manager is not None:
-                    task_map = getattr(llm_manager, "task_model_mapping", {}) or {}
-                    decision_model_order: List[str] = []
-                    for task_key, model_ids in task_map.items():
-                        task_name = str(getattr(task_key, "value", task_key) or "")
-                        if task_name == "decision_making" and isinstance(model_ids, list):
-                            decision_model_order = [str(mid) for mid in model_ids]
-                            break
-                    raw_unhealthy = getattr(llm_manager, "_unhealthy_until", {}) or {}
-                    active_circuit_breaks: List[Dict[str, Any]] = []
-                    now_ts = time.time()
-                    if isinstance(raw_unhealthy, dict):
-                        for model_id, until_ts in raw_unhealthy.items():
-                            remaining = max(0.0, float(until_ts or 0.0) - now_ts)
-                            if remaining > 0:
-                                active_circuit_breaks.append(
-                                    {
-                                        "model_id": str(model_id),
-                                        "seconds_remaining": round(remaining, 1),
-                                    }
-                                )
-                    usage_rows: List[Dict[str, Any]] = []
-                    usage_stats = llm_manager.get_usage_stats() if hasattr(llm_manager, "get_usage_stats") else {}
-                    if isinstance(usage_stats, dict):
-                        for model_id, stat in usage_stats.items():
-                            total_calls = _safe_int(getattr(stat, "total_calls", 0))
-                            success_calls = _safe_int(getattr(stat, "successful_calls", 0))
-                            success_rate = (float(success_calls) / float(total_calls)) if total_calls > 0 else 0.0
-                            usage_rows.append(
-                                {
-                                    "model_id": str(model_id),
-                                    "total_calls": total_calls,
-                                    "successful_calls": success_calls,
-                                    "failed_calls": _safe_int(getattr(stat, "failed_calls", 0)),
-                                    "success_rate": round(success_rate, 4),
-                                    "avg_latency_ms": round(_safe_float(getattr(stat, "avg_latency_ms", 0.0)), 1),
-                                }
-                            )
-                    usage_rows.sort(key=lambda x: (-x["total_calls"], x["model_id"]))
-                    llm_diag = {
-                        "default_model": str(getattr(llm_manager, "default_model", "") or ""),
-                        "decision_model_order": decision_model_order,
-                        "active_circuit_breaks": active_circuit_breaks,
-                        "usage": usage_rows[:8],
-                    }
-            except Exception:
-                llm_diag = {}
-
-            tp_net_edge_suppressed = _safe_int(
-                (sltp_stats or {}).get("tp_net_edge_suppressed", analysis.get("tp_net_edge_suppressed", 0))
+    @router.get("/commander/trading-workflow")
+    async def commander_trading_workflow(
+        symbol: str = "BTC/USDT",
+        trace_limit: int = 200,
+        trade_limit: int = 1000,
+        recent_trades_limit: int = 40,
+        recent_order_hours: float = 4.0,
+    ):
+        """
+        交易全链路工作流报告：
+        - 数据/行情/市场结构
+        - 当前持仓与 SLTP
+        - 开仓门控、拒单、执行事件
+        - 平仓原因、收益归因、优化动作
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            data = await _build_trading_workflow_report(
+                main_controller,
+                symbol=symbol,
+                trace_limit=int(trace_limit or 200),
+                trade_limit=int(trade_limit or 1000),
+                recent_trades_limit=int(recent_trades_limit or 40),
+                recent_order_hours=float(recent_order_hours or 4.0),
             )
-            opportunities_blocked = {
-                "guard_rejected": _safe_int(summary.get("guard_rejected", 0)),
-                "guard_passed": _safe_int(summary.get("guard_passed", 0)),
-                "execution_success": _safe_int(summary.get("execution_success", 0)),
-                "execution_failed": _safe_int(summary.get("execution_failed", 0)),
-                "reconciliation_blocked": _safe_int(summary.get("reconciliation_blocked", 0)),
-                "rr_rejected": _safe_int(analysis.get("rr_rejected", 0)),
-                "sr_timing_rejected": _safe_int(analysis.get("sr_timing_rejected", 0)),
-                "open_evidence_rejected": _safe_int(analysis.get("open_evidence_rejected", 0)),
-                "regime_advisory_only_rejected": _safe_int(analysis.get("regime_advisory_only_rejected", 0)),
-                "tp_net_edge_suppressed": tp_net_edge_suppressed,
-            }
-            tp_suppressed_by_regime_raw = (
-                (sltp_stats or {}).get("tp_net_edge_suppressed_by_regime")
-                or analysis.get("tp_net_edge_suppressed_by_regime", {})
-            )
-            tp_suppressed_by_reason_raw = (
-                (sltp_stats or {}).get("tp_net_edge_suppressed_by_reason")
-                or analysis.get("tp_net_edge_suppressed_by_reason", {})
-            )
-            tp_suppressed_by_regime = (
-                {
-                    str(k): _safe_int(v)
-                    for k, v in tp_suppressed_by_regime_raw.items()
-                    if _safe_int(v) > 0
-                }
-                if isinstance(tp_suppressed_by_regime_raw, dict)
-                else {}
-            )
-            tp_suppressed_by_reason = (
-                {
-                    str(k): _safe_int(v)
-                    for k, v in tp_suppressed_by_reason_raw.items()
-                    if _safe_int(v) > 0
-                }
-                if isinstance(tp_suppressed_by_reason_raw, dict)
-                else {}
-            )
-            tp_top_regimes = [
-                {"regime": k, "count": int(v)}
-                for k, v in sorted(tp_suppressed_by_regime.items(), key=lambda kv: int(kv[1]), reverse=True)[:5]
-            ]
-            tp_top_reasons = [
-                {"reason": k, "count": int(v)}
-                for k, v in sorted(tp_suppressed_by_reason.items(), key=lambda kv: int(kv[1]), reverse=True)[:5]
-            ]
-            tp_recent_events = (
-                (sltp_stats or {}).get("tp_edge_recent_events")
-                if isinstance((sltp_stats or {}).get("tp_edge_recent_events"), list)
-                else analysis.get("tp_edge_recent_events")
-            )
-            tp_recent_samples = list(tp_recent_events or [])[-10:]
-            tp_recent_by_regime: Counter[str] = Counter()
-            tp_recent_by_reason: Counter[str] = Counter()
-            for row in tp_recent_samples:
-                if not isinstance(row, dict):
-                    continue
-                tp_recent_by_regime[str(row.get("regime") or "unknown")] += 1
-                tp_recent_by_reason[str(row.get("reason") or "unknown")] += 1
-            tp_recent_top_regimes = [
-                {"regime": k, "count": int(v)}
-                for k, v in tp_recent_by_regime.most_common(5)
-            ]
-            tp_recent_top_reasons = [
-                {"reason": k, "count": int(v)}
-                for k, v in tp_recent_by_reason.most_common(5)
-            ]
-            advisory_symbol_counts: Counter[str] = Counter()
-            advisory_recent_samples: List[Dict[str, Any]] = []
-            for row in recent_advisory_rows:
-                symbol = str(row.get("symbol") or "unknown")
-                advisory_symbol_counts[symbol] += 1
-                if len(advisory_recent_samples) < 10:
-                    extras = row.get("extras") if isinstance(row.get("extras"), dict) else {}
-                    advisory_recent_samples.append(
-                        {
-                            "ts": row.get("ts"),
-                            "symbol": symbol,
-                            "side": row.get("side"),
-                            "confidence": row.get("confidence"),
-                            "entry_price": row.get("entry_price"),
-                            "regime": str(extras.get("regime") or "unknown"),
-                        }
-                    )
-            advisory_top_symbols = [
-                {"symbol": k, "count": int(v)}
-                for k, v in advisory_symbol_counts.most_common(5)
-            ]
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
-            realized_perf = {
-                "best_regime": best_regime,
-                "worst_regime": worst_regime,
-                "equity": _safe_float(analysis.get("equity")),
-                "position_count": _safe_int(analysis.get("position_count", 0)),
-                "latest_trade": latest_trade,
-            }
-
-            monitoring_gap = {
-                "monitoring_total_trades": _safe_int(monitor_summary.get("total_trades", 0)) if isinstance(monitor_summary, dict) else 0,
-                "strategy_perf_sources": len((monitor_summary.get("strategies") or [])) if isinstance(monitor_summary, dict) else 0,
-                "latest_trade_present_in_runtime_watch": bool(latest_trade),
-            }
-
-            optimization_hints: List[Dict[str, Any]] = []
-            if monitoring_gap["monitoring_total_trades"] == 0 and latest_trade:
-                optimization_hints.append(
-                    {
-                        "priority": "high",
-                        "area": "observability",
-                        "issue": "监控口径未接入真实成交闭环",
-                        "evidence": {
-                            "monitoring_total_trades": monitoring_gap["monitoring_total_trades"],
-                            "runtime_latest_trade_id": latest_trade.get("trade_id"),
-                        },
-                        "recommendation": "将 runtime_watch / 历史成交源回填到 monitoring_api 的 trades/strategies 汇总，避免收益面板空白。",
-                    }
-                )
-            if worst_regime and _safe_float(worst_regime.get("total_pnl")) < 0:
-                optimization_hints.append(
-                    {
-                        "priority": "high",
-                        "area": "strategy_regime",
-                        "issue": "波动 regime 持续亏损",
-                        "evidence": {
-                            "regime": worst_regime.get("regime"),
-                            "total_trades": _safe_int(worst_regime.get("total_trades", 0)),
-                            "win_rate": _safe_float(worst_regime.get("win_rate")),
-                            "total_pnl": _safe_float(worst_regime.get("total_pnl")),
-                            "expectancy": _safe_float(worst_regime.get("expectancy")),
-                        },
-                        "recommendation": "对 volatile regime 降杠杆/降仓位，或直接切换到 advisory-only，直到该 regime 的 expectancy 回正。",
-                    }
-                )
-            if opportunities_blocked["regime_advisory_only_rejected"] > 0:
-                optimization_hints.append(
-                    {
-                        "priority": "medium",
-                        "area": "execution_guard",
-                        "issue": "volatile regime 已进入 advisory-only 拦截",
-                        "evidence": {
-                            "regime_advisory_only_rejected": opportunities_blocked["regime_advisory_only_rejected"],
-                            "top_symbols": advisory_top_symbols,
-                        },
-                        "recommendation": "继续观察被拦截样本是否集中在 volatile；若后续 expectancy 回正，再逐步恢复小仓试单。",
-                    }
-                )
-            tp_recent_suppressed = len(tp_recent_samples)
-            if tp_recent_suppressed >= 10:
-                top_regime = tp_recent_top_regimes[0] if tp_recent_top_regimes else {}
-                optimization_hints.append(
-                    {
-                        "priority": "medium",
-                        "area": "exit_logic",
-                        "issue": "近期止盈净收益门槛抑制次数偏高",
-                        "evidence": {
-                            "recent_window_count": tp_recent_suppressed,
-                            "top_regimes": tp_recent_top_regimes,
-                            "top_reasons": tp_recent_top_reasons,
-                            "lifetime_total": opportunities_blocked["tp_net_edge_suppressed"],
-                        },
-                        "recommendation": (
-                            f"优先复核 {top_regime.get('regime', 'top regime')} 的 TP 分层和 min_net 阈值，"
-                            "避免小盈利长期无法兑现，资金占用过久。"
-                        ),
-                    }
-                )
-            if best_regime and worst_regime and str(best_regime.get("regime")) != str(worst_regime.get("regime")):
-                optimization_hints.append(
-                    {
-                        "priority": "medium",
-                        "area": "capital_allocation",
-                        "issue": "不同 regime 收益差异大",
-                        "evidence": {
-                            "best_regime": {
-                                "name": best_regime.get("regime"),
-                                "pnl": _safe_float(best_regime.get("total_pnl")),
-                                "win_rate": _safe_float(best_regime.get("win_rate")),
-                            },
-                            "worst_regime": {
-                                "name": worst_regime.get("regime"),
-                                "pnl": _safe_float(worst_regime.get("total_pnl")),
-                                "win_rate": _safe_float(worst_regime.get("win_rate")),
-                            },
-                        },
-                        "recommendation": "把仓位和开仓预算向正 expectancy regime 倾斜，负 expectancy regime 只保留试探仓。",
-                    }
-                )
-            if hold_fallback_count >= 3:
-                optimization_hints.append(
-                    {
-                        "priority": "high",
-                        "area": "llm_availability",
-                        "issue": "部分 hold 由 LLM 不可用回退触发",
-                        "evidence": {
-                            "fallback_hold_count": hold_fallback_count,
-                            "fallback_hold_ratio": round(hold_fallback_ratio, 4),
-                            "hold_total": hold_total,
-                            "top_fallback_reasons": top_fallback_reasons[:5],
-                            "top_fallback_models": top_fallback_models[:5],
-                            "top_hold_strategies": top_hold_strategies[:5],
-                        },
-                        "recommendation": "优先排查 LLM 可用性、超时和 provider 降级，否则会把系统性 fallback 误判成策略过于保守。",
-                    }
-                )
-            if llm_diag.get("active_circuit_breaks"):
-                top_break = (llm_diag.get("active_circuit_breaks") or [{}])[0]
-                optimization_hints.append(
-                    {
-                        "priority": "high",
-                        "area": "llm_routing",
-                        "issue": "决策模型存在活跃熔断",
-                        "evidence": {
-                            "default_model": llm_diag.get("default_model"),
-                            "decision_model_order": llm_diag.get("decision_model_order"),
-                            "active_circuit_breaks": llm_diag.get("active_circuit_breaks"),
-                        },
-                        "recommendation": (
-                            f"优先处理 {top_break.get('model_id', 'primary model')} 的连通性；"
-                            "若短期内仍频繁熔断，可把 decision_making 前置到更稳的模型。"
-                        ),
-                    }
-                )
-            if _safe_int(recon_summary.get("drift_total", 0)) > 0:
-                optimization_hints.append(
-                    {
-                        "priority": "high",
-                        "area": "execution_reconciliation",
-                        "issue": "本地与交易所持仓存在漂移",
-                        "evidence": {"reconciliation": recon_summary},
-                        "recommendation": "先修正持仓漂移，再谈收益优化，否则收益统计和止盈止损判断都不可信。",
-                    }
-                )
-            top_stage = workflow_focus.get("top_stage") if isinstance(workflow_focus, dict) else None
-            top_status = workflow_focus.get("top_status") if isinstance(workflow_focus, dict) else None
-            if (
-                isinstance(top_stage, dict)
-                and str(top_stage.get("key") or "") == "reconciliation"
-                and isinstance(top_status, dict)
-                and str(top_status.get("key") or "") in {"blocked", "reconcile_blocked"}
-            ):
-                optimization_hints.append(
-                    {
-                        "priority": "high",
-                        "area": "execution_workflow",
-                        "issue": "近期决策主要卡在 reconciliation 阶段",
-                        "evidence": {
-                            "top_workflow_stage": top_stage,
-                            "top_workflow_status": top_status,
-                            "decision_trace_summary": summary,
-                        },
-                        "recommendation": "优先修复持仓同步、孤儿订单和对账保护触发根因，再调整策略阈值。",
-                    }
-                )
-
-            out = {
-                "loop_health": {
-                    "verdict": analysis.get("verdict", "unknown"),
-                    "risk_level": analysis.get("risk_level", "unknown"),
-                    "running_modules": _safe_int(analysis.get("running_modules", 0)),
-                    "active_alerts": _safe_int(analysis.get("active_alerts", 0)),
-                    "active_orders": _safe_int(analysis.get("active_orders", 0)),
-                    "position_count": _safe_int(analysis.get("position_count", 0)),
-                    "equity": _safe_float(analysis.get("equity")),
-                },
-                "signal_and_guard": {
-                    "decision_traces_summary": summary,
-                    "workflow_focus": workflow_focus,
-                    "top_reject_reasons": top_reject_reasons,
-                    "top_reject_symbols": top_reject_symbols,
-                    "top_reject_stages": top_reject_stages,
-                    "hold_diagnostics": {
-                        "top_tags": top_hold_tags,
-                        "top_symbols": top_hold_symbols,
-                        "top_regimes": top_hold_regimes,
-                        "top_strategies": top_hold_strategies,
-                        "top_fallback_reasons": top_fallback_reasons,
-                        "top_fallback_models": top_fallback_models,
-                        "fallback_hold_count": hold_fallback_count,
-                        "fallback_hold_ratio": round(hold_fallback_ratio, 4),
-                        "hold_total": hold_total,
-                        "recent_samples": hold_recent_samples,
-                    },
-                    "current_symbol_bias": symbol_summaries,
-                },
-                "execution_and_reconciliation": {
-                    "policy_metrics": policy_metrics,
-                    "reconciliation_summary": recon_summary,
-                },
-                "exit_and_profitability": {
-                    "realized_performance": realized_perf,
-                    "opportunity_blocks": opportunities_blocked,
-                    "regime_advisory_only": {
-                        "top_symbols": advisory_top_symbols,
-                        "recent_samples": advisory_recent_samples,
-                    },
-                    "tp_edge_suppression": {
-                        "recent_window_count": tp_recent_suppressed,
-                        "recent_by_regime": dict(tp_recent_by_regime),
-                        "recent_by_reason": dict(tp_recent_by_reason),
-                        "recent_top_regimes": tp_recent_top_regimes,
-                        "recent_top_reasons": tp_recent_top_reasons,
-                        "lifetime_total": opportunities_blocked["tp_net_edge_suppressed"],
-                        "by_regime": tp_suppressed_by_regime,
-                        "by_reason": tp_suppressed_by_reason,
-                        "top_regimes": tp_top_regimes,
-                        "top_reasons": tp_top_reasons,
-                        "recent_samples": tp_recent_samples,
-                    },
-                },
-                "llm_diagnostics": llm_diag,
-                "observability_gaps": monitoring_gap,
-                "optimization_hints": optimization_hints,
-            }
-            return {"success": True, "data": out, "timestamp": datetime.now().isoformat()}
+    @router.get("/commander/system-mastery")
+    async def commander_system_mastery(
+        symbol: str = "BTC/USDT",
+        trace_limit: int = 120,
+        trade_limit: int = 300,
+        recent_trades_limit: int = 20,
+    ):
+        """
+        单接口全局总览：
+        - 系统运行 / 故障 / 行情 / 账户 / 持仓
+        - 决策 / 拒单 / 执行 / 止盈止损 / 收益
+        - 学习状态 / 优化建议 / 观测缺口
+        目标：让脚本、前端、人工复盘统一围绕一个标准读取入口。
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            data = await _build_system_mastery_snapshot(
+                main_controller,
+                symbol=symbol,
+                trace_limit=int(trace_limit or 120),
+                trade_limit=int(trade_limit or 300),
+                recent_trades_limit=int(recent_trades_limit or 20),
+            )
+            return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
@@ -5288,8 +6765,13 @@ def init_module_control_api(app, main_controller):
         }
 
     from src.modules.api.module_surface import attach_module_surface_routes
+    from src.modules.api.standard_registry import attach_standard_domain_apis
 
     attach_module_surface_routes(router, main_controller)
+
+    # 标准化域 API：测试和轻量启动路径直接调用 init_module_control_api 时也能获得
+    # /api/v1/{domain}/... 新入口。旧 modules 路由仍暂存为底层能力来源。
+    attach_standard_domain_apis(app, main_controller)
 
     app.include_router(router)
     app.include_router(trade_router)

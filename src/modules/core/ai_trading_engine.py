@@ -1745,7 +1745,7 @@ class AITradingEngine:
             
         except Exception as e:
             logger.error(f"计算仓位大小失败: {e}")
-            return 0.01  # 默认最小仓位
+            return 0.0
     
     def _calculate_stop_loss_take_profit(self, context: MarketContext,
                                         action: TradeAction) -> tuple:
@@ -1832,7 +1832,7 @@ class AITradingEngine:
                     logger.info(f"📊 持仓数已达上限({total_cap})，拒绝新开仓: {decision.symbol}")
                     return False
 
-                # Staged scale-in confidence gates for 2nd/3rd/4th+ same-side opens.
+                # Staged scale-in confidence gates for 2nd/3rd/4th/5th same-side opens.
                 decision_side = "long" if opening_long else "short"
                 leg_key = f"{str(decision.symbol).upper()}|{decision_side}"
                 current_legs = int(self._symbol_side_open_legs.get(leg_key, 0) or 0)
@@ -1843,8 +1843,10 @@ class AITradingEngine:
                         need_conf = float(limits.scale_in_min_confidence_2)
                     elif next_leg == 3:
                         need_conf = float(limits.scale_in_min_confidence_3)
-                    else:
+                    elif next_leg == 4:
                         need_conf = float(limits.scale_in_min_confidence_4)
+                    else:
+                        need_conf = float(limits.scale_in_min_confidence_5)
                     got_conf = float(decision.confidence or 0.0)
                     if got_conf < need_conf:
                         logger.info(
@@ -2251,9 +2253,11 @@ class AITradingEngine:
                 return False
             
             if self._is_order_result_success(result):
+                if not isinstance(result, dict):
+                    logger.error("AITradingEngine: 下单返回非结构化成功结果，拒绝继续记账 result=%r", result)
+                    return False
                 order_id = ""
-                if isinstance(result, dict):
-                    order_id = result.get("id") or result.get("order_id") or "N/A"
+                order_id = result.get("id") or result.get("order_id") or "N/A"
                 logger.info(f"✅ 订单执行成功: {order_id}")
                 
                 trade_record = {
@@ -2277,6 +2281,8 @@ class AITradingEngine:
                             "order_id": result.get("order_id", ""),
                             "symbol": decision.symbol,
                             "side": side,
+                            "action": "close" if is_close else "open",
+                            "source": "ai_trading_engine",
                             "order_type": "market",
                             "quantity": decision.quantity,
                             "price": decision.price,
@@ -2416,28 +2422,27 @@ class AITradingEngine:
             return False
         if isinstance(result, bool):
             return result
-        if isinstance(result, dict):
-            # Common failure shapes
-            if result.get("success") is False:
-                return False
-            status = str(result.get("status", "")).lower()
-            if status in {"error", "failed", "fail"}:
-                return False
-            if "error" in result and result.get("error"):
-                return False
-            message = str(result.get("message", "")).lower()
-            if "error" in message or "failed" in message:
-                return False
-            # Common success shapes
-            if result.get("success") is True:
-                return True
-            if status in {"ok", "success", "filled"}:
-                return True
-            if result.get("order_id") or result.get("id"):
-                return True
+        if not isinstance(result, dict):
             return False
-        # Non-dict truthy values from mocks/adapters
-        return bool(result)
+        # Common failure shapes
+        if result.get("success") is False:
+            return False
+        status = str(result.get("status", "")).lower()
+        if status in {"error", "failed", "fail"}:
+            return False
+        if "error" in result and result.get("error"):
+            return False
+        message = str(result.get("message", "")).lower()
+        if "error" in message or "failed" in message:
+            return False
+        # Common success shapes
+        if result.get("success") is True:
+            return True
+        if status in {"ok", "success", "filled"}:
+            return True
+        if result.get("order_id") or result.get("id"):
+            return True
+        return False
     
     async def _save_trade_to_memory(self, decision: AIDecision, result: Dict) -> None:
         """保存交易记录到增强记忆"""

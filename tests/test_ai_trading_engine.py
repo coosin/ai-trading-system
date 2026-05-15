@@ -396,6 +396,32 @@ class TestAITradingEngine(AsyncTestCase):
         assert trading_engine._is_order_result_success({"success": False, "error": "x"}) is False
         assert trading_engine._is_order_result_success({"status": "success", "order_id": "123"}) is True
         assert trading_engine._is_order_result_success({"id": "abc"}) is True
+        assert trading_engine._is_order_result_success(True) is True
+        assert trading_engine._is_order_result_success("ok") is False
+
+    @pytest.mark.asyncio
+    async def test_calculate_position_size_returns_zero_on_balance_failure(self, trading_engine):
+        """回归：仓位计算异常时禁止兜底最小实盘下单。"""
+        from src.modules.core.ai_trading_engine import MarketContext, TradeAction
+
+        trading_engine.exchange.get_balance = AsyncMock(side_effect=RuntimeError("balance unavailable"))
+        context = MarketContext(
+            symbol="BTC/USDT",
+            price=50000.0,
+            trend="bullish",
+            volatility=0.02,
+            volume_24h=1000000.0,
+            sentiment="neutral",
+        )
+
+        qty = await trading_engine._calculate_position_size(
+            "BTC/USDT",
+            context,
+            TradeAction.OPEN_LONG,
+            confidence=0.8,
+        )
+
+        assert qty == 0.0
     
     @pytest.mark.asyncio
     async def test_update_positions(self, trading_engine):
@@ -568,14 +594,41 @@ class TestRiskManagement(AsyncTestCase):
     @pytest.mark.asyncio
     async def test_assess_risk(self, risk_manager):
         """测试风险评估"""
-        # TODO: 实现风险评估测试
-        pass
+        risk_manager._initialized = True
+        assessment = await risk_manager.assess_overall_risk()
+
+        assert assessment is not None
+        assert 0.0 <= assessment.risk_score <= 1.0
+        assert assessment.risk_level.value in {"low", "medium", "high", "critical", "extreme"}
+        assert assessment.confidence >= 0.0
     
     @pytest.mark.asyncio
     async def test_position_limit_check(self, risk_manager):
         """测试仓位限制检查"""
-        # TODO: 实现仓位限制测试
-        pass
+        allowed = await risk_manager._check_position_limits(
+            {
+                "symbol": "BTC/USDT",
+                "quantity": 0.01,
+                "price": 50000.0,
+                "portfolio_value": 10000.0,
+                "current_total_position": 0.0,
+                "daily_trades": 0,
+            }
+        )
+        rejected = await risk_manager._check_position_limits(
+            {
+                "symbol": "BTC/USDT",
+                "quantity": 1.0,
+                "price": 50000.0,
+                "portfolio_value": 10000.0,
+                "current_total_position": 0.0,
+                "daily_trades": 0,
+            }
+        )
+
+        assert allowed["passed"] is True
+        assert rejected["passed"] is False
+        assert "超过" in rejected["message"]
 
 
 if __name__ == "__main__":

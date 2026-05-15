@@ -93,7 +93,7 @@ async def test_open_allowed_for_ai_core():
     ex.set_leverage = AsyncMock(return_value={"success": True})
     ex.open_swap_position = AsyncMock(return_value={"success": True, "orderId": "x"})
     gw = ExecutionGateway(_mc_with_exchange(ex, swo="ai_core"))
-    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision")
+    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision", context={"confidence": 0.80})
     assert res["success"] is True
     ex.open_swap_position.assert_awaited_once()
 
@@ -126,7 +126,7 @@ async def test_open_denied_in_semi_auto_without_manual_approval():
     ex.open_swap_position = AsyncMock(return_value={"success": True, "orderId": "x"})
     mc = _mc_with_exchange_and_policy(ex, swo="ai_core", hosting_mode="semi_auto")
     gw = ExecutionGateway(mc)
-    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision")
+    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision", context={"confidence": 0.80})
     assert res["success"] is False
     assert "半自动" in res.get("error", "") or "semi" in res.get("error", "")
     ex.open_swap_position.assert_not_called()
@@ -158,7 +158,15 @@ async def test_open_denied_by_risk_redlines_max_positions():
     ex.open_swap_position = AsyncMock(return_value={"success": True, "orderId": "x"})
     mc = _mc_with_exchange_and_policy(ex, swo="ai_core", redlines={"max_positions": 1})
     gw = ExecutionGateway(mc)
-    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision")
+    res = await gw.open_swap(
+        "BTC/USDT",
+        "long",
+        1.0,
+        20,
+        "ai_core",
+        "decision",
+        context={"confidence": 0.80},
+    )
     assert res["success"] is False
     assert "风控红线" in res.get("error", "") or "max_positions" in res.get("error", "")
     ex.open_swap_position.assert_not_called()
@@ -182,9 +190,52 @@ async def test_open_same_symbol_scale_in_not_blocked_by_max_positions():
             "exchange_errors": {},
         }
     )
-    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision")
+    res = await gw.open_swap(
+        "BTC/USDT",
+        "long",
+        1.0,
+        20,
+        "ai_core",
+        "decision",
+        context={"confidence": 0.80},
+    )
     assert res["success"] is True
     ex.open_swap_position.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_open_same_symbol_scale_in_denied_by_tiered_confidence():
+    ex = MagicMock()
+    ex.get_positions = AsyncMock(return_value=[{"symbol": "BTC/USDT/SWAP", "size": 1.0, "side": "long"}])
+    ex.open_swap_position = AsyncMock(return_value={"success": True, "orderId": "x"})
+    mc = _mc_with_exchange_and_policy(ex, swo="ai_core", redlines={"max_positions": 5})
+    gw = ExecutionGateway(mc)
+
+    ctx = {"confidence": 0.74}
+    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision", context=ctx)
+
+    assert res["success"] is False
+    assert "第2笔置信度" in res.get("error", "")
+    assert ctx["position_slot_index"] == 2
+    assert ctx["required_confidence"] == pytest.approx(0.77)
+    ex.open_swap_position.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_open_fifth_same_symbol_leg_requires_fifth_tier_confidence():
+    ex = MagicMock()
+    ex.get_positions = AsyncMock(return_value=[{"symbol": "BTC/USDT/SWAP", "size": 1.0, "side": "long"}])
+    ex.open_swap_position = AsyncMock(return_value={"success": True, "orderId": "x"})
+    mc = _mc_with_exchange_and_policy(ex, swo="ai_core", redlines={"max_positions": 5})
+    gw = ExecutionGateway(mc)
+
+    ctx = {"confidence": 0.90, "position_slot_index": 5}
+    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision", context=ctx)
+
+    assert res["success"] is False
+    assert "第5笔置信度" in res.get("error", "")
+    assert ctx["required_confidence"] == pytest.approx(0.92)
+    ex.open_swap_position.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -256,7 +307,7 @@ async def test_open_full_positions_can_replace_worst_and_retry():
         20,
         "ai_core",
         "decision",
-        context={"confidence": 0.82, "semantic_context": {"risk_verdict": "review", "execution_recommendation": "normal"}},
+        context={"confidence": 0.96, "semantic_context": {"risk_verdict": "review", "execution_recommendation": "normal"}},
     )
     assert res["success"] is True
     ex.close_swap_position.assert_awaited_once()

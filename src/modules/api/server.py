@@ -27,7 +27,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
-from src.modules.api.strategy_api import router as strategy_router
 from src.modules.core.enhanced_llm_manager import TaskType
 from src.modules.data.data_source_hub import DataSourceHub
 
@@ -381,6 +380,11 @@ class APIServer:
             "/api/v1/monitoring",
             "/api/v1/modules/commander",
             "/api/v1/trade",
+            "/api/v1/strategy",
+            "/api/v1/execution",
+            "/api/v1/agents",
+            "/api/v1/commander",
+            "/api/v1/plugins",
         ]
         self.auth_exempt_paths: Set[str] = {
             "/api/v1/auth/login",
@@ -429,6 +433,12 @@ class APIServer:
 
             # 添加中间件
             await self._add_middleware()
+
+            @self.app.get("/health", include_in_schema=False)
+            async def root_health_alias():
+                from src.modules.system.service import SystemService
+
+                return await SystemService(self.main_controller).health()
 
             # 设置路由（模块控制 / 监控 在 _setup_routes 内、静态资源挂载之前注册，避免被 / 的 StaticFiles 吞掉）
             await self._setup_routes()
@@ -1032,63 +1042,6 @@ class APIServer:
         # 根路由 - 仅在静态文件服务不存在时生效
         # 注意：静态文件服务会处理根路径的请求
 
-        # 健康检查（唯一入口）
-        @api_v1_router.get("/system/health", tags=["health"])
-        async def health_check():
-            """健康检查"""
-            reachability: Dict[str, Any] = {"ok": None, "status": "unknown"}
-            status = "healthy"
-            mc = self.main_controller or main_controller
-            ex = None
-            try:
-                if mc and hasattr(mc, "get_exchange"):
-                    ex = mc.get_exchange()
-                if not ex and mc is not None:
-                    ex = getattr(mc, "okx_exchange", None)
-                probe = getattr(ex, "probe_public_api", None) if ex is not None else None
-                if callable(probe):
-                    try:
-                        # Keep health endpoint responsive, but avoid turning transient slow public
-                        # endpoints into a false system-level degraded status too aggressively.
-                        pr = await asyncio.wait_for(probe(timeout_sec=4.2), timeout=5.0)
-                    except Exception as _e:
-                        pr = {"ok": False, "reason": "probe_exception", "error": str(_e)[:220]}
-                    probe_status = str((pr or {}).get("status_text") or "").strip().lower()
-                    ok = bool((pr or {}).get("ok"))
-                    core_time_ok = bool((pr or {}).get("core_time_ok"))
-                    if probe_status not in {"reachable", "degraded", "unreachable"}:
-                        probe_status = "reachable" if ok else "unreachable"
-                    reachability = {
-                        "ok": ok,
-                        "status": probe_status,
-                        "probe": pr,
-                    }
-                    if probe_status == "unreachable" or not core_time_ok:
-                        status = "degraded"
-                        reachability["hint"] = (
-                            "Check TLS CA chain / proxy MITM root (OPENCLAW_SSL_CA_BUNDLE) / network."
-                        )
-                    elif probe_status == "degraded":
-                        # Public time endpoint is alive; treat this as upstream latency/jitter
-                        # instead of a full system unhealthy signal.
-                        reachability["note"] = "partial_public_probe_timeout"
-                elif ex is None:
-                    reachability = {"ok": None, "status": "unknown", "message": "exchange_unavailable"}
-                else:
-                    reachability = {"ok": None, "status": "unknown", "message": "probe_not_supported"}
-            except Exception as e:
-                status = "degraded"
-                reachability = {"ok": False, "status": "unreachable", "reason": "health_probe_error", "error": str(e)[:220]}
-            return {
-                "success": True,
-                "data": {
-                    "status": status,
-                    "timestamp": datetime.now().isoformat(),
-                    "uptime": self._get_uptime(),
-                    "exchange_reachability": reachability,
-                },
-            }
-
         # 指标端点 - 同时支持 /metrics 和 /api/metrics
         @self.app.get("/metrics", tags=["metrics"])
         @api_router.get("/metrics", tags=["metrics"])
@@ -1096,34 +1049,6 @@ class APIServer:
             """获取指标"""
             stats = await self.get_api_stats()
             return stats
-
-        # 状态端点（唯一入口）
-        @api_v1_router.get("/system/status", tags=["system"])
-        async def get_status():
-            """获取系统状态"""
-            base = {
-                "system_status": "running",
-                "status": "running",
-                "uptime": 0,
-                "module_count": 0,
-                "running_modules": 0,
-                "timestamp": datetime.now().isoformat(),
-                "module_statuses": {},
-            }
-            if not main_controller:
-                return {"success": True, "data": base}
-            try:
-                mc_status = await main_controller.get_system_status()
-                if isinstance(mc_status, dict):
-                    base.update(mc_status)
-                    # 向后兼容历史字段
-                    base["status"] = base.get("system_status", base.get("status", "unknown"))
-                    base["timestamp"] = datetime.now().isoformat()
-            except Exception as e:
-                base["status"] = "degraded"
-                base["system_status"] = "degraded"
-                base["error"] = str(e)
-            return {"success": True, "data": base}
 
         # ---------------------------------------------------------------------
         # Compatibility endpoints (legacy frontends / monitoring)
@@ -1410,29 +1335,6 @@ class APIServer:
         @api_v1_router.get("/modules/trading/engine/status", tags=["system"])
         async def engine_status_alias():
             return await engine_status()
-
-        @api_v1_router.get("/risk/status", tags=["risk"])
-        async def risk_status():
-            """
-            风险管理状态（红线 + SLTP 简要统计）
-            """
-            mc = self.main_controller
-            if not mc:
-                return {"ok": False, "message": "main_controller unavailable"}
-            try:
-                red = mc.get_risk_redlines() if hasattr(mc, "get_risk_redlines") else {}
-                sltp = {}
-                mgr = getattr(mc, "stop_loss_manager", None)
-                if mgr is not None and hasattr(mgr, "get_stats"):
-                    try:
-                        sltp = await asyncio.wait_for(mgr.get_stats(), timeout=2.5)
-                    except Exception:
-                        sltp = {}
-                return {"ok": True, "risk_redlines": red, "sltp": sltp}
-            except Exception as e:
-                return {"ok": False, "message": str(e)}
-
-        # /system/health 已在上方 health_check 定义为统一入口
 
         @api_v1_router.get("/system/acceptance", tags=["system"])
         async def system_architect_acceptance_v1():
@@ -1744,268 +1646,7 @@ class APIServer:
                 "timestamp": datetime.now().isoformat(),
             }
 
-        def _strategy_manager_payload_list() -> List[Dict[str, Any]]:
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                return []
-            sm = mc.strategy_manager
-            configs = getattr(sm, "strategy_configs", None) or {}
-            metrics = getattr(sm, "performance_metrics", None) or {}
-            out: List[Dict[str, Any]] = []
-            for sid, cfg in configs.items():
-                d = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
-                item: Dict[str, Any] = {
-                    "id": d.get("strategy_id", sid),
-                    "strategy_id": d.get("strategy_id", sid),
-                    "name": d.get("name", sid),
-                    "description": d.get("description", ""),
-                    "strategy_type": d.get("strategy_type"),
-                    "status": "active" if d.get("enabled", True) else "inactive",
-                    "enabled": d.get("enabled", True),
-                    "symbols": d.get("symbols", []),
-                    "timeframe": d.get("timeframe", "1h"),
-                    "parameters": d.get("parameters", {}),
-                    "metadata": d.get("metadata", {}),
-                    "returns": "-",
-                    "max_drawdown": "-",
-                    "sharpe_ratio": "-",
-                }
-                perf = metrics.get(sid)
-                if perf:
-                    item["total_trades"] = int(getattr(perf, "total_trades", 0) or 0)
-                    item["win_rate"] = round(100.0 * float(getattr(perf, "win_rate", 0.0) or 0.0), 2)
-                    item["max_drawdown"] = str(round(float(getattr(perf, "max_drawdown", 0.0) or 0.0) * 100.0, 2))
-                    item["sharpe_ratio"] = str(round(float(getattr(perf, "sharpe_ratio", 0.0) or 0.0), 3))
-                    item["returns"] = str(round(float(getattr(perf, "total_pnl", 0.0) or 0.0), 4))
-                out.append(item)
-            return out
-
-        # 策略管理路由 - 支持 /api/v1/strategies（真实 StrategyManager）
-        def _strategy_activation_gate_or_none(sm: Any, strategy_id: str) -> Optional[Dict[str, Any]]:
-            if not sm or not hasattr(sm, "get_strategy_activation_gate"):
-                return None
-            try:
-                return sm.get_strategy_activation_gate(strategy_id)
-            except Exception:
-                return None
-
-        @api_v1_router.get("/strategies", tags=["strategies"])
-        async def get_strategies():
-            """获取所有策略（来自 StrategyManager）"""
-            return _strategy_manager_payload_list()
-
-        @api_v1_router.get("/strategies/signals", tags=["strategies"])
-        async def get_strategy_signals(
-            strategy_id: Optional[str] = None,
-            instance_id: Optional[str] = None,
-            signal_type: Optional[str] = None,
-            limit: int = 50,
-        ):
-            """
-            获取策略信号（用于“策略信号查询”验收）
-            - strategy_id/instance_id 可选过滤
-            - signal_type: BUY/SELL/HOLD（不区分大小写）
-            """
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                raise HTTPException(status_code=503, detail="策略管理器未初始化")
-            sm = mc.strategy_manager
-            st = None
-            if signal_type:
-                try:
-                    from src.modules.core.strategy_manager import SignalType as _SignalType
-
-                    st = _SignalType[str(signal_type).strip().upper()]
-                except Exception:
-                    st = None
-            try:
-                rows = await sm.get_signals(
-                    strategy_id=strategy_id) if strategy_id else None
-            except TypeError:
-                rows = None
-            # prefer calling with full signature
-            if rows is None:
-                rows = await sm.get_signals(
-                    strategy_id=str(strategy_id) if strategy_id else None,
-                    instance_id=str(instance_id) if instance_id else None,
-                    signal_type=st,
-                    limit=max(1, min(int(limit or 50), 500)),
-                )
-            out: List[Dict[str, Any]] = []
-            for s in rows or []:
-                out.append(s.to_dict() if hasattr(s, "to_dict") else dict(s))
-            return {
-                "success": True,
-                "data": out,
-                "count": len(out),
-                "filters": {
-                    "strategy_id": strategy_id,
-                    "instance_id": instance_id,
-                    "signal_type": signal_type,
-                },
-                "timestamp": datetime.now().isoformat(),
-            }
-
-        @api_v1_router.get("/strategies/{id}", tags=["strategies"])
-        async def get_strategy(id: str):
-            """获取单个策略详情"""
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                raise HTTPException(status_code=503, detail="策略管理器未初始化")
-            sm = mc.strategy_manager
-            if id not in sm.strategy_configs:
-                raise HTTPException(status_code=404, detail="策略不存在")
-            cfg = sm.strategy_configs[id]
-            d = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
-            metrics = getattr(sm, "performance_metrics", None) or {}
-            perf = metrics.get(id)
-            body: Dict[str, Any] = {
-                "id": id,
-                "strategy_id": d.get("strategy_id", id),
-                "name": d.get("name", id),
-                "status": "active" if d.get("enabled", True) else "inactive",
-                "parameters": d.get("parameters", {}),
-                "symbols": d.get("symbols", []),
-                "timeframe": d.get("timeframe", "1h"),
-                "metadata": d.get("metadata", {}),
-                "strategy_type": d.get("strategy_type"),
-                "description": d.get("description", ""),
-            }
-            if perf:
-                body["returns"] = str(round(float(getattr(perf, "total_pnl", 0.0) or 0.0), 4))
-                body["max_drawdown"] = str(round(float(getattr(perf, "max_drawdown", 0.0) or 0.0) * 100.0, 2))
-                body["sharpe_ratio"] = str(round(float(getattr(perf, "sharpe_ratio", 0.0) or 0.0), 3))
-            else:
-                body.setdefault("returns", "0")
-                body.setdefault("max_drawdown", "0")
-                body.setdefault("sharpe_ratio", "0")
-            return body
-
-        @api_v1_router.post("/strategies", tags=["strategies"])
-        async def create_strategy(strategy_data: Dict[str, Any]):
-            """创建策略（加载到 StrategyManager）"""
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                raise HTTPException(status_code=503, detail="策略管理器未初始化")
-            sm = mc.strategy_manager
-            requested_enabled = bool(strategy_data.get("enabled", True))
-            if not strategy_data.get("strategy_id"):
-                strategy_data = {**strategy_data, "strategy_id": f"api_{datetime.now().strftime('%Y%m%d%H%M%S')}"}
-            cfg = await sm.load_strategy_config({**strategy_data, "enabled": False if requested_enabled else bool(strategy_data.get("enabled", False))})
-            if not cfg:
-                raise HTTPException(status_code=400, detail="策略配置无效：需含 name、strategy_type")
-            gate = _strategy_activation_gate_or_none(sm, cfg.strategy_id)
-            if requested_enabled:
-                if gate and not gate.get("eligible"):
-                    async with sm._lock:
-                        sm.strategy_configs.pop(cfg.strategy_id, None)
-                        sm.performance_metrics.pop(cfg.strategy_id, None)
-                    raise HTTPException(status_code=400, detail=f"策略未达到启用门槛: {','.join(gate.get('reasons') or [])}")
-                cfg.enabled = True
-            return {
-                "id": cfg.strategy_id,
-                "name": cfg.name,
-                "status": "inactive" if not cfg.enabled else "active",
-                "message": "策略已加载",
-                "activation_gate": gate,
-            }
-
-        @api_v1_router.put("/strategies/{id}", tags=["strategies"])
-        async def update_strategy(id: str, strategy_data: Dict[str, Any]):
-            """更新策略（内存中的配置）"""
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                raise HTTPException(status_code=503, detail="策略管理器未初始化")
-            sm = mc.strategy_manager
-            if id not in sm.strategy_configs:
-                raise HTTPException(status_code=404, detail="策略不存在")
-            cfg = sm.strategy_configs[id]
-            if "name" in strategy_data:
-                cfg.name = str(strategy_data["name"])
-            if "description" in strategy_data:
-                cfg.description = str(strategy_data["description"])
-            if "enabled" in strategy_data:
-                requested_enabled = bool(strategy_data["enabled"])
-                if requested_enabled:
-                    gate = _strategy_activation_gate_or_none(sm, id)
-                    if gate and not gate.get("eligible"):
-                        raise HTTPException(status_code=400, detail=f"策略未达到启用门槛: {','.join(gate.get('reasons') or [])}")
-                cfg.enabled = requested_enabled
-            if "parameters" in strategy_data and isinstance(strategy_data["parameters"], dict):
-                cfg.parameters = {**cfg.parameters, **strategy_data["parameters"]}
-            if "symbols" in strategy_data and isinstance(strategy_data["symbols"], list):
-                cfg.symbols = list(strategy_data["symbols"])
-            cfg.updated_at = datetime.now()
-            return {"id": id, "name": cfg.name, "status": "active" if cfg.enabled else "inactive"}
-
-        @api_v1_router.delete("/strategies/{id}", tags=["strategies"])
-        async def delete_strategy(id: str):
-            """从策略池移除"""
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                raise HTTPException(status_code=503, detail="策略管理器未初始化")
-            sm = mc.strategy_manager
-            async with sm._lock:
-                sm.strategy_configs.pop(id, None)
-                sm.performance_metrics.pop(id, None)
-            return {"status": "success", "message": "策略已删除"}
-
-        @api_v1_router.post("/strategies/{id}/activate", tags=["strategies"])
-        async def activate_strategy(id: str):
-            """激活策略"""
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                raise HTTPException(status_code=503, detail="策略管理器未初始化")
-            sm = mc.strategy_manager
-            if id not in sm.strategy_configs:
-                raise HTTPException(status_code=404, detail="策略不存在")
-            gate = _strategy_activation_gate_or_none(sm, id)
-            if gate and not gate.get("eligible"):
-                raise HTTPException(status_code=400, detail=f"策略未达到启用门槛: {','.join(gate.get('reasons') or [])}")
-            sm.strategy_configs[id].enabled = True
-            return {"status": "success", "message": "策略已激活", "activation_gate": gate}
-
-        @api_v1_router.post("/strategies/{id}/deactivate", tags=["strategies"])
-        async def deactivate_strategy(id: str):
-            """停用策略"""
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                raise HTTPException(status_code=503, detail="策略管理器未初始化")
-            sm = mc.strategy_manager
-            if id not in sm.strategy_configs:
-                raise HTTPException(status_code=404, detail="策略不存在")
-            sm.strategy_configs[id].enabled = False
-            return {"status": "success", "message": "策略已停用"}
-
-        @api_v1_router.get("/strategies/{id}/performance", tags=["strategies"])
-        async def get_strategy_performance(id: str):
-            """获取策略性能指标"""
-            mc = self.main_controller
-            if not mc or not getattr(mc, "strategy_manager", None):
-                raise HTTPException(status_code=503, detail="策略管理器未初始化")
-            sm = mc.strategy_manager
-            perf = (getattr(sm, "performance_metrics", None) or {}).get(id)
-            if not perf:
-                return {
-                    "strategy_id": id,
-                    "total_return": "0",
-                    "max_drawdown": "0",
-                    "sharpe_ratio": "0",
-                    "win_rate": "0",
-                    "profit_factor": "0",
-                    "total_trades": "0",
-                    "average_trade": "0",
-                }
-            return {
-                "strategy_id": id,
-                "total_return": str(round(float(perf.total_pnl or 0.0), 4)),
-                "max_drawdown": str(round(float(perf.max_drawdown or 0.0) * 100.0, 2)),
-                "sharpe_ratio": str(round(float(perf.sharpe_ratio or 0.0), 3)),
-                "win_rate": str(round(100.0 * float(perf.win_rate or 0.0), 2)),
-                "profit_factor": str(round(float(perf.profit_factor or 0.0), 3)),
-                "total_trades": str(int(perf.total_trades or 0)),
-                "average_trade": str(round(float(perf.avg_trade_pnl or 0.0), 6)),
-            }
+        # Strategy management lives in src.modules.strategy.api under /api/v1/strategy.
 
         # 市场数据路由 - 支持 /api/v1/market/data
         @api_v1_router.get("/market/data", tags=["market"])
@@ -3703,12 +3344,15 @@ class APIServer:
         async def get_control_center_state(limit: int = 20):
             """单模块总控中心聚合状态接口"""
             # 总控接口必须“快返回”：避免因交易所/数据源抖动导致前端长时间无响应
+            from src.modules.system.service import SystemService
+
+            system_service = SystemService(self.main_controller or main_controller)
             try:
-                status_payload = await asyncio.wait_for(get_status(), timeout=2.5)
+                status_payload = await asyncio.wait_for(system_service.status(), timeout=2.5)
             except Exception:
                 status_payload = {"status": "degraded", "system_status": "degraded", "timestamp": datetime.now().isoformat()}
             try:
-                health_payload = await asyncio.wait_for(system_health_v1(), timeout=1.5)
+                health_payload = await asyncio.wait_for(system_service.health(), timeout=1.5)
             except Exception:
                 health_payload = {"status": "degraded", "overall": "degraded", "timestamp": datetime.now().isoformat()}
             s1_payload: Dict[str, Any] = {}
@@ -5041,8 +4685,15 @@ class APIServer:
         api_router.include_router(api_v1_router)
         self.app.include_router(api_router)
 
-        # 添加策略API路由
-        self.app.include_router(strategy_router)
+        # 标准化域 API：/api/v1/{domain}/...
+        # 业务能力通过各域 service 门面暴露，避免继续把新能力塞进 server.py。
+        try:
+            from src.modules.api.standard_registry import attach_standard_domain_apis
+
+            attach_standard_domain_apis(self.app, self.main_controller)
+            logger.info("✅ 标准域API已初始化")
+        except Exception as e:
+            logger.warning(f"标准域API初始化失败: {e}")
 
         # 模块控制 API（含 /api/v1/s1/verify）必须在静态资源之前注册
         try:

@@ -59,6 +59,7 @@ data/audit/
 data/executions/
 data/trade_history/
 data/memory/
+data/learning/
 strategy_research.log
 
 # Local backups and ad-hoc DB tree

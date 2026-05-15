@@ -216,6 +216,9 @@ class AICoreDecisionEngine:
                 "low_liquidity": {"leverage_mult": 0.80, "qty_mult": 0.85},
                 "normal": {"leverage_mult": 1.00, "qty_mult": 1.00},
             },
+            # 旧的 advisory_only 从“直接拒单”改为“结构性软降权”，减少高波动中的机会错杀。
+            "regime_advisory_only_soft_qty_mult": 0.55,
+            "regime_advisory_only_soft_leverage_mult": 0.65,
             # MA5-MA20 价差占价比低于强趋势阈值、但超过此值时视为「缓趋势」而非无方向震荡
             "regime_grind_min_trend_abs": 0.00035,
             "regime_grind_max_atr_mult": 1.25,
@@ -5097,6 +5100,23 @@ class AICoreDecisionEngine:
         decision: TradeDecision,
         semantic_context: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
+        payload = self._build_agent_orchestration_payload(
+            trace_id=trace_id,
+            decision=decision,
+            semantic_context=semantic_context,
+        )
+        verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
+        if isinstance(verdicts, list) and verdicts:
+            return verdicts
+        return []
+
+    def _build_agent_orchestration_payload(
+        self,
+        *,
+        trace_id: str,
+        decision: TradeDecision,
+        semantic_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
         ma = decision.market_analysis if isinstance(getattr(decision, "market_analysis", None), dict) else {}
         try:
             orch = getattr(self.main_controller, "agent_orchestrator", None) if self.main_controller else None
@@ -5114,9 +5134,10 @@ class AICoreDecisionEngine:
                     decision_confidence=float(decision.confidence or 0.0),
                     trace_id=trace_id,
                 )
-                verdicts = payload.get("verdicts")
-                if isinstance(verdicts, list) and verdicts:
-                    return verdicts
+                if isinstance(payload, dict):
+                    verdicts = payload.get("verdicts")
+                    if isinstance(verdicts, list) and verdicts:
+                        return payload
         except Exception:
             pass
         market_verdict = AgentVerdict(
@@ -5172,7 +5193,45 @@ class AICoreDecisionEngine:
             next_action="slice" if semantic_context.get("execution_recommendation") == "wait_or_slice" else "normal",
             trace_id=trace_id,
         )
-        return [market_verdict.to_dict(), risk_verdict.to_dict(), execution_verdict.to_dict()]
+        fallback_verdicts = [market_verdict.to_dict(), risk_verdict.to_dict(), execution_verdict.to_dict()]
+        risk_state = str(semantic_context.get("risk_verdict") or "allow").lower()
+        execution_state = str(semantic_context.get("execution_recommendation") or "normal").lower()
+        size_scale = 1.0
+        leverage_scale = 1.0
+        block_reason = ""
+        if risk_state == "deny":
+            block_reason = "risk_governor_deny"
+        elif risk_state == "caution":
+            size_scale *= 0.72
+            leverage_scale *= 0.8
+        if execution_state in {"avoid"}:
+            block_reason = block_reason or "execution_coach_avoid"
+        elif execution_state in {"wait_or_slice", "slice"}:
+            size_scale *= 0.6
+            leverage_scale *= 0.85
+        elif execution_state == "reduce_size":
+            size_scale *= 0.75
+            leverage_scale *= 0.9
+        return {
+            "mode": "execution_governed",
+            "workflow": [
+                "market_structure_agent",
+                "risk_governor_agent",
+                "execution_coach_agent",
+                "ExecutionGateway",
+            ],
+            "execution_plan": {
+                "should_block": bool(block_reason),
+                "block_reason": block_reason,
+                "risk_verdict": risk_state,
+                "execution_recommendation": execution_state,
+                "size_scale": round(max(0.35, min(1.0, size_scale)), 4),
+                "leverage_scale": round(max(0.5, min(1.0, leverage_scale)), 4),
+                "research_blocking": False,
+                "research_warnings": [],
+            },
+            "verdicts": fallback_verdicts,
+        }
 
     async def _enrich_hold_trace_extras_with_sr(
         self, symbol: str, extras: Optional[Dict[str, Any]] = None
@@ -5475,6 +5534,7 @@ class AICoreDecisionEngine:
             confidence=getattr(decision, "confidence", None),
             risk_level=getattr(decision, "risk_level", None),
         )
+        agent_verdicts: List[Dict[str, Any]] = []
 
         def _trace_store() -> Optional[DecisionTraceStore]:
             try:
@@ -5529,7 +5589,12 @@ class AICoreDecisionEngine:
                         leverage=int(decision.leverage) if getattr(decision, "leverage", None) is not None else None,
                         extras=payload,
                     )
-                    for verdict in self._build_agent_verdicts(trace_id=trace_id, decision=decision, semantic_context=verdict_context):
+                    verdict_rows = agent_verdicts or self._build_agent_verdicts(
+                        trace_id=trace_id,
+                        decision=decision,
+                        semantic_context=verdict_context,
+                    )
+                    for verdict in verdict_rows:
                         dts.record_agent_verdict(
                             trace_id=trace_id,
                             agent_name=str(verdict.get("agent_name") or "agent"),
@@ -6500,19 +6565,34 @@ class AICoreDecisionEngine:
                 try:
                     if bool((self._adaptive_guard_profile or {}).get("regime_advisory_only", False)):
                         regime_name = str((self._adaptive_guard_profile or {}).get("regime") or "unknown")
-                        self._execution_guards_stats["regime_advisory_only_rejected"] = int(
-                            self._execution_guards_stats.get("regime_advisory_only_rejected", 0) or 0
+                        self._execution_guards_stats["regime_advisory_only_softened"] = int(
+                            self._execution_guards_stats.get("regime_advisory_only_softened", 0) or 0
                         ) + 1
-                        await _record_rejected_signal(
-                            "regime_advisory_only_rejected",
-                            {"regime": regime_name},
+                        soft_qty_mult = float(self.config.get("regime_advisory_only_soft_qty_mult", 0.72) or 0.72)
+                        soft_lev_mult = float(
+                            self.config.get("regime_advisory_only_soft_leverage_mult", 0.78) or 0.78
                         )
+                        self._adaptive_guard_profile["regime_qty_mult"] = float(
+                            (self._adaptive_guard_profile.get("regime_qty_mult", 1.0) or 1.0) * soft_qty_mult
+                        )
+                        self._adaptive_guard_profile["regime_leverage_mult"] = float(
+                            (self._adaptive_guard_profile.get("regime_leverage_mult", 1.0) or 1.0) * soft_lev_mult
+                        )
+                        self._adaptive_guard_profile["regime_softened"] = True
+                        self._adaptive_guard_profile["regime_soft_qty_mult"] = float(soft_qty_mult)
+                        self._adaptive_guard_profile["regime_soft_leverage_mult"] = float(soft_lev_mult)
+                        if str(semantic_context.get("risk_verdict") or "").lower() != "deny":
+                            semantic_context["risk_verdict"] = "caution"
+                        current_exec = str(semantic_context.get("execution_recommendation") or "normal").lower()
+                        if current_exec in {"normal", "reduce_size"}:
+                            semantic_context["execution_recommendation"] = "wait_or_slice"
                         logger.warning(
-                            "⚠️ 执行门控拒绝: regime advisory-only symbol=%s regime=%s",
+                            "⚠️ 执行门控软降权: regime advisory-only symbol=%s regime=%s qty_mult=%.3f lev_mult=%.3f",
                             decision.symbol,
                             regime_name,
+                            self._adaptive_guard_profile["regime_qty_mult"],
+                            self._adaptive_guard_profile["regime_leverage_mult"],
                         )
-                        return False
                 except Exception:
                     pass
                 # Hard gate: every open decision must carry usable analysis payload
@@ -6986,6 +7066,90 @@ class AICoreDecisionEngine:
                             ) + 1
                 except Exception:
                     pass
+
+                verdict_context = dict(semantic_context)
+                verdict_context.update(
+                    {
+                        "spread_bps": spread_bps,
+                        "depth_imbalance": depth_imbalance,
+                    }
+                )
+                agent_payload = self._build_agent_orchestration_payload(
+                    trace_id=trace_id,
+                    decision=decision,
+                    semantic_context=verdict_context,
+                )
+                agent_verdicts = agent_payload.get("verdicts") if isinstance(agent_payload, dict) else []
+                plan = agent_payload.get("execution_plan") if isinstance(agent_payload, dict) else {}
+                if isinstance(plan, dict):
+                    risk_verdict = str(plan.get("risk_verdict") or semantic_context.get("risk_verdict") or "allow")
+                    execution_recommendation = str(
+                        plan.get("execution_recommendation") or semantic_context.get("execution_recommendation") or "normal"
+                    )
+                    semantic_context["risk_verdict"] = risk_verdict
+                    semantic_context["execution_recommendation"] = execution_recommendation
+                    semantic_context["agent_research_warnings"] = list(plan.get("research_warnings") or [])
+                    semantic_context["agent_execution_plan"] = dict(plan)
+                    if bool(plan.get("should_block")):
+                        block_reason = str(plan.get("block_reason") or "agent_execution_blocked")
+                        self._execution_guards_stats[block_reason] = int(
+                            self._execution_guards_stats.get(block_reason, 0) or 0
+                        ) + 1
+                        await _record_rejected_signal(
+                            block_reason,
+                            {
+                                "risk_verdict": risk_verdict,
+                                "execution_recommendation": execution_recommendation,
+                                "agent_execution_plan": dict(plan),
+                            },
+                        )
+                        logger.warning(
+                            "⚠️ 智能体执行裁决拒绝: symbol=%s reason=%s risk=%s execution=%s",
+                            decision.symbol,
+                            block_reason,
+                            risk_verdict,
+                            execution_recommendation,
+                        )
+                        _record_intent(
+                            {
+                                "rr": rr,
+                                "spread_bps": spread_bps,
+                                "depth_imbalance": depth_imbalance,
+                                "guard_profile": getattr(self, "_adaptive_guard_profile", None),
+                                "agent_execution_plan": dict(plan),
+                                **self._scanner_trace_context(str(decision.symbol)),
+                            }
+                        )
+                        _record_guard("rejected", block_reason, "agent_execution_plan", extras=dict(plan))
+                        return False
+                    plan_qty_mult = min(1.0, max(0.35, float(plan.get("size_scale", 1.0) or 1.0)))
+                    if plan_qty_mult < 0.999:
+                        qty0 = int(decision.quantity or 0)
+                        qty1 = max(1, int(qty0 * plan_qty_mult))
+                        if qty1 != qty0:
+                            logger.info(
+                                "🧠 智能体缩仓: %s -> %s (mult=%.3f symbol=%s)",
+                                qty0,
+                                qty1,
+                                plan_qty_mult,
+                                decision.symbol,
+                            )
+                            decision.quantity = qty1
+                            self._adaptive_guard_profile["agent_qty_factor"] = float(plan_qty_mult)
+                    plan_lev_mult = min(1.0, max(0.5, float(plan.get("leverage_scale", 1.0) or 1.0)))
+                    if plan_lev_mult < 0.999 and getattr(decision, "leverage", None) is not None:
+                        lev0 = int(decision.leverage or 1)
+                        lev1 = max(1, int(round(float(lev0) * plan_lev_mult)))
+                        if lev1 != lev0:
+                            logger.info(
+                                "🧠 智能体降杠杆: %s -> %s (mult=%.3f symbol=%s)",
+                                lev0,
+                                lev1,
+                                plan_lev_mult,
+                                decision.symbol,
+                            )
+                            decision.leverage = lev1
+                            self._adaptive_guard_profile["agent_leverage_factor"] = float(plan_lev_mult)
 
             logger.info(f"🎯 执行AI决策: {decision.symbol} {decision.action} {decision.side}")
             logger.info(f"   入场价: {decision.entry_price}")

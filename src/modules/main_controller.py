@@ -45,7 +45,6 @@ from src.modules.strategies.parameter_optimizer import ParameterOptimizer
 from src.modules.backtesting.backtest_engine import BacktestEngine
 from src.modules.data.enhanced_data_storage import EnhancedDataStorage
 from src.modules.data.data_backup import DataBackupManager
-from src.modules.api.strategy_api import init_strategy_api
 from src.modules.intelligence.anomaly_detection import AnomalyDetector, AnomalyDetectionConfig
 from src.modules.intelligence.natural_language_interface import NaturalLanguageInterface
 from src.modules.simulation.simulated_market import SimulatedMarket
@@ -1085,8 +1084,6 @@ class MainController:
         # 初始化多策略管理器
         self.strategy_manager = StrategyManager(self.config_manager)
         await self.strategy_manager.initialize()
-        # 初始化策略API
-        init_strategy_api(self.strategy_manager)
         
         # 初始化插件管理器（仅当有config_manager时）
         if self.config_manager:
@@ -5051,9 +5048,20 @@ class MainController:
         for row in (rows or []):
             if not isinstance(row, dict):
                 continue
-            action = str(row.get("action") or "").strip().lower()
+            md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            action = str(
+                row.get("action")
+                or md.get("action")
+                or md.get("trade_phase")
+                or ""
+            ).strip().lower()
+            decision_action = str(md.get("decision_action") or "").strip().upper()
             status = str(row.get("status") or "").strip().lower()
-            if action not in {"close", "closed"} and status not in {"filled", "closed"}:
+            is_explicit_close = action in {"close", "closed"}
+            is_close_decision = decision_action in {"CLOSE_LONG", "CLOSE_SHORT"}
+            if not is_explicit_close and not is_close_decision:
+                continue
+            if status not in {"filled", "closed"}:
                 continue
             oid = str(row.get("order_id") or "").strip()
             sym = str(row.get("symbol") or "").strip()

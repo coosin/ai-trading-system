@@ -129,6 +129,8 @@ class ExecutionGateway:
         self._open_symbol_cooldown_sec = 90.0
         self._open_symbol_cooldown_until: Dict[str, float] = {}
         self._open_symbol_fail_count: Dict[str, int] = {}
+        self._recent_open_success_at: Dict[str, float] = {}
+        self._symbol_side_open_legs: Dict[str, int] = {}
         self._open_retry_count: int = 0
         self._open_cooldown_denied_count: int = 0
         self._open_last_retry_error: Optional[str] = None
@@ -391,7 +393,7 @@ class ExecutionGateway:
                 return float(v)
         except Exception:
             pass
-        return 0.75
+        return 0.95
 
     def _risk_redlines(self) -> Dict[str, Any]:
         mc = self._mc
@@ -561,16 +563,7 @@ class ExecutionGateway:
             return None
         if str(source or "").strip().lower() != str(swo or "").strip().lower():
             return None
-        conf = None
-        try:
-            conf = float(ctx.get("confidence"))
-        except Exception:
-            conf = None
-        if conf is None:
-            try:
-                conf = float((self._semantic_context_from_context(ctx) or {}).get("decision_confidence"))
-            except Exception:
-                conf = None
+        conf = self._decision_confidence_from_context(ctx)
         if conf is None:
             return None
         if conf < self._replace_worst_min_confidence():
@@ -682,6 +675,190 @@ class ExecutionGateway:
         key = str(symbol or "").upper()
         self._open_symbol_fail_count.pop(key, None)
         self._open_symbol_cooldown_until.pop(key, None)
+
+    @staticmethod
+    def _symbol_side_open_key(symbol: str, side: str) -> str:
+        return f"{_normalize_position_slot_symbol(symbol)}|{str(side or '').strip().lower()}"
+
+    @staticmethod
+    def _normalize_position_side(raw: Any) -> str:
+        s = str(raw or "").strip().lower()
+        if s in {"long", "buy", "open_long"}:
+            return "long"
+        if s in {"short", "sell", "open_short"}:
+            return "short"
+        return s
+
+    def _decision_confidence_from_context(self, context: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not isinstance(context, dict):
+            return None
+        candidates: List[Any] = [
+            context.get("confidence"),
+            context.get("decision_confidence"),
+            context.get("open_confidence"),
+        ]
+        semantic = self._semantic_context_from_context(context)
+        if isinstance(semantic, dict):
+            candidates.extend(
+                [
+                    semantic.get("decision_confidence"),
+                    semantic.get("confidence"),
+                    semantic.get("open_confidence"),
+                ]
+            )
+        env = context.get("decision_envelope")
+        if isinstance(env, dict):
+            candidates.extend([env.get("confidence"), env.get("decision_confidence")])
+        for val in candidates:
+            try:
+                if val is None:
+                    continue
+                out = float(val)
+                if out == out:
+                    return max(0.0, min(1.0, out))
+            except Exception:
+                continue
+        return None
+
+    def _recent_successful_open_count(self, symbol: str, side: str) -> int:
+        key = self._symbol_side_open_key(symbol, self._normalize_position_side(side))
+        try:
+            return max(0, int(self._symbol_side_open_legs.get(key, 0) or 0))
+        except Exception:
+            return 0
+
+    async def _open_blocked_by_scale_in_confidence(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        source: str,
+        context: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        if self._is_manual_approved(source, context):
+            return None
+        ex = self._exchange()
+        if not ex or not hasattr(ex, "get_positions"):
+            return None
+        incoming_side = self._normalize_position_side(side)
+        if incoming_side not in {"long", "short"}:
+            return None
+
+        limits = await resolve_position_limits(
+            config_manager=(self._mc.config_manager if self._mc else None),
+            ai_config=None,
+            trading_config=None,
+        )
+        target_symbol = _normalize_position_slot_symbol(symbol)
+        same_symbol_side_exists = False
+        same_side_count = 0
+        total_count = 0
+        try:
+            rows = await ex.get_positions()
+        except Exception:
+            rows = []
+        for p in rows or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                pos_size = abs(float(p.get("size", p.get("pos", 0)) or 0.0))
+            except Exception:
+                pos_size = 0.0
+            if pos_size <= 1e-12:
+                continue
+            total_count += 1
+            p_side = self._normalize_position_side(p.get("side"))
+            if p_side == incoming_side:
+                same_side_count += 1
+            if (
+                target_symbol
+                and _normalize_position_slot_symbol(p.get("symbol") or p.get("instId")) == target_symbol
+                and p_side == incoming_side
+            ):
+                same_symbol_side_exists = True
+
+        ctx_leg = None
+        if isinstance(context, dict):
+            for key in ("position_slot_index", "scale_in_slot_index", "next_leg", "next_position_leg"):
+                try:
+                    if context.get(key) is not None:
+                        ctx_leg = int(context.get(key))
+                        break
+                except Exception:
+                    continue
+        if ctx_leg is not None and ctx_leg > 0:
+            next_leg = ctx_leg
+        elif same_symbol_side_exists:
+            # Exchange positions are usually collapsed by symbol+side. Recent successful opens
+            # provide the best available slot estimate without creating a parallel ledger.
+            next_leg = max(2, self._recent_successful_open_count(symbol, incoming_side) + 1)
+        else:
+            next_leg = 1
+
+        if next_leg > int(limits.max_same_direction_positions):
+            return f"分层开仓拦截：同向第{next_leg}笔超过上限{limits.max_same_direction_positions}"
+
+        conf = self._decision_confidence_from_context(context)
+        required = float(limits.confidence_floor_for_leg(next_leg))
+        if isinstance(context, dict):
+            context["position_slot_index"] = int(next_leg)
+            context["required_confidence"] = float(required)
+            context["decision_confidence"] = conf
+            context["scale_in_gate"] = {
+                "slot_index": int(next_leg),
+                "required_confidence": float(required),
+                "decision_confidence": conf,
+                "same_symbol_side_exists": bool(same_symbol_side_exists),
+                "same_side_count": int(same_side_count),
+                "total_positions": int(total_count),
+            }
+        if conf is None:
+            # First-leg legacy calls may not carry confidence because ai_core already gates them.
+            # Adds/replacements must be explainable and are rejected when confidence is missing.
+            if next_leg <= 1:
+                return None
+            return f"分层开仓拦截：第{next_leg}笔缺少决策置信度，要求>={required:.2f}"
+        if float(conf) < required:
+            return f"分层开仓拦截：第{next_leg}笔置信度 {float(conf):.3f} < 要求 {required:.3f}"
+
+        semantic = self._semantic_context_from_context(context if isinstance(context, dict) else {})
+        if next_leg >= 2 and isinstance(semantic, dict):
+            risk_verdict = str(semantic.get("risk_verdict") or "").strip().lower()
+            exec_rec = str(semantic.get("execution_recommendation") or "").strip().lower()
+            if risk_verdict == "deny":
+                return f"分层开仓拦截：第{next_leg}笔风险智能体否决"
+            if exec_rec == "wait_or_slice":
+                return f"分层开仓拦截：第{next_leg}笔执行建议等待或切片"
+        return None
+
+    def _recent_success_open_cooldown_left(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        source: str,
+        context: Optional[Dict[str, Any]],
+    ) -> int:
+        if self._is_manual_approved(source, context):
+            return 0
+        red = self._risk_redlines() or {}
+        cooldown_sec = float(red.get("min_open_cooldown_sec", 0) or 0)
+        if cooldown_sec <= 0:
+            return 0
+        key = self._symbol_side_open_key(symbol, side)
+        last_at = float(self._recent_open_success_at.get(key, 0.0) or 0.0)
+        if last_at <= 0:
+            return 0
+        left = (last_at + cooldown_sec) - time.time()
+        if left <= 0:
+            self._recent_open_success_at.pop(key, None)
+            return 0
+        return int(max(1.0, left))
+
+    def _mark_recent_open_success(self, symbol: str, side: str) -> None:
+        key = self._symbol_side_open_key(symbol, side)
+        self._recent_open_success_at[key] = time.time()
+        self._symbol_side_open_legs[key] = int(self._symbol_side_open_legs.get(key, 0) or 0) + 1
 
     def record_tick(self, source: str, note: str = "") -> None:
         self._snapshot.last_tick_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1521,7 +1698,21 @@ class ExecutionGateway:
                             )
                     except Exception:
                         pass
-                return res if isinstance(res, dict) else {"success": ok, "raw": res}
+                if isinstance(res, dict):
+                    if isinstance(context, dict):
+                        for k in (
+                            "position_slot_index",
+                            "required_confidence",
+                            "decision_confidence",
+                            "scale_in_gate",
+                            "slot_release_recycled_symbol",
+                            "slot_release_recycled_side",
+                            "slot_release_recycled_score",
+                        ):
+                            if k in context:
+                                res.setdefault(k, context.get(k))
+                    return res
+                return {"success": ok, "raw": res}
             except Exception as e:
                 self._metric_inc("close_fail")
                 self._record_order(source, "close", False, str(e), symbol=symbol, side=side, size=size, leverage=None, reason=reason, context=context)
@@ -1659,6 +1850,30 @@ class ExecutionGateway:
                 pass
             return {"success": False, "error": msg}
 
+        scale_gate_err = await self._open_blocked_by_scale_in_confidence(
+            symbol=symbol,
+            side=side,
+            source=source,
+            context=context,
+        )
+        if scale_gate_err:
+            self._metric_inc("open_policy_denied")
+            logger.warning("ExecutionGateway.open_swap: %s symbol=%s side=%s source=%s", scale_gate_err, symbol, side, source)
+            self._record_order(
+                source,
+                "open",
+                False,
+                scale_gate_err,
+                symbol=symbol,
+                side=side,
+                size=size,
+                leverage=leverage,
+                reason=reason,
+                context=context,
+                record_execution_trace=False,
+            )
+            return {"success": False, "error": scale_gate_err}
+
         if self._is_symbol_open_cooling_down(symbol):
             self._metric_inc("open_policy_denied")
             self._open_cooldown_denied_count += 1
@@ -1666,6 +1881,38 @@ class ExecutionGateway:
             msg = f"open_cooldown_active:{left}s"
             logger.warning("ExecutionGateway.open_swap: cooldown deny symbol=%s source=%s left=%ss", symbol, source, left)
             self._record_order(source, "open", False, msg, symbol=symbol, side=side, size=size, leverage=leverage, reason=reason, context=context, record_execution_trace=False)
+            return {"success": False, "error": msg}
+
+        success_cooldown_left = self._recent_success_open_cooldown_left(
+            symbol=symbol,
+            side=side,
+            source=source,
+            context=context,
+        )
+        if success_cooldown_left > 0:
+            self._metric_inc("open_policy_denied")
+            self._open_cooldown_denied_count += 1
+            msg = f"recent_open_cooldown_active:{success_cooldown_left}s"
+            logger.warning(
+                "ExecutionGateway.open_swap: recent success cooldown deny symbol=%s side=%s source=%s left=%ss",
+                symbol,
+                side,
+                source,
+                success_cooldown_left,
+            )
+            self._record_order(
+                source,
+                "open",
+                False,
+                msg,
+                symbol=symbol,
+                side=side,
+                size=size,
+                leverage=leverage,
+                reason=reason,
+                context=context,
+                record_execution_trace=False,
+            )
             return {"success": False, "error": msg}
 
         try:
@@ -1969,6 +2216,7 @@ class ExecutionGateway:
                 )
                 if ok:
                     self._mark_symbol_open_success(symbol)
+                    self._mark_recent_open_success(symbol, side)
                     self._metric_inc("open_ok")
                     try:
                         res = await self._enrich_open_result_with_exchange_fills(ex, symbol, res)
@@ -2163,6 +2411,12 @@ class ExecutionGateway:
                 self._snapshot.last_order_context = dict(context)
             except Exception:
                 self._snapshot.last_order_context = {"raw": str(context)[:800]}
+
+        if bool(success) and str(op or "").strip().lower() == "close" and symbol and side:
+            try:
+                self._symbol_side_open_legs.pop(self._symbol_side_open_key(symbol, side), None)
+            except Exception:
+                pass
 
         # Always emit a normalized recent_event for aggregation/diagnosis.
         try:

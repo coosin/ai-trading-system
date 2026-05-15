@@ -237,10 +237,12 @@ trading:
     max_positions_hedge: 8
     # 最终硬上限（无论任何模式/路径都不得超过）
     hard_max_positions: 8
-    # 同一方向加仓分层门槛（第2/3/4笔），每笔仍受 symbol_max_margin_ratio=20% 约束
+    # 同一方向开仓/加仓分层门槛（第1-5笔），每笔仍受 symbol_max_margin_ratio=20% 约束
+    scale_in_min_confidence_1: 0.72
     scale_in_min_confidence_2: 0.77
     scale_in_min_confidence_3: 0.82
     scale_in_min_confidence_4: 0.87
+    scale_in_min_confidence_5: 0.92
   # ExecutionVerifier 开仓探针：同一交易对最短间隔（秒）。0=关闭。用于压制 execution_verifier_open 短时风暴。
   execution_verifier:
     open_symbol_cooldown_sec: 900
@@ -552,8 +554,8 @@ ai_core:
 ai_core_runtime:
   # 收益修复第一阶段：先压尾部回撤，再提升开仓质量门槛（可回滚小步调参）
   min_confidence_to_trade: 0.60
-  ai_core_min_confidence_to_open: 0.60
-  ai_core_min_confidence_floor: 0.60
+  ai_core_min_confidence_to_open: 0.72
+  ai_core_min_confidence_floor: 0.70
   max_same_direction_ratio: 0.7
   # 快照超时且缺 K 线时允许“有价降级放行”；保留其余硬门控，避免网络抖动把交易机会全部挡掉
   open_allow_snapshot_timeout_fallback: true
@@ -679,8 +681,8 @@ ai_brain:
     allow_system_open: false
     gateway_sets_leverage: false
     # 满仓替仓只由 ExecutionGateway 处理；ai_core 不再直接读取这两个键。
-    enable_replace_worst_on_full_positions: false
-    replace_worst_min_confidence: 0.75
+    enable_replace_worst_on_full_positions: true
+    replace_worst_min_confidence: 0.95
 paths:
   base_path: /app
   data_path: /app/data
@@ -1123,6 +1125,17 @@ research:
     promote_small_score: 1.1
     redevelop_below_score: 0.35
     discard_below_score: 0.1
+    production_auto_activate_allowed: false
+  rollout:
+    manual_approval_required: false
+    auto_enable_published: true
+    auto_activate_published: true
+    auto_deploy_after_approval: true
+    auto_activate_after_approval: true
+    max_post_approval_auto_stage: paper
+    require_activation_gate: true
+    max_auto_activate_stage: paper
+    force_paper_stage: true
   cost_model:
     fee_rate: 0.0005
     slippage_rate: 0.0003

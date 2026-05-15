@@ -424,6 +424,31 @@ class HistoricalDataStorage:
             except Exception as e:
                 logger.error("update_trade_truth_by_order_id 失败: %s", e)
                 return 0
+
+    async def update_trade_metadata_by_order_id(
+        self,
+        order_id: str,
+        *,
+        symbol: Optional[str] = None,
+        metadata_json: str,
+    ) -> int:
+        """按 order_id 更新交易 metadata_json。返回受影响行数。"""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return 0
+        async with self._lock:
+            try:
+                query = "UPDATE trades SET metadata_json = ? WHERE order_id = ?"
+                params: List[Any] = [str(metadata_json or ""), oid]
+                if symbol:
+                    query += " AND symbol = ?"
+                    params.append(str(symbol))
+                cur = await self._db.execute(query, params)
+                await self._db.commit()
+                return int(getattr(cur, "rowcount", 0) or 0)
+            except Exception as e:
+                logger.error("update_trade_metadata_by_order_id 失败: %s", e)
+                return 0
     
     async def get_trades(self, symbol: str = None, 
                          start_date: str = None, end_date: str = None,

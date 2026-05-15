@@ -3,14 +3,13 @@
 Check documentation consistency against the current system.
 
 What it checks:
-- Endpoint paths mentioned in docs (*.md) exist in OpenAPI (runtime or snapshot).
+- Endpoint paths mentioned in docs (*.md) exist in runtime OpenAPI.
 - Quick scan of referenced scripts and local file paths.
 - A small "undocumented endpoints" sample for commander surfaces.
 
 Usage:
   python3 scripts/check_docs_runtime_consistency.py
-  python3 scripts/check_docs_runtime_consistency.py --runtime
-  BASE_URL=... is not needed here; this inspects OpenAPI, not live HTTP.
+  BASE_URL=... is not needed here; this builds OpenAPI from current code, not live HTTP.
 
 Exit codes:
   0: OK (no blocking issues)
@@ -91,11 +90,6 @@ def _extract_endpoints_from_markdown(text: str) -> set[str]:
             continue
         out.add(p)
     return out
-
-
-def _load_openapi_snapshot(repo: Path) -> dict:
-    p = repo / "docs" / "API_OPENAPI_FULL.json"
-    return json.loads(_read_text(p))
 
 
 def _load_openapi_runtime(repo: Path) -> dict:
@@ -259,6 +253,7 @@ def run_checks(repo: Path, openapi: dict) -> CheckResult:
         "/api/v1/auth/*",
         "/api/v1/modules",
         "/api/v1/modules/commander/*",
+        "/api/v1/{domain}/",
         # Runtime-first endpoints can be absent from stale snapshot exports
         "/api/v1/auth/status",
         "/api/v1/auth/write-policy",
@@ -311,7 +306,7 @@ def main() -> int:
     ap.add_argument(
         "--runtime",
         action="store_true",
-        help="Generate OpenAPI from runtime code (requires venv deps). Default uses docs snapshot.",
+        help="Deprecated no-op; OpenAPI is always generated from runtime code.",
     )
     ap.add_argument(
         "--json",
@@ -325,12 +320,8 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    if args.runtime:
-        openapi = _load_openapi_runtime(repo)
-        source = "runtime"
-    else:
-        openapi = _load_openapi_snapshot(repo)
-        source = "snapshot"
+    openapi = _load_openapi_runtime(repo)
+    source = "runtime"
 
     result = run_checks(repo, openapi)
 
@@ -377,4 +368,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

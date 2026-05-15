@@ -118,6 +118,13 @@ def test_surface_registry_and_channels(e2e_app):
     assert r2.status_code == 200
     assert r2.json().get("success") is True
 
+    r3 = c.get("/api/v1/modules/surface/mcp-manifest")
+    assert r3.status_code == 200
+    manifest = r3.json()["data"]
+    assert manifest["tool_count"]["read"] > 0
+    assert any(t["name"] == "system_health" for t in manifest["read_tools"])
+    assert any(t["safety"] == "guarded_write" for t in manifest["guarded_write_tools"])
+
 
 def test_commander_dispatch_chain(e2e_app):
     app, mc = e2e_app
@@ -190,6 +197,201 @@ def test_market_structure_and_research_cockpit_endpoints(e2e_app):
     assert "raw_market_events" in (data.get("feature_store") or {})
     assert "derived_features" in (data.get("feature_store") or {})
     assert "market_structure_governance" in (data.get("research") or {})
+
+
+def test_commander_system_mastery_single_entrypoint(e2e_app):
+    app, mc = e2e_app
+    c = TestClient(app)
+
+    recent_traces = [
+        {
+            "trace_id": "trace-open-1",
+            "symbol": "BTC/USDT",
+            "workflow": {"status": "completed"},
+            "guard": {"status": "passed", "reason": "ready_for_execution", "stage": "execution:open"},
+            "execution": {"status": "success"},
+            "agent_outputs": {
+                "market_structure_agent": {"confidence": 0.8, "next_action": "handoff_risk_governor", "structured_verdict": {"regime_label": "trend_up"}},
+                "research_agent": {"confidence": 0.7, "next_action": "normal", "structured_verdict": {"research_state": "ready"}},
+                "risk_governor_agent": {"confidence": 0.85, "next_action": "normal", "structured_verdict": {"risk_verdict": "allow"}},
+                "execution_coach_agent": {"confidence": 0.82, "next_action": "slice", "structured_verdict": {"execution_recommendation": "slice"}},
+            },
+        },
+        {
+            "trace_id": "trace-hold-1",
+            "symbol": "ETH/USDT",
+            "workflow": {"status": "blocked"},
+            "guard": {
+                "status": "rejected",
+                "reason": "hold_by_ai_decision",
+                "stage": "guard:decision",
+                "extras": {
+                    "regime": "liquidity_stress",
+                    "strategy_used": "ai_primary",
+                    "reasoning_excerpt": "low confidence",
+                    "hold_reason_tags": {"low_confidence": True, "neutral_market": True},
+                    "sr_snapshot": {"near_support": False},
+                },
+            },
+            "intent": {"confidence": 0.41, "extras": {}, "strategy_used": "ai_primary"},
+            "agent_outputs": {
+                "market_structure_agent": {"confidence": 0.6, "next_action": "handoff_risk_governor", "structured_verdict": {"regime_label": "liquidity_stress"}},
+                "research_agent": {"confidence": 0.6, "next_action": "normal", "structured_verdict": {"research_state": "observe"}},
+                "risk_governor_agent": {"confidence": 0.72, "next_action": "normal", "structured_verdict": {"risk_verdict": "review"}},
+                "execution_coach_agent": {"confidence": 0.65, "next_action": "normal", "structured_verdict": {"execution_recommendation": "normal"}},
+            },
+        },
+    ]
+    mc.decision_trace_store = MagicMock()
+    mc.decision_trace_store.analyze_recent = MagicMock(
+        return_value={
+            "summary": {
+                "sample_size": 2,
+                "guard_rejected": 1,
+                "guard_passed": 1,
+                "execution_success": 1,
+                "execution_failed": 0,
+                "reconciliation_blocked": 0,
+            },
+            "recent": recent_traces,
+            "top_workflow_stages": [{"key": "guard:decision", "count": 1}],
+            "top_workflow_statuses": [{"key": "blocked", "count": 1}],
+        }
+    )
+    mc.decision_trace_store.get_recent = MagicMock(return_value=recent_traces)
+    mc.trade_history_service = MagicMock()
+    mc.trade_history_service.get_trade_history = AsyncMock(
+        return_value=[
+            {
+                "timestamp": "2026-05-16T01:00:00Z",
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "price": 100000,
+                "quantity": 1,
+                "fee": -1.2,
+                "pnl": 0.0,
+                "metadata": {
+                    "gateway": {"op": "open", "context": {"trace_id": "trace-open-1"}},
+                    "semantic_context": {"regime_label": "trend_up", "risk_verdict": "allow", "execution_recommendation": "slice"},
+                    "strategy_id": "s1",
+                },
+                "reasoning": "ai_decision_open",
+            },
+            {
+                "timestamp": "2026-05-16T03:00:00Z",
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "price": 100500,
+                "quantity": 1,
+                "fee": -1.1,
+                "pnl": 12.5,
+                "pnl_percent": 0.0125,
+                "metadata": {
+                    "gateway": {"op": "close", "context": {"trace_id": "trace-open-1"}},
+                    "semantic_context": {"regime_label": "trend_up", "risk_verdict": "allow", "execution_recommendation": "slice"},
+                    "strategy_id": "s1",
+                },
+                "reasoning": "take_profit",
+            },
+        ]
+    )
+    mc.execution_gateway = MagicMock()
+    mc.execution_gateway.get_snapshot = AsyncMock(
+        return_value={
+            "policy_metrics": {"open_ok": 1, "open_fail": 0},
+            "reconciliation": {"summary": {"drift_total": 0}},
+        }
+    )
+    mc.build_ai_commander_snapshot = AsyncMock(
+        return_value={"account": {"equity": 1000.0}, "positions": [{"symbol": "BTC/USDT", "side": "long"}]}
+    )
+    mc.data_source_hub = MagicMock()
+    mc.data_source_hub.get_unified_snapshot = AsyncMock(return_value={"symbol": "BTC/USDT", "数据质量评估": {"score": 0.9}})
+
+    r = c.get("/api/v1/modules/commander/system-mastery?symbol=BTC/USDT&trace_limit=20&trade_limit=20&recent_trades_limit=5")
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("success") is True
+    data = body.get("data") or {}
+    assert (data.get("interface") or {}).get("path") == "/api/v1/modules/commander/system-mastery"
+    assert "overview" in data
+    assert "system_runtime" in data
+    assert "market_and_account" in data
+    assert "decision_execution_loop" in data
+    assert "trade_lifecycle" in data
+    assert "learning_and_optimization" in data
+    assert "coverage_gaps" in data
+    assert ((data.get("trade_lifecycle") or {}).get("summary") or {}).get("net_pnl_plus_fees") == 10.2
+    assert ((data.get("decision_execution_loop") or {}).get("signal_and_guard") or {}).get("hold_diagnostics", {}).get("hold_total") == 1
+
+
+def test_commander_trading_workflow_exposes_optimization_read_model(e2e_app):
+    app, mc = e2e_app
+    c = TestClient(app)
+    mc.decision_trace_store = MagicMock()
+    mc.decision_trace_store.analyze_recent = MagicMock(
+        return_value={
+            "summary": {
+                "sample_size": 120,
+                "guard_rejected": 110,
+                "guard_passed": 10,
+                "execution_success": 9,
+                "execution_failed": 1,
+                "reconciliation_blocked": 0,
+            },
+            "recent": [],
+            "top_workflow_stages": [{"key": "guard:decision", "count": 110}],
+            "top_workflow_statuses": [{"key": "blocked", "count": 110}],
+        }
+    )
+    mc.trade_history_service = MagicMock()
+    mc.trade_history_service.get_trade_history = AsyncMock(
+        return_value=[
+            {
+                "timestamp": "2026-05-16T01:00:00Z",
+                "symbol": "BTC/USDT",
+                "side": "long",
+                "fee": -1.0,
+                "pnl": 10.0,
+                "metadata": {"gateway": {"op": "close", "context": {"trace_id": "t1"}}, "strategy_id": "s1"},
+                "reasoning": "take_profit",
+            }
+        ]
+        * 120
+    )
+    mc.execution_gateway = MagicMock()
+    mc.execution_gateway.get_snapshot = AsyncMock(
+        return_value={
+            "single_write_owner": "ai_core",
+            "exchange_connected": True,
+            "reconciliation": {"healthy": True, "summary": {"drift_total": 0}},
+            "policy_metrics": {"open_ok": 1},
+        }
+    )
+    mc.execution_gateway.get_recent_events = AsyncMock(
+        return_value=[
+            {"op": "open", "success": True, "source": "ai_core", "symbol": "BTC/USDT", "context": {"strategy_used": "s1"}, "trace_id": "t1"}
+        ]
+    )
+    mc.data_source_hub = MagicMock()
+    mc.data_source_hub.get_unified_snapshot = AsyncMock(
+        return_value={
+            "symbol": "BTC/USDT",
+            "数据质量与作用评分": {"quality_score": 0.91, "confidence": 0.95, "grade": "A"},
+            "数据来源状态": {"provenance": "live"},
+        }
+    )
+
+    r = c.get("/api/v1/modules/commander/trading-workflow?symbol=BTC/USDT&trace_limit=120&trade_limit=120")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("success") is True
+    model = ((body.get("data") or {}).get("optimization_read_model") or {})
+    assert "kpi_scorecard" in model
+    assert "optimization_readiness" in model
+    assert "parameter_recommendations" in model
+    assert model["kpi_scorecard"]["data_quality"]["status"] == "ok"
 
 
 def test_strategy_research_profile_write_endpoints(e2e_app):

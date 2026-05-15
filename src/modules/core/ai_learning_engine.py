@@ -59,6 +59,31 @@ class TradingLesson:
             "effectiveness": self.effectiveness
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TradingLesson":
+        raw_type = str(data.get("lesson_type") or LessonType.MARKET_INSIGHT.value)
+        try:
+            lesson_type = LessonType(raw_type)
+        except Exception:
+            lesson_type = LessonType.MARKET_INSIGHT
+        ts = data.get("timestamp")
+        try:
+            timestamp = datetime.fromisoformat(str(ts)) if ts else datetime.now()
+        except Exception:
+            timestamp = datetime.now()
+        return cls(
+            id=str(data.get("id") or f"lesson_{datetime.now().timestamp()}"),
+            lesson_type=lesson_type,
+            title=str(data.get("title") or ""),
+            content=str(data.get("content") or ""),
+            context=dict(data.get("context") or {}),
+            impact_score=float(data.get("impact_score", 0.0) or 0.0),
+            confidence=float(data.get("confidence", 0.0) or 0.0),
+            timestamp=timestamp,
+            times_applied=int(data.get("times_applied", 0) or 0),
+            effectiveness=float(data.get("effectiveness", 0.0) or 0.0),
+        )
+
 
 @dataclass
 class LearningReport:
@@ -74,6 +99,50 @@ class LearningReport:
     key_insights: List[str]
     recommendations: List[str]
     next_steps: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "period_start": self.period_start.isoformat(),
+            "period_end": self.period_end.isoformat(),
+            "total_trades": self.total_trades,
+            "winning_trades": self.winning_trades,
+            "losing_trades": self.losing_trades,
+            "win_rate": self.win_rate,
+            "total_pnl": self.total_pnl,
+            "lessons_learned": [l.to_dict() for l in self.lessons_learned],
+            "key_insights": list(self.key_insights or []),
+            "recommendations": list(self.recommendations or []),
+            "next_steps": list(self.next_steps or []),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LearningReport":
+        def _dt(key: str) -> datetime:
+            try:
+                return datetime.fromisoformat(str(data.get(key)))
+            except Exception:
+                return datetime.now()
+
+        lessons = []
+        for item in list(data.get("lessons_learned") or []):
+            if isinstance(item, dict):
+                try:
+                    lessons.append(TradingLesson.from_dict(item))
+                except Exception:
+                    continue
+        return cls(
+            period_start=_dt("period_start"),
+            period_end=_dt("period_end"),
+            total_trades=int(data.get("total_trades", 0) or 0),
+            winning_trades=int(data.get("winning_trades", 0) or 0),
+            losing_trades=int(data.get("losing_trades", 0) or 0),
+            win_rate=float(data.get("win_rate", 0.0) or 0.0),
+            total_pnl=float(data.get("total_pnl", 0.0) or 0.0),
+            lessons_learned=lessons,
+            key_insights=list(data.get("key_insights") or []),
+            recommendations=list(data.get("recommendations") or []),
+            next_steps=list(data.get("next_steps") or []),
+        )
 
 
 class AILearningEngine:
@@ -150,8 +219,96 @@ class AILearningEngine:
             "generated_at": None,
             "cards": [],
         }
+        self._state_file = self._resolve_state_file()
         
         logger.info("✅ AI学习引擎初始化完成")
+
+    def _resolve_state_file(self) -> Path:
+        try:
+            cm = self.config_manager
+            if cm is not None and hasattr(cm, "get_config_sync"):
+                base = cm.get_config_sync("paths", "learning_path", None)
+                if base:
+                    return Path(str(base)) / "learning_state.json"
+        except Exception:
+            pass
+        return Path("data/learning/learning_state.json")
+
+    def _serialize_state(self) -> Dict[str, Any]:
+        max_lessons = int(self.config.get("max_lessons_kept", 200) or 200)
+        return {
+            "version": 1,
+            "saved_at": datetime.now().isoformat(),
+            "lessons": [lesson.to_dict() for lesson in self.lessons[-max_lessons:]],
+            "learning_reports": [report.to_dict() for report in self.learning_reports[-30:]],
+            "trace_feedback": dict(self._trace_feedback_summary or {}),
+            "self_review": dict(self._self_review_summary or {}),
+            "tuning_governance": dict(self._last_tuning_summary or {}),
+            "weekly_review": dict(self._weekly_review_summary or {}),
+            "learning_analytics": dict(self._learning_analytics_summary or {}),
+            "retrieval_deck": dict(self._retrieval_deck_summary or {}),
+        }
+
+    def _persist_learning_state_sync(self) -> None:
+        try:
+            path = self._state_file
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self._serialize_state(), ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:
+            logger.debug("持久化 AI 学习状态失败: %s", e)
+
+    async def _load_persisted_learning_state(self) -> None:
+        path = self._state_file
+        try:
+            if not path.is_file():
+                return
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return
+
+            loaded_lessons: List[TradingLesson] = []
+            seen_ids = set()
+            for item in list(payload.get("lessons") or []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    lesson = TradingLesson.from_dict(item)
+                except Exception:
+                    continue
+                if lesson.id in seen_ids:
+                    continue
+                seen_ids.add(lesson.id)
+                loaded_lessons.append(lesson)
+            max_lessons = int(self.config.get("max_lessons_kept", 200) or 200)
+            self.lessons = sorted(loaded_lessons, key=lambda l: l.timestamp)[-max_lessons:]
+
+            loaded_reports: List[LearningReport] = []
+            for item in list(payload.get("learning_reports") or []):
+                if isinstance(item, dict):
+                    try:
+                        loaded_reports.append(LearningReport.from_dict(item))
+                    except Exception:
+                        continue
+            self.learning_reports = sorted(loaded_reports, key=lambda r: r.period_end)[-30:]
+
+            for attr, key in (
+                ("_trace_feedback_summary", "trace_feedback"),
+                ("_self_review_summary", "self_review"),
+                ("_last_tuning_summary", "tuning_governance"),
+                ("_weekly_review_summary", "weekly_review"),
+                ("_learning_analytics_summary", "learning_analytics"),
+                ("_retrieval_deck_summary", "retrieval_deck"),
+            ):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    setattr(self, attr, value)
+            if self.learning_reports and not (self._learning_analytics_summary or {}).get("updated_at"):
+                self._learning_analytics_summary = self._build_learning_analytics(self.learning_reports[-1])
+            logger.info("✅ 已恢复 AI 学习状态: lessons=%s reports=%s path=%s", len(self.lessons), len(self.learning_reports), path)
+        except Exception as e:
+            logger.warning("恢复 AI 学习状态失败: %s", e)
 
     async def _load_runtime_config(self) -> None:
         """从正式配置入口加载学习引擎阈值，避免仅靠硬编码默认值。"""
@@ -178,6 +335,7 @@ class AILearningEngine:
     async def start(self) -> None:
         """启动学习引擎"""
         await self._load_runtime_config()
+        await self._load_persisted_learning_state()
         self._running = True
         self._learning_task = asyncio.create_task(self._learning_loop())
         logger.info("✅ AI学习引擎已启动")
@@ -195,6 +353,7 @@ class AILearningEngine:
                 logger.warning("停止学习任务时出现异常: %s", e)
             finally:
                 self._learning_task = None
+        self._persist_learning_state_sync()
         logger.info("AI学习引擎已停止")
     
     async def _learning_loop(self) -> None:
@@ -663,6 +822,7 @@ class AILearningEngine:
                 self.lessons.sort(key=lambda x: (x.confidence * x.times_applied), reverse=True)
                 self.lessons = self.lessons[:self.config["max_lessons_kept"]]
         
+        self._persist_learning_state_sync()
         logger.info(f"💡 新经验: [{lesson.lesson_type.value}] {lesson.title}")
 
     def _build_trace_lesson_summary(
@@ -778,6 +938,7 @@ class AILearningEngine:
             
             self.learning_reports.append(report)
             self._learning_analytics_summary = self._build_learning_analytics(report)
+            self._persist_learning_state_sync()
             
             if self.memory_manager and hasattr(self.memory_manager, 'enhanced_memory'):
                 self.memory_manager.enhanced_memory.save_strategy_optimization(
@@ -1076,6 +1237,7 @@ class AILearningEngine:
             },
             "generated_at": now.isoformat(),
         }
+        self._persist_learning_state_sync()
         mm = self.memory_manager
         if mm is not None and hasattr(mm, "save_knowledge_document"):
             await mm.save_knowledge_document(
@@ -1137,6 +1299,7 @@ class AILearningEngine:
             "cards": cards[: max(3, min(int(limit or 10), 20))],
         }
         self._retrieval_deck_summary = deck
+        self._persist_learning_state_sync()
         mm = self.memory_manager
         if mm is not None and hasattr(mm, "save_knowledge_document"):
             await mm.save_knowledge_document(

@@ -267,9 +267,9 @@ class StopLossTakeProfitConfig:
     min_net_take_profit_percent: float = 0.003
     min_net_take_profit_regime_overrides: Dict[str, float] = field(
         default_factory=lambda: {
-            "normal": 0.0024,
-            "range": 0.0022,
-            "low_vol_grind": 0.0025,
+            "normal": 0.0021,
+            "range": 0.0019,
+            "low_vol_grind": 0.0022,
             "trend": 0.0034,
             "high_vol": 0.0042,
             "volatile": 0.0042,
@@ -1626,6 +1626,20 @@ class StopLossTakeProfitManager:
             side=side,
             metadata=metadata,
         )
+        if not str(meta.get("strategy_id") or meta.get("strategy_used") or meta.get("strategy") or "").strip():
+            inferred_strategy_id = await self._infer_strategy_id_for_live_position(symbol=symbol, side=side)
+            if inferred_strategy_id:
+                meta["strategy_id"] = inferred_strategy_id
+                meta.setdefault("strategy_used", inferred_strategy_id)
+                meta.setdefault("strategy", inferred_strategy_id)
+        if not str(meta.get("trace_id") or meta.get("traceId") or "").strip():
+            inferred_trace_id = await self._infer_trace_id_for_live_position(symbol=symbol, side=side)
+            if inferred_trace_id:
+                meta["trace_id"] = inferred_trace_id
+                meta["trace_attribution"] = {
+                    "method": "sltp_create_inferred_from_recent_open",
+                    "inferred_at": datetime.now().isoformat(),
+                }
 
         await self._cancel_active_orders_for_index_key(canonical)
 
@@ -1769,6 +1783,80 @@ class StopLossTakeProfitManager:
             )
         
         return order
+
+    async def _infer_strategy_id_for_live_position(self, symbol: str, side: str) -> Optional[str]:
+        mc = getattr(self, "_main_controller", None) or getattr(self, "main_controller", None)
+        trade_service = getattr(mc, "trade_history_service", None) if mc else None
+        if not trade_service or not hasattr(trade_service, "get_trade_history"):
+            return None
+
+        symbol_norm = str(symbol or "").strip().upper().replace("-SWAP", "").replace("/SWAP", "")
+        side_norm = "buy" if str(side or "").strip().lower() == "long" else "sell"
+        try:
+            rows = await trade_service.get_trade_history(symbol=symbol, limit=80)
+        except Exception:
+            return None
+
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            row_symbol = str(row.get("symbol") or "").strip().upper().replace("-SWAP", "").replace("/SWAP", "")
+            if row_symbol != symbol_norm:
+                continue
+            if str(row.get("side") or "").strip().lower() != side_norm:
+                continue
+            meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+            gateway = meta.get("gateway", {}) if isinstance(meta.get("gateway"), dict) else {}
+            trade_phase = str(meta.get("trade_phase") or meta.get("action") or "").strip().lower()
+            gateway_op = str(gateway.get("op") or "").strip().lower()
+            if trade_phase not in {"open", "opened"} and gateway_op != "open":
+                continue
+            strategy_id = str(
+                meta.get("strategy_id")
+                or row.get("strategy")
+                or (
+                    gateway.get("context", {}).get("strategy_id")
+                    if isinstance(gateway.get("context"), dict)
+                    else ""
+                )
+                or ""
+            ).strip()
+            if strategy_id and strategy_id != "sltp_auto_exit":
+                return strategy_id
+        return None
+
+    async def _infer_trace_id_for_live_position(self, symbol: str, side: str) -> Optional[str]:
+        mc = getattr(self, "_main_controller", None) or getattr(self, "main_controller", None)
+        trade_service = getattr(mc, "trade_history_service", None) if mc else None
+        if not trade_service or not hasattr(trade_service, "get_trade_history"):
+            return None
+
+        symbol_norm = str(symbol or "").strip().upper().replace("-SWAP", "").replace("/SWAP", "")
+        side_norm = "buy" if str(side or "").strip().lower() == "long" else "sell"
+        try:
+            rows = await trade_service.get_trade_history(symbol=symbol, limit=80)
+        except Exception:
+            return None
+
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            row_symbol = str(row.get("symbol") or "").strip().upper().replace("-SWAP", "").replace("/SWAP", "")
+            if row_symbol != symbol_norm:
+                continue
+            if str(row.get("side") or "").strip().lower() != side_norm:
+                continue
+            meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+            gateway = meta.get("gateway", {}) if isinstance(meta.get("gateway"), dict) else {}
+            trade_phase = str(meta.get("trade_phase") or meta.get("action") or "").strip().lower()
+            gateway_op = str(gateway.get("op") or "").strip().lower()
+            if trade_phase not in {"open", "opened"} and gateway_op != "open":
+                continue
+            context = gateway.get("context", {}) if isinstance(gateway.get("context"), dict) else {}
+            trace_id = str(context.get("trace_id") or meta.get("trace_id") or row.get("trace_id") or "").strip()
+            if trace_id:
+                return trace_id
+        return None
 
     def _sanitize_sl_tp_vs_entry(
         self,

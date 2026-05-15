@@ -45,7 +45,9 @@ class DecisionTraceStore:
             "no",
             "off",
         )
-        path = (persist_path or _default_persist_path()).strip()
+        # None means "use the production default"; an explicit empty string is
+        # used by unit tests and ephemeral stores to disable disk persistence.
+        path = (_default_persist_path() if persist_path is None else str(persist_path)).strip()
         if (not disabled) and path:
             self._persist_path = path
             self._load_from_disk()

@@ -104,8 +104,7 @@ class PluginManager:
             plugins_config = await self.config_manager.get_config("plugins", {})
             self.plugin_configs = plugins_config.get("plugins", {})
         
-        # 注册默认插件路径
-        self.register_plugin_path("src/modules/plugins")
+        # Runtime plugins live outside the standard API domain package.
         self.register_plugin_path("plugins")
     
     def register_plugin_path(self, path: str) -> None:
@@ -138,7 +137,9 @@ class PluginManager:
             if os.path.exists(plugin_path):
                 for item in os.listdir(plugin_path):
                     item_path = os.path.join(plugin_path, item)
-                    if os.path.isdir(item_path) and not item.startswith("."):
+                    if os.path.isdir(item_path) and not item.startswith((".", "__")):
+                        if not os.path.exists(os.path.join(item_path, "main.py")):
+                            continue
                         plugin_name = item
                         if plugin_name not in self.plugins:
                             plugin_config = self.plugin_configs.get(plugin_name, {"enabled": True})

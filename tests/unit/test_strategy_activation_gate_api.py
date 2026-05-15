@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.modules.api.server import APIServer
-from src.modules.core.strategy_manager import StrategyManager
+from src.modules.core.strategy_manager import StrategyLifecycleStage, StrategyManager
 
 
 async def _build_strategy_manager() -> StrategyManager:
@@ -38,6 +38,12 @@ async def _build_strategy_manager() -> StrategyManager:
     )
     sm.strategy_configs["ready"].oos_status = "passed"
     sm.strategy_configs["ready"].live_drift_status = "healthy"
+    sm.strategy_configs["ready"].metadata["approval"] = {
+        "required": True,
+        "state": "manual_approval_required",
+        "approved": False,
+    }
+    sm.strategy_configs["ready"].stage = StrategyLifecycleStage.PROPOSAL
 
     await sm.load_strategy_config(
         {
@@ -48,6 +54,12 @@ async def _build_strategy_manager() -> StrategyManager:
             "enabled": False,
         }
     )
+    sm.strategy_configs["draft"].metadata["approval"] = {
+        "required": True,
+        "state": "manual_approval_required",
+        "approved": False,
+    }
+    sm.strategy_configs["draft"].stage = StrategyLifecycleStage.PROPOSAL
     return sm
 
 
@@ -81,7 +93,7 @@ def test_strategy_activation_routes_enforce_research_gate():
     headers = {"Authorization": f"Bearer {token}"}
 
     create_blocked = client.post(
-        "/api/v1/strategies",
+        "/api/v1/strategy",
         json={
             "strategy_id": "new_live",
             "name": "New Live",
@@ -94,23 +106,38 @@ def test_strategy_activation_routes_enforce_research_gate():
     assert create_blocked.status_code == 400
     assert "策略未达到启用门槛" in create_blocked.json()["detail"]
 
-    activate_blocked = client.post("/api/v1/strategies/draft/activate", headers=headers)
+    activate_blocked = client.post("/api/v1/strategy/draft/activate", headers=headers)
     assert activate_blocked.status_code == 400
     assert "策略未达到启用门槛" in activate_blocked.json()["detail"]
 
+    approve_blocked = client.post("/api/v1/strategy/draft/approve", headers=headers)
+    assert approve_blocked.status_code == 400
+    assert "策略未达到启用门槛" in approve_blocked.json()["detail"]
+
+    approve_ready = client.post(
+        "/api/v1/strategy/ready/approve",
+        json={"approved_by": "tester", "reason": "manual review passed"},
+        headers=headers,
+    )
+    assert approve_ready.status_code == 200
+    assert approve_ready.json()["status"] == "success"
+    assert sm.strategy_configs["ready"].enabled is True
+    assert sm.strategy_configs["ready"].metadata["approval"]["state"] == "approved"
+    assert sm.strategy_configs["ready"].metadata["approval"]["approved_by"] == "tester"
+
     update_blocked = client.put(
-        "/api/v1/strategies/draft",
+        "/api/v1/strategy/draft",
         json={"enabled": True},
         headers=headers,
     )
     assert update_blocked.status_code == 400
 
-    activate_ready = client.post("/api/v1/strategies/ready/activate", headers=headers)
+    activate_ready = client.post("/api/v1/strategy/ready/activate", headers=headers)
     assert activate_ready.status_code == 200
     assert activate_ready.json()["status"] == "success"
 
     create_ready = client.post(
-        "/api/v1/strategies",
+        "/api/v1/strategy",
         json={
             "strategy_id": "new_ready",
             "name": "New Ready",
@@ -139,3 +166,20 @@ def test_strategy_activation_routes_enforce_research_gate():
     )
     assert create_ready.status_code == 200
     assert create_ready.json()["status"] == "active"
+    assert client.get("/api/v1/strategies").status_code == 404
+
+    openapi_paths = set(client.get("/openapi.json").json().get("paths", {}).keys())
+    assert "/api/v1/strategy/overview" in openapi_paths
+    assert "/api/v1/strategy" in openapi_paths
+    assert not any(path.startswith("/api/v1/strategies") for path in openapi_paths)
+
+    seen = {}
+    for route in api.app.routes:
+        path = getattr(route, "path", "")
+        if not path.startswith("/api/v1"):
+            continue
+        methods = tuple(sorted(getattr(route, "methods", set()) or set()))
+        seen.setdefault((methods, path), 0)
+        seen[(methods, path)] += 1
+    duplicates = [key for key, count in seen.items() if count > 1]
+    assert duplicates == []

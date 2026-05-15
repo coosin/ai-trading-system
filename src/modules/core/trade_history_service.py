@@ -41,6 +41,26 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _metadata_trace_id(metadata: Dict[str, Any]) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    gateway = metadata.get("gateway") if isinstance(metadata.get("gateway"), dict) else {}
+    context = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
+    return str(
+        context.get("trace_id")
+        or metadata.get("trace_id")
+        or metadata.get("traceId")
+        or ""
+    ).strip()
+
+
+def _metadata_gateway_op(metadata: Dict[str, Any]) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    gateway = metadata.get("gateway") if isinstance(metadata.get("gateway"), dict) else {}
+    return str(gateway.get("op") or metadata.get("action") or metadata.get("trade_phase") or "").strip().lower()
+
+
 @dataclass
 class TradeRecord:
     """完整交易记录"""
@@ -236,9 +256,22 @@ class TradeHistoryService:
         side_raw = str(trade_dict.get("side", "buy") or "buy").strip().lower()
         side_norm = {"long": "buy", "short": "sell"}.get(side_raw, side_raw or "buy")
         meta = dict(trade_dict.get("metadata") or {})
+        action_s = str(trade_dict.get("action") or meta.get("action") or "").strip().lower()
+        source_s = str(trade_dict.get("source") or meta.get("source") or "").strip()
+        if action_s:
+            meta.setdefault("action", action_s)
+            meta.setdefault("trade_phase", "close" if action_s in {"close", "closed"} else "open")
+        if source_s:
+            meta.setdefault("source", source_s)
         strat_s = normalize_strategy_field(trade_dict, metadata=meta, default="unknown")
         if strat_s:
             meta.setdefault("strategy_id", strat_s)
+        self._backfill_close_trace_from_recent_open(
+            meta,
+            symbol=str(trade_dict.get("symbol", "") or ""),
+            side=side_norm,
+            action=action_s,
+        )
         strategy_field = strat_s or "unknown"
         reason_s = str(
             trade_dict.get("reasoning")
@@ -268,6 +301,154 @@ class TradeHistoryService:
             metadata=meta,
         )
         return await self.record_trade(trade)
+
+    def _backfill_close_trace_from_recent_open(self, metadata: Dict[str, Any], *, symbol: str, side: str, action: str) -> None:
+        """Inherit the opening trace_id when a close path lacks context.
+
+        SLTP/manual close paths often know symbol+side but not the original
+        decision trace. This keeps attribution read-only and auditable by
+        marking the source instead of fabricating a new trace.
+        """
+        if not isinstance(metadata, dict):
+            return
+        if str(action or "").strip().lower() not in {"close", "closed"}:
+            return
+        if _metadata_trace_id(metadata):
+            return
+        sym = str(symbol or "").strip().upper()
+        side_norm = str(side or "").strip().lower()
+        if not sym or not side_norm:
+            return
+        for existing in reversed(self._cache[-500:]):
+            try:
+                if str(existing.symbol or "").strip().upper() != sym:
+                    continue
+                if str(existing.side or "").strip().lower() != side_norm:
+                    continue
+                existing_meta = dict(existing.metadata or {})
+                if _metadata_gateway_op(existing_meta) != "open":
+                    continue
+                trace_id = _metadata_trace_id(existing_meta)
+                if not trace_id:
+                    continue
+                gateway = metadata.setdefault("gateway", {})
+                if not isinstance(gateway, dict):
+                    gateway = {}
+                    metadata["gateway"] = gateway
+                context = gateway.setdefault("context", {})
+                if not isinstance(context, dict):
+                    context = {}
+                    gateway["context"] = context
+                context["trace_id"] = trace_id
+                metadata.setdefault("trace_id", trace_id)
+                metadata["trace_attribution"] = {
+                    "method": "inherited_from_recent_open",
+                    "source_trade_id": existing.trade_id,
+                    "source_order_id": existing.order_id,
+                    "source_timestamp": existing.timestamp,
+                    "inherited_at": datetime.now().isoformat(),
+                }
+                return
+            except Exception:
+                continue
+
+    async def backfill_close_trace_attribution(self, *, limit: int = 1000, dry_run: bool = True) -> Dict[str, Any]:
+        """Backfill missing close trace_id values from preceding open records.
+
+        The operation is metadata-only and auditable. It never changes order
+        state, price, pnl, fee, or position data.
+        """
+        if not self._cache and self.db_storage and not self._cache_bootstrapped:
+            await self._load_cache_from_db()
+
+        rows = list(self._cache[-max(1, int(limit or 1000)):])
+        open_by_key: Dict[Tuple[str, str], TradeRecord] = {}
+        candidates: List[Dict[str, Any]] = []
+        updated = 0
+        skipped = 0
+
+        for trade in sorted(rows, key=lambda t: str(t.timestamp or "")):
+            meta = dict(trade.metadata or {})
+            op = _metadata_gateway_op(meta)
+            key = (str(trade.symbol or "").strip().upper(), str(trade.side or "").strip().lower())
+            if not key[0] or not key[1]:
+                skipped += 1
+                continue
+            trace_id = _metadata_trace_id(meta)
+            if op == "open":
+                if trace_id:
+                    open_by_key[key] = trade
+                continue
+            if op != "close":
+                skipped += 1
+                continue
+            if trace_id:
+                skipped += 1
+                continue
+            src = open_by_key.get(key)
+            if not src:
+                skipped += 1
+                continue
+            src_trace = _metadata_trace_id(dict(src.metadata or {}))
+            if not src_trace:
+                skipped += 1
+                continue
+            candidates.append(
+                {
+                    "trade_id": trade.trade_id,
+                    "order_id": trade.order_id,
+                    "symbol": trade.symbol,
+                    "side": trade.side,
+                    "trace_id": src_trace,
+                    "source_trade_id": src.trade_id,
+                    "source_order_id": src.order_id,
+                }
+            )
+            if dry_run:
+                continue
+
+            gateway = meta.setdefault("gateway", {})
+            if not isinstance(gateway, dict):
+                gateway = {}
+                meta["gateway"] = gateway
+            context = gateway.setdefault("context", {})
+            if not isinstance(context, dict):
+                context = {}
+                gateway["context"] = context
+            context["trace_id"] = src_trace
+            meta.setdefault("trace_id", src_trace)
+            meta["trace_attribution"] = {
+                "method": "historical_backfill_from_recent_open",
+                "source_trade_id": src.trade_id,
+                "source_order_id": src.order_id,
+                "source_timestamp": src.timestamp,
+                "inherited_at": datetime.now().isoformat(),
+            }
+            trade.metadata = meta
+            updated += 1
+            if self.db_storage and trade.order_id and hasattr(self.db_storage, "update_trade_metadata_by_order_id"):
+                try:
+                    await self.db_storage.update_trade_metadata_by_order_id(
+                        trade.order_id,
+                        symbol=trade.symbol,
+                        metadata_json=json.dumps(meta, ensure_ascii=False),
+                    )
+                except Exception:
+                    pass
+
+        if updated:
+            self._invalidate_stats_cache()
+            await self._rewrite_backup_jsonl()
+
+        return {
+            "success": True,
+            "dry_run": dry_run,
+            "sample_size": len(rows),
+            "candidates": len(candidates),
+            "updated": updated,
+            "skipped": skipped,
+            "examples": candidates[:10],
+        }
 
     async def apply_exchange_truth(
         self,

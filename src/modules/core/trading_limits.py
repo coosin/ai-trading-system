@@ -21,9 +21,11 @@ class PositionLimits:
     max_positions_oneway: int  # total cap in oneway mode
     max_positions_hedge: int  # total cap when both directions exist
     hard_max_positions: int  # absolute cap regardless of oneway/hedge
+    scale_in_min_confidence_1: float  # confidence floor for 1st same-side open
     scale_in_min_confidence_2: float  # confidence floor for 2nd same-side open
     scale_in_min_confidence_3: float  # confidence floor for 3rd same-side open
-    scale_in_min_confidence_4: float  # confidence floor for 4th+ same-side open
+    scale_in_min_confidence_4: float  # confidence floor for 4th same-side open
+    scale_in_min_confidence_5: float  # confidence floor for 5th same-side open
     source: Dict[str, str]  # field -> config key that produced it
 
     def to_dict(self) -> Dict[str, Any]:
@@ -33,11 +35,25 @@ class PositionLimits:
             "max_positions_oneway": int(self.max_positions_oneway),
             "max_positions_hedge": int(self.max_positions_hedge),
             "hard_max_positions": int(self.hard_max_positions),
+            "scale_in_min_confidence_1": float(self.scale_in_min_confidence_1),
             "scale_in_min_confidence_2": float(self.scale_in_min_confidence_2),
             "scale_in_min_confidence_3": float(self.scale_in_min_confidence_3),
             "scale_in_min_confidence_4": float(self.scale_in_min_confidence_4),
+            "scale_in_min_confidence_5": float(self.scale_in_min_confidence_5),
             "source": dict(self.source or {}),
         }
+
+    def confidence_floor_for_leg(self, leg: int) -> float:
+        idx = max(1, min(5, int(leg or 1)))
+        if idx <= 1:
+            return float(self.scale_in_min_confidence_1)
+        if idx == 2:
+            return float(self.scale_in_min_confidence_2)
+        if idx == 3:
+            return float(self.scale_in_min_confidence_3)
+        if idx == 4:
+            return float(self.scale_in_min_confidence_4)
+        return float(self.scale_in_min_confidence_5)
 
 
 def _as_float(v: Any, default: float) -> float:
@@ -155,6 +171,11 @@ async def resolve_position_limits(
     )
     hard_max = max(1, int(hard_max))
 
+    c1, source["scale_in_min_confidence_1"] = _pick_first(
+        ("trading.position_limits.scale_in_min_confidence_1", pl.get("scale_in_min_confidence_1") if isinstance(pl, dict) else None),
+        cast="float",
+        default=0.72,
+    )
     c2, source["scale_in_min_confidence_2"] = _pick_first(
         ("trading.position_limits.scale_in_min_confidence_2", pl.get("scale_in_min_confidence_2") if isinstance(pl, dict) else None),
         cast="float",
@@ -170,9 +191,16 @@ async def resolve_position_limits(
         cast="float",
         default=0.87,
     )
-    c2 = max(0.0, min(1.0, float(c2)))
+    c5, source["scale_in_min_confidence_5"] = _pick_first(
+        ("trading.position_limits.scale_in_min_confidence_5", pl.get("scale_in_min_confidence_5") if isinstance(pl, dict) else None),
+        cast="float",
+        default=0.92,
+    )
+    c1 = max(0.0, min(1.0, float(c1)))
+    c2 = max(c1, min(1.0, float(c2)))
     c3 = max(c2, min(1.0, float(c3)))
     c4 = max(c3, min(1.0, float(c4)))
+    c5 = max(c4, min(1.0, float(c5)))
 
     # Ensure internal consistency: hedge cap should not be below oneway cap, and hard cap >= both.
     if max_hedge < max_oneway:
@@ -199,9 +227,10 @@ async def resolve_position_limits(
         max_positions_oneway=int(max_oneway),
         max_positions_hedge=int(max_hedge),
         hard_max_positions=int(hard_max),
+        scale_in_min_confidence_1=float(c1),
         scale_in_min_confidence_2=float(c2),
         scale_in_min_confidence_3=float(c3),
         scale_in_min_confidence_4=float(c4),
+        scale_in_min_confidence_5=float(c5),
         source=source,
     )
-

@@ -55,6 +55,93 @@ class StrategyResearchPipeline:
         self.promote_small_score = 1.10
         self.redevelop_below_score = 0.35
         self.discard_below_score = 0.10
+        self.auto_activate_published = True
+        self.require_activation_gate = True
+        self.max_auto_activate_stage = "paper"
+        self.production_auto_activate_allowed = False
+        self.manual_approval_required = False
+        self.auto_enable_published = True
+        self.auto_deploy_after_approval = True
+        self.auto_activate_after_approval = True
+        self.max_post_approval_auto_stage = "paper"
+
+    @staticmethod
+    def _build_review_window(
+        *,
+        decision: str,
+        manual_approval_required: bool,
+        deployment_stage: str,
+        score: float,
+    ) -> Dict[str, Any]:
+        opened_at = datetime.now()
+        review_by = opened_at + timedelta(hours=24 if deployment_stage == "paper" else 12)
+        status = "pending_approval" if manual_approval_required else "open"
+        mode = "pre_publish_approval" if manual_approval_required else "post_publish_observation"
+        return {
+            "visible": True,
+            "status": status,
+            "mode": mode,
+            "decision": str(decision or "publish"),
+            "deployment_stage": str(deployment_stage or "paper"),
+            "opened_at": opened_at.isoformat(),
+            "review_by": review_by.isoformat(),
+            "score": float(round(score, 6)),
+            "summary": "manual approval required before enable" if manual_approval_required else "auto-published; keep visible for human review",
+        }
+
+    @staticmethod
+    def _deployment_stage_rank(stage: str) -> int:
+        return {
+            "paper": 0,
+            "shadow": 1,
+            "small": 2,
+            "full": 3,
+        }.get(str(stage or "").strip().lower(), 99)
+
+    def _resolve_publish_policy(
+        self,
+        cfg: Optional[Dict[str, Any]],
+        *,
+        gov_decision: str,
+    ) -> Tuple[str, bool, bool, Dict[str, Any]]:
+        research_cfg = cfg if isinstance(cfg, dict) else {}
+        rollout = research_cfg.get("rollout", {}) if isinstance(research_cfg.get("rollout"), dict) else {}
+        governance = research_cfg.get("governance", {}) if isinstance(research_cfg.get("governance"), dict) else {}
+        deployment_stage = "small" if gov_decision == "production_small" else "shadow"
+        force_paper = bool(rollout.get("force_paper_stage", True))
+        if force_paper:
+            deployment_stage = "paper"
+        allow_auto_activate = bool(rollout.get("auto_activate_published", self.auto_activate_published))
+        require_gate = bool(rollout.get("require_activation_gate", self.require_activation_gate))
+        max_stage = str(rollout.get("max_auto_activate_stage", self.max_auto_activate_stage) or self.max_auto_activate_stage).strip().lower()
+        prod_allow = bool(governance.get("production_auto_activate_allowed", self.production_auto_activate_allowed))
+        manual_approval_required = bool(rollout.get("manual_approval_required", self.manual_approval_required))
+        auto_enable = bool(rollout.get("auto_enable_published", self.auto_enable_published))
+        auto_deploy_after_approval = bool(rollout.get("auto_deploy_after_approval", self.auto_deploy_after_approval))
+        auto_activate_after_approval = bool(rollout.get("auto_activate_after_approval", self.auto_activate_after_approval))
+        max_post_approval_stage = str(
+            rollout.get("max_post_approval_auto_stage", self.max_post_approval_auto_stage) or self.max_post_approval_auto_stage
+        ).strip().lower()
+        if gov_decision == "publish" and not prod_allow and deployment_stage not in {"paper", "shadow"}:
+            allow_auto_activate = False
+        if self._deployment_stage_rank(deployment_stage) > self._deployment_stage_rank(max_stage):
+            allow_auto_activate = False
+        if manual_approval_required:
+            auto_enable = False
+            allow_auto_activate = False
+        policy = {
+            "auto_activate_published": allow_auto_activate,
+            "require_activation_gate": require_gate,
+            "max_auto_activate_stage": max_stage,
+            "production_auto_activate_allowed": prod_allow,
+            "force_paper_stage": force_paper,
+            "manual_approval_required": manual_approval_required,
+            "auto_enable_published": auto_enable,
+            "auto_deploy_after_approval": auto_deploy_after_approval,
+            "auto_activate_after_approval": auto_activate_after_approval,
+            "max_post_approval_auto_stage": max_post_approval_stage,
+        }
+        return deployment_stage, allow_auto_activate, auto_enable, policy
 
     def _build_experiment_card(
         self,
@@ -125,6 +212,7 @@ class StrategyResearchPipeline:
 
     async def run_cycle(self, symbols: List[str], timeframe: str = "1h", lookback_days: int = 30) -> Dict[str, Any]:
         # load config (best-effort)
+        cfg: Dict[str, Any] = {}
         try:
             cm = getattr(self.main_controller, "config_manager", None)
             cfg = await cm.get_config("research", {}) if cm else {}
@@ -157,6 +245,35 @@ class StrategyResearchPipeline:
                     self.promote_small_score = float(gov.get("promote_small_score", self.promote_small_score))
                     self.redevelop_below_score = float(gov.get("redevelop_below_score", self.redevelop_below_score))
                     self.discard_below_score = float(gov.get("discard_below_score", self.discard_below_score))
+                    self.production_auto_activate_allowed = bool(
+                        gov.get("production_auto_activate_allowed", self.production_auto_activate_allowed)
+                    )
+                rollout = cfg.get("rollout", {})
+                if isinstance(rollout, dict):
+                    self.auto_activate_published = bool(
+                        rollout.get("auto_activate_published", self.auto_activate_published)
+                    )
+                    self.require_activation_gate = bool(
+                        rollout.get("require_activation_gate", self.require_activation_gate)
+                    )
+                    self.max_auto_activate_stage = str(
+                        rollout.get("max_auto_activate_stage", self.max_auto_activate_stage) or self.max_auto_activate_stage
+                    ).strip().lower()
+                    self.manual_approval_required = bool(
+                        rollout.get("manual_approval_required", self.manual_approval_required)
+                    )
+                    self.auto_enable_published = bool(
+                        rollout.get("auto_enable_published", self.auto_enable_published)
+                    )
+                    self.auto_deploy_after_approval = bool(
+                        rollout.get("auto_deploy_after_approval", self.auto_deploy_after_approval)
+                    )
+                    self.auto_activate_after_approval = bool(
+                        rollout.get("auto_activate_after_approval", self.auto_activate_after_approval)
+                    )
+                    self.max_post_approval_auto_stage = str(
+                        rollout.get("max_post_approval_auto_stage", self.max_post_approval_auto_stage) or self.max_post_approval_auto_stage
+                    ).strip().lower()
         except Exception:
             pass
 
@@ -174,7 +291,15 @@ class StrategyResearchPipeline:
         async def _run_one(sym: str):
             async with self._symbol_semaphore:
                 try:
-                    return {"symbol": sym, "published": await self._research_symbol(sym, timeframe=timeframe, lookback_days=lookback_days)}
+                    return {
+                        "symbol": sym,
+                        "published": await self._research_symbol(
+                            sym,
+                            timeframe=timeframe,
+                            lookback_days=lookback_days,
+                            research_cfg=cfg,
+                        ),
+                    }
                 except Exception as e:
                     logger.error(f"research cycle failed for {sym}: {e}")
                     return {"symbol": sym, "error": str(e)}
@@ -188,7 +313,13 @@ class StrategyResearchPipeline:
         results["backtest_calls"] = self._bt_calls
         return results
 
-    async def _research_symbol(self, symbol: str, timeframe: str, lookback_days: int) -> List[Dict[str, Any]]:
+    async def _research_symbol(
+        self,
+        symbol: str,
+        timeframe: str,
+        lookback_days: int,
+        research_cfg: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         started_at = datetime.now()
         # Data quality gate: low-quality unified snapshot skips heavy research to avoid bad strategy fit.
         snapshot = await self._get_unified_snapshot(symbol)
@@ -242,7 +373,14 @@ class StrategyResearchPipeline:
 
             # 最低规则：先过风险门，再过最低研究评分。
             if self._passes_gates(test_metrics) and score >= self.publish_min_score:
-                item = await self._publish(best_dsl, test_metrics, best_train, score=score, decision=decision)
+                item = await self._publish(
+                    best_dsl,
+                    test_metrics,
+                    best_train,
+                    score=score,
+                    decision=decision,
+                    research_cfg=research_cfg,
+                )
                 if item:
                     published.append(item)
         return published
@@ -608,6 +746,7 @@ class StrategyResearchPipeline:
         train_metrics: Dict[str, Any],
         score: Optional[float] = None,
         decision: Optional[str] = None,
+        research_cfg: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not self.main_controller or not getattr(self.main_controller, "strategy_manager", None):
             return None
@@ -620,14 +759,24 @@ class StrategyResearchPipeline:
 
         research_score = float(score if score is not None else self._research_score(test_metrics))
         gov_decision = decision or self._governance_decision(research_score)
-        deployment_stage = "small" if gov_decision == "production_small" else "shadow"
+        deployment_stage, auto_activate_allowed, auto_enable_published, rollout_policy = self._resolve_publish_policy(
+            research_cfg,
+            gov_decision=gov_decision,
+        )
+        manual_approval_required = bool(rollout_policy.get("manual_approval_required", False))
+        review_window = self._build_review_window(
+            decision=gov_decision,
+            manual_approval_required=manual_approval_required,
+            deployment_stage=deployment_stage,
+            score=research_score,
+        )
 
         config_data = {
             "strategy_id": strategy_id,
             "name": dsl["name"],
             "description": f"DSL strategy auto-researched. gates={self.gates}",
             "strategy_type": self._map_strategy_type(dsl),
-            "enabled": True,
+            "enabled": auto_enable_published,
             "version": version,
             "parameters": {"dsl": dsl},
             "symbols": [dsl.get("symbol", "BTC/USDT")],
@@ -637,8 +786,8 @@ class StrategyResearchPipeline:
                 "dsl": dsl,
                 "deployment": {
                     "stage": deployment_stage,
-                    "cap_multiplier": 0.5 if deployment_stage == "small" else 0.25,
-                    "policy": "auto_rollout",
+                    "cap_multiplier": 0.0 if deployment_stage == "paper" else (0.5 if deployment_stage == "small" else 0.25),
+                    "policy": "guarded_rollout",
                 },
                 "research": {
                     "train": train_metrics,
@@ -647,7 +796,18 @@ class StrategyResearchPipeline:
                     "published_at": datetime.now().isoformat(),
                     "score": research_score,
                     "decision": gov_decision,
+                    "rollout_policy": rollout_policy,
+                    "approval_state": "manual_approval_required" if manual_approval_required else "auto_enabled",
+                    "review_window": review_window,
                 },
+                "approval": {
+                    "required": manual_approval_required,
+                    "state": "manual_approval_required" if manual_approval_required else "approved",
+                    "approved": False if manual_approval_required else True,
+                    "approved_by": "system_auto_publish" if not manual_approval_required else None,
+                    "approved_at": datetime.now().isoformat() if not manual_approval_required else None,
+                },
+                "review_window": review_window,
             },
         }
 
@@ -704,24 +864,35 @@ class StrategyResearchPipeline:
         except Exception:
             pass
 
-        # Auto-activate newly published strategy so research output can
-        # immediately enter live signal generation instead of staying dormant.
         instance_id = None
         activated = False
+        activation_blockers: List[str] = []
         try:
             from src.modules.core.strategy_manager import StrategyStatus
 
-            running = await strategy_manager.get_strategy_instances(
-                strategy_id=strategy_id, status=StrategyStatus.RUNNING
-            )
-            if not running:
-                instance_id = await strategy_manager.create_strategy_instance(strategy_id)
-                if instance_id:
-                    init_ok = await strategy_manager.initialize_strategy(instance_id)
-                    if init_ok:
-                        activated = await strategy_manager.start_strategy(instance_id)
+            if auto_activate_allowed:
+                if rollout_policy.get("require_activation_gate", True) and hasattr(strategy_manager, "get_strategy_activation_gate"):
+                    gate = strategy_manager.get_strategy_activation_gate(strategy_id)
+                    if not bool((gate or {}).get("eligible", False)):
+                        activation_blockers.extend(list((gate or {}).get("reasons") or ["activation_gate_denied"]))
+                running = []
+                if not activation_blockers:
+                    running = await strategy_manager.get_strategy_instances(
+                        strategy_id=strategy_id, status=StrategyStatus.RUNNING
+                    )
+                if not running and not activation_blockers:
+                    instance_id = await strategy_manager.create_strategy_instance(strategy_id)
+                    if instance_id:
+                        init_ok = await strategy_manager.initialize_strategy(instance_id)
+                        if init_ok:
+                            activated = await strategy_manager.start_strategy(instance_id)
+                        else:
+                            activation_blockers.append("initialize_failed")
+            else:
+                activation_blockers.append("auto_activate_disabled")
         except Exception as e:
             logger.warning("publish strategy activate failed %s: %s", strategy_id, e)
+            activation_blockers.append(f"activate_exception:{type(e).__name__}")
 
         # Audit + memory trace
         if hasattr(self.main_controller, "log_audit_event"):
@@ -785,6 +956,10 @@ class StrategyResearchPipeline:
                         "decision": gov_decision,
                         "score": research_score,
                         "test_metrics": dict(test_metrics or {}),
+                        "deployment_stage": deployment_stage,
+                        "auto_activated": activated,
+                        "activation_blockers": list(activation_blockers),
+                        "review_window": review_window,
                     },
                 )
         except Exception:
@@ -793,7 +968,9 @@ class StrategyResearchPipeline:
         try:
             from src.modules.core.strategy_manager import StrategyLifecycleStage
 
-            if activated and deployment_stage == "full":
+            if manual_approval_required:
+                stage = StrategyLifecycleStage.PROPOSAL
+            elif activated and deployment_stage == "full":
                 stage = StrategyLifecycleStage.SCALED_LIVE
             elif activated:
                 stage = StrategyLifecycleStage.LIMITED_LIVE
@@ -802,7 +979,7 @@ class StrategyResearchPipeline:
             strategy_manager.set_strategy_governance_state(
                 strategy_id,
                 stage=stage,
-                oos_status="passed" if gov_decision == "publish" else "review_required",
+                oos_status="manual_review_required" if manual_approval_required else ("passed" if gov_decision == "publish" else "review_required"),
                 live_drift_status="unknown",
                 reason="research_pipeline_publish",
             )
@@ -817,4 +994,9 @@ class StrategyResearchPipeline:
             "activated": activated,
             "score": research_score,
             "decision": gov_decision,
+            "deployment_stage": deployment_stage,
+            "activation_blockers": activation_blockers,
+            "enabled": auto_enable_published,
+            "manual_approval_required": manual_approval_required,
+            "review_window": review_window,
         }

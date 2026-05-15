@@ -14,10 +14,11 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Body
 
 from src.modules.api.route_catalog import extended_core_routes, read_pipeline_spec
+from src.modules.api.standard_registry import build_standard_surface
 
 CONTRACT_VERSION = "2026.05.13"
 MODULES_PREFIX = "/api/v1/modules"
-TRADE_PREFIX = "/api/v1/trade"
+TRADE_PREFIX = "/api/v1/trades"
 MARKET_PREFIX = "/api/v1/market"
 S1_PREFIX = "/api/v1/s1"
 
@@ -110,8 +111,10 @@ def build_static_route_catalog() -> List[Dict[str, Any]]:
     rows.append(r("POST", f"{MODULES_PREFIX}/skills/invoke", impl, "skills", "按 skill_name 调用"))
     rows.append(r("GET", f"{MODULES_PREFIX}/data/hub/unified-snapshot", impl, "data", "统一数据源快照"))
     rows.append(r("GET", f"{MODULES_PREFIX}/market-structure/multi-source-snapshot", impl, "market_structure", "多源市场结构聚合"))
+    rows.append(r("GET", f"{MODULES_PREFIX}/commander/system-mastery", impl, "commander", "单接口全局总览"))
     rows.append(r("GET", f"{MODULES_PREFIX}/surface/registry", impl, "surface", "API 总注册表"))
     rows.append(r("GET", f"{MODULES_PREFIX}/surface/channels", impl, "surface", "渠道契约"))
+    rows.append(r("GET", f"{MODULES_PREFIX}/surface/mcp-manifest", impl, "surface", "MCP/CLI 工具清单"))
 
     # 去重合并：顶层 /api/v1 常用只读路由（见 route_catalog.extended_core_routes）
     seen = {(x["method"], x["path"]) for x in rows}
@@ -129,20 +132,107 @@ def build_channel_contract() -> Dict[str, Any]:
     return {
         "contract_version": CONTRACT_VERSION,
         "http": {
+            "system_mastery": {
+                "method": "GET",
+                "path": "/api/v1/commander/system-mastery",
+                "query": {"symbol": "BTC/USDT", "trace_limit": 120, "trade_limit": 300, "recent_trades_limit": 20},
+                "note": "单接口读取系统状态、交易闭环、故障、学习与优化建议。",
+            },
             "commander_inbox": {
                 "method": "POST",
                 "path": f"{MODULES_PREFIX}/commander/dispatch",
                 "body": {"message": "string", "source": "control_hub | telegram | api_chat | ..."},
             },
             "registry": {"method": "GET", "path": f"{MODULES_PREFIX}/surface/registry"},
+            "mcp_manifest": {"method": "GET", "path": f"{MODULES_PREFIX}/surface/mcp-manifest"},
         },
         "websocket": {
             "note": "APIServer 内置 WebSocket 广播；订阅语义见服务端 WebSocketSubscribeRequest / channel 前缀。",
-            "trade_events_channel_hint": "trade.* 可与 GET /api/v1/trade/events 对照",
+            "trade_events_channel_hint": "trade.* 可与 GET /api/v1/trades/lifecycle 对照",
         },
         "telegram": {
             "note": "Bot 长轮询/ webhook 由 TelegramBot 接入；业务语义应与 commander dispatch 一致（同一 process_user_command 链）。",
         },
+    }
+
+
+def build_mcp_manifest() -> Dict[str, Any]:
+    """Machine-readable tool manifest for MCP/CLI adapters.
+
+    The manifest intentionally separates read-only tools from guarded write tools
+    so external clients can default to safe access.
+    """
+    standard = build_standard_surface()
+    routes = standard.get("routes", [])
+
+    def _tool_name(route: Dict[str, Any]) -> str:
+        return str(route.get("capability") or route.get("path", "")).replace(".", "_").replace("/", "_").strip("_")
+
+    read_tools: List[Dict[str, Any]] = []
+    guarded_write_tools: List[Dict[str, Any]] = []
+    for route in routes:
+        item = {
+            "name": _tool_name(route),
+            "capability": route.get("capability"),
+            "method": route.get("method"),
+            "path": route.get("path"),
+            "domain": route.get("domain"),
+            "description": route.get("summary"),
+            "safety": "read_only" if route.get("method") == "GET" else "guarded_write",
+        }
+        if route.get("method") == "GET":
+            read_tools.append(item)
+        else:
+            guarded_write_tools.append(item)
+
+    read_tools.extend(
+        [
+            {
+                "name": "surface_registry",
+                "capability": "surface.modules_registry",
+                "method": "GET",
+                "path": f"{MODULES_PREFIX}/surface/registry",
+                "domain": "surface",
+                "description": "Full module/API registry including read pipeline and channels.",
+                "safety": "read_only",
+            },
+            {
+                "name": "commander_tool_contract",
+                "capability": "commander.tool_contract",
+                "method": "GET",
+                "path": f"{MODULES_PREFIX}/commander/tool-contract",
+                "domain": "commander",
+                "description": "Tool contract catalog for OpenClaw/MCP/CLI integration.",
+                "safety": "read_only",
+            },
+            {
+                "name": "trading_diagnosis",
+                "capability": "commander.trading_diagnosis",
+                "method": "GET",
+                "path": f"{MODULES_PREFIX}/commander/trading-diagnosis",
+                "domain": "commander",
+                "description": "Trading diagnosis, reconciliation, and execution safety snapshot.",
+                "safety": "read_only",
+            },
+        ]
+    )
+
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "protocol": "openclaw-mcp-http-fallback",
+        "api_base_env": {
+            "preferred": "OPENCLAW_API_BASE",
+            "aliases": ["ACCEPTANCE_BASE", "BASE_URL"],
+            "default": "http://127.0.0.1:8000",
+        },
+        "defaults": {
+            "mode": "read_only",
+            "write_policy": "guarded_write_requires_api_auth_and_runtime_governance",
+            "timeout_sec": 20,
+        },
+        "read_tools": read_tools,
+        "guarded_write_tools": guarded_write_tools,
+        "tool_count": {"read": len(read_tools), "guarded_write": len(guarded_write_tools)},
     }
 
 
@@ -162,6 +252,7 @@ def attach_module_surface_routes(router: APIRouter, main_controller: Any) -> Non
             "success": True,
             "contract_version": CONTRACT_VERSION,
             "catalog": catalog,
+            "standard_surface": build_standard_surface(),
             "read_pipeline": read_pipeline_spec(),
             "api_base_env": {
                 "preferred": "OPENCLAW_API_BASE",
@@ -177,6 +268,10 @@ def attach_module_surface_routes(router: APIRouter, main_controller: Any) -> Non
     @router.get("/surface/channels")
     async def surface_channels() -> Dict[str, Any]:
         return {"success": True, "data": build_channel_contract(), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/surface/mcp-manifest")
+    async def surface_mcp_manifest() -> Dict[str, Any]:
+        return {"success": True, "data": build_mcp_manifest(), "timestamp": datetime.now().isoformat()}
 
     @router.get("/data/hub/unified-snapshot")
     async def data_hub_unified_snapshot(symbol: str = "BTC/USDT") -> Dict[str, Any]:

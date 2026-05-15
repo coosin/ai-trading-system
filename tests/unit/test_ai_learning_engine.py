@@ -20,9 +20,10 @@ class _FakeMemoryManager:
 
 
 @pytest.mark.asyncio
-async def test_generate_weekly_research_review_persists_document():
+async def test_generate_weekly_research_review_persists_document(tmp_path):
     mm = _FakeMemoryManager()
     engine = AILearningEngine(memory_manager=mm)
+    engine._state_file = tmp_path / "learning_state.json"
     engine.learning_reports = []
     engine.lessons = [
         TradingLesson(
@@ -61,9 +62,10 @@ async def test_generate_weekly_research_review_persists_document():
 
 
 @pytest.mark.asyncio
-async def test_generate_retrieval_practice_deck_has_cards():
+async def test_generate_retrieval_practice_deck_has_cards(tmp_path):
     mm = _FakeMemoryManager()
     engine = AILearningEngine(memory_manager=mm)
+    engine._state_file = tmp_path / "learning_state.json"
     engine.lessons = [
         TradingLesson(
             id="1",
@@ -81,7 +83,42 @@ async def test_generate_retrieval_practice_deck_has_cards():
 
 
 @pytest.mark.asyncio
-async def test_update_strategy_learning_governance_marks_degraded():
+async def test_learning_engine_persists_and_restores_lessons_reports_and_deck(tmp_path):
+    state_file = tmp_path / "learning_state.json"
+    engine = AILearningEngine()
+    engine._state_file = state_file
+    engine.config["learning_interval_hours"] = 24
+    engine._add_lesson(
+        TradingLesson(
+            id="persist-1",
+            lesson_type=LessonType.SUCCESS_PATTERN,
+            title="Persisted success",
+            content="trend continuation with low spread",
+            context={"symbol": "BTC/USDT", "strategy": "s1", "pnl": 2.5},
+            impact_score=0.7,
+            confidence=0.9,
+        )
+    )
+    report = await engine._generate_learning_report()
+    deck = await engine.generate_retrieval_practice_deck(limit=3)
+
+    assert report is not None
+    assert state_file.is_file()
+    assert len(deck["cards"]) >= 3
+
+    restored = AILearningEngine()
+    restored._state_file = state_file
+    await restored._load_persisted_learning_state()
+
+    assert len(restored.lessons) == 1
+    assert restored.lessons[0].id == "persist-1"
+    assert len(restored.learning_reports) == 1
+    assert restored.learning_reports[0].total_trades == 1
+    assert len(restored.get_status()["retrieval_deck"]["cards"]) >= 3
+
+
+@pytest.mark.asyncio
+async def test_update_strategy_learning_governance_marks_degraded(tmp_path):
     mm = _FakeMemoryManager()
     sm = StrategyManager(None)
     await sm.load_strategy_config(
@@ -93,6 +130,7 @@ async def test_update_strategy_learning_governance_marks_degraded():
         }
     )
     engine = AILearningEngine(memory_manager=mm)
+    engine._state_file = tmp_path / "learning_state.json"
     engine.main_controller = SimpleNamespace(strategy_manager=sm)
     engine.lessons = [
         TradingLesson(
@@ -122,7 +160,7 @@ async def test_update_strategy_learning_governance_marks_degraded():
 
 
 @pytest.mark.asyncio
-async def test_analyze_decision_traces_includes_workflow_signals():
+async def test_analyze_decision_traces_includes_workflow_signals(tmp_path):
     mm = _FakeMemoryManager()
     store = DecisionTraceStore(max_items=20, persist_path="")
     store.record_reconciliation_result(
@@ -139,6 +177,7 @@ async def test_analyze_decision_traces_includes_workflow_signals():
     )
 
     engine = AILearningEngine(memory_manager=mm)
+    engine._state_file = tmp_path / "learning_state.json"
     engine.main_controller = SimpleNamespace(decision_trace_store=store)
 
     await engine._analyze_decision_traces()
