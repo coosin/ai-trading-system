@@ -6,11 +6,19 @@
 
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
+from .trade_attribution import (
+    extract_trade_trace_id,
+    has_attributable_trade_strategy,
+    is_placeholder_strategy_name,
+    raw_trade_strategy_name,
+    resolve_trade_strategy_name,
+    trade_source_name,
+)
 from ..monitoring.trading_monitor import TradingMonitor, TradingAlert, TradeExecution, StrategyPerformance, MarketDataStatus, RiskMetrics
 from ..intelligence.anomaly_detection import AnomalyDetector, AnomalyDetectionConfig
 
@@ -55,9 +63,322 @@ def _parse_timestamp(value: Any) -> datetime:
     try:
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
-        return datetime.fromisoformat(text)
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
     except Exception:
         return datetime.min
+
+
+def _strategy_name_from_row(row: Dict[str, Any]) -> str:
+    return raw_trade_strategy_name(row)
+
+
+def _is_placeholder_strategy_name(name: Any) -> bool:
+    return is_placeholder_strategy_name(name)
+
+
+def _decision_trace_lookup():
+    store = getattr(_main_controller, "decision_trace_store", None) if _main_controller else None
+    if store and hasattr(store, "get_by_trace_id"):
+        return store.get_by_trace_id
+    return None
+
+
+def _strategy_name_for_performance(row: Dict[str, Any]) -> str:
+    raw = resolve_trade_strategy_name(row, decision_trace_lookup=_decision_trace_lookup(), default="")
+    if _is_placeholder_strategy_name(raw):
+        return "unattributed"
+    return raw or "unknown"
+
+
+def _has_attributable_strategy(row: Dict[str, Any]) -> bool:
+    return has_attributable_trade_strategy(row, decision_trace_lookup=_decision_trace_lookup())
+
+
+def _normalize_trade_quantity(row: Dict[str, Any]) -> float:
+    return abs(
+        _to_float(
+            row.get("executed_quantity")
+            or row.get("filled_quantity")
+            or row.get("quantity")
+            or row.get("size")
+            or 0.0
+        )
+    )
+
+
+def _is_placeholder_trade_row(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return True
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    src = str(md.get("source") or row.get("source") or "").strip().lower()
+    if "bootstrap" in src or "placeholder" in src:
+        return True
+
+    symbol = str(row.get("symbol") or "").strip()
+    if not symbol:
+        return True
+    if _parse_timestamp(row.get("timestamp")) == datetime.min:
+        return True
+
+    price = _to_float(row.get("price"))
+    avg_price = _to_float(row.get("avg_price", row.get("price")))
+    quantity = _normalize_trade_quantity(row)
+    pnl = abs(_to_float(row.get("pnl")))
+    pnl_pct = abs(_to_float(row.get("pnl_percent")))
+    fee = abs(_to_float(row.get("fee")))
+    strategy_name = _strategy_name_from_row(row)
+    trace_id = extract_trade_trace_id(row)
+
+    if quantity <= 1e-12 and price <= 1e-12 and avg_price <= 1e-12:
+        return True
+    if quantity <= 1e-12 and pnl <= 1e-12 and pnl_pct <= 1e-12 and fee <= 1e-12:
+        return True
+    if price <= 1e-12 and avg_price <= 1e-12 and fee <= 1e-12 and not strategy_name and not trace_id:
+        return True
+    return False
+
+
+def _is_low_fidelity_historical_trade_row(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    gateway = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
+    context = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
+    src = str(md.get("source") or row.get("source") or "").strip().lower()
+    if src not in {"historical_db", "legacy"}:
+        return False
+    if _has_attributable_strategy(row):
+        return False
+    if extract_trade_trace_id(row):
+        return False
+    if str(row.get("reasoning") or "").strip():
+        return False
+    if gateway or context:
+        return False
+    if any(
+        md.get(key)
+        for key in ("market_context", "semantic_context", "open_timestamp", "close_timestamp", "raw", "regime_label")
+    ):
+        return False
+    return True
+
+
+async def _estimate_live_risk_metrics(main_controller: Any) -> Dict[str, Any]:
+    mc = main_controller
+    if not mc:
+        return {}
+    try:
+        ex = mc.get_exchange() if hasattr(mc, "get_exchange") else None
+        ex = ex or getattr(mc, "okx_exchange", None)
+        if not ex or not hasattr(ex, "get_positions"):
+            return {}
+        rows = await ex.get_positions()
+        total_exposure = 0.0
+        max_position_size = 0.0
+        leverage_used = 0.0
+        margin_used = 0.0
+        position_count = 0
+        for p in rows or []:
+            if not isinstance(p, dict):
+                continue
+            size_v = abs(_to_float(p.get("size", p.get("pos", 0)) or p.get("positionAmt")))
+            if size_v <= 0:
+                continue
+            notional = abs(_to_float(p.get("notional_value") or p.get("notional") or p.get("notionalUsd")))
+            if notional <= 0:
+                mark_px = _to_float(p.get("mark_px") or p.get("mark_price") or p.get("markPx"))
+                notional = abs(size_v * mark_px)
+            lev = _to_float(p.get("leverage") or p.get("lever"))
+            total_exposure += notional
+            max_position_size = max(max_position_size, notional)
+            leverage_used = max(leverage_used, lev)
+            if lev > 0:
+                margin_used += notional / lev
+            position_count += 1
+
+        latest = getattr(mc, "_latest_account_state", {}) or {}
+        portfolio_value = 0.0
+        latest_account_state_at = latest.get("timestamp") if isinstance(latest, dict) else None
+        if isinstance(latest, dict):
+            for key in ("usdt_total", "usdt_free"):
+                portfolio_value = max(portfolio_value, _to_float(latest.get(key)))
+            balance_view = latest.get("balance")
+            if isinstance(balance_view, dict):
+                portfolio_value = max(
+                    portfolio_value,
+                    _to_float(balance_view.get("USDT") or balance_view.get("usdt")),
+                )
+
+        portfolio_value_source = "account_state_cache"
+        if portfolio_value <= 0 and hasattr(ex, "get_balance"):
+            try:
+                live_balance = await ex.get_balance()
+            except Exception:
+                live_balance = None
+            if isinstance(live_balance, dict):
+                portfolio_value = max(
+                    portfolio_value,
+                    _to_float(live_balance.get("USDT") or live_balance.get("usdt")),
+                )
+                if portfolio_value > 0:
+                    portfolio_value_source = "exchange_balance_free"
+
+        warming = bool(portfolio_value <= 0)
+        warnings: List[str] = []
+        if warming:
+            warnings.append("account_state_warming")
+            portfolio_value_source = "warming_unavailable"
+
+        margin_level = (
+            (portfolio_value / total_exposure)
+            if (portfolio_value > 0 and total_exposure > 0)
+            else 0.0
+        )
+        if warming and total_exposure > 0:
+            risk_level = "unknown"
+        elif leverage_used >= 50 or margin_level < 0.05:
+            risk_level = "high"
+        elif leverage_used >= 20 or margin_level < 0.1:
+            risk_level = "medium"
+        else:
+            risk_level = "low"
+
+        return {
+            "portfolio_value": float(portfolio_value),
+            "total_exposure": float(total_exposure),
+            "var_95": 0.0,
+            "max_position_size": float(max_position_size),
+            "leverage_used": float(leverage_used),
+            "margin_level": float(margin_level),
+            "risk_level": risk_level,
+            "position_count": int(position_count),
+            "warnings": warnings,
+            "warming": warming,
+            "degraded": warming,
+            "portfolio_value_source": portfolio_value_source,
+            "portfolio_value_lower_bound": float(margin_used) if margin_used > 0 else 0.0,
+            "latest_account_state_at": latest_account_state_at,
+            "source": "main_controller:positions_estimated",
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.debug("estimate live risk metrics failed: %s", e)
+        return {}
+
+
+async def _discover_live_market_symbols(main_controller: Any, limit: int = 8) -> List[str]:
+    mc = main_controller
+    if not mc:
+        return []
+    seen: set[str] = set()
+    ordered: List[str] = []
+
+    def _add_symbol(value: Any) -> None:
+        symbol = str(value or "").strip()
+        if not symbol or symbol in seen:
+            return
+        seen.add(symbol)
+        ordered.append(symbol)
+
+    try:
+        ex = mc.get_exchange() if hasattr(mc, "get_exchange") else None
+        ex = ex or getattr(mc, "okx_exchange", None)
+        if ex and hasattr(ex, "get_positions"):
+            for row in await ex.get_positions():
+                if not isinstance(row, dict):
+                    continue
+                size_v = abs(_to_float(row.get("size") or row.get("pos") or row.get("positionAmt")))
+                if size_v <= 0:
+                    continue
+                _add_symbol(row.get("symbol") or row.get("instId"))
+    except Exception:
+        pass
+
+    latest = getattr(mc, "_latest_account_state", None)
+    try:
+        positions = latest.get("positions") if isinstance(latest, dict) else None
+        for row in positions or []:
+            if not isinstance(row, dict):
+                continue
+            size_v = abs(_to_float(row.get("size") or row.get("pos") or row.get("positionAmt")))
+            if size_v <= 0:
+                continue
+            _add_symbol(row.get("symbol") or row.get("instId"))
+    except Exception:
+        pass
+
+    try:
+        trade_service = getattr(mc, "trade_history_service", None)
+        if trade_service and hasattr(trade_service, "get_trade_history"):
+            rows = await trade_service.get_trade_history(limit=max(20, int(limit or 8) * 4))
+            for row in rows or []:
+                if (
+                    not isinstance(row, dict)
+                    or _is_placeholder_trade_row(row)
+                    or _is_low_fidelity_historical_trade_row(row)
+                ):
+                    continue
+                _add_symbol(row.get("symbol"))
+                if len(ordered) >= int(limit or 8):
+                    break
+    except Exception:
+        pass
+
+    return ordered[: max(1, int(limit or 8))]
+
+
+async def _load_live_market_data_status(main_controller: Any) -> Dict[str, Dict[str, Any]]:
+    mc = main_controller
+    hub = getattr(mc, "data_source_hub", None) if mc else None
+    if not hub or not hasattr(hub, "get_ticker"):
+        return {}
+    symbols = await _discover_live_market_symbols(mc)
+    result: Dict[str, Dict[str, Any]] = {}
+    now = datetime.now()
+    for symbol in symbols:
+        try:
+            ticker = await hub.get_ticker(symbol)
+        except Exception:
+            continue
+        if not isinstance(ticker, dict):
+            continue
+        last_price = _to_float(ticker.get("last") or ticker.get("price"))
+        bid = _to_float(ticker.get("bid"))
+        ask = _to_float(ticker.get("ask"))
+        volume = _to_float(ticker.get("volume"))
+        if last_price <= 0 and bid <= 0 and ask <= 0 and volume <= 0:
+            continue
+        ts = _parse_timestamp(ticker.get("timestamp"))
+        data_age = max(0.0, (now - ts).total_seconds()) if ts != datetime.min else 0.0
+        spread = max(0.0, ask - bid) if ask > 0 and bid > 0 else 0.0
+        result[str(symbol)] = {
+            "last_price": last_price,
+            "volume": volume,
+            "bid": bid,
+            "ask": ask,
+            "spread": spread,
+            "last_update": ticker.get("timestamp") or now.isoformat(),
+            "data_age": data_age,
+            "price_change_24h": _to_float(
+                ticker.get("price_change_24h")
+                or ticker.get("change_24h")
+                or ticker.get("change24h")
+                or ticker.get("change")
+            ),
+            "volume_change_24h": 0.0,
+            "volatility_24h": 0.0,
+            "price_momentum": 0.0,
+            "volume_momentum": 0.0,
+            "order_book_depth": 0.0,
+            "liquidity_score": 0.0,
+            "market_regime": "unknown",
+            "anomaly_score": 0.0,
+            "source": "main_controller:data_source_hub",
+        }
+    return result
 
 
 def _trade_series_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -215,11 +536,7 @@ async def _load_trade_rows(limit: int = 200, days: int = 30, realized_only: bool
     rows = await trade_service.get_trade_history(start_date=start_date, limit=max(1, int(limit or 200)), offset=0)
     out: List[Dict[str, Any]] = []
     for row in (rows or []):
-        if not isinstance(row, dict):
-            continue
-        md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        src = str((md.get("source") or row.get("source") or "")).strip().lower()
-        if src == "db_bootstrap":
+        if _is_placeholder_trade_row(row) or _is_low_fidelity_historical_trade_row(row):
             continue
         if realized_only:
             pnl = _to_float(row.get("pnl"))
@@ -287,6 +604,7 @@ async def get_monitoring_summary():
     try:
         rows = await _load_trade_rows(limit=5000, days=30, realized_only=False)
         if rows:
+            trace_lookup = _decision_trace_lookup()
             out["total_trades"] = len(rows)
             out["symbols"] = sorted(
                 {
@@ -297,21 +615,9 @@ async def get_monitoring_summary():
             )
             out["strategies"] = sorted(
                 {
-                    str(
-                        (r.get("metadata") or {}).get("strategy_id")
-                        or (r.get("metadata") or {}).get("strategy_used")
-                        or r.get("strategy")
-                        or r.get("strategy_used")
-                        or ""
-                    ).strip()
+                    resolve_trade_strategy_name(r, decision_trace_lookup=trace_lookup, default="").strip()
                     for r in rows
-                    if str(
-                        (r.get("metadata") or {}).get("strategy_id")
-                        or (r.get("metadata") or {}).get("strategy_used")
-                        or r.get("strategy")
-                        or r.get("strategy_used")
-                        or ""
-                    ).strip()
+                    if has_attributable_trade_strategy(r, decision_trace_lookup=trace_lookup)
                 }
             )
             out["trade_source"] = "trade_history_service"
@@ -399,8 +705,10 @@ async def get_trade_history(limit: int = Query(50, description="返回的交易�
     rows = await _load_trade_rows(limit=int(limit or 50), days=90, realized_only=False)
     if rows:
         out: List[Dict[str, Any]] = []
+        trace_lookup = _decision_trace_lookup()
         for row in rows[: max(1, int(limit or 50))]:
             md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            strategy_name = resolve_trade_strategy_name(row, decision_trace_lookup=trace_lookup, default="")
             out.append(
                 {
                     "order_id": row.get("order_id") or row.get("id") or row.get("trade_id"),
@@ -415,8 +723,8 @@ async def get_trade_history(limit: int = Query(50, description="返回的交易�
                     "fee": _to_float(row.get("fee")),
                     "pnl": _to_float(row.get("pnl")),
                     "pnl_percent": _to_float(row.get("pnl_percent")),
-                    "strategy": md.get("strategy_id") or md.get("strategy_used") or row.get("strategy"),
-                    "source": md.get("source") or row.get("source") or "trade_history_service",
+                    "strategy": strategy_name or None,
+                    "source": trade_source_name(row, default="trade_history_service"),
                 }
             )
         return out
@@ -446,18 +754,15 @@ async def get_strategy_performance():
     if rows:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
-            md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-            strategy_name = str(
-                md.get("strategy_id")
-                or md.get("strategy_used")
-                or row.get("strategy")
-                or row.get("strategy_used")
-                or "unknown"
-            ).strip() or "unknown"
+            if not _has_attributable_strategy(row):
+                continue
+            strategy_name = _strategy_name_for_performance(row)
             grouped.setdefault(strategy_name, []).append(row)
         result = {}
         for strategy_name, items in grouped.items():
             realized_items = _realized_trade_rows(items)
+            if not realized_items:
+                continue
             stats = _trade_series_metrics(realized_items)
             result[strategy_name] = {
                 **stats,
@@ -520,8 +825,15 @@ async def get_market_data_status():
             "order_book_depth": data.order_book_depth,
             "liquidity_score": data.liquidity_score,
             "market_regime": data.market_regime,
-            "anomaly_score": data.anomaly_score
+            "anomaly_score": data.anomaly_score,
+            "source": "trading_monitor",
         }
+    if result:
+        return result
+
+    live_result = await _load_live_market_data_status(_main_controller)
+    if live_result:
+        return live_result
     return result
 
 @router.get("/risk")
@@ -542,6 +854,9 @@ async def get_risk_metrics():
             "last_update": risk_metrics.last_update,
             "source": "trading_monitor",
         }
+    live_metrics = await _estimate_live_risk_metrics(_main_controller)
+    if live_metrics:
+        return live_metrics
     # Fallback: keep endpoint usable for dashboards even when no live risk sample
     return {
         "portfolio_value": 0.0,

@@ -275,6 +275,13 @@ class ConfigManager:
         value = self.get_config_sync("paths", key, default)
         return value if isinstance(value, str) and value else (default or "")
 
+    @staticmethod
+    def _values_equal(left: Any, right: Any) -> bool:
+        try:
+            return left == right
+        except Exception:
+            return False
+
     async def set_config(self, section: str, key: str, value: Any, validate: bool = True) -> bool:
         """
         设置配置值
@@ -293,6 +300,10 @@ class ConfigManager:
             old_value = None
             if section in self._config and key in self._config[section]:
                 old_value = self._config[section][key]
+
+            if self._values_equal(old_value, value):
+                logger.debug("配置未变化，跳过持久化: %s.%s", section, key)
+                return True
 
             # 验证配置（如果启用了验证）
             if validate:

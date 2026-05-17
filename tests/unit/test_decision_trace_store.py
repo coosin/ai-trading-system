@@ -43,6 +43,8 @@ def test_decision_trace_store_collects_semantic_context():
     assert row["workflow"]["mode"] == "advisory_only"
     assert row["workflow"]["current_stage"] == "guard:decision"
     assert row["workflow"]["status"] == "blocked"
+    assert row["agent_outputs"] == {}
+    assert row["semantic_signals"]["guard"]["risk_verdict"] == "deny"
     stages = [item["stage"] for item in row["stage_history"]]
     assert "intent" in stages
     assert "guard:decision" in stages

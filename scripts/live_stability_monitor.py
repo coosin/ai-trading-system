@@ -80,7 +80,9 @@ def read_log_tail_counts(log_path: Path, tail_lines: int) -> Dict[str, int]:
     }
     for line in lines:
         low = line.lower()
-        if "remoteprotocolerror" in low or "server disconnected" in low or "incomplete chunked read" in low:
+        if "可重试" not in line and (
+            "remoteprotocolerror" in low or "server disconnected" in low or "incomplete chunked read" in low
+        ):
             counts["disconnects"] += 1
         if "circuit-break" in low:
             counts["circuit_breaks"] += 1
@@ -141,6 +143,12 @@ def collect(base_url: str, log_path: Path, tail_lines: int, timeout: float) -> R
 
     health_data = health.get("data") if isinstance(health, dict) else {}
     diag_data = diag.get("data") if isinstance(diag, dict) else {}
+    if not isinstance(health_data, dict):
+        warnings.append("health_payload_invalid")
+        health_data = {}
+    if not isinstance(diag_data, dict):
+        warnings.append("trading_diag_payload_invalid")
+        diag_data = {}
     ai_core = diag_data.get("ai_core") if isinstance(diag_data.get("ai_core"), dict) else {}
     exec_gw = diag_data.get("execution_gateway") if isinstance(diag_data.get("execution_gateway"), dict) else {}
     sltp = diag_data.get("sltp") if isinstance(diag_data.get("sltp"), dict) else {}

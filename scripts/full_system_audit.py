@@ -98,6 +98,22 @@ def _parse_iso8601(value: Any) -> Optional[datetime]:
         return None
 
 
+def _is_expected_order_rejection(event: Dict[str, Any]) -> bool:
+    code = str(event.get("error_code") or "").strip().upper()
+    detail = str(event.get("detail") or "")
+    if code in {"POLICY_DENIED", "HOSTING_MODE_DENIED"}:
+        return True
+    expected_markers = (
+        "policy_denied",
+        "open_policy_denied",
+        "托管模式拦截",
+        "分层开仓拦截",
+        "置信度",
+        "执行建议等待",
+    )
+    return any(marker in detail for marker in expected_markers)
+
+
 def _resolve_last_order_state(exec_gw: Dict[str, Any]) -> Tuple[Optional[bool], Optional[str], str]:
     last_order_success = exec_gw.get("last_order_success")
     last_order_at = exec_gw.get("last_order_at")
@@ -108,6 +124,8 @@ def _resolve_last_order_state(exec_gw: Dict[str, Any]) -> Tuple[Optional[bool], 
 
     for event in exec_gw.get("recent_events") or []:
         if not isinstance(event, dict):
+            continue
+        if event.get("success") is False and _is_expected_order_rejection(event):
             continue
         event_dt = _parse_iso8601(event.get("ts"))
         if event_dt is None:

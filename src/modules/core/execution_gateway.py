@@ -1536,6 +1536,8 @@ class ExecutionGateway:
 
                             pnl_val: float = 0.0
                             pnl_pct_val: float = 0.0
+                            trigger_pnl_pct_val: Optional[float] = None
+                            realized_pnl_pct_val: Optional[float] = None
                             pnl_estimated: bool = True
                             try:
                                 realized_candidates = []
@@ -1565,16 +1567,20 @@ class ExecutionGateway:
                                 # 优先使用上游已计算的触发收益率（例如 SLTP 触发上下文），
                                 # 可避免由于价格/名义缺失导致的 pnl 长期为 0。
                                 if ctx.get("trigger_pnl_percent") is not None:
-                                    pnl_pct_val = float(ctx.get("trigger_pnl_percent") or 0.0)
-                                elif ctx.get("entry_price") is not None and price_val > 0:
+                                    trigger_pnl_pct_val = float(ctx.get("trigger_pnl_percent") or 0.0)
+                                if ctx.get("entry_price") is not None and price_val > 0:
                                     ep = float(ctx.get("entry_price") or 0)
                                     if ep > 0:
                                         sd = str(side or "").strip().lower()
                                         # close_swap 的 side 入参是 long/short（策略内部约定）；trade_history_service 会归一为 buy/sell
                                         if sd == "long":
-                                            pnl_pct_val = (price_val - ep) / ep
+                                            realized_pnl_pct_val = (price_val - ep) / ep
                                         elif sd == "short":
-                                            pnl_pct_val = (ep - price_val) / ep
+                                            realized_pnl_pct_val = (ep - price_val) / ep
+                                if realized_pnl_pct_val is not None:
+                                    pnl_pct_val = float(realized_pnl_pct_val)
+                                elif trigger_pnl_pct_val is not None:
+                                    pnl_pct_val = float(trigger_pnl_pct_val)
                                 if pnl_estimated:
                                     # 名义金额兜底：position_notional -> 合约 ctVal 估算 -> 数量*价格
                                     position_notional = float(ctx.get("position_notional") or 0.0)

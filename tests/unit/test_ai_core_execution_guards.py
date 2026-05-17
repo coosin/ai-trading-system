@@ -184,6 +184,78 @@ async def test_execute_decision_loss_streak_cooldown_rejects_and_records_reason(
 
 
 @pytest.mark.asyncio
+async def test_execute_hold_decision_records_four_agent_verdicts(tmp_path):
+    eng = _engine(tmp_path)
+
+    hold = _decision()
+    hold.action = "hold"
+    hold.quantity = 0
+    hold.leverage = 0
+    hold.reasoning = "unit_hold_trace"
+    hold.market_analysis = {"quality_score": 0.42, "confidence": 0.42}
+
+    ok = await eng._execute_decision(hold)
+
+    assert ok is True
+    assert eng.main_controller.execute_command.await_count == 0
+
+    trace = eng.main_controller.decision_trace_store.get_recent(1)[0]
+    assert trace["action"] == "hold"
+    assert trace["guard"]["reason"] == "hold_by_ai_decision"
+    assert {
+        "market_structure_agent",
+        "research_agent",
+        "risk_governor_agent",
+        "execution_coach_agent",
+    }.issubset(set((trace.get("agent_outputs") or {}).keys()))
+
+
+def test_parse_ai_decision_hold_does_not_create_duplicate_parsed_trace(tmp_path):
+    eng = AICoreDecisionEngine()
+    eng.main_controller = SimpleNamespace(
+        decision_trace_store=DecisionTraceStore(
+            max_items=20,
+            persist_path=str(tmp_path / "decision_trace_store.json"),
+        )
+    )
+
+    decision = eng._parse_ai_decision(
+        '{"action":"hold","confidence":0.31,"reasoning":"unit_parse_hold","strategy_used":"s1"}',
+        "BTC/USDT",
+    )
+
+    assert decision is not None
+    assert decision.action == "hold"
+    assert eng.main_controller.decision_trace_store.get_recent(20) == []
+
+
+def test_pre_decision_agent_advisory_builds_prompt_block(tmp_path):
+    eng = _engine(tmp_path)
+
+    advisory = eng._build_pre_decision_agent_advisory(
+        symbol="BTC/USDT",
+        market_data={"price": 100.0},
+        technical={"trend_1h": "bullish", "trend_4h": "bullish", "trend_1d": "bullish"},
+        strategy_advice={"strategies": [{"strategy_id": "unit_execute_strategy"}]},
+        risk_assessment={"level": "low"},
+        multi_source_analysis={"confidence": 0.72, "sentiment": "bullish", "recommendation": "buy"},
+        ai_engine_analysis={"trend": "bullish", "confidence": 0.75, "reasoning": "trend aligned"},
+        market_intelligence={
+            "confidence": 0.7,
+            "spread_bps": 8,
+            "quality_score": 0.8,
+            "signal_conflict_score": 0.12,
+            "execution_support": {"guards": {"depth_imbalance_top5": 0.1}},
+        },
+    )
+
+    assert advisory["verdicts"]
+    block = eng._format_agent_advisory_block(advisory)
+    assert "四智能体协同建议" in block
+    assert "risk=" in block
+
+
+@pytest.mark.asyncio
 async def test_execute_decision_full_positions_fallback_uses_gateway_only(tmp_path):
     eng = _engine(tmp_path)
     eng.exchange.probe_public_api = AsyncMock(

@@ -238,6 +238,12 @@ class StopLossTakeProfitConfig:
     dynamic_update_min_interval_sec: int = 20
     dynamic_tighten_ratio: float = 0.15
     dynamic_tp_extend_ratio: float = 0.10
+    # 监控环节价格源保护：
+    # - ticker 时间戳过旧时，优先回退到持仓 mark_price
+    # - ticker 与持仓 mark_price 明显偏离时，视为异常价格源，禁止直接用于 SLTP 触发
+    monitor_price_max_ticker_age_ms: float = 8000.0
+    monitor_price_guard_max_deviation: float = 0.02
+    monitor_price_prefer_position_mark: bool = True
     # 市场跟踪窗口与阈值：用于动态调整止盈止损和追踪偏移
     market_tracking_window: int = 20
     volatility_tighten_threshold: float = 0.02
@@ -394,6 +400,8 @@ class StopLossTakeProfitManager:
             "sr_breakeven_lock_applied": 0,
             "sr_near_resistance_events": 0,
             "sr_near_support_events": 0,
+            "monitor_price_guard_hits": 0,
+            "monitor_price_mark_fallback_hits": 0,
         }
 
         # 最近 SR 事件（用于运维/调参观测，避免必须翻日志）
@@ -553,6 +561,35 @@ class StopLossTakeProfitManager:
         logger.info("SLTP: 已取消同 index 旧 ACTIVE 单以便重建 order_id=%s key=%s", oid, nk)
         await self._save_orders()
 
+    async def _cancel_active_orders_for_coord(self, symbol: str, side: str) -> int:
+        """
+        同一标的/方向只保留一条 ACTIVE。
+        解决 legacy `ATOM/USDT|long` 与 canonical `pos:ATOM-USDT-SWAP|long`
+        因索引键不同导致的重复建单问题。
+        """
+        cancelled = 0
+        while True:
+            order = self._find_active_order_by_coord(symbol, side)
+            if not order or order.status != StopLossTakeProfitStatus.ACTIVE:
+                break
+            oid = str(order.order_id or "")
+            order.status = StopLossTakeProfitStatus.CANCELLED
+            order.updated_at = datetime.now()
+            order.trigger_reason = "replaced_by_new_sltp_coord"
+            for k in self._order_index_keys_to_clear(order):
+                if self.order_index.get(k) == oid:
+                    del self.order_index[k]
+            cancelled += 1
+            logger.info(
+                "SLTP: 已取消同 coord 旧 ACTIVE 单以便重建 order_id=%s coord=%s|%s",
+                oid,
+                symbol,
+                side,
+            )
+        if cancelled:
+            await self._save_orders()
+        return cancelled
+
     async def _fetch_live_position_size(self, symbol: str, side: str) -> Optional[float]:
         """平仓前从交易所拉取当前张数，减少 residual。"""
         ex = self._exchange
@@ -595,6 +632,143 @@ class StopLossTakeProfitManager:
             order.metadata = m
         except Exception:
             pass
+
+    def _record_last_close_execution_snapshot(
+        self,
+        order: StopLossTakeProfitOrder,
+        *,
+        reason: str,
+        requested_size: Optional[float],
+        effective_size: Optional[float],
+        live_remaining: Optional[float],
+    ) -> None:
+        """记录最近一次真实平仓执行快照，供 partial TP/SR 减仓后回填本地 remaining_quantity。"""
+        try:
+            meta = dict(order.metadata or {})
+            meta["last_close_execution"] = {
+                "reason": str(reason or ""),
+                "requested_size": float(requested_size) if requested_size is not None else None,
+                "effective_size": float(effective_size) if effective_size is not None else None,
+                "live_remaining": float(live_remaining) if live_remaining is not None else None,
+                "recorded_at": datetime.now().isoformat(),
+            }
+            order.metadata = meta
+        except Exception:
+            pass
+
+    def _consume_last_close_execution_snapshot(
+        self,
+        order: StopLossTakeProfitOrder,
+        *,
+        reason: str,
+        default_effective_size: float,
+    ) -> Tuple[float, Optional[float]]:
+        """
+        读取并清理最近一次平仓执行快照。
+        若原因不匹配或快照缺失，则回退到调用方提供的默认值。
+        """
+        effective_size = float(default_effective_size or 0.0)
+        live_remaining: Optional[float] = None
+        try:
+            meta = dict(order.metadata or {})
+            snap = meta.get("last_close_execution")
+            if not isinstance(snap, dict) or str(snap.get("reason") or "") != str(reason or ""):
+                return effective_size, live_remaining
+            if snap.get("effective_size") is not None:
+                effective_size = float(snap.get("effective_size") or 0.0)
+            if snap.get("live_remaining") is not None:
+                live_remaining = float(snap.get("live_remaining") or 0.0)
+            meta.pop("last_close_execution", None)
+            order.metadata = meta
+        except Exception:
+            pass
+        return effective_size, live_remaining
+
+    def _remember_quantize_zero_partial_block(
+        self,
+        order: StopLossTakeProfitOrder,
+        reason: str,
+        desired_close_size: float,
+        live_cap: Optional[float],
+    ) -> None:
+        try:
+            meta = dict(order.metadata or {})
+            blocked = dict(meta.get("partial_close_quantize_zero") or {})
+            blocked[str(reason or "")] = {
+                "remaining_quantity": float(order.remaining_quantity or order.quantity or 0.0),
+                "desired_close_size": float(desired_close_size or 0.0),
+                "live_cap": float(live_cap) if live_cap is not None else None,
+                "blocked_at": datetime.now().isoformat(),
+                "skip_logged": False,
+                "skip_count": 0,
+            }
+            meta["partial_close_quantize_zero"] = blocked
+            order.metadata = meta
+        except Exception:
+            pass
+
+    def _clear_quantize_zero_partial_block(
+        self, order: StopLossTakeProfitOrder, reason: str
+    ) -> None:
+        try:
+            meta = dict(order.metadata or {})
+            blocked = dict(meta.get("partial_close_quantize_zero") or {})
+            if str(reason or "") not in blocked:
+                return
+            blocked.pop(str(reason or ""), None)
+            if blocked:
+                meta["partial_close_quantize_zero"] = blocked
+            else:
+                meta.pop("partial_close_quantize_zero", None)
+            order.metadata = meta
+        except Exception:
+            pass
+
+    def _is_quantize_zero_partial_blocked(
+        self,
+        order: StopLossTakeProfitOrder,
+        reason: str,
+        desired_close_size: float,
+    ) -> bool:
+        try:
+            meta = dict(order.metadata or {})
+            blocked = dict(meta.get("partial_close_quantize_zero") or {})
+            row = blocked.get(str(reason or ""))
+            if not isinstance(row, dict):
+                return False
+
+            cur_remain = float(order.remaining_quantity or order.quantity or 0.0)
+            cur_desired = float(desired_close_size or 0.0)
+            prev_remain = float(row.get("remaining_quantity") or 0.0)
+            prev_desired = float(row.get("desired_close_size") or 0.0)
+            remain_tol = max(1e-12, abs(cur_remain) * 1e-9, abs(prev_remain) * 1e-9)
+            desired_tol = max(1e-12, abs(cur_desired) * 1e-9, abs(prev_desired) * 1e-9)
+
+            if abs(cur_remain - prev_remain) > remain_tol or abs(cur_desired - prev_desired) > desired_tol:
+                blocked.pop(str(reason or ""), None)
+                if blocked:
+                    meta["partial_close_quantize_zero"] = blocked
+                else:
+                    meta.pop("partial_close_quantize_zero", None)
+                order.metadata = meta
+                return False
+
+            row["skip_count"] = int(row.get("skip_count", 0) or 0) + 1
+            if not bool(row.get("skip_logged", False)):
+                logger.info(
+                    "⏭️ 跳过重复 partial close: %s reason=%s remain=%.6f desired=%.6f (previous quantize_zero)",
+                    order.symbol,
+                    reason,
+                    cur_remain,
+                    cur_desired,
+                )
+                row["skip_logged"] = True
+            blocked[str(reason or "")] = row
+            meta["partial_close_quantize_zero"] = blocked
+            order.metadata = meta
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _is_no_position_close_error(err: Any) -> bool:
@@ -768,6 +942,8 @@ class StopLossTakeProfitManager:
             close_sz = float(order.remaining_quantity or order.quantity or 0) or None
 
         explicit_partial = close_size is not None and float(close_size) > 1e-12
+        if explicit_partial and self._is_quantize_zero_partial_blocked(order, reason, float(close_size or 0.0)):
+            return False
         if explicit_partial and close_sz is not None and float(close_sz) > 1e-12:
             live_cap: Optional[float] = None
             try:
@@ -788,6 +964,7 @@ class StopLossTakeProfitManager:
                     reason,
                     msg,
                 )
+                self._remember_quantize_zero_partial_block(order, reason, float(close_sz or 0.0), live_cap)
                 self._note_close_failure_meta(order, msg, reason)
                 await self._emit_close_execution_audit(
                     order,
@@ -798,6 +975,7 @@ class StopLossTakeProfitManager:
                     gw_used=bool(gw),
                 )
                 return False
+            self._clear_quantize_zero_partial_block(order, reason)
             if abs(q - float(close_sz or 0)) > max(1e-12, float(close_sz or 0) * 1e-9):
                 logger.info(
                     "部分平仓张数对齐 lotSz: %s reason=%s %.8f -> %.8f",
@@ -808,6 +986,11 @@ class StopLossTakeProfitManager:
                 )
             close_sz = q
 
+        try:
+            await self._ensure_order_trade_linkage(order)
+        except Exception:
+            pass
+
         used_gateway = False
         try:
             if gw:
@@ -815,6 +998,8 @@ class StopLossTakeProfitManager:
                 meta_ctx = order.metadata or {}
                 trace_id = (
                     meta_ctx.get("trace_id")
+                    or meta_ctx.get("decision_trace_id")
+                    or meta_ctx.get("root_trace_id")
                     or meta_ctx.get("traceId")
                     or f"sltp:{getattr(order, 'order_id', '') or order.symbol}:{order.side}:{reason}"
                 )
@@ -881,6 +1066,8 @@ class StopLossTakeProfitManager:
                                     meta_ctx = order.metadata or {}
                                     trace_id = (
                                         meta_ctx.get("trace_id")
+                                        or meta_ctx.get("decision_trace_id")
+                                        or meta_ctx.get("root_trace_id")
                                         or meta_ctx.get("traceId")
                                         or f"sltp:{getattr(order, 'order_id', '') or order.symbol}:{order.side}:{reason}"
                                     )
@@ -920,6 +1107,25 @@ class StopLossTakeProfitManager:
                             except Exception:
                                 pass
             if ok:
+                live_remaining: Optional[float] = None
+                try:
+                    post = (res or {}).get("post_close_check") if isinstance(res, dict) else None
+                    if isinstance(post, dict) and post.get("after_size") is not None:
+                        live_remaining = abs(float(post.get("after_size") or 0.0))
+                except Exception:
+                    live_remaining = None
+                if live_remaining is None:
+                    try:
+                        live_remaining = await self._fetch_live_position_size(order.symbol, order.side)
+                    except Exception:
+                        live_remaining = None
+                self._record_last_close_execution_snapshot(
+                    order,
+                    reason=reason,
+                    requested_size=float(close_size) if close_size is not None else None,
+                    effective_size=float(close_sz) if close_sz is not None else None,
+                    live_remaining=live_remaining,
+                )
                 logger.info("✅ 止盈止损实盘平仓已提交: %s reason=%s", order.symbol, reason)
                 # 仅当全平时清理索引；部分平仓保持 ACTIVE 跟踪。
                 try:
@@ -1332,6 +1538,174 @@ class StopLossTakeProfitManager:
                 continue
         return None
 
+    def _extract_position_mark_price(self, position_row: Optional[Dict[str, Any]]) -> float:
+        if not isinstance(position_row, dict):
+            return 0.0
+        for key in ("mark_price", "mark_px", "current_price", "last"):
+            try:
+                px = float(position_row.get(key, 0) or 0)
+            except Exception:
+                px = 0.0
+            if px > 0:
+                return px
+        return 0.0
+
+    def _extract_ticker_age_ms(self, ticker: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not isinstance(ticker, dict):
+            return None
+        try:
+            ts = float(ticker.get("timestamp", 0) or 0)
+        except Exception:
+            ts = 0.0
+        if ts <= 0:
+            return None
+        if ts < 1e11:
+            ts *= 1000.0
+        return max(0.0, (time.time() * 1000.0) - ts)
+
+    def _remember_monitor_price_resolution(
+        self,
+        order: "StopLossTakeProfitOrder",
+        *,
+        source: str,
+        resolved_price: float,
+        ticker_price: float,
+        mark_price: float,
+        ticker_age_ms: Optional[float],
+        deviation_ratio: Optional[float],
+        note: Optional[str] = None,
+    ) -> None:
+        try:
+            meta = dict(order.metadata or {})
+            info: Dict[str, Any] = {
+                "source": str(source or ""),
+                "resolved_price": float(resolved_price or 0.0),
+                "ticker_price": float(ticker_price) if ticker_price > 0 else None,
+                "mark_price": float(mark_price) if mark_price > 0 else None,
+                "ticker_age_ms": float(ticker_age_ms) if ticker_age_ms is not None else None,
+                "deviation_ratio": float(deviation_ratio) if deviation_ratio is not None else None,
+                "resolved_at": datetime.now().isoformat(),
+            }
+            if note:
+                info["note"] = str(note)
+            meta["last_monitor_price"] = info
+            order.metadata = meta
+        except Exception:
+            pass
+
+    def _resolve_monitor_price(
+        self,
+        order: "StopLossTakeProfitOrder",
+        ticker: Optional[Dict[str, Any]],
+        position_row: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[float, str]:
+        ticker_price = 0.0
+        if isinstance(ticker, dict):
+            try:
+                ticker_price = float(ticker.get("last", 0) or 0)
+            except Exception:
+                ticker_price = 0.0
+        mark_price = self._extract_position_mark_price(position_row)
+        ticker_age_ms = self._extract_ticker_age_ms(ticker)
+        deviation_ratio: Optional[float] = None
+        max_age_ms = max(
+            0.0,
+            float(getattr(self.config, "monitor_price_max_ticker_age_ms", 8000.0) or 8000.0),
+        )
+        max_deviation = max(
+            0.0,
+            float(getattr(self.config, "monitor_price_guard_max_deviation", 0.02) or 0.02),
+        )
+
+        if ticker_price > 0 and mark_price > 0:
+            deviation_ratio = abs(ticker_price - mark_price) / max(1e-12, abs(mark_price))
+            if deviation_ratio >= max_deviation:
+                self._stats["monitor_price_guard_hits"] += 1
+                resolved = mark_price if bool(getattr(self.config, "monitor_price_prefer_position_mark", True)) else ticker_price
+                source = "position_mark_guard" if resolved == mark_price else "ticker_divergence_guard_disabled"
+                self._remember_monitor_price_resolution(
+                    order,
+                    source=source,
+                    resolved_price=resolved,
+                    ticker_price=ticker_price,
+                    mark_price=mark_price,
+                    ticker_age_ms=ticker_age_ms,
+                    deviation_ratio=deviation_ratio,
+                    note="ticker_mark_price_divergence",
+                )
+                logger.warning(
+                    "SLTP 价格源异常，改用更可信价格: %s side=%s ticker=%.6f mark=%.6f dev=%.2f%% source=%s",
+                    order.symbol,
+                    order.side,
+                    ticker_price,
+                    mark_price,
+                    deviation_ratio * 100.0,
+                    source,
+                )
+                return resolved, source
+
+        if ticker_price > 0 and (ticker_age_ms is None or ticker_age_ms <= max_age_ms):
+            self._remember_monitor_price_resolution(
+                order,
+                source="ticker",
+                resolved_price=ticker_price,
+                ticker_price=ticker_price,
+                mark_price=mark_price,
+                ticker_age_ms=ticker_age_ms,
+                deviation_ratio=deviation_ratio,
+            )
+            return ticker_price, "ticker"
+
+        if mark_price > 0:
+            self._stats["monitor_price_mark_fallback_hits"] += 1
+            source = "position_mark_stale_ticker_fallback" if ticker_price > 0 else "position_mark_fallback"
+            note = "stale_ticker" if ticker_price > 0 else "missing_ticker"
+            self._remember_monitor_price_resolution(
+                order,
+                source=source,
+                resolved_price=mark_price,
+                ticker_price=ticker_price,
+                mark_price=mark_price,
+                ticker_age_ms=ticker_age_ms,
+                deviation_ratio=deviation_ratio,
+                note=note,
+            )
+            if ticker_price > 0 and ticker_age_ms is not None:
+                logger.warning(
+                    "SLTP ticker 过旧，回退到持仓 mark_price: %s side=%s ticker=%.6f age=%.0fms mark=%.6f",
+                    order.symbol,
+                    order.side,
+                    ticker_price,
+                    ticker_age_ms,
+                    mark_price,
+                )
+            return mark_price, source
+
+        if ticker_price > 0:
+            self._remember_monitor_price_resolution(
+                order,
+                source="ticker_stale_no_mark",
+                resolved_price=ticker_price,
+                ticker_price=ticker_price,
+                mark_price=mark_price,
+                ticker_age_ms=ticker_age_ms,
+                deviation_ratio=deviation_ratio,
+                note="no_position_mark_available",
+            )
+            return ticker_price, "ticker_stale_no_mark"
+
+        self._remember_monitor_price_resolution(
+            order,
+            source="unavailable",
+            resolved_price=0.0,
+            ticker_price=ticker_price,
+            mark_price=mark_price,
+            ticker_age_ms=ticker_age_ms,
+            deviation_ratio=deviation_ratio,
+            note="no_monitor_price_available",
+        )
+        return 0.0, "unavailable"
+
     async def _dedupe_active_orders_by_coord(
         self,
         keep_order: "StopLossTakeProfitOrder",
@@ -1370,17 +1744,11 @@ class StopLossTakeProfitManager:
 
     async def _heal_active_order_index_from_position(
         self, order: "StopLossTakeProfitOrder", p: Dict[str, Any]
-    ) -> None:
+    ) -> bool:
         """将本地 ACTIVE 单的 index/position 键与交易所 instId 对齐，并重建 order_index 映射。"""
         inst_id = str(p.get("instId") or "").strip()
         side = self._resolved_side_from_position(p)
         sym = self._canonical_symbol_from_position(p)
-        for vk in self._order_index_keys_to_clear(order):
-            try:
-                if self.order_index.get(vk) == order.order_id:
-                    del self.order_index[vk]
-            except Exception:
-                pass
         canonical, variants, meta_new = await self._resolve_canonical_and_variants(
             symbol=sym,
             side=side,
@@ -1390,6 +1758,39 @@ class StopLossTakeProfitManager:
                 "posSide": side,
             },
         )
+        target_keys = {
+            self._normalize_any_key(k) for k in (variants + [canonical]) if str(k or "").strip()
+        }
+        current_meta = dict(order.metadata or {})
+        current_keys = {k for k, oid in self.order_index.items() if oid == order.order_id}
+        current_index = self._normalize_any_key(
+            current_meta.get("index_key") or f"{order.symbol}|{order.side}"
+        )
+        expected_position = str(meta_new.get("position_key") or "").strip()
+        current_position = str(current_meta.get("position_key") or "").strip()
+        mapping_aligned = (
+            bool(target_keys)
+            and current_keys == target_keys
+            and all(self.order_index.get(k) == order.order_id for k in target_keys)
+        )
+        if (
+            str(order.symbol or "").strip() == sym
+            and str(order.side or "").strip().lower() == side
+            and current_index == canonical
+            and (not expected_position or current_position == expected_position)
+            and mapping_aligned
+        ):
+            return False
+
+        for vk in self._order_index_keys_to_clear(order):
+            try:
+                if self.order_index.get(vk) == order.order_id:
+                    del self.order_index[vk]
+            except Exception:
+                pass
+        for vk in current_keys:
+            if self.order_index.get(vk) == order.order_id:
+                del self.order_index[vk]
         meta = dict(order.metadata or {})
         meta.update(meta_new)
         meta["healed_at"] = datetime.now().isoformat()
@@ -1405,6 +1806,7 @@ class StopLossTakeProfitManager:
             side,
             canonical,
         )
+        return True
 
     async def sync_open_positions_from_exchange(self) -> Dict[str, Any]:
         """
@@ -1465,8 +1867,8 @@ class StopLossTakeProfitManager:
                 if idx_key not in live_norm:
                     match_p = self._match_exchange_position_row(order, positions)
                     if match_p:
-                        await self._heal_active_order_index_from_position(order, match_p)
-                        stale_healed += 1
+                        if await self._heal_active_order_index_from_position(order, match_p):
+                            stale_healed += 1
                         continue
                     order.status = StopLossTakeProfitStatus.CANCELLED
                     order.trigger_reason = "stale_not_in_exchange"
@@ -1641,6 +2043,7 @@ class StopLossTakeProfitManager:
                     "inferred_at": datetime.now().isoformat(),
                 }
 
+        await self._cancel_active_orders_for_coord(symbol, side)
         await self._cancel_active_orders_for_index_key(canonical)
 
         order_id = self._generate_order_id(canonical)
@@ -1857,6 +2260,53 @@ class StopLossTakeProfitManager:
             if trace_id:
                 return trace_id
         return None
+
+    @staticmethod
+    def _has_canonical_order_trace(metadata: Optional[Dict[str, Any]]) -> bool:
+        meta = metadata if isinstance(metadata, dict) else {}
+        trace_id = str(
+            meta.get("trace_id")
+            or meta.get("decision_trace_id")
+            or meta.get("root_trace_id")
+            or meta.get("traceId")
+            or ""
+        ).strip()
+        return bool(trace_id and not trace_id.startswith("sltp:"))
+
+    async def _ensure_order_trade_linkage(self, order: StopLossTakeProfitOrder) -> Dict[str, Any]:
+        meta = dict(order.metadata or {})
+        changed = False
+
+        if not str(meta.get("strategy_id") or meta.get("strategy_used") or meta.get("strategy") or "").strip():
+            inferred_strategy_id = await self._infer_strategy_id_for_live_position(symbol=order.symbol, side=order.side)
+            if inferred_strategy_id:
+                meta["strategy_id"] = inferred_strategy_id
+                meta.setdefault("strategy_used", inferred_strategy_id)
+                meta.setdefault("strategy", inferred_strategy_id)
+                changed = True
+
+        if not self._has_canonical_order_trace(meta):
+            inferred_trace_id = await self._infer_trace_id_for_live_position(symbol=order.symbol, side=order.side)
+            if inferred_trace_id:
+                raw_trace_id = str(meta.get("trace_id") or meta.get("traceId") or "").strip()
+                if raw_trace_id and raw_trace_id != inferred_trace_id:
+                    meta.setdefault("trigger_trace_id", raw_trace_id)
+                meta["trace_id"] = inferred_trace_id
+                meta["decision_trace_id"] = inferred_trace_id
+                meta["root_trace_id"] = inferred_trace_id
+                trace_attr = meta.get("trace_attribution") if isinstance(meta.get("trace_attribution"), dict) else {}
+                trace_attr.setdefault("method", "sltp_close_inferred_from_recent_open")
+                trace_attr["canonical_trace_id"] = inferred_trace_id
+                if raw_trace_id and raw_trace_id != inferred_trace_id:
+                    trace_attr.setdefault("trigger_trace_id", raw_trace_id)
+                trace_attr["inferred_at"] = datetime.now().isoformat()
+                meta["trace_attribution"] = trace_attr
+                changed = True
+
+        if changed:
+            order.metadata = meta
+            await self._save_orders()
+        return meta
 
     def _sanitize_sl_tp_vs_entry(
         self,
@@ -2139,10 +2589,13 @@ class StopLossTakeProfitManager:
                 done.add(level_percent)
                 continue
 
+            partial_reason = f"partial_take_profit_{int(level_percent * 100)}"
+            if self._is_quantize_zero_partial_blocked(order, partial_reason, close_qty):
+                continue
             # 实盘部分平仓：通过 ExecutionGateway/Exchange 真正减仓，避免仅本地变更造成漂移。
             ok = await self._execute_exchange_close_on_trigger(
                 order,
-                reason=f"partial_take_profit_{int(level_percent * 100)}",
+                reason=partial_reason,
                 close_size=close_qty,
             )
             if not ok:
@@ -2154,8 +2607,16 @@ class StopLossTakeProfitManager:
                 )
                 continue
 
-            order.remaining_quantity = max(0.0, float(order.remaining_quantity or 0) - close_qty)
-            order.partial_tp_executed.append((level_percent, close_qty))
+            executed_close_qty, live_remaining = self._consume_last_close_execution_snapshot(
+                order,
+                reason=partial_reason,
+                default_effective_size=close_qty,
+            )
+            if live_remaining is not None:
+                order.remaining_quantity = max(0.0, float(live_remaining))
+            else:
+                order.remaining_quantity = max(0.0, float(order.remaining_quantity or 0) - executed_close_qty)
+            order.partial_tp_executed.append((level_percent, executed_close_qty))
             self._stats["partial_tp_executed"] += 1
             done.add(level_percent)
             meta["layered_partial_done_levels"] = sorted(list(done))
@@ -2166,10 +2627,10 @@ class StopLossTakeProfitManager:
                 order.symbol,
                 level_percent * 100.0,
                 level_ratio * 100.0,
-                close_qty,
+                executed_close_qty,
                 float(order.remaining_quantity or 0),
             )
-            await self._notify_callbacks("on_partial_tp", order, level_percent, close_qty)
+            await self._notify_callbacks("on_partial_tp", order, level_percent, executed_close_qty)
 
             if float(order.remaining_quantity or 0) <= 1e-12:
                 order.status = StopLossTakeProfitStatus.TRIGGERED
@@ -2425,24 +2886,36 @@ class StopLossTakeProfitManager:
                         close_ratio = float(getattr(self.config, "sr_partial_close_ratio", 0.25) or 0.25)
                         close_ratio = min(0.8, max(0.05, close_ratio))
                         if order.side == "long" and near_res and (not brk_up):
+                            partial_reason = "sr_near_resistance_partial_take_profit"
                             self._stats["sr_near_resistance_events"] += 1
                             if not bool(meta.get("sr_partial_done_near_resistance", False)):
-                                if not self._take_profit_edge_ok(order, pnl, reason="sr_near_resistance_partial_take_profit"):
+                                if not self._take_profit_edge_ok(order, pnl, reason=partial_reason):
                                     return
                                 close_qty = max(
                                     0.0, min(float(order.remaining_quantity or 0.0), float(order.remaining_quantity or 0.0) * close_ratio)
                                 )
-                                if close_qty > 1e-12:
+                                if close_qty > 1e-12 and (not self._is_quantize_zero_partial_blocked(order, partial_reason, close_qty)):
                                     self._stats["sr_partial_tp_triggered"] += 1
                                     ok = await self._execute_exchange_close_on_trigger(
                                         order,
-                                        reason="sr_near_resistance_partial_take_profit",
+                                        reason=partial_reason,
                                         close_size=close_qty,
                                     )
                                     if ok:
+                                        executed_close_qty, live_remaining = self._consume_last_close_execution_snapshot(
+                                            order,
+                                            reason=partial_reason,
+                                            default_effective_size=close_qty,
+                                        )
                                         self._stats["sr_partial_tp_success"] += 1
-                                        order.remaining_quantity = max(0.0, float(order.remaining_quantity or 0.0) - close_qty)
-                                        order.partial_tp_executed.append((float(pnl), close_qty))
+                                        if live_remaining is not None:
+                                            order.remaining_quantity = max(0.0, float(live_remaining))
+                                        else:
+                                            order.remaining_quantity = max(
+                                                0.0,
+                                                float(order.remaining_quantity or 0.0) - executed_close_qty,
+                                            )
+                                        order.partial_tp_executed.append((float(pnl), executed_close_qty))
                                         self._stats["partial_tp_executed"] += 1
                                         meta["sr_partial_done_near_resistance"] = True
                                         self._record_sr_event(
@@ -2451,7 +2924,7 @@ class StopLossTakeProfitManager:
                                                 "side": order.side,
                                                 "event": "sr_near_resistance_partial_tp",
                                                 "pnl_percent": float(pnl),
-                                                "close_qty": float(close_qty),
+                                                "close_qty": float(executed_close_qty),
                                                 "remain_qty": float(order.remaining_quantity or 0.0),
                                                 "sr": dict(sr_snapshot),
                                             }
@@ -2459,24 +2932,40 @@ class StopLossTakeProfitManager:
                                         logger.info(
                                             "🎯 关键位分批止盈: %s near_resistance close=%.6f remain=%.6f",
                                             order.symbol,
-                                            close_qty,
+                                            executed_close_qty,
                                             float(order.remaining_quantity or 0.0),
                                         )
                                     else:
-                                        self._stats["sr_partial_tp_failed"] += 1
-                                        self._record_sr_event(
-                                            self._enrich_sr_event_with_close_error(
-                                                order,
-                                                {
-                                                    "symbol": order.symbol,
-                                                    "side": order.side,
-                                                    "event": "sr_near_resistance_partial_tp_failed",
-                                                    "pnl_percent": float(pnl),
-                                                    "close_qty": float(close_qty),
-                                                    "sr": dict(sr_snapshot),
-                                                },
+                                        if self._is_quantize_zero_partial_blocked(order, partial_reason, close_qty):
+                                            self._record_sr_event(
+                                                self._enrich_sr_event_with_close_error(
+                                                    order,
+                                                    {
+                                                        "symbol": order.symbol,
+                                                        "side": order.side,
+                                                        "event": "sr_near_resistance_partial_tp_skipped",
+                                                        "skip_reason": "quantize_zero",
+                                                        "pnl_percent": float(pnl),
+                                                        "close_qty": float(close_qty),
+                                                        "sr": dict(sr_snapshot),
+                                                    },
+                                                )
                                             )
-                                        )
+                                        else:
+                                            self._stats["sr_partial_tp_failed"] += 1
+                                            self._record_sr_event(
+                                                self._enrich_sr_event_with_close_error(
+                                                    order,
+                                                    {
+                                                        "symbol": order.symbol,
+                                                        "side": order.side,
+                                                        "event": "sr_near_resistance_partial_tp_failed",
+                                                        "pnl_percent": float(pnl),
+                                                        "close_qty": float(close_qty),
+                                                        "sr": dict(sr_snapshot),
+                                                    },
+                                                )
+                                            )
                             lock_sl = float(order.entry_price or 0.0) * (1.0 + lock_pct)
                             # 多单止损上移时，禁止推到当前价之上（避免立即触发）。
                             if lock_sl > 0 and lock_sl < float(current_price or 0.0) and (float(order.stop_loss_price or 0.0) < lock_sl):
@@ -2490,28 +2979,40 @@ class StopLossTakeProfitManager:
                                         "lock_sl": float(lock_sl),
                                         "pnl_percent": float(pnl),
                                         "sr": dict(sr_snapshot),
-                                    }
-                                )
+                                        }
+                                    )
                                 changed = True
                         elif order.side == "short" and near_sup and (not brk_down):
+                            partial_reason = "sr_near_support_partial_take_profit"
                             self._stats["sr_near_support_events"] += 1
                             if not bool(meta.get("sr_partial_done_near_support", False)):
-                                if not self._take_profit_edge_ok(order, pnl, reason="sr_near_support_partial_take_profit"):
+                                if not self._take_profit_edge_ok(order, pnl, reason=partial_reason):
                                     return
                                 close_qty = max(
                                     0.0, min(float(order.remaining_quantity or 0.0), float(order.remaining_quantity or 0.0) * close_ratio)
                                 )
-                                if close_qty > 1e-12:
+                                if close_qty > 1e-12 and (not self._is_quantize_zero_partial_blocked(order, partial_reason, close_qty)):
                                     self._stats["sr_partial_tp_triggered"] += 1
                                     ok = await self._execute_exchange_close_on_trigger(
                                         order,
-                                        reason="sr_near_support_partial_take_profit",
+                                        reason=partial_reason,
                                         close_size=close_qty,
                                     )
                                     if ok:
+                                        executed_close_qty, live_remaining = self._consume_last_close_execution_snapshot(
+                                            order,
+                                            reason=partial_reason,
+                                            default_effective_size=close_qty,
+                                        )
                                         self._stats["sr_partial_tp_success"] += 1
-                                        order.remaining_quantity = max(0.0, float(order.remaining_quantity or 0.0) - close_qty)
-                                        order.partial_tp_executed.append((float(pnl), close_qty))
+                                        if live_remaining is not None:
+                                            order.remaining_quantity = max(0.0, float(live_remaining))
+                                        else:
+                                            order.remaining_quantity = max(
+                                                0.0,
+                                                float(order.remaining_quantity or 0.0) - executed_close_qty,
+                                            )
+                                        order.partial_tp_executed.append((float(pnl), executed_close_qty))
                                         self._stats["partial_tp_executed"] += 1
                                         meta["sr_partial_done_near_support"] = True
                                         self._record_sr_event(
@@ -2520,7 +3021,7 @@ class StopLossTakeProfitManager:
                                                 "side": order.side,
                                                 "event": "sr_near_support_partial_tp",
                                                 "pnl_percent": float(pnl),
-                                                "close_qty": float(close_qty),
+                                                "close_qty": float(executed_close_qty),
                                                 "remain_qty": float(order.remaining_quantity or 0.0),
                                                 "sr": dict(sr_snapshot),
                                             }
@@ -2532,20 +3033,36 @@ class StopLossTakeProfitManager:
                                             float(order.remaining_quantity or 0.0),
                                         )
                                     else:
-                                        self._stats["sr_partial_tp_failed"] += 1
-                                        self._record_sr_event(
-                                            self._enrich_sr_event_with_close_error(
-                                                order,
-                                                {
-                                                    "symbol": order.symbol,
-                                                    "side": order.side,
-                                                    "event": "sr_near_support_partial_tp_failed",
-                                                    "pnl_percent": float(pnl),
-                                                    "close_qty": float(close_qty),
-                                                    "sr": dict(sr_snapshot),
-                                                },
+                                        if self._is_quantize_zero_partial_blocked(order, partial_reason, close_qty):
+                                            self._record_sr_event(
+                                                self._enrich_sr_event_with_close_error(
+                                                    order,
+                                                    {
+                                                        "symbol": order.symbol,
+                                                        "side": order.side,
+                                                        "event": "sr_near_support_partial_tp_skipped",
+                                                        "skip_reason": "quantize_zero",
+                                                        "pnl_percent": float(pnl),
+                                                        "close_qty": float(close_qty),
+                                                        "sr": dict(sr_snapshot),
+                                                    },
+                                                )
                                             )
-                                        )
+                                        else:
+                                            self._stats["sr_partial_tp_failed"] += 1
+                                            self._record_sr_event(
+                                                self._enrich_sr_event_with_close_error(
+                                                    order,
+                                                    {
+                                                        "symbol": order.symbol,
+                                                        "side": order.side,
+                                                        "event": "sr_near_support_partial_tp_failed",
+                                                        "pnl_percent": float(pnl),
+                                                        "close_qty": float(close_qty),
+                                                        "sr": dict(sr_snapshot),
+                                                    },
+                                                )
+                                            )
                             lock_sl = float(order.entry_price or 0.0) * (1.0 - lock_pct)
                             cur_sl = float(order.stop_loss_price or 0.0)
                             # 空单止损下移时，禁止推到当前价之下（避免立即触发）。
@@ -2581,7 +3098,9 @@ class StopLossTakeProfitManager:
                 if sr_snapshot:
                     meta["last_sr_snapshot"] = sr_snapshot
                 meta["last_trailing_offset"] = float(order.trailing_stop_offset)
-                order.metadata = meta
+                merged_meta = dict(order.metadata or {})
+                merged_meta.update(meta)
+                order.metadata = merged_meta
                 logger.info(
                     "🧭 动态调整SL/TP: %s side=%s pnl=%.2f%% sl=%.4f tp=%.4f tr_off=%.4f spread=%s imb=%s trend=%.4f vol=%.4f",
                     order.symbol,
@@ -3511,15 +4030,22 @@ class StopLossTakeProfitManager:
                         await self._save_orders()
                     except Exception as e:
                         logger.warning("SLTP pending close retry failed: %s", e)
-                
+
+                live_positions: List[Dict[str, Any]] = []
+                if hasattr(self._exchange, "get_positions"):
+                    try:
+                        live_positions = list(await self._exchange.get_positions() or [])
+                    except Exception as e:
+                        logger.debug("SLTP monitor get_positions failed: %s", e)
+
                 for order in active_orders:
                     try:
+                        position_row = self._match_exchange_position_row(order, live_positions) if live_positions else None
                         ticker = await self._exchange.get_ticker(order.symbol)
-                        if ticker:
-                            current_price = ticker.get("last", 0)
-                            if current_price > 0:
-                                idx = (order.metadata or {}).get("index_key") or order.symbol
-                                await self.update_price(order.symbol, current_price, index_key=idx)
+                        current_price, _price_source = self._resolve_monitor_price(order, ticker, position_row)
+                        if current_price > 0:
+                            idx = (order.metadata or {}).get("index_key") or order.symbol
+                            await self.update_price(order.symbol, current_price, index_key=idx)
                     except Exception as e:
                         logger.error(f"更新 {order.symbol} 价格失败: {e}")
                 

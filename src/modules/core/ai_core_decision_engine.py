@@ -33,6 +33,31 @@ def _ensure_utc(dt: datetime) -> datetime:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+
+def _is_expected_execution_rejection(message: Any) -> bool:
+    text = str(message or "")
+    expected_markers = (
+        "分层开仓拦截",
+        "风控智能体否决",
+        "执行建议等待",
+        "置信度",
+        "超过上限",
+    )
+    return any(marker in text for marker in expected_markers)
+
+
+_PLACEHOLDER_STRATEGY_USED = {
+    "",
+    "?",
+    "-",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "unknown",
+    "unassigned",
+}
+
 from src.modules.memory.memory_schema import base_metadata, kind_tag, symbol_tag, tags
 from src.modules.core.trading_limits import resolve_position_limits
 from src.modules.core.decision_trace_store import DecisionTraceStore
@@ -774,6 +799,201 @@ class AICoreDecisionEngine:
 禁止仅因本段文字下单或放宽系统最小置信度要求；若开仓须在 reasoning 中说明如何与扫描结论一致或为何不采纳。
 """
 
+    @staticmethod
+    def _is_placeholder_strategy_used(value: Any) -> bool:
+        return str(value or "").strip().lower() in _PLACEHOLDER_STRATEGY_USED
+
+    def _normalize_runtime_strategy_used(
+        self,
+        value: Any,
+        *,
+        symbol: str,
+        reasoning: str = "",
+        strategy_advice: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        current = str(value or "").strip()
+        if current and not self._is_placeholder_strategy_used(current):
+            return current
+
+        candidates: List[str] = []
+        pref = str(getattr(self, "_preferred_strategy_id", "") or "").strip()
+        if pref:
+            candidates.append(pref)
+        strategies = strategy_advice.get("strategies") if isinstance(strategy_advice, dict) else []
+        first_strategy = strategies[0] if isinstance(strategies, list) and strategies else {}
+        if isinstance(first_strategy, dict):
+            candidates.append(str(first_strategy.get("strategy_id") or first_strategy.get("name") or "").strip())
+        for candidate in candidates:
+            if candidate and not self._is_placeholder_strategy_used(candidate):
+                return candidate
+
+        reasoning_s = str(reasoning or "").strip().lower()
+        if "llm_unavailable_fallback" in reasoning_s:
+            return "s1_llm_unavailable_fallback"
+        if "ai_autonomy_override" in reasoning_s:
+            return "s1_ai_autonomy_override"
+
+        scanner_ctx = self._scanner_trace_context(symbol)
+        if any(
+            scanner_ctx.get(key)
+            for key in (
+                "upstream_scanner_trace_id",
+                "upstream_scanner_opportunity_type",
+            )
+        ):
+            return "scanner_opportunity"
+        return ""
+
+    def _build_pre_decision_agent_advisory(
+        self,
+        *,
+        symbol: str,
+        market_data: Dict[str, Any],
+        technical: Dict[str, Any],
+        strategy_advice: Dict[str, Any],
+        risk_assessment: Dict[str, Any],
+        multi_source_analysis: Optional[Dict[str, Any]] = None,
+        ai_engine_analysis: Optional[Dict[str, Any]] = None,
+        market_intelligence: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        multi = multi_source_analysis if isinstance(multi_source_analysis, dict) else {}
+        ai_view = ai_engine_analysis if isinstance(ai_engine_analysis, dict) else {}
+        mi = market_intelligence if isinstance(market_intelligence, dict) else {}
+        strategies = strategy_advice.get("strategies") if isinstance(strategy_advice, dict) else []
+        first_strategy = strategies[0] if isinstance(strategies, list) and strategies else {}
+        strategy_id = ""
+        if isinstance(first_strategy, dict):
+            strategy_id = str(first_strategy.get("strategy_id") or first_strategy.get("name") or "").strip()
+
+        guards = (mi.get("execution_support") or {}).get("guards") if isinstance(mi.get("execution_support"), dict) else {}
+        decision_confidence = max(
+            float(multi.get("confidence", 0.0) or 0.0),
+            float(ai_view.get("confidence", 0.0) or 0.0),
+            float(mi.get("confidence", 0.0) or 0.0),
+        )
+        market_snapshot = {
+            "price": market_data.get("price"),
+            "trend": ai_view.get("trend") or technical.get("trend_1h"),
+            "trend_1h": technical.get("trend_1h"),
+            "trend_4h": technical.get("trend_4h"),
+            "trend_1d": technical.get("trend_1d"),
+            "confidence": decision_confidence,
+            "spread_bps": mi.get("spread_bps"),
+            "depth_imbalance": guards.get("depth_imbalance_top5") if isinstance(guards, dict) else None,
+            "funding_rate": mi.get("funding_rate"),
+            "open_interest": mi.get("open_interest"),
+            "quality_score": mi.get("quality_score"),
+            "liquidity_state": mi.get("liquidity_state"),
+            "execution_quality_state": mi.get("execution_quality_state"),
+            "signal_conflict_score": mi.get("signal_conflict_score"),
+            "volatility_state": mi.get("volatility_state"),
+            "derivatives_state": mi.get("derivatives_state"),
+            "risk_posture": mi.get("risk_posture"),
+            "recommendation": multi.get("recommendation"),
+            "sentiment": multi.get("sentiment"),
+            "reasoning": ai_view.get("reasoning") or multi.get("reasoning") or "",
+        }
+        semantic_context = self._build_semantic_trade_context(
+            symbol=symbol,
+            strategy_used=strategy_id,
+            market_analysis=market_snapshot,
+            confidence=decision_confidence,
+            risk_level=str(risk_assessment.get("level") or "unknown"),
+        )
+        probe = TradeDecision(
+            symbol=symbol,
+            action="hold",
+            side="long",
+            quantity=0,
+            leverage=int(self.config.get("default_leverage", 1) or 1),
+            entry_price=float(market_data.get("price", 0) or 0.0),
+            stop_loss=0.0,
+            take_profit=0.0,
+            confidence=decision_confidence,
+            reasoning=str(ai_view.get("reasoning") or multi.get("reasoning") or "pre_decision_agent_advisory"),
+            strategy_used=strategy_id,
+            risk_level=str(risk_assessment.get("level") or "unknown"),
+            market_analysis=market_snapshot,
+        )
+        payload = self._build_agent_orchestration_payload(
+            trace_id=f"advisory-{str(symbol or '').replace('/', '_')}",
+            decision=probe,
+            semantic_context=semantic_context,
+        )
+        verdicts = payload.get("verdicts") if isinstance(payload, dict) else []
+        compact_verdicts: List[Dict[str, Any]] = []
+        if isinstance(verdicts, list):
+            for verdict in verdicts[:4]:
+                if not isinstance(verdict, dict):
+                    continue
+                compact_verdicts.append(
+                    {
+                        "agent_name": verdict.get("agent_name"),
+                        "summary": verdict.get("summary"),
+                        "confidence": verdict.get("confidence"),
+                        "next_action": verdict.get("next_action"),
+                        "blocking_flags": list(verdict.get("blocking_flags") or [])[:4],
+                        "structured_verdict": verdict.get("structured_verdict") if isinstance(verdict.get("structured_verdict"), dict) else {},
+                    }
+                )
+        return {
+            "workflow": list(payload.get("workflow") or []) if isinstance(payload, dict) else [],
+            "execution_plan": payload.get("execution_plan") if isinstance(payload, dict) else {},
+            "semantic_context": semantic_context,
+            "verdicts": compact_verdicts,
+        }
+
+    def _format_agent_advisory_block(self, agent_advisory: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(agent_advisory, dict):
+            return ""
+        verdicts = agent_advisory.get("verdicts")
+        if not isinstance(verdicts, list) or not verdicts:
+            return ""
+        workflow = " -> ".join(str(x) for x in (agent_advisory.get("workflow") or []) if str(x or "").strip())
+        plan = agent_advisory.get("execution_plan") if isinstance(agent_advisory.get("execution_plan"), dict) else {}
+        lines = ["", "【四智能体协同建议（只读参考，不是强制指令）】"]
+        if workflow:
+            lines.append(f"- 协同流程: {workflow}")
+        lines.append(
+            "- 执行计划: "
+            f"risk={plan.get('risk_verdict', 'unknown')} "
+            f"exec={plan.get('execution_recommendation', 'unknown')} "
+            f"block={plan.get('should_block', False)} "
+            f"size_scale={plan.get('size_scale', 1.0)} "
+            f"leverage_scale={plan.get('leverage_scale', 1.0)}"
+        )
+        for verdict in verdicts[:4]:
+            if not isinstance(verdict, dict):
+                continue
+            name = str(verdict.get("agent_name") or "unknown")
+            structured = verdict.get("structured_verdict") if isinstance(verdict.get("structured_verdict"), dict) else {}
+            flags = ",".join(str(x) for x in (verdict.get("blocking_flags") or []) if str(x or "").strip()) or "none"
+            detail = str(verdict.get("summary") or "")
+            if name == "market_structure_agent":
+                detail = (
+                    f"regime={structured.get('regime_label')} trend={structured.get('trend_state')} "
+                    f"liquidity={structured.get('liquidity_state')}"
+                )
+            elif name == "research_agent":
+                detail = (
+                    f"stage={structured.get('strategy_stage') or structured.get('governance', {}).get('stage')} "
+                    f"oos={structured.get('oos_status') or structured.get('governance', {}).get('oos_status')} "
+                    f"drift={structured.get('live_drift_status') or structured.get('governance', {}).get('live_drift_status')}"
+                )
+            elif name == "risk_governor_agent":
+                detail = f"risk={structured.get('risk_verdict')} posture={structured.get('risk_posture')}"
+            elif name == "execution_coach_agent":
+                detail = (
+                    f"exec={structured.get('execution_recommendation')} spread_bps={structured.get('spread_bps')} "
+                    f"conflict={structured.get('signal_conflict_score')}"
+                )
+            lines.append(
+                f"- {name}: conf={float(verdict.get('confidence') or 0):.2f} "
+                f"next={verdict.get('next_action') or 'unknown'} flags={flags} | {detail}"
+            )
+        lines.append("你必须把它们当作风控/执行参考；若与技术、持仓、风险数据冲突，以更保守方案为准。")
+        return "\n".join(lines) + "\n"
+
     def _merge_scanner_priority_symbols(self, symbols: List[str], *, limit: int = 8) -> List[str]:
         """将仍有未过期扫描提示的交易对优先排在前面，便于 ai_core 尽快研判。"""
         self._prune_scanner_hints()
@@ -1009,39 +1229,7 @@ class AICoreDecisionEngine:
                             if success:
                                 await self._report_decision(decision)
                         else:
-                            try:
-                                mc = self.main_controller
-                                if mc is not None and getattr(mc, "decision_trace_store", None) is None:
-                                    mc.decision_trace_store = DecisionTraceStore()
-                                dts = getattr(mc, "decision_trace_store", None) if mc is not None else None
-                                if dts:
-                                    trace_id = f"hold-{symbol.replace('/', '_')}-{int(datetime.now().timestamp())}"
-                                    hold_extras = self._build_hold_trace_extras(decision=decision, source="main_decision_loop")
-                                    hold_extras = await self._enrich_hold_trace_extras_with_sr(
-                                        str(decision.symbol or symbol), hold_extras
-                                    )
-                                    dts.record_intent(
-                                        trace_id=trace_id,
-                                        symbol=str(decision.symbol or symbol),
-                                        side=str(decision.side or "unknown"),
-                                        action="hold",
-                                        source="ai_core",
-                                        confidence=getattr(decision, "confidence", None),
-                                        strategy_used=getattr(decision, "strategy_used", None),
-                                        reasoning=getattr(decision, "reasoning", None),
-                                        quantity=None,
-                                        leverage=None,
-                                        extras=hold_extras,
-                                    )
-                                    dts.record_guard_result(
-                                        trace_id=trace_id,
-                                        status="rejected",
-                                        reason="hold_by_ai_decision",
-                                        stage="decision",
-                                        extras=hold_extras,
-                                    )
-                            except Exception:
-                                pass
+                            await self._execute_decision(decision)
                             logger.info(f"📊 {symbol} 暂无机会，继续监控")
                     
                     await asyncio.sleep(SLEEP_2S)
@@ -3598,6 +3786,16 @@ class AICoreDecisionEngine:
                 )
             
             # 构建完整的决策prompt
+            agent_advisory = self._build_pre_decision_agent_advisory(
+                symbol=symbol,
+                market_data=market_data,
+                technical=technical,
+                strategy_advice=strategy_advice,
+                risk_assessment=risk_assessment,
+                multi_source_analysis=multi_source_analysis,
+                ai_engine_analysis=ai_engine_analysis,
+                market_intelligence=(mi_view.to_dict() if mi_view else None),
+            )
             prompt = self._build_decision_prompt(
                 symbol=symbol,
                 market_data=market_data,
@@ -3611,6 +3809,7 @@ class AICoreDecisionEngine:
                 multi_source_analysis=multi_source_analysis,
                 ai_engine_analysis=ai_engine_analysis,
                 market_intelligence=(mi_view.to_dict() if mi_view else None),
+                agent_advisory=agent_advisory,
             )
             
             response = await self.llm.generate(
@@ -3990,7 +4189,8 @@ class AICoreDecisionEngine:
                                     f"weak_sr={weak_sr.get('reason', '')} "
                                     f"sr_reject_short={sr_reject_short}"
                                 )
-                                decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
+                                if self._is_placeholder_strategy_used(decision.strategy_used):
+                                    decision.strategy_used = "s1_ai_autonomy_override"
                                 self._last_hold_override_at[key] = now
                             elif bull_str > bear_str:
                                 if require_mi_align and str(mi_trend or "").lower() not in ("bullish", "up", "long"):
@@ -4009,13 +4209,20 @@ class AICoreDecisionEngine:
                                     f"weak_sr={weak_sr.get('reason', '')} "
                                     f"sr_reject_long={sr_reject_long}"
                                 )
-                                decision.strategy_used = decision.strategy_used or "s1_ai_autonomy_override"
+                                if self._is_placeholder_strategy_used(decision.strategy_used):
+                                    decision.strategy_used = "s1_ai_autonomy_override"
                                 self._last_hold_override_at[key] = now
                 except Exception as e:
                     override_skip_reason = str(e)
                     logger.debug(f"hold override skipped: {e}")
             
             if decision:
+                decision.strategy_used = self._normalize_runtime_strategy_used(
+                    decision.strategy_used,
+                    symbol=symbol,
+                    reasoning=decision.reasoning,
+                    strategy_advice=strategy_advice,
+                )
                 self._last_decision_time[symbol] = datetime.now()
                 logger.info(f"✅ AI决策完成: {symbol} {decision.action} {decision.side}")
                 self._ensure_open_market_analysis_payload(
@@ -4627,6 +4834,7 @@ class AICoreDecisionEngine:
         multi_source_analysis: Dict = None,
         ai_engine_analysis: Dict = None,
         market_intelligence: Optional[Dict] = None,
+        agent_advisory: Optional[Dict[str, Any]] = None,
     ) -> str:
         """构建AI决策prompt - 融合所有模块数据进行决策，全部实时数据"""
         
@@ -4640,6 +4848,8 @@ class AICoreDecisionEngine:
             ai_engine_analysis = {}
         if market_intelligence is None:
             market_intelligence = {}
+        if agent_advisory is None:
+            agent_advisory = {}
         
         aggressive_note = ""
         if self.config.get("aggressive_mode"):
@@ -4714,6 +4924,7 @@ class AICoreDecisionEngine:
                 positions_detail += f"  - {pos.get('symbol', '')}: {pos.get('side', '')} {pos.get('size', 0)} | 入场价: {pos.get('entry_price', 0):.4f} | 盈亏: ${pos.get('pnl', 0):+.2f}\n"
 
         scanner_hint_block = self._format_scanner_hint_block(symbol)
+        agent_advisory_detail = self._format_agent_advisory_block(agent_advisory)
         mr_hint = ""
         try:
             px = float(technical.get("price") or market_data.get("price") or 0) or 0.0
@@ -4853,6 +5064,7 @@ class AICoreDecisionEngine:
 {multi_source_detail}
 {ai_engine_detail}
 {mi_detail}
+{agent_advisory_detail}
 【用户规则】
 - 黑名单: {list(self.blacklist)} (绝对不能操作)
 - 授权状态: {'已授权全权交易' if self.authorization.get('full_authorization') else '未授权'}
@@ -5121,7 +5333,11 @@ class AICoreDecisionEngine:
         try:
             orch = getattr(self.main_controller, "agent_orchestrator", None) if self.main_controller else None
             sm = getattr(self.main_controller, "strategy_manager", None) if self.main_controller else None
-            strategy_id = str(getattr(decision, "strategy_id", "") or "")
+            strategy_id = str(
+                getattr(decision, "strategy_id", "")
+                or getattr(decision, "strategy_used", "")
+                or ""
+            )
             governance = sm.get_strategy_governance_profile(strategy_id) if (sm and strategy_id and hasattr(sm, "get_strategy_governance_profile")) else {}
             research_profile = sm.get_strategy_research_profile(strategy_id) if (sm and strategy_id and hasattr(sm, "get_strategy_research_profile")) else {}
             if orch and hasattr(orch, "evaluate_advisory_snapshot"):
@@ -5153,6 +5369,26 @@ class AICoreDecisionEngine:
             confidence=float(decision.confidence or 0.0),
             reasons=[str(ma.get("reasoning") or decision.reasoning or "")[:200]],
             next_action="continue" if semantic_context.get("risk_verdict") != "deny" else "block",
+            trace_id=trace_id,
+        )
+        research_verdict = AgentVerdict(
+            agent_name="research_agent",
+            input_context_ref=str(decision.symbol),
+            summary=(
+                f"stage={semantic_context.get('strategy_stage', 'unknown')} "
+                f"oos={semantic_context.get('oos_status', 'unknown')} "
+                f"drift={semantic_context.get('live_drift_status', 'unknown')}"
+            ),
+            structured_verdict={
+                "strategy_stage": semantic_context.get("strategy_stage"),
+                "oos_status": semantic_context.get("oos_status"),
+                "live_drift_status": semantic_context.get("live_drift_status"),
+                "knowledge_refs": list(semantic_context.get("knowledge_refs") or []),
+            },
+            confidence=0.55,
+            reasons=["fallback_research_verdict"],
+            blocking_flags=[],
+            next_action="review_strategy_context",
             trace_id=trace_id,
         )
         risk_flags: List[str] = []
@@ -5193,7 +5429,12 @@ class AICoreDecisionEngine:
             next_action="slice" if semantic_context.get("execution_recommendation") == "wait_or_slice" else "normal",
             trace_id=trace_id,
         )
-        fallback_verdicts = [market_verdict.to_dict(), risk_verdict.to_dict(), execution_verdict.to_dict()]
+        fallback_verdicts = [
+            market_verdict.to_dict(),
+            research_verdict.to_dict(),
+            risk_verdict.to_dict(),
+            execution_verdict.to_dict(),
+        ]
         risk_state = str(semantic_context.get("risk_verdict") or "allow").lower()
         execution_state = str(semantic_context.get("execution_recommendation") or "normal").lower()
         size_scale = 1.0
@@ -5216,6 +5457,7 @@ class AICoreDecisionEngine:
             "mode": "execution_governed",
             "workflow": [
                 "market_structure_agent",
+                "research_agent",
                 "risk_governor_agent",
                 "execution_coach_agent",
                 "ExecutionGateway",
@@ -5336,44 +5578,6 @@ class AICoreDecisionEngine:
             
             action = data.get('action', 'hold')
             if action == 'hold':
-                try:
-                    mc = self.main_controller
-                    if mc is not None and getattr(mc, "decision_trace_store", None) is None:
-                        mc.decision_trace_store = DecisionTraceStore()
-                    dts = getattr(mc, "decision_trace_store", None) if mc is not None else None
-                    if dts:
-                        trace_id = f"parsed-hold-{symbol.replace('/', '_')}-{int(datetime.now().timestamp())}"
-                        hold_extras = self._build_hold_trace_extras(
-                            decision=None,
-                            raw_reasoning=str(data.get("reasoning") or ""),
-                            source="parse_ai_decision",
-                            confidence=float(data.get("confidence", 0.0) or 0.0),
-                            strategy_used=str(data.get("strategy_used") or ""),
-                            risk_level=str(data.get("risk_level") or ""),
-                        )
-                        hold_extras.update(self._scanner_trace_context(symbol))
-                        dts.record_intent(
-                            trace_id=trace_id,
-                            symbol=str(symbol),
-                            side=str(data.get("side") or ""),
-                            action="hold",
-                            source="ai_core",
-                            confidence=float(data.get("confidence", 0.0) or 0.0),
-                            strategy_used=str(data.get("strategy_used") or ""),
-                            reasoning=str(data.get("reasoning") or ""),
-                            quantity=None,
-                            leverage=None,
-                            extras=hold_extras,
-                        )
-                        dts.record_guard_result(
-                            trace_id=trace_id,
-                            status="rejected",
-                            reason="hold_by_ai_decision",
-                            stage="decision_parse",
-                            extras=hold_extras,
-                        )
-                except Exception:
-                    pass
                 return TradeDecision(
                     symbol=symbol,
                     action='hold',
@@ -5576,11 +5780,18 @@ class AICoreDecisionEngine:
                     }
                 )
                 if dts:
+                    trace_action = str(getattr(decision, "action", "") or "").lower()
+                    if trace_action == "close":
+                        trace_action = "close"
+                    elif trace_action == "hold":
+                        trace_action = "hold"
+                    else:
+                        trace_action = "open"
                     dts.record_intent(
                         trace_id=trace_id,
                         symbol=str(decision.symbol),
                         side=str(decision.side),
-                        action="close" if decision.action == "close" else "open",
+                        action=trace_action,
                         source="ai_core",
                         confidence=getattr(decision, "confidence", None),
                         strategy_used=getattr(decision, "strategy_used", None),
@@ -5732,6 +5943,7 @@ class AICoreDecisionEngine:
             # Record HOLD as an explicit trace so "no-trade" paths are observable
             # in decision-traces replay/analytics.
             hold_trace_extras = await self._enrich_hold_trace_extras_with_sr(decision.symbol, hold_trace_extras)
+            hold_trace_extras.update(self._scanner_trace_context(str(decision.symbol)))
             _record_intent(hold_trace_extras)
             _record_guard("rejected", "hold_by_ai_decision", "decision", hold_trace_extras)
             return True
@@ -7398,6 +7610,7 @@ class AICoreDecisionEngine:
                 return True
             else:
                 error = order.get('error', '未知错误') if order else '返回为空'
+                log_fn = logger.warning if _is_expected_execution_rejection(error) else logger.error
                 release_cands = []
                 if isinstance(order, dict):
                     release_cands = list(order.get("slot_release_candidates") or [])
@@ -7408,11 +7621,11 @@ class AICoreDecisionEngine:
                         if isinstance(c, dict) and c.get("symbol")
                     )
                     if brief:
-                        logger.error(f"❌ AI决策执行失败: {error}；候选释放槽位: {brief}")
+                        log_fn(f"AI决策未执行: {error}；候选释放槽位: {brief}")
                     else:
-                        logger.error(f"❌ AI决策执行失败: {error}")
+                        log_fn(f"AI决策未执行: {error}")
                 else:
-                    logger.error(f"❌ AI决策执行失败: {error}")
+                    log_fn(f"AI决策未执行: {error}")
                 return False
                 
         except Exception as e:

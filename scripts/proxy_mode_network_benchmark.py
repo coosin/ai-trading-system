@@ -32,6 +32,25 @@ import urllib.request
 from typing import Any
 
 
+def _load_env_file(path: str) -> None:
+    """Load simple KEY=VALUE lines so benchmark probes match the trading service env."""
+    if not path:
+        return
+    env_path = os.path.expanduser(path)
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+
 def _fingerprint() -> dict[str, Any]:
     proxy_keys = (
         "HTTP_PROXY",
@@ -183,6 +202,7 @@ def main() -> int:
     p.add_argument("--out", default="", help="写入 JSON 路径")
     p.add_argument("--api-base", default=os.environ.get("API_BASE", ""), help="若设则测 /api/v1/market/ticker")
     p.add_argument("--symbol", default="BTC/USDT")
+    p.add_argument("--env-file", default=".env", help="Load proxy env from this file before probing")
     p.add_argument("--compare", nargs=2, metavar=("OLD.json", "NEW.json"), help="对比两次归档")
     args = p.parse_args()
 
@@ -194,6 +214,7 @@ def main() -> int:
         _compare_json(old, new)
         return 0
 
+    _load_env_file(args.env_file)
     api_base = args.api_base.strip() or None
     metrics = run_benchmark(args.runs, api_base, args.symbol)
     record = {
@@ -220,6 +241,12 @@ def main() -> int:
                 " 对交易容器去掉 HTTP_PROXY 或设 OPENCLAW_OKX_IGNORE_ENV_PROXY=1，让流量走路由/TUN。",
                 file=sys.stderr,
             )
+    elif (he.get("success_rate") or 0) > 0.5 and (hd.get("success_rate") or 0) <= 0.5:
+        print(
+            "\n提示: 当前 OKX HTTPS 必须走 HTTP(S)_PROXY；直连失败属于当前网络拓扑预期，"
+            "不要设置 OPENCLAW_OKX_IGNORE_ENV_PROXY=1。",
+            file=sys.stderr,
+        )
     tick = metrics.get("api_market_ticker") or {}
     if tick.get("ok") and tick.get("source") == "fallback":
         print(
@@ -228,12 +255,11 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    return 0 if all(
-        [
-            (metrics["https_okx_public_time_respect_env_proxy"].get("success_rate") or 0) > 0.5,
-            (metrics["https_okx_public_time_no_http_proxy"].get("success_rate") or 0) > 0.5,
-        ]
-    ) else 1
+    # This benchmark compares network paths; in many production hosts only one path is expected
+    # to work. Exit non-zero only when both OKX HTTPS paths are unhealthy.
+    env_ok = (metrics["https_okx_public_time_respect_env_proxy"].get("success_rate") or 0) > 0.5
+    direct_ok = (metrics["https_okx_public_time_no_http_proxy"].get("success_rate") or 0) > 0.5
+    return 0 if (env_ok or direct_ok) else 1
 
 
 if __name__ == "__main__":

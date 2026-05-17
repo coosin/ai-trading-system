@@ -42,11 +42,15 @@ def _human_review_window(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _strategy_status(item: Dict[str, Any]) -> str:
-    if item.get("enabled"):
-        return "active"
     md = item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {}
+    dep = md.get("deployment", {}) if isinstance(md.get("deployment"), dict) else {}
     approval = md.get("approval", {}) if isinstance(md.get("approval"), dict) else {}
     review = _human_review_window(item)
+    if str(dep.get("stage") or "").lower() == "paper" or float(dep.get("cap_multiplier", 1.0) or 0.0) <= 0.0:
+        if review.get("status") in {"open", "pending_approval"}:
+            return "review"
+    if item.get("enabled"):
+        return "active"
     if approval.get("state") == "manual_approval_required" or review.get("status") == "pending_approval":
         return "pending_approval"
     return "inactive"

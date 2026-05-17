@@ -15,7 +15,7 @@ import json
 import logging
 import random
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -25,6 +25,19 @@ from src.modules.backtesting.strategies.dsl_strategy import DSLStrategy
 from src.modules.strategies.strategy_dsl import bump_version, normalize_symbol, validate_dsl
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow_naive() -> datetime:
+    """Return a UTC timestamp normalized to tz-naive for legacy backtest code."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _normalize_backtest_index(df: pd.DataFrame) -> pd.DataFrame:
+    """BacktestEngine expects tz-naive datetimes; live feeds may produce UTC-aware indexes."""
+    out = df.copy()
+    idx = pd.to_datetime(out.index, errors="coerce", utc=True)
+    out.index = idx.tz_convert(None)
+    return out[~out.index.isna()]
 
 
 @dataclass
@@ -73,7 +86,7 @@ class StrategyResearchPipeline:
         deployment_stage: str,
         score: float,
     ) -> Dict[str, Any]:
-        opened_at = datetime.now()
+        opened_at = _utcnow_naive()
         review_by = opened_at + timedelta(hours=24 if deployment_stage == "paper" else 12)
         status = "pending_approval" if manual_approval_required else "open"
         mode = "pre_publish_approval" if manual_approval_required else "post_publish_observation"
@@ -122,6 +135,9 @@ class StrategyResearchPipeline:
         max_post_approval_stage = str(
             rollout.get("max_post_approval_auto_stage", self.max_post_approval_auto_stage) or self.max_post_approval_auto_stage
         ).strip().lower()
+        if gov_decision != "publish":
+            auto_enable = False
+            allow_auto_activate = False
         if gov_decision == "publish" and not prod_allow and deployment_stage not in {"paper", "shadow"}:
             allow_auto_activate = False
         if self._deployment_stage_rank(deployment_stage) > self._deployment_stage_rank(max_stage):
@@ -163,7 +179,7 @@ class StrategyResearchPipeline:
             "train_summary": train_metrics,
             "oos_summary": test_metrics,
             "decision": decision,
-            "created_at": datetime.now().isoformat(),
+            "created_at": _utcnow_naive().isoformat(),
         }
 
     def _build_review_answers(
@@ -293,7 +309,7 @@ class StrategyResearchPipeline:
                 try:
                     return {
                         "symbol": sym,
-                        "published": await self._research_symbol(
+                        "research": await self._research_symbol(
                             sym,
                             timeframe=timeframe,
                             lookback_days=lookback_days,
@@ -309,7 +325,10 @@ class StrategyResearchPipeline:
             if isinstance(out, dict) and out.get("error"):
                 results["errors"].append({"symbol": out.get("symbol"), "error": out.get("error")})
             else:
-                results["published"].extend(out.get("published", []))
+                research_out = out.get("research", {}) if isinstance(out, dict) else {}
+                if isinstance(research_out, dict):
+                    results["published"].extend(research_out.get("published", []))
+                    results["rejected"].extend(research_out.get("rejected", []))
         results["backtest_calls"] = self._bt_calls
         return results
 
@@ -319,8 +338,8 @@ class StrategyResearchPipeline:
         timeframe: str,
         lookback_days: int,
         research_cfg: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        started_at = datetime.now()
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        started_at = _utcnow_naive()
         # Data quality gate: low-quality unified snapshot skips heavy research to avoid bad strategy fit.
         snapshot = await self._get_unified_snapshot(symbol)
         q_score = self._extract_quality_score(snapshot)
@@ -335,12 +354,12 @@ class StrategyResearchPipeline:
             self.max_candidates_per_symbol = max(4, int(self.max_candidates_per_symbol * 0.6))
         exchange = getattr(getattr(self.main_controller, "ai_trading_engine", None), "exchange", None)
         if not exchange:
-            return []
-        end = datetime.now()
+            return {"published": [], "rejected": [{"symbol": symbol, "reason": "exchange_unavailable"}]}
+        end = _utcnow_naive()
         start = end - timedelta(days=lookback_days)
         df = await self._load_klines_df(exchange, symbol, timeframe=timeframe, limit=720)
         if df is None or len(df) < 120:
-            return []
+            return {"published": [], "rejected": [{"symbol": symbol, "reason": "insufficient_klines"}]}
 
         folds = self._walk_forward_folds(df, folds=max(1, self.fold_count), train_ratio=self.train_ratio)
         market_ctx = await self._build_market_context(symbol)
@@ -348,8 +367,10 @@ class StrategyResearchPipeline:
         candidates = self._limit_candidates(candidates, market_ctx)
 
         published: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
+        best_review_candidate: Optional[Tuple[float, Dict[str, Any], Dict[str, Any], Dict[str, Any], str]] = None
         for dsl in candidates:
-            if (datetime.now() - started_at).total_seconds() >= self.per_symbol_time_budget_sec:
+            if (_utcnow_naive() - started_at).total_seconds() >= self.per_symbol_time_budget_sec:
                 logger.info("research time budget reached for %s; stop evaluating remaining candidates", symbol)
                 break
             if self._bt_calls >= self.max_backtests_per_cycle:
@@ -370,9 +391,10 @@ class StrategyResearchPipeline:
             test_metrics = self._aggregate_fold_metrics(fold_scores)
             score = self._research_score(test_metrics)
             decision = self._governance_decision(score)
+            passes_gates = self._passes_gates(test_metrics)
 
             # 最低规则：先过风险门，再过最低研究评分。
-            if self._passes_gates(test_metrics) and score >= self.publish_min_score:
+            if passes_gates and score >= self.publish_min_score:
                 item = await self._publish(
                     best_dsl,
                     test_metrics,
@@ -383,7 +405,52 @@ class StrategyResearchPipeline:
                 )
                 if item:
                     published.append(item)
-        return published
+            else:
+                reason = self._reject_reason(test_metrics, score, passes_gates)
+                row = {
+                    "symbol": symbol,
+                    "name": best_dsl.get("name") or dsl.get("name"),
+                    "score": float(round(score, 6)),
+                    "decision": decision,
+                    "reason": reason,
+                    "metrics": {
+                        "sharpe_ratio": test_metrics.get("sharpe_ratio"),
+                        "max_drawdown": test_metrics.get("max_drawdown"),
+                        "total_trades": test_metrics.get("total_trades"),
+                        "total_pnl": test_metrics.get("total_pnl"),
+                    },
+                }
+                rejected.append(row)
+                if score >= self.redevelop_below_score:
+                    if best_review_candidate is None or score > best_review_candidate[0]:
+                        best_review_candidate = (score, best_dsl, test_metrics, best_train, decision)
+        if not published and best_review_candidate is not None:
+            score, best_dsl, test_metrics, best_train, decision = best_review_candidate
+            item = await self._publish(
+                best_dsl,
+                test_metrics,
+                best_train,
+                score=score,
+                decision=decision,
+                research_cfg=research_cfg,
+            )
+            if item:
+                published.append(item)
+        return {"published": published, "rejected": rejected[:50]}
+
+    def _reject_reason(self, metrics: Dict[str, Any], score: float, passes_gates: bool) -> str:
+        if score < self.publish_min_score:
+            return f"score_below_publish_min:{score:.4f}<{self.publish_min_score:.4f}"
+        if not passes_gates:
+            failures: List[str] = []
+            if float(metrics.get("sharpe_ratio", 0.0) or 0.0) < self.gates.min_sharpe:
+                failures.append("sharpe")
+            if float(metrics.get("max_drawdown", 1.0) or 1.0) > self.gates.max_drawdown:
+                failures.append("drawdown")
+            if int(metrics.get("total_trades", 0) or 0) < self.gates.min_trades:
+                failures.append("trades")
+            return "gate_failed:" + ",".join(failures)
+        return "unknown"
 
     async def _get_unified_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
         mc = self.main_controller
@@ -442,7 +509,7 @@ class StrategyResearchPipeline:
         if df.empty:
             return None
         df = df.sort_values("timestamp").set_index("timestamp")
-        return df
+        return _normalize_backtest_index(df)
 
     def _walk_forward_folds(self, df: pd.DataFrame, folds: int, train_ratio: float) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
         n = len(df)
@@ -685,8 +752,8 @@ class StrategyResearchPipeline:
         validate_dsl(dsl)
         config = BacktestConfig(
             symbol=dsl.get("symbol", "BTC/USDT"),
-            start_time=df.index[0].to_pydatetime(),
-            end_time=df.index[-1].to_pydatetime(),
+            start_time=df.index[0].to_pydatetime().replace(tzinfo=None),
+            end_time=df.index[-1].to_pydatetime().replace(tzinfo=None),
             initial_balance=10000.0,
             time_frame=dsl.get("timeframe", "1h"),
         )
@@ -793,7 +860,7 @@ class StrategyResearchPipeline:
                     "train": train_metrics,
                     "test": test_metrics,
                     "gates": self.gates.__dict__,
-                    "published_at": datetime.now().isoformat(),
+                    "published_at": _utcnow_naive().isoformat(),
                     "score": research_score,
                     "decision": gov_decision,
                     "rollout_policy": rollout_policy,
@@ -805,7 +872,7 @@ class StrategyResearchPipeline:
                     "state": "manual_approval_required" if manual_approval_required else "approved",
                     "approved": False if manual_approval_required else True,
                     "approved_by": "system_auto_publish" if not manual_approval_required else None,
-                    "approved_at": datetime.now().isoformat() if not manual_approval_required else None,
+                    "approved_at": _utcnow_naive().isoformat() if not manual_approval_required else None,
                 },
                 "review_window": review_window,
             },

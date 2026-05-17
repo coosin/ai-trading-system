@@ -1,5 +1,6 @@
 import pytest
 
+from src.modules.core import enhanced_llm_manager as llm_module
 from src.modules.core.enhanced_llm_manager import (
     EnhancedLLMManager,
     LLMResponse,
@@ -59,3 +60,34 @@ async def test_generate_returns_explicit_no_healthy_model_error():
     assert not resp.success
     assert resp.error_code == "NO_HEALTHY_MODEL"
     assert resp.task_type == TaskType.DECISION_MAKING
+
+
+def test_network_failures_backoff_exponentially(monkeypatch):
+    mgr = _mgr()
+    mgr.models["deepseek-v4-flash"] = ModelConfig(
+        ModelProvider.OPENAI,
+        "deepseek-v4-flash",
+        "flash",
+        enabled=True,
+    )
+    resp = LLMResponse(
+        content="",
+        model_id="deepseek-v4-flash",
+        provider=ModelProvider.OPENAI,
+        success=False,
+        error_code="NETWORK_ERROR",
+    )
+    now = [1000.0]
+    monkeypatch.setattr(llm_module.time, "time", lambda: now[0])
+    monkeypatch.setenv("OPENCLAW_LLM_CB_NETWORK_SEC", "30")
+    monkeypatch.setenv("OPENCLAW_LLM_CB_MAX_SEC", "300")
+
+    mgr._apply_failure_circuit_break("deepseek-v4-flash", resp, TaskType.GENERAL)
+    assert mgr._unhealthy_until["deepseek-v4-flash"] == pytest.approx(1030.0)
+
+    now[0] = 2000.0
+    mgr._apply_failure_circuit_break("deepseek-v4-flash", resp, TaskType.GENERAL)
+    assert mgr._unhealthy_until["deepseek-v4-flash"] == pytest.approx(2060.0)
+
+    mgr._clear_model_unhealthy("deepseek-v4-flash")
+    assert "deepseek-v4-flash" not in mgr._consecutive_failures

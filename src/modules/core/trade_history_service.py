@@ -47,9 +47,15 @@ def _metadata_trace_id(metadata: Dict[str, Any]) -> str:
     gateway = metadata.get("gateway") if isinstance(metadata.get("gateway"), dict) else {}
     context = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
     return str(
-        context.get("trace_id")
-        or metadata.get("trace_id")
+        metadata.get("trace_id")
+        or metadata.get("decision_trace_id")
+        or metadata.get("root_trace_id")
         or metadata.get("traceId")
+        or context.get("decision_trace_id")
+        or context.get("root_trace_id")
+        or context.get("trace_id")
+        or context.get("TraceId")
+        or context.get("traceId")
         or ""
     ).strip()
 
@@ -59,6 +65,54 @@ def _metadata_gateway_op(metadata: Dict[str, Any]) -> str:
         return ""
     gateway = metadata.get("gateway") if isinstance(metadata.get("gateway"), dict) else {}
     return str(gateway.get("op") or metadata.get("action") or metadata.get("trade_phase") or "").strip().lower()
+
+
+def _metadata_explicit_trace_id(metadata: Dict[str, Any]) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    return str(
+        metadata.get("trace_id")
+        or metadata.get("decision_trace_id")
+        or metadata.get("root_trace_id")
+        or metadata.get("traceId")
+        or ""
+    ).strip()
+
+
+def _metadata_context_trace_id(metadata: Dict[str, Any]) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    gateway = metadata.get("gateway") if isinstance(metadata.get("gateway"), dict) else {}
+    context = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
+    return str(
+        context.get("trace_id")
+        or context.get("TraceId")
+        or context.get("traceId")
+        or ""
+    ).strip()
+
+
+def _is_sltp_trace_id(trace_id: str) -> bool:
+    return str(trace_id or "").strip().startswith("sltp:")
+
+
+def _has_canonical_trace_override(metadata: Dict[str, Any]) -> bool:
+    trace_id = _metadata_explicit_trace_id(metadata)
+    if trace_id and not _is_sltp_trace_id(trace_id):
+        return True
+    context_trace_id = _metadata_context_trace_id(metadata)
+    return bool(context_trace_id and not _is_sltp_trace_id(context_trace_id))
+
+
+def _normalize_trade_symbol(symbol: Any) -> str:
+    return (
+        str(symbol or "")
+        .strip()
+        .upper()
+        .replace("-SWAP", "")
+        .replace("/SWAP", "")
+        .replace("-", "/")
+    )
 
 
 @dataclass
@@ -313,15 +367,15 @@ class TradeHistoryService:
             return
         if str(action or "").strip().lower() not in {"close", "closed"}:
             return
-        if _metadata_trace_id(metadata):
+        if _has_canonical_trace_override(metadata):
             return
-        sym = str(symbol or "").strip().upper()
+        sym = _normalize_trade_symbol(symbol)
         side_norm = str(side or "").strip().lower()
         if not sym or not side_norm:
             return
         for existing in reversed(self._cache[-500:]):
             try:
-                if str(existing.symbol or "").strip().upper() != sym:
+                if _normalize_trade_symbol(existing.symbol) != sym:
                     continue
                 if str(existing.side or "").strip().lower() != side_norm:
                     continue
@@ -339,13 +393,26 @@ class TradeHistoryService:
                 if not isinstance(context, dict):
                     context = {}
                     gateway["context"] = context
-                context["trace_id"] = trace_id
-                metadata.setdefault("trace_id", trace_id)
+                raw_trace_id = _metadata_context_trace_id(metadata)
+                if not raw_trace_id:
+                    context["trace_id"] = trace_id
+                else:
+                    context.setdefault("trigger_trace_id", raw_trace_id)
+                    metadata.setdefault("trigger_trace_id", raw_trace_id)
+                context["decision_trace_id"] = trace_id
+                metadata["trace_id"] = trace_id
+                metadata["decision_trace_id"] = trace_id
+                metadata["root_trace_id"] = trace_id
+                method = "inherited_from_recent_open"
+                if raw_trace_id and raw_trace_id != trace_id:
+                    method = "linked_from_recent_open_preserving_trigger_trace"
                 metadata["trace_attribution"] = {
-                    "method": "inherited_from_recent_open",
+                    "method": method,
                     "source_trade_id": existing.trade_id,
                     "source_order_id": existing.order_id,
                     "source_timestamp": existing.timestamp,
+                    "canonical_trace_id": trace_id,
+                    "trigger_trace_id": raw_trace_id or None,
                     "inherited_at": datetime.now().isoformat(),
                 }
                 return
@@ -353,7 +420,7 @@ class TradeHistoryService:
                 continue
 
     async def backfill_close_trace_attribution(self, *, limit: int = 1000, dry_run: bool = True) -> Dict[str, Any]:
-        """Backfill missing close trace_id values from preceding open records.
+        """Backfill missing/canonicalized close trace_id values from preceding open records.
 
         The operation is metadata-only and auditable. It never changes order
         state, price, pnl, fee, or position data.
@@ -361,7 +428,15 @@ class TradeHistoryService:
         if not self._cache and self.db_storage and not self._cache_bootstrapped:
             await self._load_cache_from_db()
 
-        rows = list(self._cache[-max(1, int(limit or 1000)):])
+        sample_limit = max(1, int(limit or 1000))
+        rows = list(self._cache[-sample_limit:])
+        if self.db_storage and sample_limit > len(rows):
+            try:
+                db_rows = await self._load_trade_records_from_db(limit=sample_limit)
+                if db_rows:
+                    rows = db_rows[-sample_limit:]
+            except Exception:
+                pass
         open_by_key: Dict[Tuple[str, str], TradeRecord] = {}
         candidates: List[Dict[str, Any]] = []
         updated = 0
@@ -370,7 +445,7 @@ class TradeHistoryService:
         for trade in sorted(rows, key=lambda t: str(t.timestamp or "")):
             meta = dict(trade.metadata or {})
             op = _metadata_gateway_op(meta)
-            key = (str(trade.symbol or "").strip().upper(), str(trade.side or "").strip().lower())
+            key = (_normalize_trade_symbol(trade.symbol), str(trade.side or "").strip().lower())
             if not key[0] or not key[1]:
                 skipped += 1
                 continue
@@ -382,7 +457,7 @@ class TradeHistoryService:
             if op != "close":
                 skipped += 1
                 continue
-            if trace_id:
+            if _has_canonical_trace_override(meta):
                 skipped += 1
                 continue
             src = open_by_key.get(key)
@@ -393,6 +468,7 @@ class TradeHistoryService:
             if not src_trace:
                 skipped += 1
                 continue
+            raw_trace_id = _metadata_context_trace_id(meta)
             candidates.append(
                 {
                     "trade_id": trade.trade_id,
@@ -400,6 +476,7 @@ class TradeHistoryService:
                     "symbol": trade.symbol,
                     "side": trade.side,
                     "trace_id": src_trace,
+                    "raw_trace_id": raw_trace_id or None,
                     "source_trade_id": src.trade_id,
                     "source_order_id": src.order_id,
                 }
@@ -415,16 +492,29 @@ class TradeHistoryService:
             if not isinstance(context, dict):
                 context = {}
                 gateway["context"] = context
-            context["trace_id"] = src_trace
-            meta.setdefault("trace_id", src_trace)
+            if not raw_trace_id:
+                context["trace_id"] = src_trace
+            else:
+                context.setdefault("trigger_trace_id", raw_trace_id)
+                meta.setdefault("trigger_trace_id", raw_trace_id)
+            context["decision_trace_id"] = src_trace
+            meta["trace_id"] = src_trace
+            meta["decision_trace_id"] = src_trace
+            meta["root_trace_id"] = src_trace
+            method = "historical_backfill_from_recent_open"
+            if raw_trace_id and raw_trace_id != src_trace:
+                method = "historical_linked_from_recent_open_preserving_trigger_trace"
             meta["trace_attribution"] = {
-                "method": "historical_backfill_from_recent_open",
+                "method": method,
                 "source_trade_id": src.trade_id,
                 "source_order_id": src.order_id,
                 "source_timestamp": src.timestamp,
+                "canonical_trace_id": src_trace,
+                "trigger_trace_id": raw_trace_id or None,
                 "inherited_at": datetime.now().isoformat(),
             }
             trade.metadata = meta
+            self._sync_cached_trade_metadata(trade, meta)
             updated += 1
             if self.db_storage and trade.order_id and hasattr(self.db_storage, "update_trade_metadata_by_order_id"):
                 try:
@@ -1071,58 +1161,10 @@ class TradeHistoryService:
         """从数据库加载缓存"""
         try:
             if self.db_storage:
-                rows = await self.db_storage.get_trades(limit=self._cache_max_size)
                 self._cache_bootstrapped = True
-                if not rows:
+                loaded = await self._load_trade_records_from_db(limit=self._cache_max_size)
+                if not loaded:
                     return
-
-                loaded: List[TradeRecord] = []
-                for idx, row in enumerate(rows):
-                    if not isinstance(row, dict):
-                        continue
-                    symbol = str(row.get("symbol") or "").strip()
-                    if not symbol:
-                        continue
-
-                    side_raw = str(row.get("side", "buy") or "buy").strip().lower()
-                    side_norm = {"long": "buy", "short": "sell"}.get(side_raw, side_raw or "buy")
-                    row_meta: Dict[str, Any] = {}
-                    try:
-                        raw_meta = row.get("metadata_json")
-                        if isinstance(raw_meta, str) and raw_meta.strip():
-                            parsed = json.loads(raw_meta)
-                            if isinstance(parsed, dict):
-                                row_meta = parsed
-                    except Exception:
-                        row_meta = {}
-                    row_meta = dict(row_meta)
-                    row_meta["source"] = "historical_db"
-                    row_meta["db_id"] = row.get("id")
-                    loaded.append(
-                        TradeRecord(
-                            trade_id=f"db_{row.get('id', idx)}",
-                            order_id=str(row.get("order_id") or ""),
-                            symbol=symbol,
-                            side=side_norm,
-                            order_type=str(row.get("order_type") or "market"),
-                            quantity=_to_float(row.get("quantity"), 0.0),
-                            price=_to_float(row.get("price"), 0.0),
-                            fee=_to_float(row.get("fee"), 0.0),
-                            pnl=_to_float(row.get("pnl"), 0.0),
-                            pnl_percent=_to_float(row.get("pnl_percent"), 0.0),
-                            status="filled",
-                            strategy=str(row.get("strategy") or "unknown"),
-                            stop_loss=_to_float(row.get("stop_loss")) if row.get("stop_loss") is not None else None,
-                            take_profit=_to_float(row.get("take_profit")) if row.get("take_profit") is not None else None,
-                            leverage=_to_int(row.get("leverage"), 1),
-                            reasoning=str(row.get("reasoning") or ""),
-                            timestamp=str(row.get("timestamp") or datetime.now().isoformat()),
-                            # Rows loaded from persistent DB are real history, not synthetic bootstrap.
-                            metadata=row_meta,
-                        )
-                    )
-
-                loaded.sort(key=lambda t: t.timestamp)
                 self._cache = loaded[-self._cache_max_size :]
                 self._symbol_index.clear()
                 self._date_index.clear()
@@ -1131,6 +1173,80 @@ class TradeHistoryService:
                 logger.info("✅ 从数据库回灌交易缓存 %s 条", len(self._cache))
         except Exception as e:
             logger.warning(f"加载数据库缓存失败: {e}")
+
+    async def _load_trade_records_from_db(self, limit: int) -> List[TradeRecord]:
+        if not self.db_storage:
+            return []
+        rows = await self.db_storage.get_trades(limit=max(1, int(limit or self._cache_max_size or 1000)))
+        if not rows:
+            return []
+
+        loaded: List[TradeRecord] = []
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").strip()
+            if not symbol:
+                continue
+
+            side_raw = str(row.get("side", "buy") or "buy").strip().lower()
+            side_norm = {"long": "buy", "short": "sell"}.get(side_raw, side_raw or "buy")
+            row_meta: Dict[str, Any] = {}
+            try:
+                raw_meta = row.get("metadata_json")
+                if isinstance(raw_meta, str) and raw_meta.strip():
+                    parsed = json.loads(raw_meta)
+                    if isinstance(parsed, dict):
+                        row_meta = parsed
+            except Exception:
+                row_meta = {}
+            row_meta = dict(row_meta)
+            row_meta["source"] = "historical_db"
+            row_meta["db_id"] = row.get("id")
+            loaded.append(
+                TradeRecord(
+                    trade_id=f"db_{row.get('id', idx)}",
+                    order_id=str(row.get("order_id") or ""),
+                    symbol=symbol,
+                    side=side_norm,
+                    order_type=str(row.get("order_type") or "market"),
+                    quantity=_to_float(row.get("quantity"), 0.0),
+                    price=_to_float(row.get("price"), 0.0),
+                    fee=_to_float(row.get("fee"), 0.0),
+                    pnl=_to_float(row.get("pnl"), 0.0),
+                    pnl_percent=_to_float(row.get("pnl_percent"), 0.0),
+                    status="filled",
+                    strategy=str(row.get("strategy") or "unknown"),
+                    stop_loss=_to_float(row.get("stop_loss")) if row.get("stop_loss") is not None else None,
+                    take_profit=_to_float(row.get("take_profit")) if row.get("take_profit") is not None else None,
+                    leverage=_to_int(row.get("leverage"), 1),
+                    reasoning=str(row.get("reasoning") or ""),
+                    timestamp=str(row.get("timestamp") or datetime.now().isoformat()),
+                    metadata=row_meta,
+                )
+            )
+
+        loaded.sort(key=lambda t: t.timestamp)
+        return loaded
+
+    def _sync_cached_trade_metadata(self, trade: TradeRecord, metadata: Dict[str, Any]) -> None:
+        target_trade_id = str(getattr(trade, "trade_id", "") or "").strip()
+        target_order_id = str(getattr(trade, "order_id", "") or "").strip()
+        target_symbol = str(getattr(trade, "symbol", "") or "").strip()
+        target_ts = str(getattr(trade, "timestamp", "") or "").strip()
+        for cached in self._cache:
+            cached_trade_id = str(getattr(cached, "trade_id", "") or "").strip()
+            cached_order_id = str(getattr(cached, "order_id", "") or "").strip()
+            if target_trade_id and cached_trade_id == target_trade_id:
+                cached.metadata = dict(metadata or {})
+                return
+            if target_order_id and cached_order_id == target_order_id:
+                if target_symbol and str(getattr(cached, "symbol", "") or "").strip() != target_symbol:
+                    continue
+                if target_ts and str(getattr(cached, "timestamp", "") or "").strip() != target_ts:
+                    continue
+                cached.metadata = dict(metadata or {})
+                return
     
     async def _update_cache(self, trade: TradeRecord):
         """更新内存缓存"""

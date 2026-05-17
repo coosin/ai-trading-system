@@ -11,17 +11,19 @@
 """
 
 import asyncio
+import hashlib
 import logging
 import json
 import os
 import random
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import httpx
 
@@ -127,6 +129,11 @@ class BaseLLMProvider(ABC):
         self._last_client_mode_log_ts: float = 0.0
         self._last_transient_error_log_key: Optional[str] = None
         self._last_transient_error_log_ts: float = 0.0
+        self._request_concurrency: int = self._resolve_request_concurrency()
+        self._request_min_interval_sec: float = self._resolve_request_min_interval_sec()
+        self._request_semaphore = asyncio.Semaphore(self._request_concurrency)
+        self._request_pacing_lock = asyncio.Lock()
+        self._last_request_started_at: float = 0.0
 
     def _log_client_mode(self, key: str, message: str) -> None:
         now = time.time()
@@ -155,6 +162,85 @@ class BaseLLMProvider(ABC):
             return host in ("127.0.0.1", "localhost", "::1", "host.docker.internal")
         except Exception:
             return False
+
+    def _is_coding_endpoint(self) -> bool:
+        raw = f"{self.config.base_url} {self.config.model_id}".lower()
+        return any(marker in raw for marker in ("coding", "code", "maas-coding-api"))
+
+    def _resolve_request_concurrency(self) -> int:
+        raw = (os.getenv("OPENCLAW_LLM_MAX_CONCURRENCY_PER_MODEL") or "").strip()
+        if raw:
+            try:
+                return max(1, int(raw))
+            except Exception:
+                logger.warning("OPENCLAW_LLM_MAX_CONCURRENCY_PER_MODEL 无效: %s", raw)
+        return 1 if self._is_coding_endpoint() else 4
+
+    def _resolve_request_min_interval_sec(self) -> float:
+        raw = (os.getenv("OPENCLAW_LLM_MIN_INTERVAL_SEC") or "").strip()
+        if raw:
+            try:
+                return max(0.0, float(raw))
+            except Exception:
+                logger.warning("OPENCLAW_LLM_MIN_INTERVAL_SEC 无效: %s", raw)
+        return 0.8 if self._is_coding_endpoint() else 0.0
+
+    async def _apply_request_pacing(self) -> None:
+        if self._request_min_interval_sec <= 0:
+            return
+        delay = 0.0
+        async with self._request_pacing_lock:
+            now = time.monotonic()
+            if self._last_request_started_at > 0:
+                delay = max(0.0, self._request_min_interval_sec - (now - self._last_request_started_at))
+            if delay <= 0:
+                self._last_request_started_at = now
+        if delay > 0:
+            await asyncio.sleep(delay)
+            async with self._request_pacing_lock:
+                self._last_request_started_at = time.monotonic()
+
+    def _should_dump_failed_prompt(self) -> bool:
+        raw = (os.getenv("OPENCLAW_LLM_DUMP_FAILED_PROMPTS") or "").strip().lower()
+        if raw:
+            return raw in ("1", "true", "yes")
+        return self._is_coding_endpoint()
+
+    def _dump_failed_prompt(
+        self,
+        prompt: str,
+        *,
+        task_label: str,
+        prompt_meta: str,
+        error_code: str,
+        status_code: Optional[int] = None,
+        detail: str = "",
+    ) -> None:
+        if not self._should_dump_failed_prompt():
+            return
+        digest = hashlib.sha1(str(prompt).encode("utf-8", errors="ignore")).hexdigest()[:12]
+        dump_dir = Path(os.getenv("OPENCLAW_LLM_FAILED_PROMPT_DIR", "runtime/llm_failed_prompts"))
+        try:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            base = f"{self.config.model_id}__{task_label}__{digest}"
+            prompt_path = dump_dir / f"{base}.prompt.txt"
+            meta_path = dump_dir / f"{base}.meta.json"
+            if not prompt_path.exists():
+                prompt_path.write_text(str(prompt), encoding="utf-8")
+            meta = {
+                "model_id": self.config.model_id,
+                "task": task_label,
+                "error_code": error_code,
+                "status_code": status_code,
+                "detail": (detail or "")[:2000],
+                "prompt_meta": prompt_meta,
+                "dumped_at": datetime.now().isoformat(),
+                "prompt_file": str(prompt_path),
+            }
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.warning("LLM 失败 prompt 已落盘: %s", prompt_path)
+        except Exception as e:
+            logger.debug("LLM dump failed prompt skipped: %s", e)
 
     def _build_httpx_client(self) -> httpx.AsyncClient:
         """创建 httpx 客户端（显式超时与连接池，降低复用死连接导致的 Server disconnected）"""
@@ -279,13 +365,36 @@ class OpenAIProvider(BaseLLMProvider):
         if status_code != 429:
             return None
         # Provider-specific quota wording (e.g. volc ark AccountQuotaExceeded)
-        if "accountquotaexceeded" in lower or "quota exceeded" in lower or "exceeded the weekly usage quota" in lower:
+        if (
+            "accountquotaexceeded" in lower
+            or "quota exceeded" in lower
+            or "quota_exceeded" in lower
+            or "hour_quota_exceeded" in lower
+            or "daily_quota_exceeded" in lower
+            or "weekly_quota_exceeded" in lower
+            or "coding_plan_hour_quota_exceeded" in lower
+            or "exceeded the weekly usage quota" in lower
+        ):
             return "QUOTA_EXCEEDED"
         return "RATE_LIMIT"
+
+    @staticmethod
+    def _build_prompt_meta(
+        prompt: str, task_label: str, model_id: str, kwargs: Dict[str, Any]
+    ) -> str:
+        digest = hashlib.sha1(prompt.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        line_count = prompt.count("\n") + 1 if prompt else 0
+        max_tokens = kwargs.get("max_tokens")
+        return (
+            f"task={task_label} model={model_id} prompt_chars={len(prompt)} "
+            f"prompt_lines={line_count} prompt_sha1={digest} max_tokens={max_tokens}"
+        )
 
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
         """生成文本（带重试机制和认证错误检测）"""
         start_time = time.time()
+        task_label = str(kwargs.get("task_type_name") or kwargs.get("task_type") or "unknown")
+        prompt_meta = self._build_prompt_meta(prompt, task_label, self.config.model_id, kwargs)
         max_retries = int(kwargs.get('max_retries', self.config.max_retries) or 3)
         network_fail_fast = bool(kwargs.get("network_fail_fast", False))
         env_mr = os.getenv("OPENCLAW_LLM_MAX_RETRIES", "").strip()
@@ -306,10 +415,16 @@ class OpenAIProvider(BaseLLMProvider):
             )
         
         direct_fb = os.getenv("OPENCLAW_LLM_DIRECT_FALLBACK", "").strip().lower() in ("1", "true", "yes")
-        proxy_env_set = (not self._httpx_force_direct) and bool(os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")) and (
+        fail_fast_retries = max(0, int(os.getenv("OPENCLAW_LLM_FAIL_FAST_RETRIES", "2") or "2"))
+        if network_fail_fast and fail_fast_retries > 0:
+            max_retries = max(max_retries, fail_fast_retries + 1)
+        raw_proxy_env_set = bool(os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")) and (
             not self._base_host_bypasses_process_proxy()
         )
+        proxy_env_set = (not self._httpx_force_direct) and raw_proxy_env_set
+        proxy_fb = os.getenv("OPENCLAW_LLM_PROXY_FALLBACK", "1").strip().lower() in ("1", "true", "yes")
         tried_direct_fallback = False
+        tried_proxy_fallback = False
 
         # direct fallback should be temporary unless the environment explicitly forces direct.
         if self._httpx_force_direct and (not self._env_force_direct) and bool(os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")):
@@ -343,13 +458,23 @@ class OpenAIProvider(BaseLLMProvider):
                 extra_body = kwargs.get("extra_body", self.config.extra_body) or {}
                 if isinstance(extra_body, dict):
                     data.update(extra_body)
-                
-                response = await self.session.post(url, headers=headers, json=data)
+
+                async with self._request_semaphore:
+                    await self._apply_request_pacing()
+                    response = await self.session.post(url, headers=headers, json=data)
                 
                 if response.status_code != 200:
                     error_text = response.text
                     is_auth_failure = self._is_auth_error(response.status_code, error_text)
                     limit_kind = self._detect_rate_limit_kind(response.status_code, error_text)
+                    self._dump_failed_prompt(
+                        prompt,
+                        task_label=task_label,
+                        prompt_meta=prompt_meta,
+                        error_code="AUTH_FAILED" if is_auth_failure else (limit_kind or "HTTP_ERROR"),
+                        status_code=response.status_code,
+                        detail=error_text,
+                    )
                     
                     if is_auth_failure:
                         logger.warning(f"LLM API认证失败 ({self.config.model_id}): {error_text[:200]}")
@@ -365,7 +490,25 @@ class OpenAIProvider(BaseLLMProvider):
                         )
                     if limit_kind:
                         last_error = f"{limit_kind}: {response.status_code}"
-                        # Don't aggressively retry quota/limit errors; let the manager failover.
+                        if limit_kind == "RATE_LIMIT" and retry < max_retries - 1:
+                            retry_after_raw = (response.headers.get("Retry-After") or "").strip()
+                            try:
+                                retry_after = float(retry_after_raw) if retry_after_raw else 0.0
+                            except Exception:
+                                retry_after = 0.0
+                            backoff = retry_after if retry_after > 0 else (1.2 * (retry + 1) + random.random())
+                            backoff = min(8.0, max(0.8, backoff))
+                            logger.warning(
+                                "OpenAI API限流，退避后重试 (%s/%s): model=%s status=%s wait=%.2fs [%s]",
+                                retry + 2,
+                                max_retries,
+                                self.config.model_id,
+                                response.status_code,
+                                backoff,
+                                prompt_meta,
+                            )
+                            await asyncio.sleep(backoff)
+                            continue
                         return LLMResponse(
                             content="",
                             model_id=self.config.model_id,
@@ -392,8 +535,52 @@ class OpenAIProvider(BaseLLMProvider):
                     )
                 
                 result = response.json()
-                
-                content = result["choices"][0]["message"]["content"]
+
+                choice = ((result.get("choices") or [{}])[0]) if isinstance(result, dict) else {}
+                message = choice.get("message") or {}
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    text_parts: List[str] = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            text = part.get("text")
+                            if text:
+                                text_parts.append(str(text))
+                        elif part:
+                            text_parts.append(str(part))
+                    content = "".join(text_parts)
+                content = "" if content is None else str(content)
+                if not content.strip():
+                    logger.warning(
+                        "OpenAI兼容响应 content 为空: model=%s finish_reason=%s has_reasoning=%s [%s]",
+                        self.config.model_id,
+                        choice.get("finish_reason"),
+                        bool(message.get("reasoning_content")),
+                        prompt_meta,
+                    )
+                    self._dump_failed_prompt(
+                        prompt,
+                        task_label=task_label,
+                        prompt_meta=prompt_meta,
+                        error_code="EMPTY_CONTENT",
+                        detail=json.dumps(
+                            {
+                                "finish_reason": choice.get("finish_reason"),
+                                "has_reasoning_content": bool(message.get("reasoning_content")),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    return LLMResponse(
+                        content="",
+                        model_id=self.config.model_id,
+                        provider=self.config.provider,
+                        latency_ms=(time.time() - start_time) * 1000,
+                        success=False,
+                        error_message="响应内容为空",
+                        error_code="EMPTY_CONTENT",
+                    )
+
                 usage = result.get("usage", {})
                 input_tokens = usage.get("prompt_tokens", 0)
                 output_tokens = usage.get("completion_tokens", 0)
@@ -420,16 +607,48 @@ class OpenAIProvider(BaseLLMProvider):
                         await self.recycle_session(force=True, force_direct=False)
                     except Exception as re:
                         logger.debug(f"LLM restore proxy session after direct fallback success: {re}")
+                if tried_proxy_fallback and self._env_force_direct:
+                    try:
+                        await self.recycle_session(force=True, force_direct=True)
+                    except Exception as re:
+                        logger.debug(f"LLM restore direct session after proxy fallback success: {re}")
                 return response_obj
             except httpx.ReadTimeout as e:
                 latency_ms = (time.time() - start_time) * 1000
                 phase = "快速失败" if network_fail_fast else f"重试 {retry + 1}/{max_retries}"
-                self._log_transient_failure(
-                    f"timeout:{self.config.model_id}:{type(e).__name__}:{network_fail_fast}",
-                    f"OpenAI API超时 ({phase}): {type(e).__name__}",
-                )
+                will_fast_retry = network_fail_fast and retry < max_retries - 1 and retry < fail_fast_retries
+                if will_fast_retry:
+                    logger.info("OpenAI API超时 (%s，可重试): %s [%s]", phase, type(e).__name__, prompt_meta)
+                else:
+                    self._log_transient_failure(
+                        f"timeout:{self.config.model_id}:{type(e).__name__}:{network_fail_fast}",
+                        f"OpenAI API超时 ({phase}): {type(e).__name__} [{prompt_meta}]",
+                    )
                 last_error = f"请求超时"
+                self._dump_failed_prompt(
+                    prompt,
+                    task_label=task_label,
+                    prompt_meta=prompt_meta,
+                    error_code="TIMEOUT",
+                    detail=type(e).__name__,
+                )
                 if network_fail_fast:
+                    if proxy_fb and self._httpx_force_direct and raw_proxy_env_set and not tried_proxy_fallback:
+                        tried_proxy_fallback = True
+                        logger.warning("LLM 直连超时，尝试代理回退 (OPENCLAW_LLM_PROXY_FALLBACK=1)")
+                        try:
+                            await self.recycle_session(force=True, force_direct=False)
+                        except Exception as re:
+                            logger.debug(f"LLM recycle_session after timeout proxy fallback: {re}")
+                        continue
+                    if will_fast_retry:
+                        logger.info("LLM fail-fast timeout; rebuild session and retry")
+                        try:
+                            await self.recycle_session(force=True)
+                        except Exception as re:
+                            logger.debug(f"LLM recycle_session before fail-fast timeout retry: {re}")
+                        await asyncio.sleep(0.15)
+                        continue
                     try:
                         await self.recycle_session(force=True)
                     except Exception as re:
@@ -477,6 +696,14 @@ class OpenAIProvider(BaseLLMProvider):
                 )
             except httpx.HTTPStatusError as e:
                 latency_ms = (time.time() - start_time) * 1000
+                self._dump_failed_prompt(
+                    prompt,
+                    task_label=task_label,
+                    prompt_meta=prompt_meta,
+                    error_code="HTTP_ERROR",
+                    status_code=e.response.status_code,
+                    detail=e.response.text,
+                )
                 logger.error(f"OpenAI API HTTP错误: {e.response.status_code} - {e.response.text[:200]}")
                 last_error = f"HTTP错误: {e.response.status_code}"
                 if retry < max_retries - 1:
@@ -494,12 +721,45 @@ class OpenAIProvider(BaseLLMProvider):
             except httpx.RequestError as e:
                 latency_ms = (time.time() - start_time) * 1000
                 phase = "快速失败" if network_fail_fast else f"重试 {retry + 1}/{max_retries}"
-                self._log_transient_failure(
-                    f"request-error:{self.config.model_id}:{type(e).__name__}:{network_fail_fast}",
-                    f"OpenAI API网络错误 ({phase}): {type(e).__name__}: {e}",
-                )
+                will_fast_retry = network_fail_fast and retry < max_retries - 1 and retry < fail_fast_retries
+                if will_fast_retry:
+                    logger.info(
+                        "OpenAI API网络错误 (%s，可重试): %s: %s [%s]",
+                        phase,
+                        type(e).__name__,
+                        e,
+                        prompt_meta,
+                    )
+                else:
+                    self._log_transient_failure(
+                        f"request-error:{self.config.model_id}:{type(e).__name__}:{network_fail_fast}",
+                        f"OpenAI API网络错误 ({phase}): {type(e).__name__}: {e} [{prompt_meta}]",
+                    )
                 last_error = f"网络错误: {type(e).__name__}"
+                self._dump_failed_prompt(
+                    prompt,
+                    task_label=task_label,
+                    prompt_meta=prompt_meta,
+                    error_code="NETWORK_ERROR",
+                    detail=f"{type(e).__name__}: {e}",
+                )
                 if network_fail_fast:
+                    if proxy_fb and self._httpx_force_direct and raw_proxy_env_set and not tried_proxy_fallback:
+                        tried_proxy_fallback = True
+                        logger.warning("LLM 直连请求失败，尝试代理回退 (OPENCLAW_LLM_PROXY_FALLBACK=1)")
+                        try:
+                            await self.recycle_session(force=True, force_direct=False)
+                        except Exception as re:
+                            logger.debug(f"LLM recycle_session proxy fallback: {re}")
+                        continue
+                    if will_fast_retry:
+                        logger.info("LLM fail-fast request error; rebuild session and retry")
+                        try:
+                            await self.recycle_session(force=True)
+                        except Exception as re:
+                            logger.debug(f"LLM recycle_session before fail-fast request retry: {re}")
+                        await asyncio.sleep(0.15)
+                        continue
                     try:
                         await self.recycle_session(force=True)
                     except Exception as re:
@@ -566,6 +826,13 @@ class OpenAIProvider(BaseLLMProvider):
                 err_name = type(e).__name__
                 logger.error(f"OpenAI API调用失败: {err_name}: {e}")
                 last_error = str(e)
+                self._dump_failed_prompt(
+                    prompt,
+                    task_label=task_label,
+                    prompt_meta=prompt_meta,
+                    error_code="NETWORK_ERROR" if err_name.endswith("Error") else "UNHANDLED_ERROR",
+                    detail=f"{err_name}: {e}",
+                )
                 transient_resource_errors = {
                     "ClosedResourceError",
                     "ReadError",
@@ -582,6 +849,18 @@ class OpenAIProvider(BaseLLMProvider):
                     except Exception as re:
                         logger.debug(f"LLM recycle_session after transient error: {re}")
                     if network_fail_fast:
+                        if proxy_fb and self._httpx_force_direct and raw_proxy_env_set and not tried_proxy_fallback:
+                            tried_proxy_fallback = True
+                            logger.warning("LLM 直连瞬态错误，尝试代理回退 (OPENCLAW_LLM_PROXY_FALLBACK=1)")
+                            try:
+                                await self.recycle_session(force=True, force_direct=False)
+                            except Exception as re:
+                                logger.debug(f"LLM recycle_session proxy fallback after transient error: {re}")
+                            continue
+                        if retry < max_retries - 1 and retry < fail_fast_retries:
+                            logger.info("LLM fail-fast transient error; rebuild session and retry")
+                            await asyncio.sleep(0.15)
+                            continue
                         return LLMResponse(
                             content="",
                             model_id=self.config.model_id,
@@ -748,10 +1027,15 @@ class EnhancedLLMManager:
         self.default_model: Optional[str] = None
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._runtime_only_models: Set[str] = set()
+        self._runtime_disabled_models: Set[str] = set()
+        self._runtime_provider_allowlist: Set[str] = set()
         # Circuit breaker: model_id -> unix_ts (seconds) until which the model is considered unhealthy.
         self._unhealthy_until: Dict[str, float] = {}
         self._all_unhealthy_log_until: Dict[str, float] = {}
         self._no_model_log_until: Dict[str, float] = {}
+        self._last_success_at: Dict[str, float] = {}
+        self._consecutive_failures: Dict[str, int] = {}
 
     def _is_model_healthy(self, model_id: str) -> bool:
         until = float(self._unhealthy_until.get(model_id, 0.0) or 0.0)
@@ -822,10 +1106,19 @@ class EnhancedLLMManager:
         self._no_model_log_until[key] = now + 60.0
         logger.warning("任务 %s 当前无可用模型，返回空响应并等待候选恢复", task_type.value)
 
+    def _next_failure_backoff_seconds(self, model_id: str, base_seconds: float) -> float:
+        base = float(max(1.0, base_seconds))
+        count = int(self._consecutive_failures.get(model_id, 0) or 0) + 1
+        self._consecutive_failures[model_id] = count
+        cap = float(os.getenv("OPENCLAW_LLM_CB_MAX_SEC", "900") or "900")
+        scaled = base * float(2 ** max(0, count - 1))
+        return min(cap, scaled)
+
     def _clear_model_unhealthy(self, model_id: str) -> None:
         """Successful calls clear circuit state so transient timeouts do not block fallbacks too long."""
         if self._unhealthy_until.pop(model_id, None) is not None:
             logger.debug("LLM circuit-break: cleared unhealthy state for %s after success", model_id)
+        self._consecutive_failures.pop(model_id, None)
 
     def _apply_failure_circuit_break(self, model_id: str, response: "LLMResponse", task_type: Optional[TaskType] = None) -> None:
         if not response or response.success:
@@ -840,9 +1133,95 @@ class EnhancedLLMManager:
         elif code == "QUOTA_EXCEEDED":
             self._mark_model_group_unhealthy(model_id, seconds=quota_sec, reason=code, task_type=task_type)
         elif code == "TIMEOUT":
-            self._mark_model_unhealthy(model_id, seconds=to_sec, reason=code, task_type=task_type)
+            self._mark_model_unhealthy(
+                model_id,
+                seconds=self._next_failure_backoff_seconds(model_id, to_sec),
+                reason=code,
+                task_type=task_type,
+            )
         elif code in {"NETWORK_ERROR", "HTTP_ERROR"}:
-            self._mark_model_unhealthy(model_id, seconds=net_sec, reason=code, task_type=task_type)
+            if net_sec <= 0:
+                logger.info(
+                    "LLM transient %s ignored for circuit-break: model=%s network_cb_disabled=1",
+                    code,
+                    model_id,
+                )
+                return
+            grace_sec = float(os.getenv("OPENCLAW_LLM_CB_RECENT_SUCCESS_GRACE_SEC", "120") or "120")
+            last_success = float(self._last_success_at.get(model_id, 0.0) or 0.0)
+            if last_success and (time.time() - last_success) <= grace_sec:
+                logger.info(
+                    "LLM transient %s ignored for circuit-break: model=%s recent_success_age=%.1fs grace=%.1fs",
+                    code,
+                    model_id,
+                    time.time() - last_success,
+                    grace_sec,
+                )
+                return
+            self._mark_model_unhealthy(
+                model_id,
+                seconds=self._next_failure_backoff_seconds(model_id, net_sec),
+                reason=code,
+                task_type=task_type,
+            )
+
+    @staticmethod
+    def _normalize_model_id_list(value: Any) -> List[str]:
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            items = []
+        out: List[str] = []
+        for item in items:
+            text = str(item or "").strip()
+            if text:
+                out.append(text)
+        return list(dict.fromkeys(out))
+
+    def _filter_policy_model_ids(self, model_ids: Any) -> List[str]:
+        filtered: List[str] = []
+        for model_id in self._normalize_model_id_list(model_ids):
+            model = self.models.get(model_id)
+            if model is None or not model.enabled:
+                continue
+            filtered.append(model_id)
+        return filtered
+
+    def _apply_runtime_model_policy(self, config: Dict[str, Any]) -> None:
+        self._runtime_only_models = set(self._normalize_model_id_list(config.get("only_models")))
+        self._runtime_disabled_models = set(self._normalize_model_id_list(config.get("disable_models")))
+        provider_allowlist = config.get("provider_allowlist")
+        if isinstance(provider_allowlist, str):
+            provider_items = [provider_allowlist]
+        elif isinstance(provider_allowlist, (list, tuple, set)):
+            provider_items = list(provider_allowlist)
+        else:
+            provider_items = []
+        self._runtime_provider_allowlist = {
+            str(item or "").strip().lower() for item in provider_items if str(item or "").strip()
+        }
+
+        if not self._runtime_only_models and not self._runtime_disabled_models and not self._runtime_provider_allowlist:
+            return
+
+        for model_id, model in self.models.items():
+            allowed = bool(model.enabled)
+            provider_name = str(getattr(model.provider, "value", model.provider) or "").strip().lower()
+            if self._runtime_only_models and model_id not in self._runtime_only_models:
+                allowed = False
+            if model_id in self._runtime_disabled_models:
+                allowed = False
+            if self._runtime_provider_allowlist and provider_name not in self._runtime_provider_allowlist:
+                allowed = False
+            if model.enabled and not allowed:
+                model.enabled = False
+                logger.info("LLM runtime policy: disable model %s", model_id)
+
+        for model in self.models.values():
+            if model.fallback_models:
+                model.fallback_models = self._filter_policy_model_ids(model.fallback_models)
 
     async def initialize(self, config: Dict[str, Any]):
         """初始化管理器"""
@@ -855,23 +1234,48 @@ class EnhancedLLMManager:
         if "models" in config:
             for model_config in config["models"]:
                 await self._register_model_from_config(model_config)
+
+        self._apply_runtime_model_policy(config)
         
         # 设置任务-模型映射
         if "task_model_mapping" in config:
             for task_type, model_ids in config["task_model_mapping"].items():
                 try:
                     task = TaskType(task_type)
-                    self.task_model_mapping[task] = model_ids
+                    self.task_model_mapping[task] = self._filter_policy_model_ids(model_ids)
                 except ValueError:
                     logger.warning(f"未知任务类型: {task_type}")
         
         # 设置默认模型
-        self.default_model = config.get("default_model", list(self.models.keys())[0] if self.models else None)
+        configured_default = str(config.get("default_model", "") or "").strip()
+        if configured_default:
+            candidate_default = configured_default
+        else:
+            candidate_default = next(
+                (model_id for model_id, model in self.models.items() if model.enabled),
+                None,
+            )
+        if candidate_default and candidate_default in self.models and self.models[candidate_default].enabled:
+            self.default_model = candidate_default
+        else:
+            self.default_model = next(
+                (model_id for model_id, model in self.models.items() if model.enabled),
+                None,
+            )
+            if configured_default and self.default_model != configured_default:
+                logger.warning(
+                    "LLM 默认模型 %s 已被运行策略禁用，切换为 %s",
+                    configured_default,
+                    self.default_model,
+                )
         
         # 初始化提供者
         for model_id, model_config in self.models.items():
             if model_config.enabled:
                 await self._initialize_provider(model_id)
+
+        if self.default_model not in self.providers:
+            self.default_model = next(iter(self.providers.keys()), None)
         
         self._initialized = True
         logger.info(f"增强大模型管理器初始化完成，加载了 {len(self.models)} 个模型")
@@ -1150,20 +1554,57 @@ class EnhancedLLMManager:
                 success=False,
                 error_message=f"模型提供者未初始化: {model_id}"
             )
-        
+
+        prompt, removed_chars = self._sanitize_prompt_text(prompt)
+        if removed_chars > 0:
+            logger.info(
+                "Prompt sanitized before LLM request: task=%s model=%s removed_chars=%s remaining_chars=%s",
+                task_type.value,
+                model_id,
+                removed_chars,
+                len(prompt),
+            )
+
         MAX_PROMPT_CHARS = 150000
         if len(prompt) > MAX_PROMPT_CHARS:
             logger.warning(f"Prompt过长 ({len(prompt)} chars), 截断至 {MAX_PROMPT_CHARS}")
             prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n[...内容已截断...]"
         
         provider = self.providers[model_id]
-        response = await provider.generate(prompt, **kwargs)
+        provider_kwargs = dict(kwargs)
+        provider_kwargs.setdefault("task_type_name", task_type.value)
+        response = await provider.generate(prompt, **provider_kwargs)
         response.task_type = task_type
         
         # 更新使用统计
         await self._update_usage_stats(model_id, response)
         
         return response
+
+    @staticmethod
+    def _sanitize_prompt_text(prompt: Any) -> Tuple[str, int]:
+        """Normalize line endings and drop hidden control characters before JSON encoding."""
+        if not isinstance(prompt, str):
+            prompt = str(prompt)
+
+        normalized = prompt.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned_chars: List[str] = []
+        removed = 0
+        for ch in normalized:
+            code = ord(ch)
+            if ch in ("\n", "\t"):
+                cleaned_chars.append(ch)
+                continue
+            if code < 32 or 127 <= code < 160:
+                removed += 1
+                continue
+            cleaned_chars.append(ch)
+
+        cleaned = "".join(cleaned_chars)
+        utf8_cleaned = cleaned.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+        if utf8_cleaned != cleaned:
+            removed += max(0, len(cleaned) - len(utf8_cleaned))
+        return utf8_cleaned, removed
 
     async def _update_usage_stats(self, model_id: str, response: LLMResponse):
         """更新使用统计"""
@@ -1174,6 +1615,7 @@ class EnhancedLLMManager:
         stats.total_calls += 1
         
         if response.success:
+            self._last_success_at[model_id] = time.time()
             self._clear_model_unhealthy(model_id)
             stats.successful_calls += 1
             stats.total_tokens += response.tokens_used

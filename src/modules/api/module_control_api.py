@@ -15,6 +15,18 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_PLACEHOLDER_STRATEGY_NAMES = {
+    "",
+    "?",
+    "-",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "unknown",
+    "unassigned",
+}
+
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
@@ -33,6 +45,60 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _parse_iso_datetime(value: Any) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.min
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return datetime.min
+
+
+def _trade_row_operation(row: Dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    gateway = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
+    op = str(gateway.get("op") or "").strip().lower()
+    if op in {"open", "close"}:
+        return op
+    action = str(row.get("action") or md.get("action") or md.get("trade_phase") or "").strip().lower()
+    if action in {"open", "opened"}:
+        return "open"
+    if action in {"close", "closed"}:
+        return "close"
+    decision_action = str(md.get("decision_action") or "").strip().upper()
+    if decision_action.startswith("OPEN_"):
+        return "open"
+    if decision_action.startswith("CLOSE_"):
+        return "close"
+    return ""
+
+
+def _trade_row_leg_side(row: Dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    decision_action = str(md.get("decision_action") or "").strip().upper()
+    if decision_action.endswith("_LONG"):
+        return "long"
+    if decision_action.endswith("_SHORT"):
+        return "short"
+    op = _trade_row_operation(row)
+    side = str(row.get("side") or "").strip().lower()
+    if op == "open":
+        return "long" if side == "buy" else ("short" if side == "sell" else "")
+    if op == "close":
+        return "long" if side == "sell" else ("short" if side == "buy" else "")
+    return ""
+
+
 def _load_runtime_json(filename: str) -> Dict[str, Any]:
     try:
         runtime_dir = Path(__file__).resolve().parents[3] / "runtime"
@@ -40,6 +106,36 @@ def _load_runtime_json(filename: str) -> Dict[str, Any]:
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
+
+
+def _load_runtime_json_snapshot(filename: str, *, stale_after_sec: float = 1800.0) -> Dict[str, Any]:
+    runtime_dir = Path(__file__).resolve().parents[3] / "runtime"
+    path = runtime_dir / filename
+    out: Dict[str, Any] = {
+        "path": str(path),
+        "available": False,
+        "fresh": False,
+        "stale_after_seconds": float(stale_after_sec),
+        "age_seconds": None,
+        "last_modified": None,
+        "payload": {},
+    }
+    try:
+        stat = path.stat()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        age_seconds = max(0.0, time.time() - float(stat.st_mtime))
+        out.update(
+            {
+                "available": True,
+                "fresh": age_seconds <= float(stale_after_sec),
+                "age_seconds": round(age_seconds, 3),
+                "last_modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                "payload": payload if isinstance(payload, dict) else {},
+            }
+        )
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 def _load_recent_capacity_block_from_runtime() -> Optional[Dict[str, Any]]:
@@ -157,6 +253,41 @@ async def _get_live_sltp_active_order_count(main_controller: Any) -> int:
         return _safe_int((stats or {}).get("active_orders", 0))
     except Exception:
         return 0
+
+
+async def _get_live_equity(main_controller: Any) -> float:
+    mc = main_controller
+    if not mc:
+        return 0.0
+    try:
+        latest = getattr(mc, "_latest_account_state", {}) or {}
+        if isinstance(latest, dict):
+            portfolio_value = 0.0
+            for key in ("usdt_total", "usdt_free", "total_equity", "equity", "totalEq"):
+                portfolio_value = max(portfolio_value, _safe_float(latest.get(key)))
+            balance_view = latest.get("balance")
+            if isinstance(balance_view, dict):
+                portfolio_value = max(
+                    portfolio_value,
+                    _safe_float(balance_view.get("USDT") or balance_view.get("usdt")),
+                )
+            if portfolio_value > 0:
+                return portfolio_value
+    except Exception:
+        pass
+    try:
+        ex = mc.get_exchange() if hasattr(mc, "get_exchange") else getattr(mc, "okx_exchange", None)
+        if ex and hasattr(ex, "get_balance"):
+            acct = await ex.get_balance()
+            if isinstance(acct, dict):
+                return max(
+                    _safe_float(acct.get("total_equity") or acct.get("equity") or acct.get("totalEq")),
+                    _safe_float(((acct.get("USDT") or {}).get("total")) if isinstance(acct.get("USDT"), dict) else 0.0),
+                    _safe_float(acct.get("USDT") or acct.get("usdt")),
+                )
+    except Exception:
+        pass
+    return 0.0
 
 
 async def _build_agent_effectiveness_summary(
@@ -356,6 +487,14 @@ async def _build_agent_effectiveness_summary(
     )
     out["agents"] = per_agent
     realized_intersection = realized_trace_ids & store_trace_ids
+    attribution_diagnosis = "insufficient_trace_data"
+    if realized_trace_ids and store_trace_ids:
+        if executed_trace_count == 0:
+            attribution_diagnosis = "store_sample_contains_no_executions"
+        elif realized_intersection:
+            attribution_diagnosis = "ok"
+        else:
+            attribution_diagnosis = "realized_trace_namespace_mismatch"
     out["attribution_diagnostics"] = {
         "store_trace_count": len(store_trace_ids),
         "trade_trace_count": len(open_trace_ids),
@@ -366,11 +505,7 @@ async def _build_agent_effectiveness_summary(
         "realized_trace_namespaces": [{"key": k, "count": int(v)} for k, v in realized_trace_prefixes.most_common(8)],
         "realized_trace_examples": realized_trace_examples,
         "intersection_examples": list(sorted(realized_intersection))[:8],
-        "diagnosis": (
-            "realized_trace_namespace_mismatch"
-            if realized_trace_ids and store_trace_ids and not realized_intersection
-            else "ok" if realized_intersection else "insufficient_trace_data"
-        ),
+        "diagnosis": attribution_diagnosis,
     }
 
     top_issues: List[Dict[str, Any]] = []
@@ -419,7 +554,22 @@ async def _build_agent_effectiveness_summary(
                     "recommendation": "增加 wait_or_slice / reduce_size / cancel_chase 等明确执行动作，否则执行教练对盈利提升有限。",
                 }
             )
-    if realized_linked_trace_count == 0:
+    if executed_trace_count == 0 and len(rows) > 0:
+        top_issues.append(
+            {
+                "priority": "medium",
+                "issue": "当前 trace 样本没有成功执行记录，无法评估真实收益闭环",
+                "evidence": {
+                    "trace_sample_size": len(rows),
+                    "executed_trace_count": int(executed_trace_count),
+                    "blocked_trace_count": int(blocked_trace_count),
+                    "realized_trace_count": len(realized_trace_ids),
+                    "attribution_diagnosis": out["attribution_diagnostics"]["diagnosis"],
+                },
+                "recommendation": "等待出现 execution=success 的新样本，或增大 trace_limit 后再评估四智能体对真实收益的影响。",
+            }
+        )
+    elif realized_linked_trace_count == 0:
         top_issues.append(
             {
                 "priority": "high",
@@ -466,9 +616,15 @@ def _extract_trade_trace_id(row: Dict[str, Any]) -> str:
     gateway = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
     context = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
     return str(
-        context.get("trace_id")
-        or md.get("trace_id")
+        md.get("trace_id")
+        or md.get("decision_trace_id")
+        or md.get("root_trace_id")
         or row.get("trace_id")
+        or context.get("decision_trace_id")
+        or context.get("root_trace_id")
+        or context.get("trace_id")
+        or context.get("TraceId")
+        or context.get("traceId")
         or ""
     ).strip()
 
@@ -484,6 +640,148 @@ def _extract_trade_semantic_context(row: Dict[str, Any]) -> Dict[str, Any]:
     context = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
     payload = context.get("semantic_context")
     return payload if isinstance(payload, dict) else {}
+
+
+async def _build_live_trade_context(main_controller: Any, *, limit: int = 1000) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "latest_trade": {},
+        "best_regime": {},
+        "worst_regime": {},
+        "symbol_summaries": [],
+        "source": "trade_history_service",
+    }
+    ths = getattr(main_controller, "trade_history_service", None) if main_controller else None
+    if not ths or not hasattr(ths, "get_trade_history"):
+        out["source"] = "trade_history_service_unavailable"
+        return out
+    try:
+        rows = await ths.get_trade_history(limit=max(100, int(limit or 1000)))
+    except Exception:
+        out["source"] = "trade_history_service_failed"
+        return out
+
+    ordered_rows = sorted(
+        [row for row in (rows or []) if isinstance(row, dict)],
+        key=lambda row: _parse_iso_datetime(row.get("timestamp")),
+        reverse=True,
+    )
+    if not ordered_rows:
+        return out
+
+    latest = ordered_rows[0]
+    latest_md = latest.get("metadata") if isinstance(latest.get("metadata"), dict) else {}
+    latest_semantic = _extract_trade_semantic_context(latest)
+    latest_regime = _infer_regime_from_trade_row(latest)
+    out["latest_trade"] = {
+        "timestamp": latest.get("timestamp"),
+        "trade_id": latest.get("trade_id") or latest.get("order_id") or latest.get("id"),
+        "symbol": latest.get("symbol"),
+        "side": latest.get("side"),
+        "operation": _trade_row_operation(latest),
+        "price": _safe_float(latest.get("price")),
+        "quantity": _safe_float(latest.get("quantity") or latest.get("size") or latest.get("executed_quantity")),
+        "pnl": _safe_float(latest.get("pnl")),
+        "fee": _safe_float(latest.get("fee")),
+        "reasoning": latest.get("reasoning"),
+        "strategy_id": latest_md.get("strategy_id") or latest.get("strategy"),
+        "regime_label": latest_semantic.get("regime_label") or latest_md.get("regime_label") or latest_regime.get("regime"),
+        "trace_id": _extract_trade_trace_id(latest) or None,
+    }
+
+    regime_buckets: Dict[str, Dict[str, Any]] = {}
+    symbol_buckets: Dict[str, Dict[str, Any]] = {}
+    for row in ordered_rows:
+        if _is_low_fidelity_historical_trade_row(row):
+            continue
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        op = _trade_row_operation(row)
+        pnl = _safe_float(row.get("pnl"))
+        fee = _safe_float(row.get("fee"))
+        pnl_pct = _safe_float(row.get("pnl_percent"))
+        ts = row.get("timestamp")
+
+        bucket = symbol_buckets.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "rows": 0,
+                "opens": 0,
+                "closes": 0,
+                "realized_closes": 0,
+                "total_pnl": 0.0,
+                "total_fee": 0.0,
+                "net_after_fees": 0.0,
+                "last_timestamp": ts,
+            },
+        )
+        bucket["rows"] += 1
+        bucket["total_fee"] += fee
+        bucket["net_after_fees"] += pnl + fee
+        if op == "open":
+            bucket["opens"] += 1
+        elif op == "close":
+            bucket["closes"] += 1
+            bucket["realized_closes"] += 1
+            bucket["total_pnl"] += pnl
+        if not bucket.get("last_timestamp"):
+            bucket["last_timestamp"] = ts
+
+        if op != "close" and abs(pnl) <= 1e-12 and abs(pnl_pct) <= 1e-12:
+            continue
+        regime_info = _infer_regime_from_trade_row(row)
+        regime = str(regime_info.get("regime") or "unknown").strip().lower() or "unknown"
+        if regime == "unknown":
+            continue
+        regime_bucket = regime_buckets.setdefault(
+            regime,
+            {"regime": regime, "total_trades": 0, "wins": 0, "losses": 0, "total_pnl": 0.0},
+        )
+        regime_bucket["total_trades"] += 1
+        regime_bucket["total_pnl"] += pnl
+        if pnl > 1e-12:
+            regime_bucket["wins"] += 1
+        elif pnl < -1e-12:
+            regime_bucket["losses"] += 1
+
+    regime_rows: List[Dict[str, Any]] = []
+    for item in regime_buckets.values():
+        total_trades = _safe_int(item.get("total_trades"))
+        wins = _safe_int(item.get("wins"))
+        total_pnl = _safe_float(item.get("total_pnl"))
+        regime_rows.append(
+            {
+                "regime": item.get("regime"),
+                "total_trades": total_trades,
+                "win_rate": round((wins / total_trades), 4) if total_trades > 0 else 0.0,
+                "total_pnl": round(total_pnl, 6),
+                "expectancy": round((total_pnl / total_trades), 6) if total_trades > 0 else 0.0,
+            }
+        )
+    regime_rows.sort(key=lambda item: (_safe_float(item.get("total_pnl")), _safe_int(item.get("total_trades"))), reverse=True)
+    if regime_rows:
+        out["best_regime"] = regime_rows[0]
+        out["worst_regime"] = regime_rows[-1]
+
+    symbol_rows: List[Dict[str, Any]] = []
+    for item in symbol_buckets.values():
+        symbol_rows.append(
+            {
+                "symbol": item.get("symbol"),
+                "rows": _safe_int(item.get("rows")),
+                "opens": _safe_int(item.get("opens")),
+                "closes": _safe_int(item.get("closes")),
+                "realized_closes": _safe_int(item.get("realized_closes")),
+                "total_pnl": round(_safe_float(item.get("total_pnl")), 6),
+                "total_fee": round(_safe_float(item.get("total_fee")), 6),
+                "net_after_fees": round(_safe_float(item.get("net_after_fees")), 6),
+                "last_timestamp": item.get("last_timestamp"),
+            }
+        )
+    symbol_rows.sort(key=lambda item: (_safe_float(item.get("net_after_fees")), item.get("last_timestamp") or ""), reverse=True)
+    out["symbol_summaries"] = symbol_rows[:10]
+    return out
 
 
 async def _build_trade_lifecycle_summary(
@@ -541,28 +839,34 @@ async def _build_trade_lifecycle_summary(
         "partial_take_profit_positive_count": 0,
     }
 
-    ordered_rows = list(rows or [])
-    for row in ordered_rows:
+    ordered_rows = sorted(
+        [
+            row
+            for row in (rows or [])
+            if isinstance(row, dict) and not _is_low_fidelity_historical_trade_row(row)
+        ],
+        key=lambda row: _parse_iso_datetime(row.get("timestamp")),
+        reverse=True,
+    )
+    chronological_rows = list(reversed(ordered_rows))
+    for row in chronological_rows:
         if not isinstance(row, dict):
             continue
         md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         gateway = md.get("gateway") if isinstance(md.get("gateway"), dict) else {}
-        op = str(gateway.get("op") or "").lower()
+        op = _trade_row_operation(row) or str(gateway.get("op") or "").lower()
         fees += _safe_float(row.get("fee"))
         if _extract_trade_trace_id(row):
             trace_linked_rows += 1
-        ts_raw = row.get("timestamp")
-        ts = None
-        try:
-            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) if ts_raw else None
-        except Exception:
+        ts = _parse_iso_datetime(row.get("timestamp"))
+        if ts == datetime.min:
             ts = None
         symbol = str(row.get("symbol") or "").upper()
-        side = str(row.get("side") or "").lower()
-        leg_key = (symbol, side)
+        leg_side = _trade_row_leg_side(row)
+        leg_key = (symbol, leg_side)
         if op == "open":
             opens += 1
-            if ts is not None and symbol and side:
+            if ts is not None and symbol and leg_side:
                 open_legs[leg_key].append(ts)
         elif op == "close":
             closes += 1
@@ -581,7 +885,7 @@ async def _build_trade_lifecycle_summary(
                 exit_review["partial_take_profit_positive_count"] += 1
             if "stop_loss" in low_reason and pnl < 0:
                 exit_review["stop_loss_negative_count"] += 1
-            if ts is not None and symbol and side:
+            if ts is not None and symbol and leg_side:
                 queue = open_legs.get(leg_key) or []
                 if queue:
                     opened_at = queue.pop(0)
@@ -589,7 +893,7 @@ async def _build_trade_lifecycle_summary(
                     if delta >= 0:
                         durations_sec.append(delta)
 
-    for row in reversed(ordered_rows[-max(1, int(recent_limit or 20)):]):
+    for row in ordered_rows[: max(1, int(recent_limit or 20))]:
         if not isinstance(row, dict):
             continue
         md = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
@@ -600,7 +904,7 @@ async def _build_trade_lifecycle_summary(
                 "timestamp": row.get("timestamp"),
                 "symbol": row.get("symbol"),
                 "side": row.get("side"),
-                "operation": str(gateway.get("op") or "").lower(),
+                "operation": _trade_row_operation(row) or str(gateway.get("op") or "").lower(),
                 "price": row.get("price"),
                 "quantity": row.get("quantity") or row.get("size"),
                 "pnl": _safe_float(row.get("pnl")),
@@ -646,12 +950,23 @@ async def _build_closed_loop_summary_data(main_controller: Any, *, trace_limit: 
     workflow_focus = _summarize_trace_workflow_focus(traces)
     recent = traces.get("recent", []) if isinstance(traces, dict) else []
 
-    watch = _load_runtime_json("realtime_watch.latest.json")
-    analysis = watch.get("analysis", {}) if isinstance(watch.get("analysis"), dict) else {}
+    watch_snapshot = _load_runtime_json_snapshot("realtime_watch.latest.json")
+    watch = watch_snapshot.get("payload", {}) if isinstance(watch_snapshot.get("payload"), dict) else {}
+    watch_fresh = bool(watch_snapshot.get("fresh"))
+    analysis = watch.get("analysis", {}) if (watch_fresh and isinstance(watch.get("analysis"), dict)) else {}
+    live_trade_context = await _build_live_trade_context(mc, limit=max(240, int(trace_limit or 120) * 8))
     latest_trade = analysis.get("latest_trade", {}) if isinstance(analysis.get("latest_trade"), dict) else {}
     best_regime = analysis.get("best_regime", {}) if isinstance(analysis.get("best_regime"), dict) else {}
     worst_regime = analysis.get("worst_regime", {}) if isinstance(analysis.get("worst_regime"), dict) else {}
     symbol_summaries = analysis.get("symbol_summaries", []) if isinstance(analysis.get("symbol_summaries"), list) else []
+    if not latest_trade:
+        latest_trade = live_trade_context.get("latest_trade", {}) if isinstance(live_trade_context.get("latest_trade"), dict) else {}
+    if not best_regime:
+        best_regime = live_trade_context.get("best_regime", {}) if isinstance(live_trade_context.get("best_regime"), dict) else {}
+    if not worst_regime:
+        worst_regime = live_trade_context.get("worst_regime", {}) if isinstance(live_trade_context.get("worst_regime"), dict) else {}
+    if not symbol_summaries:
+        symbol_summaries = live_trade_context.get("symbol_summaries", []) if isinstance(live_trade_context.get("symbol_summaries"), list) else []
     ai_core = getattr(mc, "ai_core", None)
     rejected_rows = list(getattr(ai_core, "_rejected_signals", []) or []) if ai_core is not None else []
     recent_advisory_rows = [
@@ -816,7 +1131,7 @@ async def _build_closed_loop_summary_data(main_controller: Any, *, trace_limit: 
         "rr_rejected": _safe_int(analysis.get("rr_rejected", 0)),
         "sr_timing_rejected": _safe_int(analysis.get("sr_timing_rejected", 0)),
         "open_evidence_rejected": _safe_int(analysis.get("open_evidence_rejected", 0)),
-        "regime_advisory_only_rejected": _safe_int(analysis.get("regime_advisory_only_rejected", 0)),
+        "regime_advisory_only_rejected": _safe_int(analysis.get("regime_advisory_only_rejected", len(recent_advisory_rows))),
         "tp_net_edge_suppressed": tp_net_edge_suppressed,
     }
     tp_suppressed_by_regime_raw = (sltp_stats or {}).get("tp_net_edge_suppressed_by_regime") or analysis.get("tp_net_edge_suppressed_by_regime", {})
@@ -878,25 +1193,31 @@ async def _build_closed_loop_summary_data(main_controller: Any, *, trace_limit: 
     live_active_orders = await _get_live_sltp_active_order_count(mc)
     gateway_equity = _safe_float(analysis.get("equity"))
     if gateway_equity <= 0:
-        try:
-            acct = await (mc.get_exchange().get_balance() if hasattr(mc, "get_exchange") and mc.get_exchange() else None)
-            if isinstance(acct, dict):
-                gateway_equity = _safe_float(
-                    acct.get("total_equity")
-                    or acct.get("equity")
-                    or acct.get("totalEq")
-                    or ((acct.get("USDT") or {}).get("total") if isinstance(acct.get("USDT"), dict) else 0)
-                )
-        except Exception:
-            pass
+        gateway_equity = await _get_live_equity(mc)
 
     monitoring_gap = {
         "monitoring_total_trades": _safe_int(monitor_summary.get("total_trades", 0)) if isinstance(monitor_summary, dict) else 0,
         "strategy_perf_sources": len((monitor_summary.get("strategies") or [])) if isinstance(monitor_summary, dict) else 0,
-        "latest_trade_present_in_runtime_watch": bool(latest_trade),
+        "latest_trade_present_in_runtime_watch": bool(watch_fresh and isinstance(analysis.get("latest_trade"), dict) and analysis.get("latest_trade")),
+        "runtime_watch_fresh": watch_fresh,
+        "runtime_watch_age_seconds": watch_snapshot.get("age_seconds"),
     }
 
     optimization_hints: List[Dict[str, Any]] = []
+    if not watch_fresh:
+        optimization_hints.append(
+            {
+                "priority": "high",
+                "area": "trade_analytics_freshness",
+                "issue": "runtime_watch 快照已经过期，闭环摘要已切到真实成交回退口径",
+                "evidence": {
+                    "runtime_watch_age_seconds": watch_snapshot.get("age_seconds"),
+                    "runtime_watch_last_modified": watch_snapshot.get("last_modified"),
+                    "fallback_source": live_trade_context.get("source"),
+                },
+                "recommendation": "恢复 realtime_watch 刷新后再观察其增量价值；在此之前，以 trade_history_service 与 live 风控口径为准。",
+            }
+        )
     if monitoring_gap["monitoring_total_trades"] == 0 and latest_trade:
         optimization_hints.append(
             {
@@ -1056,11 +1377,19 @@ async def _build_closed_loop_summary_data(main_controller: Any, *, trace_limit: 
             running_modules = 0
 
     return {
+        "runtime_watch": {
+            "available": bool(watch_snapshot.get("available")),
+            "fresh": watch_fresh,
+            "age_seconds": watch_snapshot.get("age_seconds"),
+            "last_modified": watch_snapshot.get("last_modified"),
+            "stale_after_seconds": watch_snapshot.get("stale_after_seconds"),
+            "fallback_source": live_trade_context.get("source"),
+        },
         "loop_health": {
             "verdict": analysis.get("verdict") or ("PASS" if _safe_int(recon_summary.get("drift_total", 0)) == 0 else "WARN"),
             "risk_level": analysis.get("risk_level") or ("low" if _safe_int(recon_summary.get("drift_total", 0)) == 0 else "medium"),
             "running_modules": running_modules,
-            "active_alerts": _safe_int(analysis.get("active_alerts", 0)),
+            "active_alerts": _safe_int(analysis.get("active_alerts", monitor_summary.get("active_alerts", 0))),
             "active_orders": live_active_orders,
             "position_count": live_position_count,
             "equity": gateway_equity,
@@ -1298,13 +1627,68 @@ def _trade_regime(row: Dict[str, Any]) -> str:
     md = g["metadata"]
     ctx = g["context"]
     mcx = md.get("market_context") if isinstance(md.get("market_context"), dict) else {}
+    semantic = md.get("semantic_context") if isinstance(md.get("semantic_context"), dict) else {}
     gp = ctx.get("guard_profile") if isinstance(ctx.get("guard_profile"), dict) else {}
     sem = ctx.get("semantic_context") if isinstance(ctx.get("semantic_context"), dict) else {}
-    return str(mcx.get("regime") or gp.get("regime") or sem.get("regime_label") or "unknown").strip() or "unknown"
+    return str(
+        mcx.get("regime")
+        or semantic.get("regime_label")
+        or semantic.get("regime")
+        or gp.get("regime")
+        or sem.get("regime_label")
+        or sem.get("regime")
+        or "unknown"
+    ).strip() or "unknown"
 
 
 def _norm_trade_symbol(symbol: Any) -> str:
     return str(symbol or "unknown").replace("/SWAP", "").strip() or "unknown"
+
+
+def _is_placeholder_strategy_name(name: Any) -> bool:
+    return str(name or "").strip().lower() in _PLACEHOLDER_STRATEGY_NAMES
+
+
+def _is_low_fidelity_historical_trade_row(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    g = _trade_gateway_context(row)
+    md = g["metadata"]
+    gw = g["gateway"]
+    ctx = g["context"]
+    source = str(row.get("source") or md.get("source") or "").strip().lower()
+    if source not in {"historical_db", "legacy"}:
+        return False
+    if not _is_placeholder_strategy_name(_trade_strategy(row)):
+        return False
+    if _extract_trade_trace_id(row):
+        return False
+    if str(row.get("reasoning") or "").strip():
+        return False
+    if gw or ctx:
+        return False
+    if any(
+        md.get(key)
+        for key in ("market_context", "semantic_context", "open_timestamp", "close_timestamp", "raw", "regime_label")
+    ):
+        return False
+    return True
+
+
+def _infer_regime_from_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    direct = str(_trade_regime(row) or "").strip().lower()
+    if direct and direct != "unknown":
+        return {"regime": direct, "inferred": False}
+    strategy = str(_trade_strategy(row) or "").strip().lower()
+    reasoning = str(_trade_reason(row) or "").strip().lower()
+    text = f"{strategy} {reasoning}"
+    if any(k in text for k in ("trend", "breakout", "momentum", "bull", "bear", "moving_average", "_ma")):
+        return {"regime": "trend", "inferred": True}
+    if any(k in text for k in ("support", "resistance", "mean_reversion", "bollinger", "sr_near")):
+        return {"regime": "range", "inferred": True}
+    if any(k in text for k in ("stop_loss", "volatility", "spike", "liq", "liquidity_stress")):
+        return {"regime": "volatile", "inferred": True}
+    return {"regime": "unknown", "inferred": False}
 
 
 def _compact_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1325,7 +1709,7 @@ def _compact_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "reason": _trade_reason(row),
         "regime": _trade_regime(row),
         "leverage": row.get("leverage"),
-        "trace_id": ctx.get("trace_id") or g["gateway"].get("trace_id"),
+        "trace_id": _extract_trade_trace_id(row) or None,
         "decision_reasoning_excerpt": str(ctx.get("decision_reasoning") or "")[:360],
     }
 
@@ -2111,6 +2495,40 @@ def init_module_control_api(app, main_controller):
                 }
             )
 
+        try:
+            async with research_semaphore:
+                result = await asyncio.wait_for(
+                    pipeline.run_cycle(symbols=sym_slice, timeframe=timeframe, lookback_days=lookback_days),
+                    timeout=timeout_sec,
+                )
+            async with research_jobs_lock:
+                research_jobs[job_id].update(
+                    {
+                        "status": "completed",
+                        "result": result,
+                        "finished_at": datetime.now().isoformat(),
+                    }
+                )
+        except asyncio.TimeoutError:
+            async with research_jobs_lock:
+                research_jobs[job_id].update(
+                    {
+                        "status": "failed",
+                        "message": f"策略研发执行超时（>{timeout_sec}s）",
+                        "finished_at": datetime.now().isoformat(),
+                    }
+                )
+        except Exception as e:
+            logger.exception("手动策略研发失败")
+            async with research_jobs_lock:
+                research_jobs[job_id].update(
+                    {
+                        "status": "failed",
+                        "message": str(e),
+                        "finished_at": datetime.now().isoformat(),
+                    }
+                )
+
     @trade_router.get("/events")
     async def get_trade_events(
         limit: int = 200,
@@ -2389,43 +2807,6 @@ def init_module_control_api(app, main_controller):
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
-        def _run_cycle_in_thread() -> Dict[str, Any]:
-            # 在独立线程事件循环中执行重型研究流程，避免阻塞主 API loop。
-            return asyncio.run(
-                pipeline.run_cycle(symbols=sym_slice, timeframe=timeframe, lookback_days=lookback_days)
-            )
-
-        try:
-            async with research_semaphore:
-                result = await asyncio.wait_for(asyncio.to_thread(_run_cycle_in_thread), timeout=timeout_sec)
-            async with research_jobs_lock:
-                research_jobs[job_id].update(
-                    {
-                        "status": "completed",
-                        "result": result,
-                        "finished_at": datetime.now().isoformat(),
-                    }
-                )
-        except asyncio.TimeoutError:
-            async with research_jobs_lock:
-                research_jobs[job_id].update(
-                    {
-                        "status": "failed",
-                        "message": f"策略研发执行超时（>{timeout_sec}s）",
-                        "finished_at": datetime.now().isoformat(),
-                    }
-                )
-        except Exception as e:
-            logger.exception("手动策略研发失败")
-            async with research_jobs_lock:
-                research_jobs[job_id].update(
-                    {
-                        "status": "failed",
-                        "message": str(e),
-                        "finished_at": datetime.now().isoformat(),
-                    }
-                )
-    
     @router.get("/list")
     async def get_all_modules():
         """获取所有模块列表和状态"""

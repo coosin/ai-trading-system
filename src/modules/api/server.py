@@ -27,6 +27,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
+from src.modules.api.trade_attribution import (
+    is_placeholder_strategy_name,
+    resolve_trade_strategy_name,
+    trade_source_name,
+)
 from src.modules.core.enhanced_llm_manager import TaskType
 from src.modules.data.data_source_hub import DataSourceHub
 
@@ -349,6 +354,7 @@ class APIServer:
             "api_response_time_ms": 0.0,
             "avg_response_time_ms": 0.0,
         }
+        self._started_at = datetime.now()
 
         # Uvicorn runtime handles (to keep API responsive even if the main event loop
         # is temporarily busy during startup tasks).
@@ -1650,28 +1656,10 @@ class APIServer:
 
         # 市场数据路由 - 支持 /api/v1/market/data
         @api_v1_router.get("/market/data", tags=["market"])
-        async def get_market_data(symbol: str = "BTC/USDT"):
-            """获取市场数据"""
-            # 这里应该从市场数据服务获取真实数据
-            # 为简化，返回模拟数据
-            import random
-            data = []
-            now = datetime.now()
-            for i in range(100):
-                timestamp = (now - timedelta(minutes=i)).isoformat()
-                base_price = 50000 if symbol == "BTC/USDT" else 3000
-                price = base_price + random.uniform(-1000, 1000)
-                data.append({
-                    "timestamp": timestamp,
-                    "open": price - random.uniform(100, 200),
-                    "high": price + random.uniform(50, 100),
-                    "low": price - random.uniform(50, 100),
-                    "close": price,
-                    "volume": random.uniform(1000, 5000)
-                })
-            # 反转数据，使最新的数据在最后
-            data.reverse()
-            return data
+        async def get_market_data(symbol: str = "BTC/USDT", interval: str = "1m", limit: int = 100):
+            """获取真实K线数据；无可用数据时返回空列表，不再生成随机模拟行情。"""
+            rows = await _resolve_data_source_hub().get_klines(symbol, interval=interval, limit=limit)
+            return rows if isinstance(rows, list) else []
 
         # 市场行情路由 - 支持 /api/v1/market/ticker/{symbol}
         @api_v1_router.get("/market/ticker/{symbol}", tags=["market"])
@@ -1779,17 +1767,56 @@ class APIServer:
 
                         latest = getattr(mc, "_latest_account_state", {}) or {}
                         portfolio_value = 0.0
+                        latest_account_state_at = None
+                        if isinstance(latest, dict):
+                            latest_account_state_at = latest.get("timestamp")
                         for k in ("usdt_total", "usdt_free"):
                             try:
                                 v = float(latest.get(k) or 0.0)
                                 portfolio_value = max(portfolio_value, v)
                             except Exception:
                                 continue
-                        if portfolio_value <= 0:
-                            portfolio_value = margin_used
+                        balance_view = latest.get("balance") if isinstance(latest, dict) else None
+                        if isinstance(balance_view, dict):
+                            try:
+                                portfolio_value = max(
+                                    portfolio_value,
+                                    float(balance_view.get("USDT") or balance_view.get("usdt") or 0.0),
+                                )
+                            except Exception:
+                                pass
 
-                        margin_level = (portfolio_value / total_exposure) if total_exposure > 0 else 0.0
-                        if leverage_used >= 50 or margin_level < 0.05:
+                        portfolio_value_source = "account_state_cache"
+                        if portfolio_value <= 0 and hasattr(ex, "get_balance"):
+                            try:
+                                live_balance = await asyncio.wait_for(ex.get_balance(), timeout=6.0)
+                            except Exception:
+                                live_balance = None
+                            if isinstance(live_balance, dict):
+                                try:
+                                    portfolio_value = max(
+                                        portfolio_value,
+                                        float(live_balance.get("USDT") or live_balance.get("usdt") or 0.0),
+                                    )
+                                except Exception:
+                                    pass
+                                if portfolio_value > 0:
+                                    portfolio_value_source = "exchange_balance_free"
+
+                        warming = bool(portfolio_value <= 0)
+                        warnings: List[str] = []
+                        if warming:
+                            warnings.append("account_state_warming")
+                            portfolio_value_source = "warming_unavailable"
+
+                        margin_level = (
+                            (portfolio_value / total_exposure)
+                            if (portfolio_value > 0 and total_exposure > 0)
+                            else 0.0
+                        )
+                        if warming and total_exposure > 0:
+                            risk_level = "unknown"
+                        elif leverage_used >= 50 or margin_level < 0.05:
                             risk_level = "high"
                         elif leverage_used >= 20 or margin_level < 0.1:
                             risk_level = "medium"
@@ -1805,7 +1832,12 @@ class APIServer:
                             "margin_level": float(margin_level),
                             "risk_level": risk_level,
                             "position_count": int(position_count),
-                            "warnings": [],
+                            "warnings": warnings,
+                            "warming": warming,
+                            "degraded": warming,
+                            "portfolio_value_source": portfolio_value_source,
+                            "portfolio_value_lower_bound": float(margin_used) if margin_used > 0 else 0.0,
+                            "latest_account_state_at": latest_account_state_at,
                             "source": "main_controller:positions_estimated",
                             "timestamp": datetime.now().isoformat(),
                         }
@@ -1967,6 +1999,38 @@ class APIServer:
             status = str(row.get("status") or "").strip().lower()
             return action in {"close", "closed"} or status in {"closed", "filled"}
 
+        def _decision_trace_lookup_for_mc(mc: Any):
+            store = getattr(mc, "decision_trace_store", None) if mc else None
+            if store and hasattr(store, "get_by_trace_id"):
+                return store.get_by_trace_id
+            return None
+
+        def _enrich_trade_row_for_api(row: Dict[str, Any], *, mc: Any) -> Dict[str, Any]:
+            if not isinstance(row, dict):
+                return row
+            out = dict(row)
+            md = out.get("metadata") if isinstance(out.get("metadata"), dict) else {}
+            md_copy = dict(md) if md else {}
+            strategy_name = resolve_trade_strategy_name(
+                out,
+                decision_trace_lookup=_decision_trace_lookup_for_mc(mc),
+                default="",
+            )
+            if strategy_name:
+                out["strategy"] = strategy_name
+                if is_placeholder_strategy_name(md_copy.get("strategy_id")):
+                    md_copy["strategy_id"] = strategy_name
+                if is_placeholder_strategy_name(md_copy.get("strategy_used")):
+                    md_copy["strategy_used"] = strategy_name
+                if md_copy:
+                    out["metadata"] = md_copy
+            else:
+                out["strategy"] = None
+                if md_copy:
+                    out["metadata"] = md_copy
+            out["source"] = trade_source_name(out, default=str(out.get("source") or ""))
+            return out
+
         @api_v1_router.get("/trades", tags=["trades"])
         async def get_trades(
             range: str = "7d",
@@ -2037,7 +2101,7 @@ class APIServer:
                             continue
                         if realized_only and not _is_realized_trade(row):
                             continue
-                        clean_trades.append(row)
+                        clean_trades.append(_enrich_trade_row_for_api(row, mc=mc))
                     paged_trades = clean_trades[offset: offset + max(limit, 1)]
                     
                     if not paged_trades:
@@ -2093,7 +2157,7 @@ class APIServer:
                                     continue
                                 if realized_only and not _is_realized_trade(row):
                                     continue
-                                clean_list.append(row)
+                                clean_list.append(_enrich_trade_row_for_api(row, mc=mc))
                             
                             return {
                                 "trades": clean_list,
@@ -2126,20 +2190,23 @@ class APIServer:
                         for row in audit_rows[offset: offset + max(limit, 1)]:
                             details = row.get("details") or {}
                             mapped.append(
-                                {
-                                    "order_id": details.get("order_id"),
-                                    "symbol": row.get("symbol") or details.get("symbol"),
-                                    "side": details.get("side") or row.get("action"),
-                                    "quantity": details.get("quantity"),
-                                    "price": details.get("price"),
-                                    "status": row.get("status"),
-                                    "timestamp": row.get("timestamp"),
-                                    "executed_quantity": details.get("quantity"),
-                                    "avg_price": details.get("price"),
-                                    "fee": None,
-                                    "source": "execution_audit",
-                                    "error_message": row.get("error_message"),
-                                }
+                                _enrich_trade_row_for_api(
+                                    {
+                                        "order_id": details.get("order_id"),
+                                        "symbol": row.get("symbol") or details.get("symbol"),
+                                        "side": details.get("side") or row.get("action"),
+                                        "quantity": details.get("quantity"),
+                                        "price": details.get("price"),
+                                        "status": row.get("status"),
+                                        "timestamp": row.get("timestamp"),
+                                        "executed_quantity": details.get("quantity"),
+                                        "avg_price": details.get("price"),
+                                        "fee": None,
+                                        "source": "execution_audit",
+                                        "error_message": row.get("error_message"),
+                                    },
+                                    mc=mc,
+                                )
                             )
                         clean_mapped: List[Dict[str, Any]] = []
                         for row in mapped:
@@ -2815,20 +2882,19 @@ class APIServer:
                         continue
                     if accurate_only and bool(md.get("pnl_estimated")):
                         continue
+                    enriched = _enrich_trade_row_for_api(r, mc=mc)
                     # Historical bootstrap-like rows with only db_id/source carry
                     # little attribution value and can dominate analytics with "unknown".
                     if exclude_low_fidelity:
-                        strategy_hint = (
-                            md.get("strategy_id")
-                            or md.get("strategy_used")
-                            or r.get("strategy")
-                            or r.get("strategy_used")
-                            or ""
+                        strategy_hint = resolve_trade_strategy_name(
+                            enriched,
+                            decision_trace_lookup=_decision_trace_lookup_for_mc(mc),
+                            default="",
                         )
                         has_min_context = bool(md.get("market_context")) or bool(md.get("open_timestamp")) or bool(md.get("close_timestamp"))
                         if (src in {"historical_db", "legacy"}) and (not strategy_hint) and (not has_min_context):
                             continue
-                    trades.append(r)
+                    trades.append(enriched)
 
                 def _infer_regime_from_trade(r: Dict[str, Any]) -> Dict[str, Any]:
                     md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
@@ -2861,15 +2927,12 @@ class APIServer:
                     return {"regime": "unknown", "inferred": False}
 
                 def _bucket_strategy(r: Dict[str, Any]) -> str:
-                    md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
-                    s = (
-                        md.get("strategy_id")
-                        or md.get("strategy_used")
-                        or r.get("strategy")
-                        or r.get("strategy_used")
-                        or ""
+                    resolved = resolve_trade_strategy_name(
+                        r,
+                        decision_trace_lookup=_decision_trace_lookup_for_mc(mc),
+                        default="",
                     )
-                    return str(s or "").strip() or "unknown"
+                    return str(resolved or "").strip() or "unknown"
 
                 def _bucket_regime(r: Dict[str, Any]) -> str:
                     return str((_infer_regime_from_trade(r) or {}).get("regime") or "unknown").strip().lower() or "unknown"
@@ -4936,10 +4999,15 @@ class APIServer:
         return True
 
     def _get_uptime(self) -> str:
-        """获取运行时间（模拟）"""
-        # 这里应该计算实际的运行时间
-        # 为简化，返回固定值
-        return "0 days, 0:00:00"
+        """获取运行时间。"""
+        started_at = getattr(self, "_started_at", None)
+        if not isinstance(started_at, datetime):
+            return "unknown"
+        delta = datetime.now() - started_at
+        if delta.total_seconds() < 0:
+            delta = timedelta(0)
+        delta -= timedelta(microseconds=delta.microseconds)
+        return str(delta)
 
 
 # 使用示例

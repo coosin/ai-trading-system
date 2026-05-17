@@ -639,6 +639,8 @@ class StrategyManager:
         }
         self._latest_market_structure_snapshots: Dict[str, Dict[str, Any]] = {}
         self._last_trade_feedback_opt_at: Optional[datetime] = None
+        self._loading_strategy_configs = False
+        self._last_persisted_strategy_signature: Optional[str] = None
 
         logger.info("策略管理器初始化完成")
 
@@ -779,6 +781,8 @@ class StrategyManager:
                 self.strategy_configs[config.strategy_id] = config
 
             logger.info(f"加载策略配置: {config.name} ({config.strategy_id})")
+            if not self._loading_strategy_configs:
+                await self._persist_strategy_configs()
             return config
 
         except Exception as e:
@@ -1605,6 +1609,7 @@ class StrategyManager:
     async def _load_strategy_configs(self) -> None:
         """加载策略配置"""
         loaded_from_config = False
+        self._loading_strategy_configs = True
         if self.config_manager:
             try:
                 strategies_config = await self.config_manager.get_config("strategies", {})
@@ -1635,6 +1640,47 @@ class StrategyManager:
                 logger.info("未加载任何策略配置，已注入默认策略配置（多策略）")
             except Exception as e:
                 logger.info(f"未加载任何策略配置，默认策略注入失败: {e}")
+        self._loading_strategy_configs = False
+        if loaded_from_config:
+            self._last_persisted_strategy_signature = self._strategy_configs_signature()
+
+    @staticmethod
+    def _strategy_material_state(config: StrategyConfig) -> Dict[str, Any]:
+        data = config.to_dict()
+        data.pop("updated_at", None)
+        return data
+
+    def _strategy_configs_payload(self) -> List[Dict[str, Any]]:
+        rows = [cfg.to_dict() for cfg in self.strategy_configs.values()]
+        rows.sort(key=lambda row: str(row.get("strategy_id") or ""))
+        return rows
+
+    def _strategy_configs_signature(self, payload: Optional[List[Dict[str, Any]]] = None) -> str:
+        rows = payload if payload is not None else self._strategy_configs_payload()
+        blob = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    async def _persist_strategy_configs(self) -> bool:
+        """Persist strategy pool changes so researched/optimized strategies survive restarts."""
+        if not self.config_manager:
+            return False
+        try:
+            setter = getattr(self.config_manager, "set_config", None)
+            if not setter:
+                return False
+            strategies = self._strategy_configs_payload()
+            signature = self._strategy_configs_signature(strategies)
+            if signature == self._last_persisted_strategy_signature:
+                logger.debug("策略配置未变化，跳过持久化")
+                return True
+            ok = await setter("strategies", "strategies", strategies, validate=False)
+            if ok:
+                self._last_persisted_strategy_signature = signature
+                logger.info("策略配置已持久化: %s 个", len(strategies))
+            return bool(ok)
+        except Exception as e:
+            logger.warning("策略配置持久化失败: %s", e)
+            return False
 
     async def create_ai_strategy(self, strategy_data: Dict) -> Optional[str]:
         """AI动态创建策略"""
@@ -1654,6 +1700,7 @@ class StrategyManager:
             )
             
             self.strategy_configs[strategy_id] = config
+            await self._persist_strategy_configs()
             logger.info(f"✅ AI创建策略成功: {config.name} ({strategy_id})")
             
             return strategy_id
@@ -1692,6 +1739,7 @@ class StrategyManager:
             )
             
             self.strategy_configs[combined_id] = config
+            await self._persist_strategy_configs()
             logger.info(f"✅ AI组合策略成功: {combined_name} ({combined_id})")
             
             return combined_id
@@ -2108,14 +2156,16 @@ class StrategyManager:
         research_candidates.sort(key=lambda row: row[1], reverse=True)
         selected_ids = {sid for sid, _, _ in research_candidates[:max_active_research]}
         retired: List[str] = []
+        changed = False
 
         async with self._lock:
-            for sid, score, cfg in research_candidates:
+            for rank, (sid, score, cfg) in enumerate(research_candidates, start=1):
+                before_state = self._strategy_material_state(cfg)
                 md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
                 research = md.get("research", {}) if isinstance(md.get("research"), dict) else {}
                 review_window = self._build_human_review_window(cfg)
                 review_window["selection_score"] = float(round(score, 6))
-                review_window["selection_rank"] = next((idx + 1 for idx, row in enumerate(research_candidates) if row[0] == sid), None)
+                review_window["selection_rank"] = rank
                 review_window["selection_reason"] = "selected_high_score" if sid in selected_ids else "retired_low_score"
                 md["review_window"] = review_window
                 research["selection_score"] = float(round(score, 6))
@@ -2123,14 +2173,20 @@ class StrategyManager:
                 md["research"] = research
                 cfg.metadata = md
                 if sid in selected_ids:
-                    if not cfg.enabled:
+                    if self._get_deployment_stage(cfg) == "paper":
+                        cfg.enabled = False
+                    elif not cfg.enabled:
                         cfg.enabled = True
                 else:
                     cfg.enabled = False
                     cfg.stage = StrategyLifecycleStage.RETIRED
                     retired.append(sid)
-                cfg.updated_at = datetime.now()
+                if self._strategy_material_state(cfg) != before_state:
+                    cfg.updated_at = datetime.now()
+                    changed = True
 
+        if changed:
+            await self._persist_strategy_configs()
         return {"selected": sorted(selected_ids), "retired": retired}
 
     async def _prune_low_score_strategies(self) -> None:
@@ -2341,6 +2397,8 @@ class StrategyManager:
                 )
             await self._auto_manage_deployment_stages()
 
+        await self._persist_strategy_configs()
+
     def _get_deployment_stage(self, config: StrategyConfig) -> str:
         md = config.metadata if isinstance(config.metadata, dict) else {}
         dep = md.get("deployment", {}) if isinstance(md.get("deployment", {}), dict) else {}
@@ -2392,25 +2450,30 @@ class StrategyManager:
         market_structure: Optional[Dict[str, Any]] = None,
         from_stage: Optional[str] = None,
         to_stage: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         md = config.metadata if isinstance(config.metadata, dict) else {}
         gov = md.get("governance", {}) if isinstance(md.get("governance"), dict) else {}
         rows = gov.get("deployment_actions", []) if isinstance(gov.get("deployment_actions"), list) else []
-        rows.append(
-            {
-                "action": str(action or "hold"),
-                "symbol": str(symbol or ""),
-                "reason": str(reason or ""),
-                "from_stage": from_stage,
-                "to_stage": to_stage,
-                "market_structure": dict(market_structure or {}),
-                "recorded_at": datetime.now().isoformat(),
-            }
-        )
+        event = {
+            "action": str(action or "hold"),
+            "symbol": str(symbol or ""),
+            "reason": str(reason or ""),
+            "from_stage": from_stage,
+            "to_stage": to_stage,
+            "market_structure": dict(market_structure or {}),
+        }
+        last = rows[-1] if rows else None
+        if isinstance(last, dict):
+            last_compact = {k: last.get(k) for k in event.keys()}
+            if last_compact == event:
+                return False
+        event["recorded_at"] = datetime.now().isoformat()
+        rows.append(event)
         gov["deployment_actions"] = rows[-50:]
         md["governance"] = gov
         config.metadata = md
         config.updated_at = datetime.now()
+        return True
 
     def _infer_lifecycle_stage(self, config_data: Dict[str, Any], metadata: Dict[str, Any]) -> StrategyLifecycleStage:
         raw = str(config_data.get("stage") or metadata.get("stage") or "").strip().lower()
@@ -2874,7 +2937,14 @@ class StrategyManager:
         snap["recorded_at"] = datetime.now().isoformat()
         self._latest_market_structure_snapshots[sym] = snap
         if apply_now:
-            return self.apply_market_structure_governance(sym, snap)
+            result = self.apply_market_structure_governance(sym, snap)
+            if result.get("changed") and self.config_manager:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._persist_strategy_configs())
+                except RuntimeError:
+                    pass
+            return result
         return {"symbol": sym, "updated": True, "applied": False}
 
     def apply_market_structure_governance(
@@ -2898,6 +2968,7 @@ class StrategyManager:
 
         matched: List[str] = []
         actions: List[Dict[str, Any]] = []
+        changed_any = False
         candidates = strategy_ids or list(self.strategy_configs.keys())
         for sid in candidates:
             cfg = self.strategy_configs.get(sid)
@@ -2908,6 +2979,7 @@ class StrategyManager:
                 if symbols and sym not in symbols:
                     continue
             matched.append(sid)
+            before_state = self._strategy_material_state(cfg)
             md = cfg.metadata if isinstance(cfg.metadata, dict) else {}
             gov = md.get("governance", {}) if isinstance(md.get("governance"), dict) else {}
             overlay = gov.get("market_structure_overlay", {}) if isinstance(gov.get("market_structure_overlay"), dict) else {}
@@ -2954,7 +3026,7 @@ class StrategyManager:
             elif action == "recover" and target_stage != current_stage:
                 self._set_deployment_stage(cfg, target_stage, reason=f"market_structure_recover:{reason}")
 
-            gov["market_structure_overlay"] = {
+            overlay_payload = {
                 "symbol": sym,
                 "status": status,
                 "action": action,
@@ -2965,13 +3037,19 @@ class StrategyManager:
                 "reason": reason,
                 "confidence": round(confidence, 4),
                 "signal_conflict_score": round(conflict, 4),
-                "updated_at": datetime.now().isoformat(),
             }
-            md["governance"] = gov
-            cfg.metadata = md
-            cfg.updated_at = datetime.now()
-            if action != "hold":
-                self._record_deployment_action(
+            previous_overlay = {k: v for k, v in overlay.items() if k != "updated_at"} if isinstance(overlay, dict) else {}
+            overlay_changed = previous_overlay != overlay_payload
+            if overlay_changed:
+                gov["market_structure_overlay"] = {
+                    **overlay_payload,
+                    "updated_at": datetime.now().isoformat(),
+                }
+                md["governance"] = gov
+                cfg.metadata = md
+            action_recorded = False
+            if action != "hold" and overlay_changed:
+                action_recorded = self._record_deployment_action(
                     cfg,
                     action=action,
                     symbol=sym,
@@ -2980,6 +3058,9 @@ class StrategyManager:
                     from_stage=current_stage,
                     to_stage=self._get_deployment_stage(cfg),
                 )
+            if self._strategy_material_state(cfg) != before_state:
+                cfg.updated_at = datetime.now()
+                changed_any = True
             actions.append(
                 {
                     "strategy_id": sid,
@@ -2988,6 +3069,7 @@ class StrategyManager:
                     "from_stage": current_stage,
                     "to_stage": self._get_deployment_stage(cfg),
                     "effective_cap_multiplier": effective_mult,
+                    "changed": bool(overlay_changed or action_recorded),
                 }
             )
 
@@ -3002,15 +3084,21 @@ class StrategyManager:
                 "signal_conflict_score": round(conflict, 4),
             },
             "actions": actions,
+            "changed": changed_any,
             "applied_at": datetime.now().isoformat(),
         }
 
     async def _auto_apply_market_structure_governance(self) -> None:
+        changed_any = False
         for symbol, snapshot in list(self._latest_market_structure_snapshots.items()):
             try:
-                self.apply_market_structure_governance(symbol, snapshot)
+                result = self.apply_market_structure_governance(symbol, snapshot)
+                if bool((result or {}).get("changed")):
+                    changed_any = True
             except Exception as e:
                 logger.debug("market structure governance apply failed for %s: %s", symbol, e)
+        if changed_any:
+            await self._persist_strategy_configs()
 
     def get_market_structure_governance_status(self) -> Dict[str, Any]:
         status_counts: Dict[str, int] = {}

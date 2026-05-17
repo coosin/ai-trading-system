@@ -10,9 +10,9 @@ system:
   log_level: INFO
   environment: production
 llm:
-  # 主模型：DeepSeek 为主，千帆 / Astron 作为回退
-  default_model: deepseek-v4-flash
-  # 自动轮询策略：优先MiMo Pro，失败后降级，支持自动恢复
+  # 主模型：千帆为主，Astron 作为唯一默认回退；DeepSeek 配置保留但默认禁用
+  default_model: qianfan-code-latest
+  # 自动轮询策略：优先当前主模型，失败后降级，支持自动恢复
   auto_polling:
     enabled: true
     strategy: priority_with_fallback
@@ -21,7 +21,7 @@ llm:
     max_failures_before_switch: 2
     cooldown_after_switch: 30
   models:
-  # 0. 千帆 Code Latest — 可用备用（OpenAI 兼容）
+  # 0. 千帆 Code Latest — 生产默认主模型（OpenAI 兼容）
   - provider: openai
     model_id: qianfan-code-latest
     display_name: Baidu Qianfan Code Latest
@@ -37,14 +37,12 @@ llm:
     supports_vision: false
     supports_reasoning: true
     enabled: true
-    priority: 140
+    priority: 180
     region: cn
-    notes: Usable fallback via Baidu Qianfan official OpenAI-compatible endpoint
+    notes: Production primary via Baidu Qianfan official OpenAI-compatible endpoint
     fallback_models:
-    - deepseek-v4-pro
-    - deepseek-v4-flash
     - astron-code-latest
-  # 1. DeepSeek V4 Flash — 生产默认主模型（低延迟）
+  # 1. DeepSeek V4 Flash — 低延迟回退
   - provider: openai
     model_id: deepseek-v4-flash
     display_name: DeepSeek V4 Flash
@@ -59,13 +57,13 @@ llm:
     context_window: 128000
     supports_vision: false
     supports_reasoning: true
-    enabled: true
-    priority: 160
+    enabled: false
+    priority: 150
     region: global
-    notes: Production primary via DeepSeek OpenAI-compatible endpoint
+    notes: Low-latency fallback via DeepSeek OpenAI-compatible endpoint
     fallback_models:
-    - deepseek-v4-pro
     - qianfan-code-latest
+    - deepseek-v4-pro
     - astron-code-latest
   # 2. DeepSeek V4 Pro — 高推理质量回退 / 重点任务优先
   - provider: openai
@@ -82,8 +80,8 @@ llm:
     context_window: 128000
     supports_vision: false
     supports_reasoning: true
-    enabled: true
-    priority: 150
+    enabled: false
+    priority: 160
     region: global
     notes: Deep reasoning fallback / preferred for complex decisions
     fallback_models:
@@ -111,55 +109,35 @@ llm:
     notes: Final fallback via iFlytek MaaS coding OpenAI-compatible endpoint
     fallback_models: []
   task_model_mapping:
-    # 默认优先 DeepSeek；千帆保留在回退链；Astron 为末级备用
+    # 默认任务仅走千帆主路由 + Astron 兜底，避免 DeepSeek 配额不足时拖慢回退链。
     general:
-    - deepseek-v4-pro
-    - deepseek-v4-flash
     - qianfan-code-latest
     - astron-code-latest
     market_analysis:
-    - deepseek-v4-pro
-    - deepseek-v4-flash
     - qianfan-code-latest
     - astron-code-latest
     strategy_generation:
-    - deepseek-v4-pro
-    - deepseek-v4-flash
     - qianfan-code-latest
     - astron-code-latest
     signal_generation:
-    - deepseek-v4-flash
-    - deepseek-v4-pro
     - qianfan-code-latest
     - astron-code-latest
     risk_assessment:
-    - deepseek-v4-pro
-    - deepseek-v4-flash
     - qianfan-code-latest
     - astron-code-latest
     news_analysis:
-    - deepseek-v4-flash
-    - deepseek-v4-pro
     - qianfan-code-latest
     - astron-code-latest
     code_generation:
-    - deepseek-v4-pro
-    - deepseek-v4-flash
     - qianfan-code-latest
     - astron-code-latest
     natural_language:
-    - deepseek-v4-flash
-    - deepseek-v4-pro
     - qianfan-code-latest
     - astron-code-latest
     decision_making:
-    - deepseek-v4-flash
-    - deepseek-v4-pro
     - qianfan-code-latest
     - astron-code-latest
     reasoning:
-    - deepseek-v4-pro
-    - deepseek-v4-flash
     - qianfan-code-latest
     - astron-code-latest
 trading:

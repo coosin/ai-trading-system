@@ -3292,17 +3292,45 @@ class AITradingEngine:
             memory = self.llm_integration.enhanced_memory
             if not memory:
                 return
-            
-            memory.save_strategy_optimization(
-                strategy_name=strategy_name,
-                optimization_type=optimization_type,
-                old_params=old_params,
-                new_params=new_params,
-                reason=reason,
-                expected_improvement=expected_improvement
-            )
-            
-            logger.info(f"� 策略优化记录已保存到记忆库")
+
+            save_optimization = getattr(memory, "save_strategy_optimization", None)
+            if callable(save_optimization):
+                result = save_optimization(
+                    strategy_name=strategy_name,
+                    optimization_type=optimization_type,
+                    old_params=old_params,
+                    new_params=new_params,
+                    reason=reason,
+                    expected_improvement=expected_improvement
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+            elif hasattr(memory, "store"):
+                await memory.store(
+                    json.dumps(
+                        {
+                            "strategy_name": strategy_name,
+                            "optimization_type": optimization_type,
+                            "old_params": old_params,
+                            "new_params": new_params,
+                            "reason": reason,
+                            "expected_improvement": expected_improvement,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    category="strategy_optimization",
+                    importance=0.7,
+                    metadata={
+                        "source": "ai_trading_engine",
+                        "strategy_name": strategy_name,
+                        "optimization_type": optimization_type,
+                    },
+                )
+            else:
+                logger.debug("策略优化记录跳过：记忆后端不支持保存接口")
+                return
+
+            logger.info("策略优化记录已保存到记忆库")
             
         except Exception as e:
             logger.error(f"保存策略优化记录失败: {e}")

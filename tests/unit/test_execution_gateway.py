@@ -504,3 +504,55 @@ async def test_close_records_reconciliation_before_execution():
     assert row["execution"]["status"] == "success"
     assert row["workflow"]["current_stage"] == "execution:close"
     assert [x["stage"] for x in row["stage_history"][-2:]] == ["reconciliation", "execution:close"]
+
+
+@pytest.mark.asyncio
+async def test_close_trade_history_prefers_realized_fill_pnl_percent_over_trigger_context():
+    ex = MagicMock()
+    ex.close_swap_position = AsyncMock(
+        return_value={
+            "success": True,
+            "orderId": "c1",
+            "average": 1.93,
+            "price": 1.93,
+            "realizedPnl": -0.142,
+            "fee": -0.00193,
+        }
+    )
+    ex.get_positions = AsyncMock(return_value=[])
+    mc = _mc_with_exchange(ex, swo="ai_core")
+    mc.trade_history_service = MagicMock()
+    mc.trade_history_service.record_trade_dict = AsyncMock()
+    gw = ExecutionGateway(mc)
+    gw._reconciler.build_snapshot = AsyncMock(
+        return_value={
+            "healthy": True,
+            "severity": "ok",
+            "summary": {"drift_total": 0, "stale_open_orders": 0},
+            "position_drifts": {},
+            "order_signals": {},
+            "safe_recovery": {"policy": "safe_only_no_cancel_no_force_close"},
+            "exchange_errors": {},
+        }
+    )
+
+    res = await gw.close_swap(
+        "ATOM/USDT/SWAP",
+        "long",
+        2.0,
+        "stop_loss_take_profit",
+        "take_profit",
+        context={
+            "trace_id": "trace-close-realized-pnl-pct",
+            "entry_price": 2.001,
+            "trigger_price": 2.122,
+            "trigger_pnl_percent": 0.06046976511744128,
+        },
+    )
+
+    assert res["success"] is True
+    mc.trade_history_service.record_trade_dict.assert_awaited_once()
+    trade = mc.trade_history_service.record_trade_dict.await_args.args[0]
+    assert trade["price"] == pytest.approx(1.93)
+    assert trade["pnl_percent"] == pytest.approx((1.93 - 2.001) / 2.001)
+    assert trade["metadata"]["gateway"]["context"]["trigger_pnl_percent"] == pytest.approx(0.06046976511744128)

@@ -11,6 +11,15 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+CANONICAL_AGENT_OUTPUT_NAMES = {
+    "market_structure_agent",
+    "research_agent",
+    "risk_governor_agent",
+    "execution_coach_agent",
+    "execution_gateway",
+}
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -69,6 +78,7 @@ class DecisionTraceStore:
                 tid = str(row.get("trace_id") or "").strip()
                 if not tid:
                     continue
+                self._sanitize_row(row)
                 items.append(row)
             while len(items) > self._max_items:
                 items.pop(0)
@@ -76,6 +86,25 @@ class DecisionTraceStore:
             self._by_trace_id = {str(r.get("trace_id") or ""): r for r in items if r.get("trace_id")}
         except Exception as e:
             logger.warning("decision_trace_store load failed: %s", e)
+
+    def _sanitize_row(self, row: Dict[str, Any]) -> None:
+        if not isinstance(row, dict):
+            return
+        agents = row.get("agent_outputs") if isinstance(row.get("agent_outputs"), dict) else {}
+        semantic = row.get("semantic_signals") if isinstance(row.get("semantic_signals"), dict) else {}
+        clean_agents: Dict[str, Any] = {}
+        clean_semantic: Dict[str, Any] = dict(semantic)
+        for name, payload in agents.items():
+            key = str(name or "").strip()
+            if not key or not isinstance(payload, dict):
+                continue
+            if key in CANONICAL_AGENT_OUTPUT_NAMES:
+                clean_agents[key] = payload
+            else:
+                clean_semantic[key] = payload
+        row["agent_outputs"] = clean_agents
+        if clean_semantic:
+            row["semantic_signals"] = clean_semantic
 
     def _persist_to_disk(self) -> None:
         if not self._persist_path:
@@ -110,6 +139,7 @@ class DecisionTraceStore:
                 "reconciliation": {},
                 "market_context": {},
                 "agent_outputs": {},
+                "semantic_signals": {},
                 "workflow": {
                     "mode": None,
                     "current_stage": None,
@@ -313,16 +343,16 @@ class DecisionTraceStore:
             if val is not None:
                 market[field] = val
         cur["market_context"] = market
-        agents = cur.get("agent_outputs") if isinstance(cur.get("agent_outputs"), dict) else {}
+        signals = cur.get("semantic_signals") if isinstance(cur.get("semantic_signals"), dict) else {}
         if any(k in extras for k in ("risk_verdict", "execution_recommendation", "lesson_summary", "tuning_suggestion")):
-            agents[source] = {
+            signals[source] = {
                 "risk_verdict": extras.get("risk_verdict"),
                 "execution_recommendation": extras.get("execution_recommendation"),
                 "lesson_summary": extras.get("lesson_summary"),
                 "mistake_tags": extras.get("mistake_tags"),
                 "tuning_suggestion": extras.get("tuning_suggestion"),
             }
-            cur["agent_outputs"] = agents
+            cur["semantic_signals"] = signals
 
     @staticmethod
     def _extract_workflow_mode(extras: Dict[str, Any]) -> Optional[str]:
@@ -430,12 +460,22 @@ class DecisionTraceStore:
             if stage_name:
                 strategy_stages[stage_name] = int(strategy_stages.get(stage_name, 0)) + 1
             agent_outputs = row.get("agent_outputs") if isinstance(row.get("agent_outputs"), dict) else {}
+            semantic_signals = row.get("semantic_signals") if isinstance(row.get("semantic_signals"), dict) else {}
+            counted_risk_verdict = False
             for _agent_name, verdict in agent_outputs.items():
                 if not isinstance(verdict, dict):
                     continue
                 risk_verdict = str(verdict.get("risk_verdict") or "")
                 if risk_verdict:
                     risk_verdicts[risk_verdict] = int(risk_verdicts.get(risk_verdict, 0)) + 1
+                    counted_risk_verdict = True
+            if not counted_risk_verdict:
+                for verdict in semantic_signals.values():
+                    if not isinstance(verdict, dict):
+                        continue
+                    risk_verdict = str(verdict.get("risk_verdict") or "")
+                    if risk_verdict:
+                        risk_verdicts[risk_verdict] = int(risk_verdicts.get(risk_verdict, 0)) + 1
             workflow = row.get("workflow") if isinstance(row.get("workflow"), dict) else {}
             wf_stage = str(workflow.get("current_stage") or "")
             if wf_stage:
