@@ -2,6 +2,7 @@ import React from 'react';
 import { ActionList, DataTable, InsightCard, JsonDetails, MetricGrid } from '../components/UiBlocks';
 
 export default function RiskOpsSection({ state }) {
+  const monitoringHumanized = state.monitoringSummary?.humanized || {};
   const alertRows = (state.monitoringAlerts || []).slice(0, 20).map((row, idx) => ({
     id: idx,
     level: row.severity || row.level || '-',
@@ -32,11 +33,11 @@ export default function RiskOpsSection({ state }) {
         />
         <InsightCard
           title="风控结论"
-          content={`当前风险等级：${state.riskMonitor?.risk_level || '-'}，活跃告警 ${state.monitoringSummary?.active_alerts ?? 0} 条。`}
+          content={monitoringHumanized.headline || `当前风险等级：${state.riskMonitor?.risk_level || '-'}，活跃告警 ${state.monitoringSummary?.active_alerts ?? 0} 条。`}
           tone={(state.monitoringSummary?.active_alerts ?? 0) > 0 ? 'warn' : 'info'}
         />
         <ActionList
-          items={[
+          items={Array.isArray(monitoringHumanized.next_actions) && monitoringHumanized.next_actions.length ? monitoringHumanized.next_actions : [
             '若出现高风险告警，请先暂停新增仓位',
             '优先处理“当前告警”中的最高级别问题',
             '告警清零后再恢复正常开仓节奏',

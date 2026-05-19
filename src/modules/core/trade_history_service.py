@@ -41,6 +41,13 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _float_value_changed(current: Any, incoming: Any, *, eps: float = 1e-12) -> bool:
+    try:
+        return abs(float(current or 0.0) - float(incoming or 0.0)) > float(eps)
+    except Exception:
+        return str(current) != str(incoming)
+
+
 def _metadata_trace_id(metadata: Dict[str, Any]) -> str:
     if not isinstance(metadata, dict):
         return ""
@@ -565,27 +572,41 @@ class TradeHistoryService:
                     continue
                 if str(tr.symbol or "").strip().upper() != sym:
                     continue
+                row_changed = False
                 if exchange_pnl is not None:
-                    tr.pnl = _to_float(exchange_pnl, tr.pnl)
-                    changed = True
+                    new_pnl = _to_float(exchange_pnl, tr.pnl)
+                    if _float_value_changed(tr.pnl, new_pnl):
+                        tr.pnl = new_pnl
+                        row_changed = True
                 if exchange_fee is not None:
-                    tr.fee = _to_float(exchange_fee, tr.fee)
-                    changed = True
+                    new_fee = _to_float(exchange_fee, tr.fee)
+                    if _float_value_changed(tr.fee, new_fee):
+                        tr.fee = new_fee
+                        row_changed = True
                 if exchange_price is not None and _to_float(exchange_price, 0.0) > 0:
-                    tr.price = _to_float(exchange_price, tr.price)
+                    new_price = _to_float(exchange_price, tr.price)
+                    if _float_value_changed(tr.price, new_price):
+                        tr.price = new_price
+                        row_changed = True
+                meta = dict(tr.metadata or {})
+                meta_changed = (
+                    row_changed
+                    or not bool(meta.get("truth_synced"))
+                    or str(meta.get("truth_source") or "") != str(source or "exchange_auto_sync")
+                )
+                if meta_changed:
+                    meta["truth_synced"] = True
+                    meta["truth_source"] = str(source or "exchange_auto_sync")
+                    meta["truth_synced_at"] = datetime.now().isoformat()
+                    meta["pnl_estimated"] = False
+                    tr.metadata = meta
                     changed = True
-                if changed:
-                    tr.metadata = dict(tr.metadata or {})
-                    tr.metadata["truth_synced"] = True
-                    tr.metadata["truth_source"] = str(source or "exchange_auto_sync")
-                    tr.metadata["truth_synced_at"] = datetime.now().isoformat()
-                    tr.metadata["pnl_estimated"] = False
             if changed:
                 self._invalidate_stats_cache()
                 await self._rewrite_backup_jsonl()
-        if self.db_storage:
+        if changed and self.db_storage:
             suffix = f"\n[truth_sync:{datetime.now().isoformat()}]"
-            rows_updated = await self.db_storage.update_trade_truth_by_order_id(
+            await self.db_storage.update_trade_truth_by_order_id(
                 oid,
                 symbol=sym,
                 price=exchange_price,

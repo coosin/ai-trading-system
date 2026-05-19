@@ -153,6 +153,31 @@ export const api = {
       request(`/modules/commander/snapshot?symbol=${encodeURIComponent(symbol)}&mode=fast`),
     getCommanderSnapshotFull: (symbol = 'BTC/USDT') =>
       request(`/modules/commander/snapshot?symbol=${encodeURIComponent(symbol)}&mode=full`),
+    getCommanderTradingWorkflow: (symbol = 'BTC/USDT', params = {}) => {
+      const query = new URLSearchParams({ symbol, ...params }).toString();
+      return request(`/modules/commander/trading-workflow?${query}`);
+    },
+    getCommanderSystemMastery: (symbol = 'BTC/USDT', params = {}) => {
+      const query = new URLSearchParams({ symbol, ...params }).toString();
+      return request(`/modules/commander/system-mastery?${query}`);
+    },
+    getCommanderPlatformOversight: (symbol = 'BTC/USDT', params = {}) => {
+      const query = new URLSearchParams({ symbol, ...params }).toString();
+      return request(`/modules/commander/platform-oversight?${query}`);
+    },
+    getCommanderClosedLoopSummary: (params = {}) => {
+      const query = new URLSearchParams(params).toString();
+      return request(`/modules/commander/closed-loop-summary${query ? `?${query}` : ''}`);
+    },
+    getCommanderAgentEffectiveness: (params = {}) => {
+      const query = new URLSearchParams(params).toString();
+      return request(`/modules/commander/agent-effectiveness${query ? `?${query}` : ''}`);
+    },
+    getMemoryStats: () => request('/modules/memory/stats'),
+    getProfitOpsOverview: (params = {}) => {
+      const query = new URLSearchParams(params).toString();
+      return request(`/modules/profit/ops-overview${query ? `?${query}` : ''}`);
+    },
     runCommanderChores: (body = {}) =>
       request('/modules/commander/chores', { method: 'POST', body: JSON.stringify(body || {}) }),
     dispatchCommanderMessage: (message, source = 'control_hub') =>

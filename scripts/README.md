@@ -30,6 +30,8 @@
   - 统一验收入口。
 - `trading_exec_fullcheck.py`
   - 交易闭环验收。
+- `validate_trading_model_aliases.py`
+  - `CLIProxyAPI` 交易逻辑别名验收：检查 `trading-fast/json/reasoning/fallback` 是否可见、可实际回包、且符合 `config/trading_model_alias_expectations.json` 中的 owner / upstream model 期望。
 - `startup_acceptance.py`
   - 启动验收。
 - `full_system_audit.py`

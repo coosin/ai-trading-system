@@ -54,6 +54,9 @@ def test_matches_builtin_defaults_shape():
     cfg = stop_loss_take_profit_config_from_mapping({})
     assert cfg.trailing_only_mode == base.trailing_only_mode
     assert cfg.persist_file == base.persist_file
+    assert cfg.layered_partial_tp_levels == [(0.015, 0.25), (0.03, 0.35), (0.05, 0.40)]
+    assert cfg.sr_partial_tp_trigger_pnl == 0.0075
+    assert cfg.sr_partial_close_ratio == 0.33
 
 
 def test_trailing_only_coerce_inputs_mapping():

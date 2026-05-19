@@ -152,9 +152,18 @@ class AITradingEngine:
         self.contract_config = {
             "enabled": True,
             "trade_type": "swap",
-            "leverage_min": 20,
+            "leverage_min": 30,
             "leverage_max": 100,
             "default_leverage": 30,
+            "leverage_curve": [
+                {"atr_gte": 0.060, "leverage": 30},
+                {"atr_gte": 0.040, "leverage": 34},
+                {"atr_gte": 0.030, "leverage": 40},
+                {"atr_gte": 0.020, "leverage": 52},
+                {"atr_gte": 0.015, "leverage": 64},
+                {"atr_gte": 0.010, "leverage": 78},
+                {"atr_gte": 0.000, "leverage": 92},
+            ],
             "max_positions": DEFAULT_MAX_POSITIONS,
             "min_positions": 1,
             "margin_mode": "cross",
@@ -165,7 +174,7 @@ class AITradingEngine:
         
         self.ai_config = {
             "enabled": True,
-            "model_id": "gemini-2.5-flash",
+            "model_id": "trading-fast",
             "analysis_interval": DEFAULT_ANALYSIS_INTERVAL_SECONDS,
             "min_confidence": 0.75,
             "max_positions": DEFAULT_MAX_POSITIONS,
@@ -241,6 +250,24 @@ class AITradingEngine:
         self._stop_loss_feedback_seen_ttl_sec: float = 6 * 3600
         # Track successful same-symbol same-side opens for staged scale-in confidence gates.
         self._symbol_side_open_legs: Dict[str, int] = {}
+
+    @staticmethod
+    def _is_close_action(action: Any) -> bool:
+        return action in [TradeAction.CLOSE_LONG, TradeAction.CLOSE_SHORT]
+
+    def _close_execution_source(self, decision: AIDecision) -> str:
+        meta = getattr(decision, "metadata", None) or {}
+        if isinstance(meta, dict):
+            explicit = str(meta.get("execution_source") or "").strip().lower()
+            if explicit:
+                return explicit
+            trigger_kind = str(meta.get("trigger_kind") or meta.get("risk_trigger_kind") or "").strip().lower()
+            if trigger_kind in {"stop_loss", "take_profit", "sltp", "risk_close"}:
+                return "stop_loss_take_profit"
+        reasoning = str(getattr(decision, "reasoning", "") or "")
+        if ("止损" in reasoning) or ("止盈" in reasoning):
+            return "stop_loss_take_profit"
+        return "ai_trading_engine"
         
         logger.info("全智能AI交易引擎初始化完成")
 
@@ -2132,6 +2159,8 @@ class AITradingEngine:
                 return False
 
             meta = getattr(decision, "metadata", None) or {}
+            is_close = self._is_close_action(getattr(decision, "action", None))
+            close_source = self._close_execution_source(decision) if is_close else "ai_trading_engine"
             mc = self.main_controller
             if mc and hasattr(mc, "get_ai_managed_config"):
                 try:
@@ -2140,12 +2169,19 @@ class AITradingEngine:
                         policy.get("single_write_owner") or policy.get("primary_controller") or "ai_core"
                     ).strip().lower()
                     enable_secondary = bool(policy.get("enable_secondary_controller", False))
-                    if swo == "ai_core" and not enable_secondary:
+                    allow_aux_close = is_close and close_source == "stop_loss_take_profit"
+                    if swo == "ai_core" and not enable_secondary and not allow_aux_close:
                         logger.warning(
                             "AITradingEngine: 跳过执行（single_write_owner=ai_core，辅引擎不直连交易所；"
                             "若需双控请设置 ai_brain.enable_secondary_controller=true）"
                         )
                         return False
+                    if allow_aux_close and swo == "ai_core" and not enable_secondary:
+                        logger.warning(
+                            "AITradingEngine: 风险平仓允许旁路执行 source=%s symbol=%s",
+                            close_source,
+                            getattr(decision, "symbol", ""),
+                        )
                 except Exception:
                     pass
             
@@ -2153,7 +2189,6 @@ class AITradingEngine:
                        f"@ {decision.price}, 数量={decision.quantity}")
             
             # 确定仓位方向（OKX posSide：开/平哪一侧仓位；勿将 CLOSE_SHORT 与 OPEN_LONG 混为 long）
-            is_close = decision.action in [TradeAction.CLOSE_LONG, TradeAction.CLOSE_SHORT]
             if decision.action in [TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG]:
                 pos_side = "long"
             elif decision.action in [TradeAction.OPEN_SHORT, TradeAction.CLOSE_SHORT]:
@@ -2188,13 +2223,14 @@ class AITradingEngine:
                             decision.symbol,
                             pos_side,
                             None,
-                            "ai_trading_engine",
+                            close_source,
                             "aitrading_close",
                             context={
                                 "decision_reasoning": getattr(decision, "reasoning", None),
                                 "confidence": getattr(decision, "confidence", None),
                                 "risk_level": getattr(decision, "risk_level", None),
                                 "metadata": getattr(decision, "metadata", None),
+                                "trigger_kind": (meta or {}).get("trigger_kind"),
                             },
                         )
                     else:
@@ -2968,6 +3004,8 @@ class AITradingEngine:
                     self._symbol_side_open_legs.pop(f"{sym_u}|short", None)
                 except Exception:
                     pass
+
+            await self._refresh_position_sltp_from_active_orders()
             
             if self.positions:
                 logger.info(f"📊 当前监控 {len(self.positions)} 个持仓")
@@ -3067,6 +3105,53 @@ class AITradingEngine:
                 self._sltp_bound_keys.add(key)
             except Exception as e:
                 logger.debug(f"补挂SLTP失败 {symbol}: {e}")
+
+    @staticmethod
+    def _normalize_monitor_symbol_key(raw: Any) -> str:
+        symbol = str(raw or "").strip().upper().replace("-", "/")
+        if not symbol:
+            return ""
+        if symbol.endswith("/USDT/SWAP"):
+            symbol = symbol.replace("/USDT/SWAP", "/USDT")
+        elif symbol.endswith("/SWAP"):
+            symbol = symbol[: -len("/SWAP")]
+        if symbol.endswith("USDT") and "/" not in symbol:
+            symbol = f"{symbol[:-4]}/USDT"
+        return symbol
+
+    async def _refresh_position_sltp_from_active_orders(self) -> None:
+        """以活动 SLTP 单覆盖本地监控止盈止损，避免继续使用已失效的旧值。"""
+        if not self.main_controller or not self.positions:
+            return
+        stop_loss_manager = self.main_controller.get_stop_loss_manager()
+        if not stop_loss_manager or not hasattr(stop_loss_manager, "get_all_active_orders"):
+            return
+        try:
+            active_orders = await stop_loss_manager.get_all_active_orders()
+        except Exception as e:
+            logger.debug(f"读取活动SLTP失败: {e}")
+            return
+        active_by_key: Dict[str, Any] = {}
+        for order in active_orders or []:
+            key = (
+                f"{self._normalize_monitor_symbol_key(getattr(order, 'symbol', ''))}|"
+                f"{str(getattr(order, 'side', '')).strip().lower()}"
+            )
+            if key:
+                active_by_key[key] = order
+        for symbol, pos in list(self.positions.items()):
+            key = f"{self._normalize_monitor_symbol_key(symbol)}|{str(pos.side or '').strip().lower()}"
+            order = active_by_key.get(key)
+            if not order:
+                continue
+            pos.stop_loss = getattr(order, "stop_loss_price", pos.stop_loss)
+            pos.take_profit = getattr(order, "take_profit_price", pos.take_profit)
+            try:
+                remaining_qty = float(getattr(order, "remaining_quantity", 0.0) or 0.0)
+                if remaining_qty > 0:
+                    pos.quantity = remaining_qty
+            except Exception:
+                pass
     
     async def _monitoring_loop(self) -> None:
         """监控循环 - 持仓跟踪和止损止盈检查"""
@@ -3124,7 +3209,8 @@ class AITradingEngine:
                             quantity=position.quantity,
                             confidence=1.0,
                             reasoning="止损触发",
-                            risk_level="high"
+                            risk_level="high",
+                            metadata={"trigger_kind": "stop_loss", "execution_source": "stop_loss_take_profit"},
                         ))
                     
                     elif take_profit_triggered:
@@ -3136,7 +3222,8 @@ class AITradingEngine:
                             quantity=position.quantity,
                             confidence=1.0,
                             reasoning="止盈触发",
-                            risk_level="low"
+                            risk_level="low",
+                            metadata={"trigger_kind": "take_profit", "execution_source": "stop_loss_take_profit"},
                         ))
                     
                     # 检查持仓风险（无止损止盈时）

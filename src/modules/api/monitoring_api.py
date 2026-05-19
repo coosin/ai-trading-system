@@ -56,6 +56,38 @@ def _to_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _build_humanized_monitoring_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    total_trades = int(summary.get("total_trades") or 0)
+    active_alerts = int(summary.get("active_alerts") or 0)
+    status = str(summary.get("status") or summary.get("overall_status") or "unknown")
+    symbols = summary.get("symbols") if isinstance(summary.get("symbols"), list) else []
+    strategies = summary.get("strategies") if isinstance(summary.get("strategies"), list) else []
+    headline = (
+        f"监控摘要显示当前状态 {status}，活跃告警 {active_alerts} 条，"
+        f"近端统计交易 {total_trades} 笔，覆盖 {len(symbols)} 个标的。"
+    )
+    verdict = "监控摘要适合直接用于前端总览和风控概览。"
+    if active_alerts > 0:
+        verdict = "当前有活跃告警，前端应优先突出显示告警而不是只展示统计数。"
+    next_actions: List[str] = []
+    if active_alerts > 0:
+        next_actions.append("优先查看活跃告警列表中的最高级别问题。")
+    if total_trades == 0:
+        next_actions.append("当前没有抓到交易样本，建议核对 trade_history_service 与监控回填链路。")
+    if not next_actions:
+        next_actions.append("监控链路基本可用，可以继续结合风险面板做联动查看。")
+    return {
+        "headline": headline,
+        "verdict": verdict,
+        "focus_cards": [
+            {"title": "告警状态", "tone": "warn" if active_alerts > 0 else "normal", "summary": f"当前活跃告警 {active_alerts} 条。"},
+            {"title": "交易覆盖", "tone": "normal", "summary": f"最近统计交易 {total_trades} 笔，标的 {len(symbols)} 个，策略 {len(strategies)} 个。"},
+        ],
+        "next_actions": next_actions,
+        "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+    }
+
+
 def _parse_timestamp(value: Any) -> datetime:
     text = str(value or "").strip()
     if not text:
@@ -633,6 +665,7 @@ async def get_monitoring_summary():
         except Exception as e:
             logger.debug("enhanced_monitoring.get_system_status failed: %s", e)
             out["enhanced_monitoring"] = {"status": "error", "error": str(e)}
+    out["humanized"] = _build_humanized_monitoring_summary(out)
     return out
 
 @router.get("/alerts")

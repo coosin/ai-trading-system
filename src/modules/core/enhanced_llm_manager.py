@@ -1030,30 +1030,67 @@ class EnhancedLLMManager:
         self._runtime_only_models: Set[str] = set()
         self._runtime_disabled_models: Set[str] = set()
         self._runtime_provider_allowlist: Set[str] = set()
-        # Circuit breaker: model_id -> unix_ts (seconds) until which the model is considered unhealthy.
+        # Task-scoped circuit breaker: "{task_type}::{model_id}" -> unix_ts until unhealthy.
         self._unhealthy_until: Dict[str, float] = {}
+        # Global circuit breaker for true cross-task outages such as exhausted quota on a shared endpoint.
+        self._global_unhealthy_until: Dict[str, float] = {}
         self._all_unhealthy_log_until: Dict[str, float] = {}
         self._no_model_log_until: Dict[str, float] = {}
+        self._all_unhealthy_probe_after: Dict[str, float] = {}
         self._last_success_at: Dict[str, float] = {}
+        self._last_success_at_global: Dict[str, float] = {}
         self._consecutive_failures: Dict[str, int] = {}
 
-    def _is_model_healthy(self, model_id: str) -> bool:
-        until = float(self._unhealthy_until.get(model_id, 0.0) or 0.0)
-        return time.time() >= until
+    @staticmethod
+    def _task_type_label(task_type: Optional[TaskType]) -> str:
+        if isinstance(task_type, TaskType):
+            return task_type.value
+        text = str(task_type or "").strip()
+        return text or "unknown"
 
-    def _mark_model_unhealthy(self, model_id: str, *, seconds: float, reason: str, task_type: Optional[TaskType] = None) -> None:
+    def _task_health_key(self, model_id: str, task_type: Optional[TaskType]) -> str:
+        return f"{self._task_type_label(task_type)}::{model_id}"
+
+    def _effective_unhealthy_until(self, model_id: str, task_type: Optional[TaskType] = None) -> float:
+        global_until = float(self._global_unhealthy_until.get(model_id, 0.0) or 0.0)
+        if task_type is None:
+            return global_until
+        task_until = float(self._unhealthy_until.get(self._task_health_key(model_id, task_type), 0.0) or 0.0)
+        return max(global_until, task_until)
+
+    def _is_model_healthy(self, model_id: str, task_type: Optional[TaskType] = None) -> bool:
+        return time.time() >= self._effective_unhealthy_until(model_id, task_type)
+
+    def _mark_model_unhealthy(
+        self,
+        model_id: str,
+        *,
+        seconds: float,
+        reason: str,
+        task_type: Optional[TaskType] = None,
+        global_scope: bool = False,
+    ) -> None:
         seconds = float(max(1.0, seconds))
         until = time.time() + seconds
-        prev = float(self._unhealthy_until.get(model_id, 0.0) or 0.0)
+        if global_scope:
+            key = model_id
+            store = self._global_unhealthy_until
+            scope = "global"
+        else:
+            key = self._task_health_key(model_id, task_type)
+            store = self._unhealthy_until
+            scope = "task"
+        prev = float(store.get(key, 0.0) or 0.0)
         if until > prev:
-            self._unhealthy_until[model_id] = until
-            task_label = getattr(task_type, "value", "unknown") if task_type is not None else "unknown"
+            store[key] = until
+            task_label = self._task_type_label(task_type)
             logger.warning(
-                "LLM circuit-break: mark %s unhealthy %ss reason=%s task=%s",
+                "LLM circuit-break: mark %s unhealthy %ss reason=%s task=%s scope=%s",
                 model_id,
                 int(seconds),
                 reason,
                 task_label,
+                scope,
             )
 
     def _mark_model_group_unhealthy(
@@ -1066,7 +1103,13 @@ class EnhancedLLMManager:
     ) -> None:
         base = self.models.get(model_id)
         if base is None:
-            self._mark_model_unhealthy(model_id, seconds=seconds, reason=reason, task_type=task_type)
+            self._mark_model_unhealthy(
+                model_id,
+                seconds=seconds,
+                reason=reason,
+                task_type=task_type,
+                global_scope=True,
+            )
             return
         group = []
         for other_id, other in self.models.items():
@@ -1082,7 +1125,13 @@ class EnhancedLLMManager:
         if not group:
             group = [model_id]
         for other_id in group:
-            self._mark_model_unhealthy(other_id, seconds=seconds, reason=reason, task_type=task_type)
+            self._mark_model_unhealthy(
+                other_id,
+                seconds=seconds,
+                reason=reason,
+                task_type=task_type,
+                global_scope=True,
+            )
 
     def _log_all_unhealthy_once(self, task_type: TaskType, candidate_ids: List[str]) -> None:
         key = f"{task_type.value}:{','.join(candidate_ids)}"
@@ -1106,19 +1155,95 @@ class EnhancedLLMManager:
         self._no_model_log_until[key] = now + 60.0
         logger.warning("任务 %s 当前无可用模型，返回空响应并等待候选恢复", task_type.value)
 
-    def _next_failure_backoff_seconds(self, model_id: str, base_seconds: float) -> float:
+    def _pick_unhealthy_probe_candidate(
+        self,
+        task_type: TaskType,
+        candidate_ids: List[str],
+        *,
+        prefer_reasoning: bool = False,
+        max_cost: Optional[float] = None,
+    ) -> Optional[str]:
+        ranked: List[Tuple[float, float, int, float, str]] = []
+        for model_id in candidate_ids:
+            model = self.models.get(model_id)
+            if not model or not model.enabled or model_id not in self.providers:
+                continue
+            if prefer_reasoning and not model.supports_reasoning:
+                continue
+            if max_cost is not None:
+                if (model.cost_per_input_token + model.cost_per_output_token * 1000) > max_cost:
+                    continue
+            until = self._effective_unhealthy_until(model_id, task_type)
+            last_success = float(
+                self._last_success_at.get(self._task_health_key(model_id, task_type), 0.0)
+                or self._last_success_at_global.get(model_id, 0.0)
+                or 0.0
+            )
+            ranked.append((until, -last_success, -int(model.priority or 0), float(model.cost_per_input_token or 0.0), model_id))
+        ranked.sort()
+        return ranked[0][-1] if ranked else None
+
+    def _select_unhealthy_probe_candidate(
+        self,
+        task_type: TaskType,
+        candidate_ids: List[str],
+        *,
+        prefer_reasoning: bool = False,
+        max_cost: Optional[float] = None,
+    ) -> Optional[str]:
+        probe_interval = float(os.getenv("OPENCLAW_LLM_CB_ALL_UNHEALTHY_PROBE_SEC", "30") or "30")
+        if probe_interval <= 0:
+            return None
+        key = f"{task_type.value}:{','.join(sorted(candidate_ids))}"
+        now = time.time()
+        not_before = float(self._all_unhealthy_probe_after.get(key, 0.0) or 0.0)
+        if now < not_before:
+            return None
+        model_id = self._pick_unhealthy_probe_candidate(
+            task_type,
+            candidate_ids,
+            prefer_reasoning=prefer_reasoning,
+            max_cost=max_cost,
+        )
+        if not model_id:
+            return None
+        self._all_unhealthy_probe_after[key] = now + probe_interval
+        remaining = max(0.0, self._effective_unhealthy_until(model_id, task_type) - now)
+        logger.warning(
+            "任务 %s 的候选模型均处于熔断，放行探活请求: %s remaining=%.1fs next_probe_in=%.1fs",
+            task_type.value,
+            model_id,
+            remaining,
+            probe_interval,
+        )
+        return model_id
+
+    def _next_failure_backoff_seconds(
+        self,
+        model_id: str,
+        base_seconds: float,
+        task_type: Optional[TaskType] = None,
+    ) -> float:
         base = float(max(1.0, base_seconds))
-        count = int(self._consecutive_failures.get(model_id, 0) or 0) + 1
-        self._consecutive_failures[model_id] = count
+        failure_key = self._task_health_key(model_id, task_type) if task_type is not None else model_id
+        count = int(self._consecutive_failures.get(failure_key, 0) or 0) + 1
+        self._consecutive_failures[failure_key] = count
         cap = float(os.getenv("OPENCLAW_LLM_CB_MAX_SEC", "900") or "900")
         scaled = base * float(2 ** max(0, count - 1))
         return min(cap, scaled)
 
-    def _clear_model_unhealthy(self, model_id: str) -> None:
+    def _clear_model_unhealthy(self, model_id: str, task_type: Optional[TaskType] = None) -> None:
         """Successful calls clear circuit state so transient timeouts do not block fallbacks too long."""
-        if self._unhealthy_until.pop(model_id, None) is not None:
-            logger.debug("LLM circuit-break: cleared unhealthy state for %s after success", model_id)
-        self._consecutive_failures.pop(model_id, None)
+        if task_type is None:
+            return
+        task_key = self._task_health_key(model_id, task_type)
+        if self._unhealthy_until.pop(task_key, None) is not None:
+            logger.debug(
+                "LLM circuit-break: cleared unhealthy state for %s task=%s after success",
+                model_id,
+                self._task_type_label(task_type),
+            )
+        self._consecutive_failures.pop(task_key, None)
 
     def _apply_failure_circuit_break(self, model_id: str, response: "LLMResponse", task_type: Optional[TaskType] = None) -> None:
         if not response or response.success:
@@ -1135,7 +1260,7 @@ class EnhancedLLMManager:
         elif code == "TIMEOUT":
             self._mark_model_unhealthy(
                 model_id,
-                seconds=self._next_failure_backoff_seconds(model_id, to_sec),
+                seconds=self._next_failure_backoff_seconds(model_id, to_sec, task_type),
                 reason=code,
                 task_type=task_type,
             )
@@ -1148,19 +1273,24 @@ class EnhancedLLMManager:
                 )
                 return
             grace_sec = float(os.getenv("OPENCLAW_LLM_CB_RECENT_SUCCESS_GRACE_SEC", "120") or "120")
-            last_success = float(self._last_success_at.get(model_id, 0.0) or 0.0)
+            last_success = float(
+                self._last_success_at.get(self._task_health_key(model_id, task_type), 0.0)
+                or self._last_success_at_global.get(model_id, 0.0)
+                or 0.0
+            )
             if last_success and (time.time() - last_success) <= grace_sec:
                 logger.info(
-                    "LLM transient %s ignored for circuit-break: model=%s recent_success_age=%.1fs grace=%.1fs",
+                    "LLM transient %s ignored for circuit-break: model=%s task=%s recent_success_age=%.1fs grace=%.1fs",
                     code,
                     model_id,
+                    self._task_type_label(task_type),
                     time.time() - last_success,
                     grace_sec,
                 )
                 return
             self._mark_model_unhealthy(
                 model_id,
-                seconds=self._next_failure_backoff_seconds(model_id, net_sec),
+                seconds=self._next_failure_backoff_seconds(model_id, net_sec, task_type),
                 reason=code,
                 task_type=task_type,
             )
@@ -1188,6 +1318,95 @@ class EnhancedLLMManager:
                 continue
             filtered.append(model_id)
         return filtered
+
+    def _get_task_candidate_model_ids(
+        self,
+        task_type: TaskType,
+        *,
+        prefer_reasoning: bool = False,
+        max_cost: Optional[float] = None,
+        exclude_model_ids: Optional[Set[str]] = None,
+    ) -> Tuple[List[str], bool]:
+        """Return ordered candidate model ids for a task.
+
+        When a task has explicit mapping, candidates are strictly limited to that mapping.
+        If a task has no mapping, fall back to globally enabled models ordered by priority.
+        """
+        excluded = exclude_model_ids or set()
+        mapped_ids = list(self.task_model_mapping.get(task_type) or [])
+        constrained = bool(mapped_ids)
+        ordered_ids = mapped_ids if constrained else [
+            m.model_id
+            for m in sorted(
+                [m for m in self.models.values() if m.enabled and m.model_id in self.providers],
+                key=lambda x: (-x.priority, x.cost_per_input_token),
+            )
+        ]
+
+        candidates: List[str] = []
+        for model_id in ordered_ids:
+            if model_id in excluded:
+                continue
+            model = self.models.get(model_id)
+            if not model or not model.enabled or model_id not in self.providers:
+                continue
+            if prefer_reasoning and not model.supports_reasoning:
+                continue
+            if max_cost is not None:
+                if (model.cost_per_input_token + model.cost_per_output_token * 1000) > max_cost:
+                    continue
+            candidates.append(model_id)
+        return candidates, constrained
+
+    def _get_fallback_candidate_model_ids(
+        self,
+        model_id: str,
+        task_type: TaskType,
+        *,
+        prefer_reasoning: bool = False,
+        max_cost: Optional[float] = None,
+    ) -> List[str]:
+        """Return fallback candidates while preserving task_model_mapping constraints."""
+        candidates, constrained = self._get_task_candidate_model_ids(
+            task_type,
+            prefer_reasoning=prefer_reasoning,
+            max_cost=max_cost,
+            exclude_model_ids={model_id},
+        )
+        model_config = self.models.get(model_id)
+        explicit_fallbacks = self._filter_policy_model_ids(
+            model_config.fallback_models if model_config else []
+        )
+
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        allowed = set(candidates) if constrained else None
+
+        for fallback_model_id in explicit_fallbacks:
+            if fallback_model_id == model_id:
+                continue
+            if allowed is not None and fallback_model_id not in allowed:
+                continue
+            if fallback_model_id not in self.providers:
+                continue
+            candidate = self.models.get(fallback_model_id)
+            if not candidate or not candidate.enabled:
+                continue
+            if prefer_reasoning and not candidate.supports_reasoning:
+                continue
+            if max_cost is not None:
+                if (candidate.cost_per_input_token + candidate.cost_per_output_token * 1000) > max_cost:
+                    continue
+            if fallback_model_id not in seen:
+                seen.add(fallback_model_id)
+                ordered.append(fallback_model_id)
+
+        for candidate_model_id in candidates:
+            if candidate_model_id not in seen:
+                seen.add(candidate_model_id)
+                ordered.append(candidate_model_id)
+
+        return ordered
 
     def _apply_runtime_model_policy(self, config: Dict[str, Any]) -> None:
         self._runtime_only_models = set(self._normalize_model_id_list(config.get("only_models")))
@@ -1381,45 +1600,26 @@ class EnhancedLLMManager:
                           prefer_reasoning: bool = False,
                           max_cost: Optional[float] = None) -> Optional[str]:
         """根据任务选择最优模型"""
-        task_candidates: List[str] = []
-        unhealthy_task_candidates: List[str] = []
-        if task_type in self.task_model_mapping:
-            for model_id in self.task_model_mapping[task_type]:
-                if model_id in self.providers:
-                    task_candidates.append(model_id)
-                if model_id in self.providers:
-                    model = self.models.get(model_id)
-                    if model and model.enabled:
-                        if not self._is_model_healthy(model_id):
-                            unhealthy_task_candidates.append(model_id)
-                            continue
-                        if prefer_reasoning and not model.supports_reasoning:
-                            continue
-                        if max_cost is not None:
-                            if (model.cost_per_input_token + model.cost_per_output_token * 1000) > max_cost:
-                                continue
-                        return model_id
-        
-        available_models = sorted(
-            [m for m in self.models.values() if m.enabled and m.model_id in self.providers],
-            key=lambda x: (-x.priority, x.cost_per_input_token)
+        ordered_candidates, task_constrained = self._get_task_candidate_model_ids(
+            task_type,
+            prefer_reasoning=prefer_reasoning,
+            max_cost=max_cost,
         )
-        
-        for model in available_models:
-            if not self._is_model_healthy(model.model_id):
+        unhealthy_task_candidates: List[str] = []
+
+        for model_id in ordered_candidates:
+            if not self._is_model_healthy(model_id, task_type):
+                unhealthy_task_candidates.append(model_id)
                 continue
-            if prefer_reasoning and not model.supports_reasoning:
-                continue
-            if max_cost is not None:
-                if (model.cost_per_input_token + model.cost_per_output_token * 1000) > max_cost:
-                    continue
-            return model.model_id
+            return model_id
 
         enabled_provider_ids = self._get_enabled_provider_model_ids()
         if len(enabled_provider_ids) == 1:
             only_model_id = enabled_provider_ids[0]
             only_model = self.models.get(only_model_id)
             if only_model:
+                if task_constrained and only_model_id not in set(self.task_model_mapping.get(task_type) or []):
+                    return None
                 if prefer_reasoning and not only_model.supports_reasoning:
                     return None
                 if max_cost is not None:
@@ -1431,7 +1631,17 @@ class EnhancedLLMManager:
                 )
                 return only_model_id
 
-        if unhealthy_task_candidates:
+        probe_candidates = unhealthy_task_candidates
+        probe_model_id = self._select_unhealthy_probe_candidate(
+            task_type,
+            probe_candidates,
+            prefer_reasoning=prefer_reasoning,
+            max_cost=max_cost,
+        )
+        if probe_model_id:
+            return probe_model_id
+
+        if unhealthy_task_candidates and task_constrained:
             self._log_all_unhealthy_once(task_type, unhealthy_task_candidates)
         
         return None
@@ -1455,7 +1665,7 @@ class EnhancedLLMManager:
         if not model_id:
             model_id = await self.select_model(task_type, prefer_reasoning)
             logger.debug(f"自动选择模型: {model_id}, 可用providers: {list(self.providers.keys())}")
-        elif not self._is_model_healthy(model_id):
+        elif not self._is_model_healthy(model_id, task_type):
             # Caller requested a specific model, but it's currently unhealthy. Try selecting an alternative.
             alt = await self.select_model(task_type, prefer_reasoning)
             if alt and alt != model_id:
@@ -1497,49 +1707,35 @@ class EnhancedLLMManager:
         
         if not response.success and use_fallback:
             is_auth_error = getattr(response, 'error_code', None) == 'AUTH_FAILED'
-            
-            model_config = self.models.get(model_id)
-            if model_config and model_config.fallback_models:
-                for fallback_model_id in model_config.fallback_models:
-                    if fallback_model_id in self.providers:
-                        if not self._is_model_healthy(fallback_model_id):
-                            continue
-                        logger.info(
-                            "尝试回退模型: task=%s from=%s to=%s",
-                            task_type.value,
-                            model_id,
-                            fallback_model_id,
-                        )
-                        fallback_response = await self._generate_with_model(
-                            prompt, fallback_model_id, task_type, **call_kwargs
-                        )
-                        if fallback_response.success:
-                            return fallback_response
-                        last_failure_response = fallback_response
-                        self._apply_failure_circuit_break(fallback_model_id, fallback_response, task_type)
-            
-            if is_auth_error or (model_config and not model_config.fallback_models):
-                available_models = sorted(
-                    [m for m in self.models.values() 
-                     if m.enabled and m.model_id in self.providers and m.model_id != model_id],
-                    key=lambda x: -x.priority
-                )
-                for alt_model in available_models:
-                    if not self._is_model_healthy(alt_model.model_id):
-                        continue
+            fallback_candidates = self._get_fallback_candidate_model_ids(
+                model_id,
+                task_type,
+                prefer_reasoning=prefer_reasoning,
+            )
+            for fallback_model_id in fallback_candidates:
+                if not self._is_model_healthy(fallback_model_id, task_type):
+                    continue
+                if is_auth_error:
                     logger.info(
-                        "认证失败，尝试备用模型: task=%s from=%s to=%s",
+                        "认证失败，尝试任务约束备用模型: task=%s from=%s to=%s",
                         task_type.value,
                         model_id,
-                        alt_model.model_id,
+                        fallback_model_id,
                     )
-                    alt_response = await self._generate_with_model(
-                        prompt, alt_model.model_id, task_type, **call_kwargs
+                else:
+                    logger.info(
+                        "尝试任务约束回退模型: task=%s from=%s to=%s",
+                        task_type.value,
+                        model_id,
+                        fallback_model_id,
                     )
-                    if alt_response.success:
-                        return alt_response
-                    last_failure_response = alt_response
-                    self._apply_failure_circuit_break(alt_model.model_id, alt_response, task_type)
+                fallback_response = await self._generate_with_model(
+                    prompt, fallback_model_id, task_type, **call_kwargs
+                )
+                if fallback_response.success:
+                    return fallback_response
+                last_failure_response = fallback_response
+                self._apply_failure_circuit_break(fallback_model_id, fallback_response, task_type)
 
         return last_failure_response
 
@@ -1615,8 +1811,11 @@ class EnhancedLLMManager:
         stats.total_calls += 1
         
         if response.success:
-            self._last_success_at[model_id] = time.time()
-            self._clear_model_unhealthy(model_id)
+            now = time.time()
+            self._last_success_at_global[model_id] = now
+            if response.task_type is not None:
+                self._last_success_at[self._task_health_key(model_id, response.task_type)] = now
+                self._clear_model_unhealthy(model_id, response.task_type)
             stats.successful_calls += 1
             stats.total_tokens += response.tokens_used
             stats.input_tokens += response.input_tokens

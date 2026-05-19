@@ -2,6 +2,10 @@ import React from 'react';
 import { ActionList, DataTable, InsightCard, JsonDetails, MetricGrid } from '../components/UiBlocks';
 
 export default function AiStrategySection({ state }) {
+  const memoryHumanized = state.memoryDailySummaryRaw?.humanized || {};
+  const systemMasteryHumanized = state.systemMastery?.data?.humanized || state.systemMastery?.humanized || {};
+  const memoryStatsHumanized = state.memoryStats?.humanized || {};
+  const agentEffectivenessHumanized = state.agentEffectiveness?.data?.humanized || state.agentEffectiveness?.humanized || {};
   const strategyRows = (state.strategies || []).slice(0, 20).map((row, idx) => ({
     id: idx,
     name: row.name || row.strategy_name || `strategy-${idx + 1}`,
@@ -37,11 +41,17 @@ export default function AiStrategySection({ state }) {
         />
         <InsightCard
           title="策略智能建议"
-          content={`当前可用策略 ${state.strategies?.length || 0} 个，AI机会 ${state.opportunities?.length || 0} 条。建议优先处理高评分机会。`}
+          content={
+            memoryHumanized.headline
+              || memoryStatsHumanized.headline
+              || agentEffectivenessHumanized.headline
+              || systemMasteryHumanized.verdict
+              || `当前可用策略 ${state.strategies?.length || 0} 个，AI机会 ${state.opportunities?.length || 0} 条。建议优先处理高评分机会。`
+          }
           tone="info"
         />
         <ActionList
-          items={[
+          items={Array.isArray(memoryHumanized.next_actions) && memoryHumanized.next_actions.length ? memoryHumanized.next_actions.slice(0, 3) : Array.isArray(agentEffectivenessHumanized.next_actions) && agentEffectivenessHumanized.next_actions.length ? agentEffectivenessHumanized.next_actions.slice(0, 3) : [
             '先看“AI机会建议”评分高的标的',
             '研究任务状态长期不变时，建议重新触发研究任务',
             '策略状态异常时，先停用再恢复，避免误触发',

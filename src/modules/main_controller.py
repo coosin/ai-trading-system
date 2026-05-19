@@ -520,22 +520,37 @@ class MainController:
             return brain.exchange
         return None
 
+    @staticmethod
+    def _normalize_hosting_mode_value(raw: Any, default: str = "full_auto") -> str:
+        mode = str(raw or "").strip().lower()
+        if mode in {"全自动", "自动", "full", "auto", "full_auto"}:
+            return "full_auto"
+        if mode in {"半自动", "semi", "semi-automatic", "semi_automatic", "semi_auto"}:
+            return "semi_auto"
+        return default
+
+    @staticmethod
+    def _normalize_automation_profile_value(raw: Any, default: str = "semi_auto") -> str:
+        profile = str(raw or "").strip().lower()
+        if profile in {"保守", "conservative"}:
+            return "conservative"
+        if profile in {"半自动", "semi_auto", "semi"}:
+            return "semi_auto"
+        if profile in {"全自动", "full_auto", "auto"}:
+            return "full_auto"
+        return default
+
     def get_hosting_mode(self) -> str:
         """
         托管模式（可运行期切换）:
         - full_auto: 全自动托管（默认）
         - semi_auto: 半自动（策略开仓需人工确认）
         """
-        raw = str(getattr(self, "_hosting_mode", "full_auto") or "full_auto").strip().lower()
-        return raw if raw in {"full_auto", "semi_auto"} else "full_auto"
+        return self._normalize_hosting_mode_value(getattr(self, "_hosting_mode", "full_auto"), default="full_auto")
 
     def set_hosting_mode(self, mode: str) -> str:
         before = self.get_hosting_mode()
-        m = str(mode or "").strip().lower()
-        if m in {"全自动", "自动", "full", "auto"}:
-            m = "full_auto"
-        elif m in {"半自动", "semi", "semi-automatic", "semi_automatic"}:
-            m = "semi_auto"
+        m = self._normalize_hosting_mode_value(mode, default="")
         if m not in {"full_auto", "semi_auto"}:
             raise ValueError("invalid hosting mode, expected: full_auto or semi_auto")
         self._hosting_mode = m
@@ -556,21 +571,15 @@ class MainController:
         return self._hosting_mode
 
     def get_automation_profile(self) -> str:
-        p = str(getattr(self, "_automation_profile", "semi_auto") or "semi_auto").strip().lower()
-        if p not in {"conservative", "semi_auto", "full_auto"}:
-            p = "semi_auto"
-        return p
+        return self._normalize_automation_profile_value(
+            getattr(self, "_automation_profile", "semi_auto"),
+            default="semi_auto",
+        )
 
     def set_automation_profile(self, profile: str) -> str:
         before_profile = self.get_automation_profile()
         before_mode = self.get_hosting_mode()
-        p = str(profile or "").strip().lower()
-        if p in {"保守", "conservative"}:
-            p = "conservative"
-        elif p in {"半自动", "semi_auto", "semi"}:
-            p = "semi_auto"
-        elif p in {"全自动", "full_auto", "auto"}:
-            p = "full_auto"
+        p = self._normalize_automation_profile_value(profile, default="")
         if p not in {"conservative", "semi_auto", "full_auto"}:
             raise ValueError("invalid automation profile")
         self._automation_profile = p
@@ -856,6 +865,26 @@ class MainController:
             self.max_restart_attempts = controller_config.get("max_restart_attempts", self.max_restart_attempts)
             self.health_check_interval = controller_config.get("health_check_interval", self.health_check_interval)
             self.event_history_limit = controller_config.get("event_history_limit", self.event_history_limit)
+            if controller_config.get("automation_profile") is not None:
+                try:
+                    self.set_automation_profile(str(controller_config.get("automation_profile")))
+                except Exception as e:
+                    logger.warning("忽略无效 controller.automation_profile=%r: %s", controller_config.get("automation_profile"), e)
+            if controller_config.get("hosting_mode") is not None:
+                try:
+                    self.set_hosting_mode(str(controller_config.get("hosting_mode")))
+                except Exception as e:
+                    logger.warning("忽略无效 controller.hosting_mode=%r: %s", controller_config.get("hosting_mode"), e)
+            hosting_guard_cfg = controller_config.get("hosting_guard")
+            if isinstance(hosting_guard_cfg, dict):
+                merged_guard_cfg = dict(self._hosting_guard_config)
+                merged_guard_cfg.update(hosting_guard_cfg)
+                self._hosting_guard_config = merged_guard_cfg
+            logger.info(
+                "控制面配置已应用 automation_profile=%s hosting_mode=%s",
+                self.get_automation_profile(),
+                self.get_hosting_mode(),
+            )
 
         # 初始化增强事件系统
         self.event_system = EnhancedEventSystem("data/events.db")
@@ -1038,6 +1067,7 @@ class MainController:
             llm_manager=self.enhanced_llm_manager,
             memory_manager=self.ai_memory_manager
         )
+        self.llm_integration.set_runtime_config(llm_config)
         
         # 设置增强记忆系统（用于对话记录）
         if self.ai_memory_manager:

@@ -11,6 +11,19 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Tuple
 
 
+PLACEHOLDER_STRATEGY_NAMES = {
+    "",
+    "?",
+    "-",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "unknown",
+    "unassigned",
+}
+
+
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -66,7 +79,9 @@ def normalize_action(raw: Any) -> str:
 
 def normalize_strategy_id(raw: Any, default: str = "ai_core_default") -> str:
     s = str(raw or "").strip()
-    return s or default
+    if not s or s.lower() in PLACEHOLDER_STRATEGY_NAMES:
+        return default
+    return s
 
 
 def normalize_strategy_field(
@@ -77,15 +92,32 @@ def normalize_strategy_field(
 ) -> str:
     p = payload if isinstance(payload, dict) else {}
     m = metadata if isinstance(metadata, dict) else {}
-    sid = (
-        p.get("strategy_id")
-        or p.get("strategy_used")
-        or p.get("strategy")
-        or m.get("strategy_id")
-        or m.get("strategy_used")
-        or m.get("strategy")
-    )
-    return normalize_strategy_id(sid, default=default)
+    gateway = m.get("gateway") if isinstance(m.get("gateway"), dict) else {}
+    gateway_ctx = gateway.get("context") if isinstance(gateway.get("context"), dict) else {}
+    candidates = [
+        p.get("strategy_id"),
+        p.get("strategy_used"),
+        p.get("strategy"),
+        m.get("strategy_id"),
+        m.get("strategy_used"),
+        m.get("strategy"),
+        gateway_ctx.get("strategy_id"),
+        gateway_ctx.get("strategy_used"),
+        gateway_ctx.get("strategy"),
+    ]
+    for carrier in (p, m, gateway_ctx):
+        env = carrier.get("decision_envelope") if isinstance(carrier.get("decision_envelope"), dict) else {}
+        if env:
+            candidates.extend([env.get("strategy_id"), env.get("strategy_used"), env.get("strategy")])
+        semantic = carrier.get("semantic_context") if isinstance(carrier.get("semantic_context"), dict) else {}
+        if semantic:
+            candidates.extend([semantic.get("strategy_id"), semantic.get("strategy_used")])
+            candidates.extend(list(semantic.get("knowledge_refs") or []))
+    for sid in candidates:
+        normalized = normalize_strategy_id(sid, default="")
+        if normalized:
+            return normalized
+    return normalize_strategy_id("", default=default)
 
 
 @dataclass

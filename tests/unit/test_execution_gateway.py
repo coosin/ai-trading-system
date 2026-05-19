@@ -222,6 +222,31 @@ async def test_open_same_symbol_scale_in_denied_by_tiered_confidence():
 
 
 @pytest.mark.asyncio
+async def test_open_same_symbol_scale_in_denied_by_profitability_guard():
+    ex = MagicMock()
+    ex.get_positions = AsyncMock(return_value=[{"symbol": "BTC/USDT/SWAP", "size": 1.0, "side": "long"}])
+    ex.open_swap_position = AsyncMock(return_value={"success": True, "orderId": "x"})
+    mc = _mc_with_exchange_and_policy(ex, swo="ai_core", redlines={"max_positions": 5})
+    gw = ExecutionGateway(mc)
+
+    ctx = {
+        "confidence": 0.92,
+        "semantic_context": {
+            "risk_verdict": "review",
+            "execution_recommendation": "normal",
+            "profitability_scale_in_ready": False,
+            "profitability_scale_in_blockers": ["llm_fallback", "quality_below_scale_in_floor"],
+        },
+    }
+    res = await gw.open_swap("BTC/USDT", "long", 1.0, 20, "ai_core", "decision", context=ctx)
+
+    assert res["success"] is False
+    assert "收益保护门控" in res.get("error", "")
+    assert "llm_fallback" in res.get("error", "")
+    ex.open_swap_position.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_open_fifth_same_symbol_leg_requires_fifth_tier_confidence():
     ex = MagicMock()
     ex.get_positions = AsyncMock(return_value=[{"symbol": "BTC/USDT/SWAP", "size": 1.0, "side": "long"}])

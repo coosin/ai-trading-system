@@ -1,0 +1,22 @@
+{
+  "trading-fast": {
+    "expected_owner": "qianfan-openclaw",
+    "expected_response_model": "kimi-k2.5",
+    "validation": "ok"
+  },
+  "trading-json": {
+    "expected_owner": "qianfan-openclaw",
+    "expected_response_model": "kimi-k2.5",
+    "validation": "json"
+  },
+  "trading-reasoning": {
+    "expected_owner": "qianfan-openclaw",
+    "expected_response_model": "kimi-k2.5",
+    "validation": "ok"
+  },
+  "trading-fallback": {
+    "expected_owner": "qianfan-openclaw",
+    "expected_response_model": "kimi-k2.5",
+    "validation": "ok"
+  }
+}

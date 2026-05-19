@@ -3,12 +3,52 @@
 #
 # 示例（取消注释并修改）：
 # llm:
-#   default_model: doubao-seed-2.0-pro
+#   # 推荐长期形态：交易系统只对接 CLIProxyAPI 暴露的逻辑别名
+#   # 真实模型、供应商、账号切换都收敛在 CLIProxyAPI 内部处理。
+#   default_model: trading-fast
 #   models:
 #   - provider: openai
-#     model_id: doubao-seed-2.0-pro
-#     api_key_env: ARK_API_KEY
-#     base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+#     model_id: trading-fast
+#     api_key_env: OPENAI_API_KEY
+#     base_url: http://127.0.0.1:8317/v1
+#   - provider: openai
+#     model_id: trading-json
+#     api_key_env: OPENAI_API_KEY
+#     base_url: http://127.0.0.1:8317/v1
+#   - provider: openai
+#     model_id: trading-reasoning
+#     api_key_env: OPENAI_API_KEY
+#     base_url: http://127.0.0.1:8317/v1
+#   - provider: openai
+#     model_id: trading-fallback
+#     api_key_env: OPENAI_API_KEY
+#     base_url: http://127.0.0.1:8317/v1
+#   task_model_mapping:
+#     general: [trading-fast, trading-fallback]
+#     market_analysis: [trading-json, trading-fast, trading-fallback]
+#     strategy_generation: [trading-json, trading-fast, trading-fallback]
+#     signal_generation: [trading-fast, trading-fallback]
+#     risk_assessment: [trading-json, trading-fast, trading-fallback]
+#     news_analysis: [trading-fast, trading-fallback]
+#     decision_making: [trading-reasoning, trading-fallback]
+#     reasoning: [trading-reasoning, trading-fallback]
+#   integration:
+#     task_overrides:
+#       analyze_market:
+#         max_tokens: 900
+#         temperature: 0.4
+#       generate_strategy:
+#         max_tokens: 900
+#         temperature: 0.4
+#       analyze_news:
+#         max_tokens: 800
+#         temperature: 0.3
+#       evaluate_risk:
+#         max_tokens: 700
+#         temperature: 0.3
+#       generate_trading_signal:
+#         max_tokens: 500
+#         temperature: 0.2
 # trading:
 #   paper_trading: true
 #

@@ -155,9 +155,18 @@ class AICoreDecisionEngine:
         }
         
         self.config = {
-            "leverage_min": 20,
+            "leverage_min": 30,
             "leverage_max": 100,
             "default_leverage": 30,
+            "leverage_curve": [
+                {"atr_gte": 0.060, "leverage": 30},
+                {"atr_gte": 0.040, "leverage": 34},
+                {"atr_gte": 0.030, "leverage": 40},
+                {"atr_gte": 0.020, "leverage": 52},
+                {"atr_gte": 0.015, "leverage": 64},
+                {"atr_gte": 0.010, "leverage": 78},
+                {"atr_gte": 0.000, "leverage": 92},
+            ],
             "max_positions": 5,
             # 开仓最小间隔：收敛到 60 秒，降低噪声交易频率
             "min_trade_interval": 60,
@@ -328,6 +337,7 @@ class AICoreDecisionEngine:
             "research_timeout_seconds": 420,
             # hold_avoidance_override hardening (reduce churn in choppy markets)
             "hold_avoidance_override_enabled": True,
+            "hold_avoidance_override_require_live_llm": True,
             "hold_avoidance_override_cooldown_sec": 1200,
             "hold_avoidance_override_min_abs_sentiment": 0.06,
             "hold_avoidance_override_min_mi_quality_score": 0.62,
@@ -872,11 +882,18 @@ class AICoreDecisionEngine:
             float(mi.get("confidence", 0.0) or 0.0),
         )
         market_snapshot = {
+            "symbol": symbol,
             "price": market_data.get("price"),
             "trend": ai_view.get("trend") or technical.get("trend_1h"),
             "trend_1h": technical.get("trend_1h"),
             "trend_4h": technical.get("trend_4h"),
             "trend_1d": technical.get("trend_1d"),
+            "rsi_1h": technical.get("rsi_1h"),
+            "atr_pct_1h": technical.get("atr_pct_1h"),
+            "near_support": technical.get("near_support"),
+            "near_resistance": technical.get("near_resistance"),
+            "breakout_up_confirmed": technical.get("breakout_up_confirmed"),
+            "breakdown_down_confirmed": technical.get("breakdown_down_confirmed"),
             "confidence": decision_confidence,
             "spread_bps": mi.get("spread_bps"),
             "depth_imbalance": guards.get("depth_imbalance_top5") if isinstance(guards, dict) else None,
@@ -891,6 +908,7 @@ class AICoreDecisionEngine:
             "risk_posture": mi.get("risk_posture"),
             "recommendation": multi.get("recommendation"),
             "sentiment": multi.get("sentiment"),
+            "exchange_reachability": mi.get("exchange_reachability"),
             "reasoning": ai_view.get("reasoning") or multi.get("reasoning") or "",
         }
         semantic_context = self._build_semantic_trade_context(
@@ -3935,6 +3953,8 @@ class AICoreDecisionEngine:
             if decision and decision.action == "hold" and bool(self.config.get("hold_avoidance_override_enabled", True)):
                 try:
                     override_skip_reason = ""
+                    if bool(self.config.get("hold_avoidance_override_require_live_llm", True)) and self._decision_is_degraded_hold_for_profit_protection(decision):
+                        raise RuntimeError("hold_avoidance_override llm_fallback_block")
                     fusion_conf = float(multi_source_analysis.get("confidence", 0) or 0)
                     fusion_sent = multi_source_analysis.get("sentiment", 0)
                     fusion_signal_strength = multi_source_analysis.get("signal_strength", 0)
@@ -4428,7 +4448,167 @@ class AICoreDecisionEngine:
             logger.error(f"获取历史经验失败: {e}")
         
         return ""
-    
+
+    @staticmethod
+    def _truncate_text_for_prompt(value: Any, limit: int = 240) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[: max(0, int(limit) - 3)] + "..."
+
+    def _build_compact_decision_prompt(
+        self,
+        *,
+        symbol: str,
+        market_data: Dict,
+        technical: Dict,
+        strategy_advice: Dict,
+        risk_assessment: Dict,
+        current_positions: List[Dict],
+        account_balance: Optional[Dict] = None,
+        third_party_data: Optional[Dict] = None,
+        historical_experience: str = "",
+        multi_source_analysis: Optional[Dict] = None,
+        ai_engine_analysis: Optional[Dict] = None,
+        market_intelligence: Optional[Dict] = None,
+        agent_advisory: Optional[Dict[str, Any]] = None,
+        scanner_hint_block: str = "",
+    ) -> str:
+        account_balance = account_balance or {}
+        third_party_data = third_party_data or {}
+        multi_source_analysis = multi_source_analysis or {}
+        ai_engine_analysis = ai_engine_analysis or {}
+        market_intelligence = market_intelligence or {}
+        agent_advisory = agent_advisory or {}
+
+        positions_summary = "none"
+        if current_positions:
+            rows: List[str] = []
+            for pos in current_positions[:4]:
+                if not isinstance(pos, dict):
+                    continue
+                try:
+                    pnl_text = f"{float(pos.get('pnl', 0) or 0):+.2f}"
+                except Exception:
+                    pnl_text = str(pos.get("pnl", 0))
+                rows.append(
+                    f"{pos.get('symbol', '?')} {pos.get('side', '?')} size={pos.get('size', 0)} pnl={pnl_text}"
+                )
+            if rows:
+                positions_summary = "; ".join(rows)
+
+        strategy_rows: List[str] = []
+        for row in (strategy_advice.get("strategies") or [])[:2]:
+            if not isinstance(row, dict):
+                strategy_rows.append(self._truncate_text_for_prompt(row, 120))
+                continue
+            name = (
+                row.get("strategy_id")
+                or row.get("id")
+                or row.get("name")
+                or row.get("strategy_name")
+                or "unknown"
+            )
+            parts = [self._truncate_text_for_prompt(name, 48)]
+            bias = row.get("direction_bias") or row.get("signal") or row.get("recommendation")
+            if bias:
+                parts.append(f"bias={self._truncate_text_for_prompt(bias, 24)}")
+            for label, key in (("conf", "confidence"), ("rr", "risk_reward")):
+                try:
+                    val = row.get(key)
+                    if val is not None:
+                        parts.append(f"{label}={float(val):.2f}")
+                except Exception:
+                    continue
+            strategy_rows.append(" ".join(parts))
+        strategy_summary = "; ".join(x for x in strategy_rows if x) or "none"
+
+        tp_summary = (
+            f"available={third_party_data.get('available', False)} "
+            f"sentiment={third_party_data.get('sentiment', 'neutral')} "
+            f"fear_greed={third_party_data.get('fear_greed_index', 'N/A')}"
+        )
+        ms_summary = (
+            f"status={multi_source_analysis.get('status', 'unknown')} "
+            f"sentiment={multi_source_analysis.get('sentiment', 'neutral')} "
+            f"signal={multi_source_analysis.get('signal_strength', 0)} "
+            f"conf={multi_source_analysis.get('confidence', 0)}"
+        )
+        ai_summary = (
+            f"trend={ai_engine_analysis.get('trend', 'unknown')} "
+            f"sentiment={ai_engine_analysis.get('sentiment', 'neutral')} "
+            f"signal={ai_engine_analysis.get('signal_strength', 0)}"
+        )
+        mi_summary = (
+            f"quality={market_intelligence.get('quality_score')} "
+            f"provenance={market_intelligence.get('provenance')} "
+            f"spread_bps={market_intelligence.get('spread_bps')} "
+            f"atr_pct_1h={market_intelligence.get('atr_pct_1h')} "
+            f"change_24h={market_intelligence.get('change_24h')} "
+            f"trend={market_intelligence.get('trend')} "
+            f"bias={market_intelligence.get('action_bias')} "
+            f"conf={market_intelligence.get('confidence')}"
+        )
+        agent_summary = self._truncate_text_for_prompt(
+            self._format_agent_advisory_block(agent_advisory).replace("\n", " | "),
+            420,
+        ) or "none"
+        history_summary = self._truncate_text_for_prompt(
+            historical_experience.replace("\n", " "),
+            220,
+        ) or "none"
+        scanner_summary = self._truncate_text_for_prompt(
+            scanner_hint_block.replace("\n", " | "),
+            260,
+        ) or "none"
+
+        return f"""你是量化交易AI。只返回JSON，不要解释。
+
+任务: 基于实时数据为 {symbol} 输出 buy/sell/hold/close。
+
+关键规则:
+- 证据不足、方向冲突明显、或风险不允许时 -> hold
+- close 仅在趋势实质反转或风险不可接受时
+- 不能只因为缺少 SR 确认就机械 hold；但 long 贴近阻力未突破、或 short 贴近支撑未跌破时应更保守
+- quantity 必须是整数；confidence 范围 0-1
+
+数据:
+- market: price={market_data.get('price', 0)} high24={market_data.get('high', 0)} low24={market_data.get('low', 0)} volume={market_data.get('volume', 0)}
+- tech_1h: ma5={technical.get('ma5_1h', 0):.4f} ma20={technical.get('ma20_1h', 0):.4f} rsi={technical.get('rsi_1h', 0):.1f} trend={technical.get('trend_1h', 'unknown')}
+- tech_4h: ma5={technical.get('ma5_4h', 0):.4f} ma20={technical.get('ma20_4h', 0):.4f} rsi={technical.get('rsi_4h', 0):.1f} trend={technical.get('trend_4h', 'unknown')}
+- tech_1d: ma20={technical.get('ma20_1d', 0):.4f} trend={technical.get('trend_1d', 'unknown')}
+- sr: support_1h={technical.get('support_1h', 0):.4f} resistance_1h={technical.get('resistance_1h', 0):.4f} near_support={technical.get('near_support', False)} near_resistance={technical.get('near_resistance', False)} breakout_up={technical.get('breakout_up_confirmed', False)} breakdown_down={technical.get('breakdown_down_confirmed', False)}
+- strategies(count={strategy_advice.get('count', 0)}): {strategy_summary}
+- risk: level={risk_assessment.get('level', 'unknown')} margin_ratio={risk_assessment.get('margin_ratio', 0):.2%}
+- balance: available={account_balance.get('available', 0):.2f} total={account_balance.get('total', 0):.2f} locked={account_balance.get('locked', 0):.2f}
+- positions: {positions_summary}
+- third_party: {tp_summary}
+- multi_source: {ms_summary}
+- ai_engine: {ai_summary}
+- market_intel: {mi_summary}
+- scanner_hint: {scanner_summary}
+- agent_advisory: {agent_summary}
+- history: {history_summary}
+- trade_limits: leverage={self.config['leverage_min']}-{self.config['leverage_max']} default={self.config['default_leverage']} max_positions={self.config['max_positions']} min_confidence={self.config.get('min_confidence_to_trade', 0.6)}
+
+返回JSON:
+{{
+  "action": "buy/sell/hold/close",
+  "side": "long/short",
+  "quantity": 0,
+  "leverage": 0,
+  "confidence": 0.0,
+  "reasoning": "简明说明核心证据",
+  "strategy_used": "strategy id or name",
+  "risk_level": "low/medium/high",
+  "stop_loss_pct": 0.0,
+  "take_profit_pct": 0.0
+}}
+
+只返回 JSON。"""
+
     def _symbol_fetch_variants(self, symbol: str) -> List[str]:
         """Build robust symbol variants for exchange fetch calls."""
         base = str(symbol or "").strip().upper()
@@ -5118,7 +5298,36 @@ class AICoreDecisionEngine:
 }}
 
 只返回JSON。"""
-        
+
+        max_prompt_bytes = int(self.config.get("llm_decision_prompt_max_bytes", 5200) or 5200)
+        prompt_bytes = len(prompt.encode("utf-8", "ignore"))
+        if prompt_bytes > max_prompt_bytes:
+            compact_prompt = self._build_compact_decision_prompt(
+                symbol=symbol,
+                market_data=market_data,
+                technical=technical,
+                strategy_advice=strategy_advice,
+                risk_assessment=risk_assessment,
+                current_positions=current_positions,
+                account_balance=account_balance,
+                third_party_data=third_party_data,
+                historical_experience=historical_experience,
+                multi_source_analysis=multi_source_analysis,
+                ai_engine_analysis=ai_engine_analysis,
+                market_intelligence=market_intelligence,
+                agent_advisory=agent_advisory,
+                scanner_hint_block=scanner_hint_block,
+            )
+            compact_bytes = len(compact_prompt.encode("utf-8", "ignore"))
+            logger.warning(
+                "decision prompt compacted: symbol=%s bytes=%s limit=%s compact_bytes=%s",
+                symbol,
+                prompt_bytes,
+                max_prompt_bytes,
+                compact_bytes,
+            )
+            return compact_prompt
+
         return prompt
 
     def _build_hold_trace_extras(
@@ -5201,6 +5410,121 @@ class AICoreDecisionEngine:
             **self._scanner_trace_context(getattr(decision, "symbol", "") if decision is not None else ""),
         }
 
+    @staticmethod
+    def _semantic_string_list(raw: Any, *, limit: int = 12) -> List[str]:
+        if isinstance(raw, str):
+            items = [raw]
+        elif isinstance(raw, (list, tuple, set)):
+            items = list(raw)
+        else:
+            return []
+        out: List[str] = []
+        seen = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+            if len(out) >= max(1, int(limit or 1)):
+                break
+        return out
+
+    @staticmethod
+    def _decision_is_degraded_hold_for_profit_protection(decision: Optional[TradeDecision]) -> bool:
+        if decision is None or str(getattr(decision, "action", "") or "").strip().lower() != "hold":
+            return False
+        strategy_used = str(getattr(decision, "strategy_used", "") or "").strip().lower()
+        reasoning = str(getattr(decision, "reasoning", "") or "").strip().lower()
+        market_analysis = (
+            getattr(decision, "market_analysis", None)
+            if isinstance(getattr(decision, "market_analysis", None), dict)
+            else {}
+        )
+        return (
+            "llm_unavailable_fallback" in reasoning
+            or "fallback" in strategy_used
+            or bool(market_analysis.get("llm_fallback", False))
+        )
+
+    def _adaptive_open_leverage_target(
+        self,
+        *,
+        decision: TradeDecision,
+        atr_pct_1h: Optional[float],
+    ) -> int:
+        lev_min = int(self.config.get("leverage_min", 30) or 30)
+        lev_max = int(self.config.get("leverage_max", 100) or 100)
+        lev_default = int(self.config.get("default_leverage", 30) or 30)
+        curve = self.config.get("leverage_curve")
+
+        try:
+            atr = float(atr_pct_1h) if atr_pct_1h is not None else None
+        except Exception:
+            atr = None
+
+        target: Optional[int] = None
+        if isinstance(curve, list):
+            parsed = []
+            for row in curve:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    parsed.append((float(row.get("atr_gte")), int(row.get("leverage"))))
+                except Exception:
+                    continue
+            parsed.sort(key=lambda x: x[0], reverse=True)
+            if atr is not None:
+                for thr, lev in parsed:
+                    if atr >= thr:
+                        target = lev
+                        break
+
+        if target is None:
+            if atr is None:
+                target = lev_default
+            else:
+                atr = max(0.001, min(0.15, atr))
+                if atr >= 0.06:
+                    target = 30
+                elif atr >= 0.04:
+                    target = 34
+                elif atr >= 0.03:
+                    target = 40
+                elif atr >= 0.02:
+                    target = 52
+                elif atr >= 0.015:
+                    target = 64
+                elif atr >= 0.010:
+                    target = 78
+                else:
+                    target = 92
+
+        try:
+            confidence = float(getattr(decision, "confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+        risk_level = str(getattr(decision, "risk_level", "") or "").strip().lower()
+
+        confidence_mult = 1.0
+        if confidence >= 0.90:
+            confidence_mult = 1.10
+        elif confidence >= 0.80:
+            confidence_mult = 1.05
+        elif confidence < 0.65:
+            confidence_mult = 0.92
+
+        risk_mult = 1.0
+        if risk_level == "low":
+            risk_mult = 1.05
+        elif risk_level == "high":
+            risk_mult = 0.85
+        elif risk_level == "critical":
+            risk_mult = 0.75
+
+        target = int(round(float(target) * confidence_mult * risk_mult))
+        return max(lev_min, min(lev_max, target))
+
     def _build_semantic_trade_context(
         self,
         *,
@@ -5213,12 +5537,16 @@ class AICoreDecisionEngine:
         ma = market_analysis if isinstance(market_analysis, dict) else {}
         strategy_id = str(strategy_used or "")
         governance: Dict[str, Any] = {}
+        research_profile: Dict[str, Any] = {}
         try:
             sm = getattr(self.main_controller, "strategy_manager", None) if self.main_controller else None
             if sm and strategy_id and hasattr(sm, "get_strategy_governance_profile"):
                 governance = sm.get_strategy_governance_profile(strategy_id) or {}
+            if sm and strategy_id and hasattr(sm, "get_strategy_research_profile"):
+                research_profile = sm.get_strategy_research_profile(strategy_id) or {}
         except Exception:
             governance = {}
+            research_profile = {}
 
         structure: Dict[str, Any] = {}
         try:
@@ -5250,6 +5578,104 @@ class AICoreDecisionEngine:
             execution_recommendation = "reduce_size"
         if structure.get("volatility_state") == "extreme":
             execution_recommendation = "wait_or_slice"
+
+        exchange_reachability = (
+            ma.get("exchange_reachability")
+            if isinstance(ma.get("exchange_reachability"), dict)
+            else {}
+        )
+        exchange_reachability_status = str(
+            exchange_reachability.get("status")
+            or ma.get("exchange_reachability_status")
+            or "unknown"
+        )
+        exchange_reachability_ok = (
+            exchange_reachability.get("ok")
+            if isinstance(exchange_reachability, dict) and "ok" in exchange_reachability
+            else ma.get("exchange_reachability_ok")
+        )
+        peer_answers = (
+            research_profile.get("peer_review_answers")
+            if isinstance(research_profile.get("peer_review_answers"), dict)
+            else {}
+        )
+        required_peer_answers = [
+            "what_edge",
+            "why_not_immediately_gone",
+            "net_after_cost",
+            "failure_shape",
+            "kill_signal",
+        ]
+        missing_peer_review_answers = [
+            key for key in required_peer_answers if not str(peer_answers.get(key) or "").strip()
+        ]
+        failure_cases = (
+            research_profile.get("failure_cases")
+            if isinstance(research_profile.get("failure_cases"), list)
+            else []
+        )
+        parameter_sensitivity = (
+            research_profile.get("parameter_sensitivity")
+            if isinstance(research_profile.get("parameter_sensitivity"), dict)
+            else {}
+        )
+        action_items = self._semantic_string_list(research_profile.get("action_items"), limit=8)
+        review_completion_status = str(
+            research_profile.get("review_completion_status") or "missing"
+        )
+        review_status = str(research_profile.get("review_status") or "unknown")
+        llm_fallback = bool(ma.get("llm_fallback", False))
+        try:
+            quality_score = float(ma.get("quality_score")) if ma.get("quality_score") is not None else None
+        except Exception:
+            quality_score = None
+        review_ready = review_completion_status.lower() in {"completed", "complete", "approved", "ready"}
+        peer_review_complete = len(missing_peer_review_answers) == 0
+        profitability_scale_in_blockers: List[str] = []
+        if llm_fallback:
+            profitability_scale_in_blockers.append("llm_fallback")
+        if not review_ready:
+            profitability_scale_in_blockers.append("research_review_incomplete")
+        if not peer_review_complete:
+            profitability_scale_in_blockers.append("peer_review_incomplete")
+        if quality_score is None or quality_score < 0.72:
+            profitability_scale_in_blockers.append("quality_below_scale_in_floor")
+        governance_summary = {
+            "strategy_id": str(governance.get("strategy_id") or strategy_id or ""),
+            "stage": str(governance.get("stage") or "researching"),
+            "oos_status": str(governance.get("oos_status") or "unknown"),
+            "live_drift_status": str(governance.get("live_drift_status") or "unknown"),
+            "deployment_stage": str(governance.get("deployment_stage") or "unknown"),
+            "effective_cap_multiplier": governance.get("effective_cap_multiplier"),
+            "market_structure_overlay_status": (
+                str(
+                    ((governance.get("market_structure_overlay") or {}).get("status"))
+                    if isinstance(governance.get("market_structure_overlay"), dict)
+                    else "unknown"
+                )
+            ),
+            "updated_at": governance.get("updated_at"),
+        }
+        research_summary = {
+            "strategy_id": str(research_profile.get("strategy_id") or strategy_id or ""),
+            "hypothesis": str(research_profile.get("hypothesis") or "")[:240],
+            "review_status": review_status,
+            "review_completion_status": review_completion_status,
+            "last_review_type": str(research_profile.get("last_review_type") or ""),
+            "last_reviewed_at": research_profile.get("last_reviewed_at"),
+            "action_item_count": len(action_items),
+            "failure_case_count": len(failure_cases),
+            "parameter_sensitivity_count": len(parameter_sensitivity),
+            "missing_peer_review_answers": list(missing_peer_review_answers),
+            "peer_review_net_after_cost": str(peer_answers.get("net_after_cost") or ""),
+            "peer_review_failure_shape": str(peer_answers.get("failure_shape") or ""),
+            "peer_review_kill_signal": str(peer_answers.get("kill_signal") or ""),
+        }
+        knowledge_refs = self._semantic_string_list(
+            [strategy_id, governance.get("strategy_id"), research_profile.get("strategy_id")],
+            limit=6,
+        )
+        memory_refs = self._semantic_string_list(ma.get("memory_refs"), limit=12)
 
         try:
             fs = getattr(self.main_controller, "feature_store_lite", None) if self.main_controller else None
@@ -5301,8 +5727,35 @@ class AICoreDecisionEngine:
             "effective_cap_multiplier": governance.get("effective_cap_multiplier"),
             "risk_verdict": risk_verdict,
             "execution_recommendation": execution_recommendation,
-            "knowledge_refs": [strategy_id] if strategy_id else [],
-            "memory_refs": [],
+            "symbol": str(symbol or ""),
+            "strategy_id": strategy_id,
+            "confidence": float(confidence) if confidence is not None else ma.get("confidence"),
+            "price": ma.get("price"),
+            "spread_bps": ma.get("spread_bps"),
+            "depth_imbalance": ma.get("depth_imbalance"),
+            "funding_rate": ma.get("funding_rate"),
+            "open_interest": ma.get("open_interest"),
+            "quality_score": quality_score,
+            "sentiment": ma.get("sentiment"),
+            "recommendation": ma.get("recommendation"),
+            "reasoning": str(ma.get("reasoning") or "")[:240],
+            "llm_fallback": llm_fallback,
+            "profitability_scale_in_ready": len(profitability_scale_in_blockers) == 0,
+            "profitability_scale_in_blockers": list(profitability_scale_in_blockers),
+            "research_review_ready": review_ready,
+            "peer_review_complete": peer_review_complete,
+            "exchange_reachability_status": exchange_reachability_status,
+            "exchange_reachability_ok": exchange_reachability_ok,
+            "research_review_status": review_status,
+            "research_review_completion_status": review_completion_status,
+            "missing_peer_review_answers": list(missing_peer_review_answers),
+            "research_action_items": list(action_items),
+            "research_failure_case_count": len(failure_cases),
+            "parameter_sensitivity_keys": sorted(parameter_sensitivity.keys())[:12],
+            "governance_summary": governance_summary,
+            "research_summary": research_summary,
+            "knowledge_refs": knowledge_refs,
+            "memory_refs": memory_refs,
         }
 
     def _build_agent_verdicts(
@@ -6391,7 +6844,12 @@ class AICoreDecisionEngine:
             
             lev_min = float(self.config.get("leverage_min", 1) or 1)
             lev_max = float(self.config.get("leverage_max", 100) or 100)
-            leverage = float(decision.leverage or self.config.get("default_leverage", 20))
+            atr_pct_1h = None
+            try:
+                atr_pct_1h = float((self._adaptive_guard_profile or {}).get("atr_pct_1h", 0.0) or 0.0)
+            except Exception:
+                atr_pct_1h = None
+            leverage = float(self._adaptive_open_leverage_target(decision=decision, atr_pct_1h=atr_pct_1h))
             leverage = min(max(leverage, lev_min), lev_max)
             if is_open and ex_reach_lev_factor < 0.999:
                 leverage = min(
@@ -7707,6 +8165,34 @@ class AICoreDecisionEngine:
     ) -> None:
         """开仓成功后将自适应门控结果应用到仓位跟踪止盈止损。"""
         if not self.main_controller or not hasattr(self.main_controller, "create_stop_loss_order"):
+            return
+        details = (
+            order_result.get("details")
+            if isinstance(order_result, dict) and isinstance(order_result.get("details"), dict)
+            else {}
+        )
+        effect = (
+            order_result.get("position_effect")
+            if isinstance(order_result, dict) and isinstance(order_result.get("position_effect"), dict)
+            else details.get("position_effect")
+            if isinstance(details.get("position_effect"), dict)
+            else {}
+        )
+        effective_action = str(
+            (order_result or {}).get("effective_action")
+            or details.get("effective_action")
+            or effect.get("effective_action")
+            or "open"
+        ).strip().lower()
+        if effective_action and effective_action != "open":
+            logger.info(
+                "⏭️ 跳过开仓后 SLTP 同步: symbol=%s requested_side=%s effect=%s effective_side=%s qty=%s",
+                decision.symbol,
+                decision.side,
+                effect.get("kind"),
+                effect.get("effective_side"),
+                effect.get("effective_quantity"),
+            )
             return
         entry, qty = await self._resolve_entry_qty_after_open(decision, order_result)
         if entry <= 0:

@@ -265,12 +265,59 @@ def run_tests(venv_python: Path, timeout_sec: int) -> Dict[str, Any]:
         }
 
 
+def run_trading_model_checks(venv_python: Path, timeout_sec: float) -> Dict[str, Any]:
+    script = REPO / "scripts" / "validate_trading_model_aliases.py"
+    python_bin = venv_python if venv_python.exists() else Path(sys.executable)
+    cmd = [str(python_bin), str(script), "--output-json", "--timeout", str(timeout_sec)]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO),
+            text=True,
+            capture_output=True,
+            timeout=max(int(timeout_sec * 4), 60),
+            check=False,
+        )
+        parsed: Dict[str, Any] | None = None
+        if proc.stdout.strip():
+            try:
+                maybe = json.loads(proc.stdout)
+                if isinstance(maybe, dict):
+                    parsed = maybe
+            except Exception:
+                parsed = None
+        return {
+            "returncode": proc.returncode,
+            "stdout_tail": "\n".join(proc.stdout.splitlines()[-60:]),
+            "stderr_tail": "\n".join(proc.stderr.splitlines()[-30:]),
+            "report": parsed,
+            "cmd": cmd,
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            "returncode": None,
+            "error": f"timeout_after_{max(int(timeout_sec * 4), 60)}s",
+            "stdout_tail": "\n".join((e.stdout or "").splitlines()[-60:]),
+            "stderr_tail": "\n".join((e.stderr or "").splitlines()[-30:]),
+            "cmd": cmd,
+        }
+    except OSError as e:
+        return {
+            "returncode": None,
+            "error": f"{type(e).__name__}: {e}",
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "cmd": cmd,
+        }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default=os.environ.get("OPENCLAW_API_BASE") or os.environ.get("BASE_URL") or "")
     ap.add_argument("--timeout-sec", type=float, default=20.0)
     ap.add_argument("--diag-timeout-sec", type=float, default=30.0)
     ap.add_argument("--skip-tests", action="store_true")
+    ap.add_argument("--skip-trading-models", action="store_true")
     ap.add_argument("--test-timeout-sec", type=int, default=900)
     ap.add_argument("--log-tail-lines", type=int, default=2000)
     args = ap.parse_args()
@@ -412,6 +459,39 @@ def main() -> int:
                 if int(log_summary.get("circuit_breaks", 0)) >= 10 and circuit_break_growth > 0
                 else None
             ),
+        )
+
+    # CLIProxyAPI trading alias contract
+    if args.skip_trading_models:
+        add(checks, "trading_model_aliases", True, "P3", "skipped by flag")
+        trading_model_result = None
+    else:
+        trading_model_result = run_trading_model_checks(venv_python, timeout_sec=args.timeout_sec)
+        trading_model_rc = trading_model_result.get("returncode")
+        trading_model_ok = isinstance(trading_model_rc, int) and trading_model_rc == 0
+        report = trading_model_result.get("report")
+        detail = (
+            f"returncode={trading_model_rc}"
+            if trading_model_result.get("error") is None
+            else str(trading_model_result.get("error"))
+        )
+        if isinstance(report, dict):
+            failed = [
+                item.get("name")
+                for item in (report.get("checks") or [])
+                if isinstance(item, dict) and not bool(item.get("ok"))
+            ]
+            if failed:
+                detail = f"failed_checks={failed}"
+            elif trading_model_ok:
+                detail = "alias contract verified"
+        add(
+            checks,
+            "trading_model_aliases",
+            trading_model_ok,
+            "P1" if not trading_model_ok else "P3",
+            detail,
+            trading_model_result if not trading_model_ok else report,
         )
 
     # focused tests

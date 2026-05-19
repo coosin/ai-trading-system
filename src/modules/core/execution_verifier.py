@@ -462,6 +462,19 @@ class ExecutionVerifier:
                 return result
 
         try:
+            open_confidence = None
+            if env and env.get("confidence") is not None:
+                open_confidence = env.get("confidence")
+            elif params.get("decision_confidence") is not None:
+                open_confidence = params.get("decision_confidence")
+            elif params.get("confidence") is not None:
+                open_confidence = params.get("confidence")
+            semantic_context = (
+                dict(params.get("semantic_context"))
+                if isinstance(params.get("semantic_context"), dict)
+                else None
+            )
+            decision_envelope = dict(env) if isinstance(env, dict) else None
             gres = await gw.open_swap(
                 sym,
                 side,
@@ -483,6 +496,11 @@ class ExecutionVerifier:
                     "trace_id": params.get("trace_id"),
                     "strategy_used": params.get("strategy_used") or params.get("strategy_id"),
                     "strategy_id": params.get("strategy_id") or params.get("strategy_used"),
+                    "confidence": open_confidence,
+                    "decision_confidence": open_confidence,
+                    "open_confidence": params.get("open_confidence"),
+                    "semantic_context": semantic_context,
+                    "decision_envelope": decision_envelope,
                 },
             )
         except Exception as e:
@@ -492,18 +510,35 @@ class ExecutionVerifier:
             return result
 
         if gres.get("success"):
-            if cd > 0:
+            position_effect = gres.get("position_effect") if isinstance(gres.get("position_effect"), dict) else {}
+            effective_action = str(gres.get("effective_action") or position_effect.get("effective_action") or "open")
+            effective_side = str(gres.get("effective_side") or position_effect.get("effective_side") or side)
+            try:
+                effective_qty = float(
+                    gres.get("effective_quantity")
+                    if gres.get("effective_quantity") is not None
+                    else position_effect.get("effective_quantity")
+                    if position_effect.get("effective_quantity") is not None
+                    else quantity
+                )
+                if effective_qty <= 0:
+                    effective_qty = quantity
+            except Exception:
+                effective_qty = quantity
+            if cd > 0 and effective_action == "open":
                 self._verifier_symbol_last_open[nk] = time.time()
             result.status = ExecutionStatus.SUCCESS
             result.details = {
                 "order_id": (gres.get("orderId") or gres.get("order_id") or gres.get("id")),
                 "symbol": sym,
-                "side": side,
-                "quantity": quantity,
+                "side": effective_side,
+                "quantity": effective_qty,
                 "price": gres.get("average", price),
                 "status": "filled",
                 "gateway": True,
                 "trace_id": gres.get("trace_id") or params.get("trace_id"),
+                "effective_action": effective_action,
+                "position_effect": position_effect,
             }
             self._stats["successful"] += 1
             # 僅在明確傳入 SL/TP 配置時註冊，避免僅有數字 stop_loss 時誤用默認百分比，
@@ -512,6 +547,7 @@ class ExecutionVerifier:
                 self._stop_loss_manager
                 and params.get("stop_loss_config") is not None
                 and params.get("take_profit_config") is not None
+                and effective_action == "open"
             ):
                 ep = float(gres.get("average") or params.get("entry_price") or price or 0)
                 if ep > 0:

@@ -32,6 +32,7 @@ const API_MATRIX = [
   { module: '风控', endpoint: '风险状态', key: 'riskStatus' },
   { module: '风控', endpoint: '止盈止损统计', key: 'stopLossStats' },
   { module: '司令部', endpoint: '司令部快照', key: 'commanderSnapshot' },
+  { module: '司令部', endpoint: '平台总巡检', key: 'platformOversight' },
   { module: '司令部', endpoint: '司令部能力', key: 'commanderCapabilities' },
   { module: '司令部', endpoint: '司令部审计', key: 'commanderAudit' },
   { module: 'AI', endpoint: 'AI门控规则', key: 'aiGuards' },
@@ -56,6 +57,7 @@ function diagnoseMissing(row, errors, value) {
     'riskStatus',
     'stopLossStats',
     'commanderSnapshot',
+    'platformOversight',
     'commanderCapabilities',
     'commanderAudit',
     'aiGuards',
@@ -73,6 +75,8 @@ function diagnoseMissing(row, errors, value) {
 const SEVERITY_RANK = { block: 0, reduce: 1, warn: 2 };
 const SEVERITY_LABEL = { block: '阻断', reduce: '降风险', warn: '告警' };
 const SEVERITY_COLOR = { block: '#dc2626', reduce: '#d97706', warn: '#64748b' };
+const OVERSIGHT_SEVERITY_LABEL = { critical: '关键', high: '高', medium: '中', low: '低' };
+const OVERSIGHT_SEVERITY_COLOR = { critical: '#b91c1c', high: '#dc2626', medium: '#d97706', low: '#64748b' };
 
 export default function CommandDocsSection({ commandInput, setCommandInput, commandReply, actions, state, errors }) {
   const [docId, setDocId] = useState('readme');
@@ -112,6 +116,64 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
     detail: JSON.stringify(x.detail || {}, null, 0),
   }));
   const commanderSnapshot = state.commanderSnapshot?.data || state.commanderSnapshot || {};
+  const snapshotHumanized = commanderSnapshot.humanized || {};
+  const systemMasteryHumanized = state.systemMastery?.data?.humanized || state.systemMastery?.humanized || {};
+  const platformOversight = state.platformOversight?.data || state.platformOversight || {};
+  const platformHumanized = platformOversight.humanized || {};
+  const componentRows = Array.isArray(platformOversight.component_inventory)
+    ? platformOversight.component_inventory.slice(0, 30).map((row, idx) => ({
+        id: idx,
+        component: row.component || '-',
+        status: row.available ? 'READY' : 'MISSING',
+        responsibility: row.responsibility || '-',
+        source_file: row.source_file || '-',
+      }))
+    : [];
+  const routeSummary = platformOversight.route_inventory?.summary || {};
+  const routeRows = Array.isArray(platformOversight.route_inventory?.routes)
+    ? platformOversight.route_inventory.routes.slice(0, 40).map((row, idx) => ({
+        id: idx,
+        path: row.path || '-',
+        methods: Array.isArray(row.methods) ? row.methods.join(', ') : '-',
+        domain: row.domain || '-',
+        file: row.endpoint_file || '-',
+      }))
+    : [];
+  const oversightFocusRows = Array.isArray(platformHumanized.focus_cards)
+    ? platformHumanized.focus_cards.map((row, idx) => ({
+        id: idx,
+        title: row.title || '-',
+        tone: row.tone || '-',
+        summary: row.summary || '-',
+      }))
+    : [];
+  const priorityAlertRows = Array.isArray(platformOversight.priority_alerts)
+    ? platformOversight.priority_alerts.slice(0, 12).map((row, idx) => {
+        const sev = String(row.severity || 'low').toLowerCase();
+        return {
+          id: row.id ?? idx,
+          severity: (
+            <span
+              style={{
+                display: 'inline-block',
+                padding: '2px 8px',
+                borderRadius: 999,
+                color: '#fff',
+                background: OVERSIGHT_SEVERITY_COLOR[sev] || OVERSIGHT_SEVERITY_COLOR.low,
+                fontSize: 12,
+                fontWeight: 700,
+              }}
+            >
+              {OVERSIGHT_SEVERITY_LABEL[sev] || OVERSIGHT_SEVERITY_LABEL.low}
+            </span>
+          ),
+          area: row.area || '-',
+          title: row.title || '-',
+          summary: row.summary || '-',
+          recommendation: row.recommendation || '-',
+        };
+      })
+    : [];
   const executionAttribution =
     commanderSnapshot.execution_attribution ||
     commanderSnapshot.data?.execution_attribution ||
@@ -172,12 +234,28 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
           <div className="panel-title">指挥与运维</div>
         </div>
         <div className="panel-body">
+          {(snapshotHumanized.headline || systemMasteryHumanized.headline || platformHumanized.headline) ? (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+              {snapshotHumanized.headline ? (
+                <InsightCard title="司令部快照摘要" tone="normal" content={`${snapshotHumanized.headline} ${snapshotHumanized.verdict || ''}`.trim()} />
+              ) : null}
+              {systemMasteryHumanized.headline ? (
+                <InsightCard title="系统掌控摘要" tone="normal" content={`${systemMasteryHumanized.headline} ${systemMasteryHumanized.verdict || ''}`.trim()} />
+              ) : null}
+              {platformHumanized.headline ? (
+                <InsightCard title="平台总巡检摘要" tone="normal" content={`${platformHumanized.headline} ${platformHumanized.verdict || ''}`.trim()} />
+              ) : null}
+            </div>
+          ) : null}
           <MetricGrid
             items={[
               { label: '司令部能力检查', value: state.commanderAudit?.all_passed ? '通过' : '部分缺失' },
               { label: '能力项数量', value: Array.isArray(state.commanderCapabilities?.specialists) ? state.commanderCapabilities.specialists.length : '-' },
               { label: '审计检查项', value: auditChecks.length },
               { label: 'API覆盖率', value: `${connected}/${coverageRows.length}` },
+              { label: '运行时路由', value: routeSummary.total_routes ?? '-' },
+              { label: '核心组件', value: componentRows.length ? `${componentRows.filter((x) => x.status === 'READY').length}/${componentRows.length}` : '-' },
+              { label: '高优先级告警', value: priorityAlertRows.length },
             ]}
           />
           <InsightCard
@@ -191,12 +269,42 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
             tone="normal"
           />
           <ActionList
-            items={[
+            items={platformHumanized.next_actions?.length ? platformHumanized.next_actions.slice(0, 4) : [
               '点击“一键联调关键API”自动检测',
               '出现“链路超时”先检查网络/代理',
               '出现“鉴权失败”先检查交易所密钥',
             ]}
           />
+          {oversightFocusRows.length ? (
+            <>
+              <div className="sub-title">平台总巡检焦点</div>
+              <DataTable
+                columns={[
+                  { key: 'title', title: '焦点' },
+                  { key: 'tone', title: '语气' },
+                  { key: 'summary', title: '摘要' },
+                ]}
+                rows={oversightFocusRows}
+                emptyText="暂无巡检焦点"
+              />
+            </>
+          ) : null}
+          {priorityAlertRows.length ? (
+            <>
+              <div className="sub-title">优先处理告警</div>
+              <DataTable
+                columns={[
+                  { key: 'severity', title: '级别' },
+                  { key: 'area', title: '区域' },
+                  { key: 'title', title: '问题' },
+                  { key: 'summary', title: '现象' },
+                  { key: 'recommendation', title: '建议' },
+                ]}
+                rows={priorityAlertRows}
+                emptyText="暂无高优先级告警"
+              />
+            </>
+          ) : null}
           <div style={{ display: 'flex', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
             <button type="button" className="btn btn-sm btn-outline" onClick={actions.runApiSmokeTest}>
               一键联调关键API
@@ -216,6 +324,36 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
             rows={coverageRows}
             emptyText="暂无覆盖清单"
           />
+          {componentRows.length ? (
+            <>
+              <div className="sub-title" style={{ marginTop: 12 }}>核心组件与代码模块</div>
+              <DataTable
+                columns={[
+                  { key: 'component', title: '组件' },
+                  { key: 'status', title: '状态' },
+                  { key: 'responsibility', title: '职责' },
+                  { key: 'source_file', title: '代码位置' },
+                ]}
+                rows={componentRows}
+                emptyText="暂无组件清单"
+              />
+            </>
+          ) : null}
+          {routeRows.length ? (
+            <>
+              <div className="sub-title" style={{ marginTop: 12 }}>运行时路由抽样</div>
+              <DataTable
+                columns={[
+                  { key: 'path', title: '路径' },
+                  { key: 'methods', title: '方法' },
+                  { key: 'domain', title: '域' },
+                  { key: 'file', title: '代码文件' },
+                ]}
+                rows={routeRows}
+                emptyText="暂无路由清单"
+              />
+            </>
+          ) : null}
           <div className="sub-title" style={{ marginTop: 12 }}>API 联调结果</div>
           <DataTable
             columns={[{ key: 'module', title: '模块' }, { key: 'endpoint', title: '接口路径' }, { key: 'status', title: '联调' }, { key: 'latency_ms', title: '耗时(ms)' }, { key: 'hint', title: '结果' }]}
@@ -274,6 +412,7 @@ export default function CommandDocsSection({ commandInput, setCommandInput, comm
           <JsonDetails title="高级原始数据：数据集成健康" value={state.dataIntegrationHealth} />
           <JsonDetails title="高级原始数据：插件状态" value={state.pluginsStatus} />
           <JsonDetails title="高级原始数据：司令部快照" value={state.commanderSnapshot} />
+          <JsonDetails title="高级原始数据：平台总巡检" value={state.platformOversight} />
           <JsonDetails title="高级原始数据：司令部能力" value={state.commanderCapabilities} />
         </div>
       </div>

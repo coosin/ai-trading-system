@@ -10,6 +10,8 @@ export default function TradingSection({
   loading,
   updatedAt,
 }) {
+  const closedLoopHumanized = state.closedLoopSummary?.data?.humanized || state.closedLoopSummary?.humanized || {};
+  const profitOpsHumanized = state.profitOpsOverview?.data?.humanized || state.profitOpsOverview?.humanized || {};
   const [ignoredSuggestionIds, setIgnoredSuggestionIds] = React.useState([]);
   const [nowTs, setNowTs] = React.useState(Date.now());
   const [secondConfirmEnabled, setSecondConfirmEnabled] = React.useState(() => {
@@ -184,12 +186,17 @@ export default function TradingSection({
         <InsightCard
           title="交易执行建议"
           content={
-            syncOk
+            closedLoopHumanized.headline
+              || profitOpsHumanized.headline
+              || (syncOk
               ? `当前可执行交易。持仓 ${view.positions?.length || 0} 笔，建议优先小仓位开单并观察事件流回报。`
-              : '账户同步处于降级状态，建议先点“手动账户同步”，确认仓位和钱包正常后再开单。'
+              : '账户同步处于降级状态，建议先点“手动账户同步”，确认仓位和钱包正常后再开单。')
           }
           tone={syncOk ? 'info' : 'warn'}
         />
+        {(closedLoopHumanized.next_actions?.length || profitOpsHumanized.next_actions?.length) ? (
+          <ActionList items={(closedLoopHumanized.next_actions || profitOpsHumanized.next_actions || []).slice(0, 4)} />
+        ) : null}
         {hostingMode === 'semi_auto' && (
           <div className="confirm-card">
             <div className="confirm-title">半自动待确认开仓（傻瓜化确认区）</div>

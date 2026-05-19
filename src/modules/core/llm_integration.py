@@ -408,10 +408,12 @@ class EnhancedLLMIntegration:
         self.enhanced_memory = None
         # 可选：用于读取 memory.context_policy（条数/Budget）
         self.policy_config_manager = None
+        self.runtime_config: Dict[str, Any] = {}
         self._initialized = False
     
     async def initialize(self, config: Dict[str, Any]):
         """初始化大模型集成"""
+        self.runtime_config = dict(config or {}) if isinstance(config, dict) else {}
         if self.llm_manager is None:
             # 如果没有提供llm_manager，创建一个新的
             from src.modules.core.enhanced_llm_manager import EnhancedLLMManager
@@ -432,6 +434,64 @@ class EnhancedLLMIntegration:
         self.llm_manager = llm_manager
         self._initialized = True
         logger.info("增强大模型集成已设置外部LLM管理器")
+
+    def set_runtime_config(self, config: Optional[Dict[str, Any]]) -> None:
+        """设置运行时 LLM 配置，供集成层任务参数调优使用。"""
+        self.runtime_config = dict(config or {}) if isinstance(config, dict) else {}
+
+    def _task_options(
+        self,
+        task_name: str,
+        *,
+        default_temperature: float,
+        default_max_tokens: int,
+    ) -> Dict[str, Any]:
+        """读取 llm.integration.task_overrides 中的轻量任务参数覆盖。"""
+        integration_cfg = self.runtime_config.get("integration", {})
+        if not isinstance(integration_cfg, dict):
+            integration_cfg = {}
+        task_overrides = integration_cfg.get("task_overrides", {})
+        if not isinstance(task_overrides, dict):
+            task_overrides = {}
+        task_cfg = task_overrides.get(task_name, {})
+        if not isinstance(task_cfg, dict):
+            task_cfg = {}
+
+        try:
+            temperature = float(task_cfg.get("temperature", default_temperature))
+        except Exception:
+            temperature = default_temperature
+        try:
+            max_tokens = int(task_cfg.get("max_tokens", default_max_tokens))
+        except Exception:
+            max_tokens = default_max_tokens
+
+        max_tokens = max(64, min(max_tokens, 4000))
+        temperature = max(0.0, min(temperature, 2.0))
+        return {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+    def _parse_structured_response(
+        self,
+        response: Any,
+        provider: Optional[str],
+        *,
+        fallback_key: str,
+    ) -> Dict[str, Any]:
+        raw = getattr(response, "content", None) or ""
+        parsed = safe_json_parse(raw)
+        provider_name = response.provider.value if getattr(response, "provider", None) else provider
+        if "error" in parsed and "raw_content" in parsed:
+            logger.debug("结构化JSON解析失败，回退文本结果: %s", parsed.get("error"))
+            return {
+                fallback_key: raw,
+                "provider": provider_name,
+                "parse_failed": True,
+            }
+        parsed["provider"] = provider_name
+        return parsed
     
     async def generate(self, prompt: str, provider: Optional[str] = None, 
                        is_user_input: bool = True,
@@ -624,20 +684,20 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回分析结果。"""
 
-        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000, is_user_input=False)
+        task_opts = self._task_options(
+            "analyze_market",
+            default_temperature=0.4,
+            default_max_tokens=900,
+        )
+        response = await self.generate(
+            prompt,
+            model_id=provider,
+            is_user_input=False,
+            **task_opts,
+        )
         
         if response.success:
-            try:
-                import json
-                result = json.loads(response.content)
-                result["provider"] = response.provider.value if response.provider else provider
-                return result
-            except Exception as e:
-                logger.debug(f"市场分析JSON解析失败，回退文本结果: {e}")
-                return {
-                    "analysis": response.content,
-                    "provider": response.provider.value if response.provider else provider
-                }
+            return self._parse_structured_response(response, provider, fallback_key="analysis")
         else:
             return {"error": response.error_message or "市场分析失败"}
     
@@ -660,20 +720,20 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回策略。"""
 
-        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000, is_user_input=False)
+        task_opts = self._task_options(
+            "generate_strategy",
+            default_temperature=0.4,
+            default_max_tokens=900,
+        )
+        response = await self.generate(
+            prompt,
+            model_id=provider,
+            is_user_input=False,
+            **task_opts,
+        )
         
         if response.success:
-            try:
-                import json
-                result = json.loads(response.content)
-                result["provider"] = response.provider.value if response.provider else provider
-                return result
-            except Exception as e:
-                logger.debug(f"策略JSON解析失败，回退文本结果: {e}")
-                return {
-                    "strategy": response.content,
-                    "provider": response.provider.value if response.provider else provider
-                }
+            return self._parse_structured_response(response, provider, fallback_key="strategy")
         else:
             return {"error": response.error_message or "策略生成失败"}
     
@@ -696,20 +756,20 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回分析结果。"""
 
-        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000, is_user_input=False)
+        task_opts = self._task_options(
+            "analyze_news",
+            default_temperature=0.3,
+            default_max_tokens=800,
+        )
+        response = await self.generate(
+            prompt,
+            model_id=provider,
+            is_user_input=False,
+            **task_opts,
+        )
         
         if response.success:
-            try:
-                import json
-                result = json.loads(response.content)
-                result["provider"] = response.provider.value if response.provider else provider
-                return result
-            except Exception as e:
-                logger.debug(f"新闻分析JSON解析失败，回退文本结果: {e}")
-                return {
-                    "analysis": response.content,
-                    "provider": response.provider.value if response.provider else provider
-                }
+            return self._parse_structured_response(response, provider, fallback_key="analysis")
         else:
             return {"error": response.error_message or "新闻分析失败"}
     
@@ -731,20 +791,20 @@ class EnhancedLLMIntegration:
 
 请以JSON格式返回风险评估。"""
 
-        response = await self.generate(prompt, model_id=provider, temperature=0.7, max_tokens=2000, is_user_input=False)
+        task_opts = self._task_options(
+            "evaluate_risk",
+            default_temperature=0.3,
+            default_max_tokens=700,
+        )
+        response = await self.generate(
+            prompt,
+            model_id=provider,
+            is_user_input=False,
+            **task_opts,
+        )
         
         if response.success:
-            try:
-                import json
-                result = json.loads(response.content)
-                result["provider"] = response.provider.value if response.provider else provider
-                return result
-            except Exception as e:
-                logger.debug(f"风险评估JSON解析失败，回退文本结果: {e}")
-                return {
-                    "risk_assessment": response.content,
-                    "provider": response.provider.value if response.provider else provider
-                }
+            return self._parse_structured_response(response, provider, fallback_key="risk_assessment")
         else:
             return {"error": response.error_message or "风险评估失败"}
     
@@ -782,8 +842,18 @@ class EnhancedLLMIntegration:
 8. 有效期
 
 请以JSON格式返回交易信号。"""
-        
-        response = await self.generate(prompt, provider, temperature=0.5, max_tokens=1000, is_user_input=False)
+
+        task_opts = self._task_options(
+            "generate_trading_signal",
+            default_temperature=0.2,
+            default_max_tokens=500,
+        )
+        response = await self.generate(
+            prompt,
+            provider,
+            is_user_input=False,
+            **task_opts,
+        )
         
         try:
             raw = getattr(response, "content", None) or ""

@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -43,6 +44,545 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _fmt_pct(value: Any, digits: int = 1) -> str:
+    try:
+        num = float(value)
+    except Exception:
+        return "-"
+    return f"{num * 100:.{digits}f}%"
+
+
+def _fmt_num(value: Any, digits: int = 2) -> str:
+    try:
+        num = float(value)
+    except Exception:
+        return "-"
+    return f"{num:.{digits}f}"
+
+
+def _build_humanized_snapshot_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    system = snapshot.get("system") if isinstance(snapshot.get("system"), dict) else {}
+    account = snapshot.get("account") if isinstance(snapshot.get("account"), dict) else {}
+    execution = snapshot.get("execution") if isinstance(snapshot.get("execution"), dict) else {}
+    risk = snapshot.get("risk") if isinstance(snapshot.get("risk"), dict) else {}
+    alerts = snapshot.get("alerts") if isinstance(snapshot.get("alerts"), list) else []
+    positions = account.get("positions") if isinstance(account.get("positions"), list) else []
+    reconciliation = execution.get("reconciliation") if isinstance(execution.get("reconciliation"), dict) else {}
+    policy_metrics = execution.get("policy_metrics") if isinstance(execution.get("policy_metrics"), dict) else {}
+    position_recs = risk.get("position_recommendations") if isinstance(risk.get("position_recommendations"), dict) else {}
+    status = str(system.get("system_status") or "unknown")
+    module_count = _safe_int(system.get("module_count"))
+    position_count = len(positions)
+    active_alerts = len(alerts)
+    success_ratio = _safe_float(policy_metrics.get("success_ratio"))
+
+    headline = (
+        f"系统当前状态 {status}，已加载 {module_count} 个模块；"
+        f"账户侧检测到 {position_count} 个持仓，当前告警 {active_alerts} 条。"
+    )
+    verdict = "快照可用，可以直接用于前端巡检和运维查看。"
+    if active_alerts > 0:
+        verdict = "快照可用，但有告警需要先处理。"
+    if not bool(reconciliation.get("healthy", True)):
+        verdict = "快照可用，但执行对账链路不健康，应优先排查。"
+
+    focus_cards = [
+        {
+            "title": "系统运行",
+            "tone": "warn" if status not in {"running", "healthy", "ok"} else "normal",
+            "summary": f"系统状态 {status}，运行模块数 {module_count}。",
+        },
+        {
+            "title": "账户与持仓",
+            "tone": "normal",
+            "summary": f"当前持仓 {position_count} 个，同步时间 {account.get('synced_at') or '未知'}。",
+        },
+        {
+            "title": "执行与风控",
+            "tone": "warn" if not bool(reconciliation.get('healthy', True)) else "normal",
+            "summary": (
+                f"执行成功率 {_fmt_pct(success_ratio, 1)}，"
+                f"对账{'正常' if bool(reconciliation.get('healthy', True)) else '需关注'}，"
+                f"仓位建议条目 {len(position_recs) if isinstance(position_recs, dict) else 0}。"
+            ),
+        },
+    ]
+    next_actions: List[str] = []
+    if active_alerts > 0:
+        next_actions.append("先处理快照中的告警项，再决定是否继续放大自动化执行。")
+    if not bool(reconciliation.get("healthy", True)):
+        next_actions.append("执行对账链路异常时，暂停依赖收益归因的自动调参动作。")
+    if not next_actions:
+        next_actions.append("当前快照无明显阻塞项，可继续进入更细的交易闭环诊断。")
+    return {
+        "headline": headline,
+        "verdict": verdict,
+        "focus_cards": focus_cards,
+        "next_actions": next_actions,
+        "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+    }
+
+
+def _build_humanized_system_mastery_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    overview = report.get("overview") if isinstance(report.get("overview"), dict) else {}
+    learning = report.get("learning_and_optimization") if isinstance(report.get("learning_and_optimization"), dict) else {}
+    coverage_gaps = report.get("coverage_gaps") if isinstance(report.get("coverage_gaps"), list) else []
+    learning_status = learning.get("learning_status") if isinstance(learning.get("learning_status"), dict) else {}
+    opt_hints = learning.get("optimization_hints") if isinstance(learning.get("optimization_hints"), list) else []
+    loop_verdict = str(overview.get("loop_verdict") or "unknown")
+    risk_level = str(overview.get("risk_level") or "unknown")
+    pnl = _safe_float(overview.get("recent_net_pnl_plus_fees"))
+    win_rate = _safe_float(overview.get("recent_win_rate"))
+    position_count = _safe_int(overview.get("position_count"))
+    active_orders = _safe_int(overview.get("active_orders"))
+
+    headline = (
+        f"全局总览显示系统闭环判定为 {loop_verdict}，风险等级 {risk_level}；"
+        f"当前持仓 {position_count} 个，活动订单 {active_orders} 个，最近净收益 {_fmt_num(pnl, 2)}。"
+    )
+    verdict = "这个接口适合做全局巡检入口。"
+    if coverage_gaps:
+        verdict = "当前可以做全局巡检，但部分观测缺口还会影响自动优化可信度。"
+    if pnl < 0:
+        verdict = "当前系统可巡检，但收益表现偏弱，建议优先看闭环诊断和优化建议。"
+
+    next_actions = [str(g.get("message")).strip() for g in coverage_gaps[:3] if isinstance(g, dict) and str(g.get("message") or "").strip()]
+    for hint in opt_hints[:2]:
+        if isinstance(hint, dict) and str(hint.get("recommendation") or "").strip():
+            next_actions.append(str(hint.get("recommendation")).strip())
+    if not next_actions:
+        next_actions.append("当前没有明显观测缺口，可以继续按闭环报告验证优化动作。")
+
+    focus_cards = [
+        {"title": "闭环判定", "tone": "warn" if pnl < 0 else "normal", "summary": f"最近胜率 {_fmt_pct(win_rate, 2)}，净收益 {_fmt_num(pnl, 2)}。"},
+        {"title": "运行负载", "tone": "normal", "summary": f"当前持仓 {position_count} 个，活动订单 {active_orders} 个。"},
+        {"title": "学习与优化", "tone": "normal", "summary": f"学习状态键数 {len(learning_status)}，优化提示 {len(opt_hints)} 条，观测缺口 {len(coverage_gaps)} 项。"},
+    ]
+    return {
+        "headline": headline,
+        "verdict": verdict,
+        "focus_cards": focus_cards,
+        "next_actions": next_actions,
+        "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+    }
+
+
+def _build_humanized_agent_effectiveness_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    top_issues = report.get("top_issues") if isinstance(report.get("top_issues"), list) else []
+    diagnostics = report.get("attribution_diagnostics") if isinstance(report.get("attribution_diagnostics"), dict) else {}
+    trace_sample = _safe_int(summary.get("trace_sample_size"))
+    coverage_ratio = _safe_float(summary.get("agent_trace_coverage_ratio"))
+    executed = _safe_int(summary.get("executed_trace_count"))
+    realized_linked = _safe_int(summary.get("realized_trade_linked_trace_count"))
+    headline = (
+        f"最近检查 {trace_sample} 条决策轨迹，四智能体覆盖率 {_fmt_pct(coverage_ratio, 1)}；"
+        f"其中成功执行 {executed} 条，已实现收益闭环关联 {realized_linked} 条。"
+    )
+    verdict = "当前可以看出智能体是否真正进入主路径。"
+    if realized_linked == 0:
+        verdict = "当前最关键的问题仍是智能体到真实收益的闭环归因不足。"
+    elif coverage_ratio < 0.4:
+        verdict = "智能体已经有样本，但覆盖率偏低，还不足以证明它们稳定影响交易结果。"
+    next_actions = [str(x.get("recommendation")).strip() for x in top_issues[:3] if isinstance(x, dict) and str(x.get("recommendation") or "").strip()]
+    if not next_actions:
+        next_actions.append("当前没有突出的智能体阻塞项，可以继续滚动观察新增样本。")
+    focus_cards = [
+        {"title": "覆盖率", "tone": "warn" if coverage_ratio < 0.4 else "normal", "summary": f"四智能体覆盖率 {_fmt_pct(coverage_ratio, 1)}，全栈参与 {_safe_int(summary.get('full_stack_trace_count'))} 条。"},
+        {"title": "执行到达", "tone": "normal", "summary": f"成功执行 {executed} 条，被阻断 {_safe_int(summary.get('blocked_trace_count'))} 条。"},
+        {"title": "收益归因", "tone": "warn" if realized_linked == 0 else "normal", "summary": f"归因诊断 {diagnostics.get('diagnosis') or 'unknown'}，已实现闭环 {realized_linked} 条。"},
+    ]
+    return {
+        "headline": headline,
+        "verdict": verdict,
+        "focus_cards": focus_cards,
+        "next_actions": next_actions,
+        "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+    }
+
+
+def _build_humanized_closed_loop_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    loop_health = report.get("loop_health") if isinstance(report.get("loop_health"), dict) else {}
+    signal_guard = report.get("signal_and_guard") if isinstance(report.get("signal_and_guard"), dict) else {}
+    exit_profit = report.get("exit_and_profitability") if isinstance(report.get("exit_and_profitability"), dict) else {}
+    hints = report.get("optimization_hints") if isinstance(report.get("optimization_hints"), list) else []
+    performance = exit_profit.get("realized_performance") if isinstance(exit_profit.get("realized_performance"), dict) else {}
+    opp_blocks = exit_profit.get("opportunity_blocks") if isinstance(exit_profit.get("opportunity_blocks"), dict) else {}
+    top_rejects = signal_guard.get("top_reject_reasons") if isinstance(signal_guard.get("top_reject_reasons"), list) else []
+    best_regime = performance.get("best_regime") if isinstance(performance.get("best_regime"), dict) else {}
+    worst_regime = performance.get("worst_regime") if isinstance(performance.get("worst_regime"), dict) else {}
+    headline = (
+        f"闭环判定 {loop_health.get('verdict') or 'unknown'}，风险等级 {loop_health.get('risk_level') or 'unknown'}；"
+        f"当前持仓 {_safe_int(loop_health.get('position_count'))} 个，活动订单 {_safe_int(loop_health.get('active_orders'))} 个，净值 {_fmt_num(loop_health.get('equity'), 2)}。"
+    )
+    verdict = "这条接口适合判断问题主要卡在信号、执行、对账还是退出。"
+    if _safe_int(opp_blocks.get("reconciliation_blocked")) > 0:
+        verdict = "当前闭环的主要阻塞点在对账保护。"
+    elif _safe_int(opp_blocks.get("tp_net_edge_suppressed")) > 0:
+        verdict = "当前闭环里已经出现止盈收益兑现受抑制的迹象。"
+    top_reject = "暂无"
+    if top_rejects:
+        top_reject = str((top_rejects[0] or {}).get("reason") or "暂无")
+    focus_cards = [
+        {"title": "系统闭环", "tone": "normal", "summary": f"活跃告警 {_safe_int(loop_health.get('active_alerts'))} 条，运行模块 {_safe_int(loop_health.get('running_modules'))} 个。"},
+        {"title": "信号阻塞", "tone": "warn" if top_reject != '暂无' else 'normal', "summary": f"主要拒绝原因：{top_reject}。guard_rejected {_safe_int(opp_blocks.get('guard_rejected'))} 次。"},
+        {"title": "收益分化", "tone": "normal", "summary": f"最佳 regime {best_regime.get('regime') or '-'}，最弱 regime {worst_regime.get('regime') or '-'}。"},
+    ]
+    next_actions = [str(x.get("recommendation")).strip() for x in hints[:4] if isinstance(x, dict) and str(x.get("recommendation") or "").strip()]
+    if not next_actions:
+        next_actions.append("当前没有明显闭环阻塞项，可以继续观察新增交易样本。")
+    return {
+        "headline": headline,
+        "verdict": verdict,
+        "focus_cards": focus_cards,
+        "next_actions": next_actions,
+        "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+    }
+
+
+def _build_humanized_memory_stats_summary(stats: Dict[str, Any]) -> Dict[str, Any]:
+    short_term = _safe_int(stats.get("short_term_count"))
+    long_term = _safe_int(stats.get("long_term_count"))
+    trade_records = _safe_int(stats.get("trade_records"))
+    risk_events = _safe_int(stats.get("risk_events"))
+    headline = (
+        f"记忆系统当前短期记忆 {short_term} 条，长期经验 {long_term} 条；"
+        f"其中交易记录 {trade_records} 条，风险事件 {risk_events} 条。"
+    )
+    verdict = "这组数据适合判断学习与复盘素材是否在持续积累。"
+    next_actions = []
+    if trade_records == 0:
+        next_actions.append("交易记录仍为 0，先检查 trade_close 写入记忆链路。")
+    if risk_events == 0:
+        next_actions.append("风险事件为空时，建议确认风控异常是否已写入记忆系统。")
+    if not next_actions:
+        next_actions.append("记忆素材已有积累，可以继续结合每日复盘和周报做学习闭环。")
+    return {
+        "headline": headline,
+        "verdict": verdict,
+        "focus_cards": [
+            {"title": "短期记忆", "tone": "normal", "summary": f"工作记忆 {short_term} 条。"},
+            {"title": "长期经验", "tone": "normal", "summary": f"经验记忆 {long_term} 条。"},
+            {"title": "交易与风险", "tone": "normal", "summary": f"交易记录 {trade_records}，风险事件 {risk_events}。"},
+        ],
+        "next_actions": next_actions,
+        "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+    }
+
+
+def _build_humanized_profit_ops_overview(report: Dict[str, Any]) -> Dict[str, Any]:
+    attribution = report.get("profit_attribution") if isinstance(report.get("profit_attribution"), dict) else {}
+    regime_rows = attribution.get("regime") if isinstance(attribution.get("regime"), list) else []
+    health = attribution.get("health") if isinstance(attribution.get("health"), dict) else {}
+    readiness = health.get("readiness") if isinstance(health.get("readiness"), dict) else {}
+    coverage = health.get("coverage") if isinstance(health.get("coverage"), dict) else {}
+    protect = report.get("profit_protect_debug") if isinstance(report.get("profit_protect_debug"), dict) else {}
+    best = regime_rows[0] if regime_rows else {}
+    worst = regime_rows[-1] if regime_rows else {}
+    headline = (
+        f"盈利运营视图最近样本 {_safe_int((health.get('sample') or {}).get('total'))} 笔，"
+        f"regime 覆盖率 {_fmt_pct(coverage.get('regime_coverage'), 1)}，"
+        f"当前盈利保护活跃订单 {_safe_int(protect.get('active_count'))} 个。"
+    )
+    verdict = "这条接口适合直接判断是否已经具备按 regime 调参的条件。"
+    if not bool(readiness.get("ready_for_regime_tuning")):
+        verdict = "当前还不建议直接按 regime 自动调参，先补样本和覆盖率。"
+    next_actions: List[str] = []
+    if not bool(readiness.get("ready_for_regime_tuning")):
+        next_actions.append("先把真实成交样本和 regime 归因补到阈值以上，再进入调参。")
+    if worst and _safe_float(worst.get("total_pnl")) < 0:
+        next_actions.append(f"优先收缩 {worst.get('regime') or '弱势 regime'} 的仓位和杠杆。")
+    if _safe_int(protect.get("active_count")) > 0:
+        next_actions.append("检查盈利保护活跃订单的 stage 和 lock_pct 是否符合预期。")
+    if not next_actions:
+        next_actions.append("当前盈利样本与保护状态都可读，可以继续做精细化调优。")
+    return {
+        "headline": headline,
+        "verdict": verdict,
+        "focus_cards": [
+            {"title": "调参准备度", "tone": "warn" if not bool(readiness.get('ready_for_regime_tuning')) else "normal", "summary": f"是否可调参：{'可' if bool(readiness.get('ready_for_regime_tuning')) else '否'}。"},
+            {"title": "最佳与最弱", "tone": "normal", "summary": f"最佳 {best.get('regime') or '-'}，最弱 {worst.get('regime') or '-'}。"},
+            {"title": "盈利保护", "tone": "normal", "summary": f"活跃保护订单 {_safe_int(protect.get('active_count'))} 个。"},
+        ],
+        "next_actions": next_actions,
+        "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+    }
+
+
+def _guess_route_domain(path: str) -> str:
+    text = str(path or "").lower()
+    if "/system/" in text:
+        return "system"
+    if "/monitoring/" in text:
+        return "monitoring"
+    if "/market" in text:
+        return "market"
+    if "/trade" in text or "/trades" in text:
+        return "trade"
+    if "/risk" in text or "/stop-loss" in text:
+        return "risk"
+    if "/memory" in text or "/learning" in text:
+        return "memory_learning"
+    if "/strategy" in text:
+        return "strategy"
+    if "/surface/" in text or "/plugins/" in text or "/skills/" in text:
+        return "surface_plugins"
+    if "/commander/" in text or "/modules/" in text:
+        return "commander_modules"
+    return "other"
+
+
+def _build_runtime_route_inventory(app: Any) -> Dict[str, Any]:
+    from fastapi.routing import APIRoute
+
+    rows: List[Dict[str, Any]] = []
+    method_counter: Counter[str] = Counter()
+    domain_counter: Counter[str] = Counter()
+    for route in getattr(app, "routes", []) or []:
+        if not isinstance(route, APIRoute):
+            continue
+        methods = sorted([m for m in (route.methods or set()) if m not in {"HEAD", "OPTIONS"}])
+        path = str(getattr(route, "path", "") or "")
+        endpoint = getattr(route, "endpoint", None)
+        endpoint_file = ""
+        try:
+            if endpoint is not None:
+                endpoint_file = str(inspect.getsourcefile(endpoint) or "")
+        except Exception:
+            endpoint_file = ""
+        domain = _guess_route_domain(path)
+        for method in methods:
+            method_counter[method] += 1
+        domain_counter[domain] += 1
+        rows.append(
+            {
+                "path": path,
+                "methods": methods,
+                "name": str(getattr(route, "name", "") or ""),
+                "domain": domain,
+                "endpoint_file": endpoint_file,
+            }
+        )
+    rows.sort(key=lambda x: (x.get("domain") or "", x.get("path") or ""))
+    return {
+        "summary": {
+            "total_routes": len(rows),
+            "by_method": dict(method_counter),
+            "by_domain": dict(domain_counter),
+        },
+        "routes": rows,
+    }
+
+
+def _build_core_component_inventory(main_controller: Any) -> List[Dict[str, Any]]:
+    mc = main_controller
+    specs = [
+        ("main_controller", mc, "src/main.py", "系统编排入口"),
+        ("ai_core", getattr(mc, "ai_core", None) if mc else None, "src/modules/core/ai_core_decision_engine.py", "AI 决策与开平仓门控"),
+        ("ai_trading_engine", getattr(mc, "ai_trading_engine", None) if mc else None, "src/modules/trading/ai_trading_engine.py", "交易主循环"),
+        ("execution_gateway", getattr(mc, "execution_gateway", None) if mc else None, "src/modules/execution", "执行脊柱与单写者"),
+        ("stop_loss_manager", getattr(mc, "stop_loss_manager", None) if mc else None, "src/modules/risk", "SLTP 与退出保护"),
+        ("trade_history_service", getattr(mc, "trade_history_service", None) if mc else None, "src/modules/trades", "成交历史与收益归因"),
+        ("trade_event_hub", getattr(mc, "trade_event_hub", None) if mc else None, "src/modules/trades", "交易事件流"),
+        ("decision_trace_store", getattr(mc, "decision_trace_store", None) if mc else None, "src/modules/core/decision_trace_store.py", "决策轨迹与智能体分析"),
+        ("strategy_manager", getattr(mc, "strategy_manager", None) if mc else None, "src/modules/strategy", "策略注册与审批"),
+        ("memory_gateway", getattr(mc, "memory_gateway", None) if mc else None, "src/modules/memory/memory_gateway.py", "统一记忆写入与检索"),
+        ("ai_memory_manager", getattr(mc, "ai_memory_manager", None) if mc else None, "src/modules/memory", "兼容记忆管理"),
+        ("market_intelligence", getattr(mc, "market_intelligence", None) if mc else None, "src/modules/market", "行情理解与结构视图"),
+        ("data_source_hub", getattr(mc, "data_source_hub", None) if mc else None, "src/modules/data", "统一数据源聚合"),
+        ("data_integration", getattr(mc, "data_integration", None) if mc else None, "src/modules/data", "外部数据接入"),
+        ("plugin_manager", getattr(mc, "plugin_manager", None) if mc else None, "src/modules/plugins", "插件与技能管理"),
+        ("enhanced_llm_manager", getattr(mc, "enhanced_llm_manager", None) if mc else None, "src/modules/llm", "模型路由与熔断"),
+        ("telegram_bot", getattr(mc, "telegram_bot", None) if mc else None, "src/modules/notification", "Telegram 入口"),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for idx, (name, obj, source_file, responsibility) in enumerate(specs):
+        rows.append(
+            {
+                "id": idx,
+                "component": name,
+                "available": bool(obj),
+                "status": "ready" if obj else "missing",
+                "source_file": source_file,
+                "responsibility": responsibility,
+            }
+        )
+    return rows
+
+
+def _build_platform_alerts(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    alerts: List[Dict[str, Any]] = []
+    components = report.get("component_inventory") if isinstance(report.get("component_inventory"), list) else []
+    closed_loop = report.get("closed_loop_summary") if isinstance(report.get("closed_loop_summary"), dict) else {}
+    agents = report.get("agent_effectiveness") if isinstance(report.get("agent_effectiveness"), dict) else {}
+    profit = report.get("profit_ops_overview") if isinstance(report.get("profit_ops_overview"), dict) else {}
+    memory_stats = report.get("memory_stats") if isinstance(report.get("memory_stats"), dict) else {}
+    route_alignment = report.get("route_catalog_alignment") if isinstance(report.get("route_catalog_alignment"), dict) else {}
+    order_tracking = report.get("order_tracking") if isinstance(report.get("order_tracking"), dict) else {}
+
+    missing_components = [x for x in components if isinstance(x, dict) and not bool(x.get("available"))]
+    for row in missing_components:
+        alerts.append(
+            {
+                "severity": "critical",
+                "area": "component_availability",
+                "title": f"核心组件缺失: {row.get('component') or 'unknown'}",
+                "summary": str(row.get("responsibility") or row.get("source_file") or "缺少组件"),
+                "recommendation": f"优先恢复 {row.get('component') or '该组件'}，否则相关链路无法可信运行。",
+            }
+        )
+
+    loop_health = closed_loop.get("loop_health") if isinstance(closed_loop.get("loop_health"), dict) else {}
+    if _safe_int(loop_health.get("active_alerts")) > 0:
+        alerts.append(
+            {
+                "severity": "high",
+                "area": "system_alerts",
+                "title": "系统存在活跃告警",
+                "summary": f"当前活跃告警 {_safe_int(loop_health.get('active_alerts'))} 条。",
+                "recommendation": "先处理活跃告警，再继续扩大仓位或调整策略。",
+            }
+        )
+
+    recon = (closed_loop.get("execution_and_reconciliation") or {}).get("reconciliation_summary")
+    if isinstance(recon, dict) and _safe_int(recon.get("drift_total")) > 0:
+        alerts.append(
+            {
+                "severity": "critical",
+                "area": "reconciliation",
+                "title": "本地与交易所持仓存在漂移",
+                "summary": f"drift_total={_safe_int(recon.get('drift_total'))}",
+                "recommendation": "先修正对账漂移，否则收益统计和风控判断都不可靠。",
+            }
+        )
+
+    agent_summary = agents.get("summary") if isinstance(agents.get("summary"), dict) else {}
+    if _safe_int(agent_summary.get("realized_trade_linked_trace_count")) == 0:
+        alerts.append(
+            {
+                "severity": "high",
+                "area": "agent_attribution",
+                "title": "智能体与真实收益未形成稳定闭环",
+                "summary": f"已实现收益关联 {_safe_int(agent_summary.get('realized_trade_linked_trace_count'))} 条。",
+                "recommendation": "继续打通 trace_id 从开仓到平仓的收益回写。",
+            }
+        )
+    if _safe_float(agent_summary.get("agent_trace_coverage_ratio")) < 0.4:
+        alerts.append(
+            {
+                "severity": "medium",
+                "area": "agent_coverage",
+                "title": "四智能体覆盖率偏低",
+                "summary": f"覆盖率 {_fmt_pct(agent_summary.get('agent_trace_coverage_ratio'), 1)}。",
+                "recommendation": "把四智能体 advisory 链路更稳定地挂到主决策路径。",
+            }
+        )
+
+    readiness = (((profit.get("profit_attribution") or {}).get("health") or {}).get("readiness") or {})
+    if not bool(readiness.get("ready_for_regime_tuning")):
+        alerts.append(
+            {
+                "severity": "medium",
+                "area": "profit_tuning",
+                "title": "当前尚未达到按 regime 调参条件",
+                "summary": "真实样本或归因覆盖率不足。",
+                "recommendation": "先补真实成交样本和 regime 归因，再进入自动调参。",
+            }
+        )
+
+    active_orders_summary = order_tracking.get("active_orders_summary") if isinstance(order_tracking.get("active_orders_summary"), dict) else {}
+    if _safe_int(active_orders_summary.get("active_sltp_orders")) == 0 and _safe_int((order_tracking.get("positions_summary") or {}).get("position_count")) > 0:
+        alerts.append(
+            {
+                "severity": "high",
+                "area": "position_protection",
+                "title": "存在持仓但没有活动保护单",
+                "summary": "持仓数大于 0，但活动 SLTP 订单为 0。",
+                "recommendation": "检查止盈止损挂单链路，避免裸持仓暴露风险。",
+            }
+        )
+
+    if _safe_int(memory_stats.get("trade_records")) == 0:
+        alerts.append(
+            {
+                "severity": "medium",
+                "area": "learning_memory",
+                "title": "记忆系统未积累交易记录",
+                "summary": "trade_records=0",
+                "recommendation": "检查 trade_close 到 memory_gateway 的写入链路。",
+            }
+        )
+
+    static_routes = _safe_int(route_alignment.get("static_catalog_routes"))
+    overlap = _safe_int(route_alignment.get("runtime_static_overlap"))
+    if static_routes > 0 and overlap == 0:
+        alerts.append(
+            {
+                "severity": "low",
+                "area": "route_catalog",
+                "title": "运行时路由与静态目录没有交集",
+                "summary": f"static_catalog_routes={static_routes}, overlap={overlap}",
+                "recommendation": "检查静态目录是否落后于实际注册路由。",
+            }
+        )
+
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    alerts.sort(key=lambda x: (severity_rank.get(str(x.get("severity") or "low"), 9), str(x.get("area") or ""), str(x.get("title") or "")))
+    for idx, row in enumerate(alerts):
+        row["id"] = idx
+    return alerts
+
+
+def _build_humanized_platform_oversight(report: Dict[str, Any]) -> Dict[str, Any]:
+    system = report.get("system_health") if isinstance(report.get("system_health"), dict) else {}
+    agents = report.get("agent_effectiveness") if isinstance(report.get("agent_effectiveness"), dict) else {}
+    closed_loop = report.get("closed_loop_summary") if isinstance(report.get("closed_loop_summary"), dict) else {}
+    orders = report.get("order_tracking") if isinstance(report.get("order_tracking"), dict) else {}
+    routes = report.get("route_inventory") if isinstance(report.get("route_inventory"), dict) else {}
+    components = report.get("component_inventory") if isinstance(report.get("component_inventory"), list) else []
+    profit = report.get("profit_ops_overview") if isinstance(report.get("profit_ops_overview"), dict) else {}
+    alerts = report.get("priority_alerts") if isinstance(report.get("priority_alerts"), list) else []
+    ready_components = sum(1 for x in components if isinstance(x, dict) and x.get("available"))
+    total_components = len(components)
+    route_total = _safe_int((routes.get("summary") or {}).get("total_routes"))
+    headline = (
+        f"全系统巡检已覆盖 {route_total} 条运行时路由、{total_components} 个核心组件；"
+        f"当前可用组件 {ready_components} 个，持仓 {_safe_int((orders.get('positions_summary') or {}).get('position_count'))} 个，"
+        f"活跃保护单 {_safe_int((orders.get('active_orders_summary') or {}).get('active_sltp_orders'))} 个。"
+    )
+    verdict = "这个总览已经可以作为交易系统运维入口。"
+    if alerts and str((alerts[0] or {}).get("severity") or "") == "critical":
+        verdict = "当前存在需要立即处理的关键风险项。"
+    elif ready_components < total_components:
+        verdict = "当前有核心组件缺失，先恢复基础模块，再谈收益优化。"
+    elif _safe_int(((closed_loop.get("loop_health") or {}).get("active_alerts"))) > 0:
+        verdict = "系统可运行，但当前存在活跃告警，建议先处理风险与执行链路。"
+    next_actions: List[str] = []
+    agent_h = agents.get("humanized") if isinstance(agents.get("humanized"), dict) else {}
+    loop_h = closed_loop.get("humanized") if isinstance(closed_loop.get("humanized"), dict) else {}
+    profit_h = profit.get("humanized") if isinstance(profit.get("humanized"), dict) else {}
+    for source in [loop_h.get("next_actions"), agent_h.get("next_actions"), profit_h.get("next_actions")]:
+        if isinstance(source, list):
+            for item in source:
+                text = str(item or "").strip()
+                if text and text not in next_actions:
+                    next_actions.append(text)
+    if not next_actions:
+        next_actions.append("当前未发现明显阻塞项，可以保持巡检并继续积累真实交易样本。")
+    return {
+        "headline": headline,
+        "verdict": verdict,
+        "focus_cards": [
+            {"title": "系统组件", "tone": "warn" if ready_components < total_components else "normal", "summary": f"组件可用 {ready_components}/{total_components}。"},
+            {"title": "交易闭环", "tone": "normal", "summary": str(loop_h.get("headline") or "闭环摘要暂不可用")},
+            {"title": "路由与接口", "tone": "normal", "summary": f"运行时路由 {route_total} 条，静态目录 {_safe_int((report.get('route_catalog_alignment') or {}).get('static_catalog_routes'))} 条。"},
+            {"title": "优先告警", "tone": "warn" if alerts else "normal", "summary": str((alerts[0] or {}).get("title") or "当前没有高优先级告警")},
+        ],
+        "next_actions": next_actions[:6],
+        "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+    }
 
 
 def _parse_iso_datetime(value: Any) -> datetime:
@@ -589,6 +1129,7 @@ async def _build_agent_effectiveness_summary(
             }
         )
     out["top_issues"] = top_issues
+    out["humanized"] = _build_humanized_agent_effectiveness_summary(out)
     return out
 
 
@@ -1376,7 +1917,7 @@ async def _build_closed_loop_summary_data(main_controller: Any, *, trace_limit: 
         except Exception:
             running_modules = 0
 
-    return {
+    out = {
         "runtime_watch": {
             "available": bool(watch_snapshot.get("available")),
             "fresh": watch_fresh,
@@ -1453,6 +1994,8 @@ async def _build_closed_loop_summary_data(main_controller: Any, *, trace_limit: 
         "observability_gaps": monitoring_gap,
         "optimization_hints": optimization_hints,
     }
+    out["humanized"] = _build_humanized_closed_loop_summary(out)
+    return out
 
 
 async def _build_system_mastery_snapshot(
@@ -1532,7 +2075,7 @@ async def _build_system_mastery_snapshot(
         }
     )
 
-    return {
+    report = {
         "interface": {
             "name": "commander.system_mastery",
             "version": "2026.05.16",
@@ -1572,6 +2115,8 @@ async def _build_system_mastery_snapshot(
         },
         "coverage_gaps": coverage_gaps,
     }
+    report["humanized"] = _build_humanized_system_mastery_summary(report)
+    return report
 
 
 def _parse_trade_timestamp_utc(raw: Any) -> Optional[datetime]:
@@ -2309,7 +2854,7 @@ async def _build_trading_workflow_report(
         ],
     }
 
-    return {
+    report = {
         "interface": {
             "name": "commander.trading_workflow",
             "version": "2026.05.16",
@@ -2379,6 +2924,128 @@ async def _build_trading_workflow_report(
             ],
         },
         "workflow_actions": workflow_actions,
+    }
+    report["humanized"] = _build_humanized_workflow_summary(report)
+    return report
+
+
+def _build_humanized_workflow_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    health = report.get("health") if isinstance(report.get("health"), dict) else {}
+    exposure = report.get("current_exposure") if isinstance(report.get("current_exposure"), dict) else {}
+    decision = report.get("decision_and_guard") if isinstance(report.get("decision_and_guard"), dict) else {}
+    pnl = report.get("exits_and_pnl") if isinstance(report.get("exits_and_pnl"), dict) else {}
+    optimization = report.get("optimization_read_model") if isinstance(report.get("optimization_read_model"), dict) else {}
+    readiness = optimization.get("optimization_readiness") if isinstance(optimization.get("optimization_readiness"), dict) else {}
+    kpi = optimization.get("kpi_scorecard") if isinstance(optimization.get("kpi_scorecard"), dict) else {}
+    trade_summary = pnl.get("trade_summary") if isinstance(pnl.get("trade_summary"), dict) else {}
+    decision_summary = decision.get("summary") if isinstance(decision.get("summary"), dict) else {}
+    data_quality = kpi.get("data_quality") if isinstance(kpi.get("data_quality"), dict) else {}
+    execution_quality = kpi.get("execution_quality") if isinstance(kpi.get("execution_quality"), dict) else {}
+    exit_quality = kpi.get("exit_quality") if isinstance(kpi.get("exit_quality"), dict) else {}
+    recommendations = optimization.get("parameter_recommendations") if isinstance(optimization.get("parameter_recommendations"), list) else []
+    actions = report.get("workflow_actions") if isinstance(report.get("workflow_actions"), list) else []
+    top_rejects = decision.get("top_reject_reasons") if isinstance(decision.get("top_reject_reasons"), list) else []
+    blocking_gaps = readiness.get("blocking_gaps") if isinstance(readiness.get("blocking_gaps"), list) else []
+
+    position_count = _safe_int(exposure.get("position_count", 0))
+    active_sltp_count = _safe_int(exposure.get("active_sltp_count", 0))
+    guard_pass_rate = _safe_float(decision_summary.get("guard_pass_rate"))
+    trade_sample_size = _safe_int(trade_summary.get("sample_size", 0))
+    win_rate = _safe_float(trade_summary.get("win_rate"))
+    net_pnl = _safe_float(trade_summary.get("net_pnl_plus_fees"))
+    exec_success_ratio = _safe_float(execution_quality.get("success_ratio"))
+    quality_score = _safe_float(data_quality.get("score"))
+
+    health_lines: List[str] = []
+    health_lines.append("交易所连接正常" if bool(health.get("exchange_connected")) else "交易所连接待确认")
+    health_lines.append("对账状态正常" if bool((health.get("reconciliation") or {}).get("healthy")) else "对账链路需要关注")
+    if quality_score > 0:
+        health_lines.append(f"数据质量分 {quality_score:.2f}")
+
+    headline = (
+        f"当前系统共持有 {position_count} 个仓位，挂着 {active_sltp_count} 个风控单；"
+        f"最近样本 {trade_sample_size} 笔，胜率 {_fmt_pct(win_rate, 2)}，净收益 {_fmt_num(net_pnl, 2)}。"
+    )
+
+    if blocking_gaps:
+        verdict = "当前更适合先修链路和补归因，不适合直接自动调参。"
+    elif bool(readiness.get("ready_for_auto_apply")):
+        verdict = "当前链路完整度较好，可以在保护条件下进入自动化调优。"
+    else:
+        verdict = "当前可以继续读报告和给建议，但自动应用参数还需要更多样本和更高归因覆盖。"
+
+    if exec_success_ratio < 0.9:
+        risk_hint = f"执行成功率只有 {_fmt_pct(exec_success_ratio, 1)}，优先排查执行和交易所链路。"
+    elif net_pnl < 0:
+        risk_hint = "最近净收益为负，先检查开仓筛选、退出逻辑和高波动场景参与度。"
+    else:
+        risk_hint = "执行链路基本可用，重点看哪些场景在拖累收益兑现。"
+
+    top_reject_text = "暂无"
+    if top_rejects:
+        top0 = top_rejects[0] if isinstance(top_rejects[0], dict) else {}
+        top_reject_text = str(top0.get("reason") or top0.get("key") or "暂无").strip() or "暂无"
+
+    focus_cards = [
+        {
+            "title": "系统状态",
+            "tone": "normal" if bool(health.get("exchange_connected")) else "warn",
+            "summary": "；".join(health_lines) if health_lines else "系统状态信息不足，建议补抓快照。",
+        },
+        {
+            "title": "开仓筛选",
+            "tone": "normal" if guard_pass_rate >= 0.05 else "warn",
+            "summary": f"最近开仓通过率 {_fmt_pct(guard_pass_rate, 2)}。主要拦截原因：{top_reject_text}。",
+        },
+        {
+            "title": "执行与退出",
+            "tone": "normal" if exec_success_ratio >= 0.9 and net_pnl >= 0 else "warn",
+            "summary": (
+                f"执行成功率 {_fmt_pct(exec_success_ratio, 1)}，"
+                f"止盈抑制 {_safe_int(exit_quality.get('tp_suppressed', 0))} 次，"
+                f"净收益 {_fmt_num(net_pnl, 2)}。"
+            ),
+        },
+    ]
+
+    next_actions: List[str] = []
+    for gap in blocking_gaps[:3]:
+        if isinstance(gap, dict) and str(gap.get("message") or "").strip():
+            next_actions.append(str(gap.get("message")).strip())
+    for item in recommendations[:2]:
+        if isinstance(item, dict) and str(item.get("guardrail") or "").strip():
+            next_actions.append(str(item.get("guardrail")).strip())
+    for item in actions[:2]:
+        if isinstance(item, dict) and str(item.get("reason") or "").strip():
+            next_actions.append(str(item.get("reason")).strip())
+    if not next_actions:
+        next_actions.append("当前没有明显阻塞项，可以继续观察最近样本并按报告建议逐项验证。")
+
+    metrics = [
+        {"label": "数据质量", "value": _fmt_num(quality_score, 2), "status": str(data_quality.get("status") or "unknown")},
+        {
+            "label": "开仓通过率",
+            "value": _fmt_pct(guard_pass_rate, 2),
+            "status": str((kpi.get("decision_selectivity") or {}).get("status") or "unknown"),
+        },
+        {"label": "执行成功率", "value": _fmt_pct(exec_success_ratio, 1), "status": str(execution_quality.get("status") or "unknown")},
+        {"label": "最近净收益", "value": _fmt_num(net_pnl, 2), "status": str(exit_quality.get("status") or "unknown")},
+    ]
+
+    return {
+        "version": "2026.05.16",
+        "headline": headline,
+        "verdict": verdict,
+        "risk_hint": risk_hint,
+        "focus_cards": focus_cards,
+        "next_actions": next_actions,
+        "metrics": metrics,
+        "display_preferences": {
+            "locale": "zh-CN",
+            "tone": "humanized",
+            "frontend_ready": True,
+            "api_readable": True,
+        },
     }
 
 
@@ -3776,6 +4443,7 @@ def init_module_control_api(app, main_controller):
                     except Exception:
                         pass
         
+        stats["humanized"] = _build_humanized_memory_stats_summary(stats)
         return stats
 
     @router.get("/stop-loss/stats")
@@ -4107,7 +4775,7 @@ def init_module_control_api(app, main_controller):
                             }
                         )
 
-            return {
+            out = {
                 "success": True,
                 "ok": True,
                 "status": "success",
@@ -4128,6 +4796,8 @@ def init_module_control_api(app, main_controller):
                     "stats": (ai_guard.get("stats") or {}) if isinstance(ai_guard, dict) else {},
                 },
             }
+            out["humanized"] = _build_humanized_profit_ops_overview(out)
+            return out
         except Exception as e:
             return {"success": False, "message": f"读取盈利运营总览失败: {e}"}
 
@@ -4584,7 +5254,33 @@ def init_module_control_api(app, main_controller):
                     reverse=True,
                 )[:safe_limit]
                 data = fallback_rows
-            return {"success": True, "data": data, "count": len(data), "timestamp": datetime.now().isoformat()}
+            highlights: List[str] = []
+            for row in data[:3]:
+                content = str(row.get("content") or "").strip().replace("\n", " ")
+                if content:
+                    highlights.append(content[:120])
+            humanized = {
+                "headline": (
+                    f"最近共找到 {len(data)} 条每日复盘摘要。"
+                    + (f" 最近一条时间 {data[0].get('timestamp') or '未知'}。" if data else " 当前还没有可展示的复盘记录。")
+                ),
+                "verdict": "这些内容已经适合直接投到前端卡片和运维接口，不需要页面侧再手工拼接。",
+                "focus_cards": [
+                    {
+                        "title": "复盘数量",
+                        "tone": "normal",
+                        "summary": f"当前返回 {len(data)} 条摘要，接口 limit={safe_limit}。",
+                    },
+                    {
+                        "title": "最近记录",
+                        "tone": "normal",
+                        "summary": highlights[0] if highlights else "暂无复盘正文。",
+                    },
+                ],
+                "next_actions": highlights if highlights else ["先触发一次每日复盘写入，再观察接口是否开始持续出数。"],
+                "display_preferences": {"locale": "zh-CN", "tone": "humanized", "frontend_ready": True, "api_readable": True},
+            }
+            return {"success": True, "data": data, "count": len(data), "humanized": humanized, "timestamp": datetime.now().isoformat()}
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 
@@ -4819,6 +5515,7 @@ def init_module_control_api(app, main_controller):
             out["data_hub"]["market_intelligence"] = out["data_hub"].get("market_intelligence") or {
                 "status": "warming_up_or_busy",
             }
+        out["humanized"] = _build_humanized_snapshot_summary(out)
         return out
 
     @router.get("/commander/snapshot")
@@ -4838,6 +5535,8 @@ def init_module_control_api(app, main_controller):
                 data["mode"] = "full"
             else:
                 data = await asyncio.wait_for(_build_commander_fast_snapshot(symbol=symbol), timeout=8.0)
+            if isinstance(data, dict) and not isinstance(data.get("humanized"), dict):
+                data["humanized"] = _build_humanized_snapshot_summary(data)
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
         except asyncio.TimeoutError:
             return {
@@ -6635,6 +7334,161 @@ def init_module_control_api(app, main_controller):
                 recent_trades_limit=int(recent_trades_limit or 20),
             )
             return {"success": True, "data": data, "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
+
+    @router.get("/commander/platform-oversight")
+    async def commander_platform_oversight(
+        symbol: str = "BTC/USDT",
+        trace_limit: int = 120,
+        trade_limit: int = 300,
+    ):
+        """
+        全交易系统总巡检：
+        - 系统健康、模块能力、关键代码模块可用性
+        - 智能体覆盖率、交易闭环、订单/持仓/SLTP
+        - 盈利能力、学习记忆、运行时路由与静态目录对齐
+        """
+        if not main_controller:
+            return {"success": False, "message": "主控制器未初始化", "timestamp": datetime.now().isoformat()}
+        try:
+            mc = main_controller
+            system_health = await get_system_health()
+            commander_audit_data = await commander_audit(enrich=True)
+            closed_loop_summary = await _build_closed_loop_summary_data(mc, trace_limit=int(trace_limit or 120))
+            agent_effectiveness = await _build_agent_effectiveness_summary(
+                mc,
+                trace_limit=int(trace_limit or 120),
+                trade_limit=int(trade_limit or 300),
+            )
+            trade_lifecycle = await _build_trade_lifecycle_summary(
+                mc,
+                trade_limit=max(100, int(trade_limit or 300)),
+                recent_limit=20,
+            )
+            profit_ops_overview = await get_profit_ops_overview(
+                days=30,
+                sample_limit=max(100, int(trade_limit or 300)),
+                active_order_limit=20,
+            )
+            memory_stats = await get_memory_stats()
+
+            runtime_routes = _build_runtime_route_inventory(app)
+            from src.modules.api.module_surface import build_static_route_catalog
+            from src.modules.api.route_catalog import extended_core_routes, read_pipeline_spec
+
+            static_routes = build_static_route_catalog()
+            core_routes = extended_core_routes()
+            runtime_keys = {
+                (method, str(row.get("path") or ""))
+                for row in (runtime_routes.get("routes") or [])
+                for method in (row.get("methods") or [])
+            }
+            static_keys = {(str(row.get("method") or ""), str(row.get("path") or "")) for row in static_routes if isinstance(row, dict)}
+            overlap = len(runtime_keys & static_keys)
+
+            positions: List[Dict[str, Any]] = []
+            exchange = mc.get_exchange() if hasattr(mc, "get_exchange") else getattr(mc, "okx_exchange", None)
+            if exchange and hasattr(exchange, "get_positions"):
+                try:
+                    raw_positions = await exchange.get_positions()
+                    for row in raw_positions or []:
+                        if not isinstance(row, dict):
+                            continue
+                        size = _safe_float(row.get("size") or row.get("pos") or row.get("positionAmt"))
+                        if abs(size) <= 1e-12:
+                            continue
+                        positions.append(
+                            {
+                                "symbol": row.get("symbol") or row.get("instId"),
+                                "side": row.get("side") or row.get("posSide"),
+                                "size": size,
+                                "mark_price": _safe_float(row.get("mark_px") or row.get("markPx") or row.get("mark_price")),
+                                "unrealized_pnl": _safe_float(row.get("unrealized_pnl") or row.get("upl") or row.get("unrealizedPnl")),
+                            }
+                        )
+                except Exception:
+                    positions = []
+
+            active_orders: List[Dict[str, Any]] = []
+            sltp = getattr(mc, "stop_loss_manager", None)
+            if sltp and hasattr(sltp, "get_all_active_orders"):
+                try:
+                    for order in await sltp.get_all_active_orders():
+                        row = order.to_dict() if hasattr(order, "to_dict") else (dict(order) if isinstance(order, dict) else {})
+                        active_orders.append(
+                            {
+                                "order_id": row.get("order_id"),
+                                "symbol": row.get("symbol"),
+                                "side": row.get("side"),
+                                "status": row.get("status"),
+                                "stop_loss_price": row.get("stop_loss_price"),
+                                "take_profit_price": row.get("take_profit_price"),
+                                "remaining_quantity": row.get("remaining_quantity") or row.get("quantity"),
+                            }
+                        )
+                except Exception:
+                    active_orders = []
+
+            recent_execution_events: List[Dict[str, Any]] = []
+            gw = getattr(mc, "execution_gateway", None)
+            if gw and hasattr(gw, "get_recent_events"):
+                try:
+                    for evt in await gw.get_recent_events(limit=40):
+                        if not isinstance(evt, dict):
+                            continue
+                        recent_execution_events.append(
+                            {
+                                "ts": evt.get("ts"),
+                                "op": evt.get("op"),
+                                "symbol": evt.get("symbol"),
+                                "side": evt.get("side"),
+                                "success": evt.get("success"),
+                                "reason": evt.get("reason"),
+                                "error_code": evt.get("error_code"),
+                                "trace_id": evt.get("trace_id"),
+                            }
+                        )
+                except Exception:
+                    recent_execution_events = []
+
+            out = {
+                "success": True,
+                "ok": True,
+                "status": "success",
+                "timestamp": datetime.now().isoformat(),
+                "symbol": symbol,
+                "system_health": system_health,
+                "commander_audit": commander_audit_data,
+                "component_inventory": _build_core_component_inventory(mc),
+                "route_inventory": runtime_routes,
+                "route_catalog_alignment": {
+                    "runtime_routes": len(runtime_routes.get("routes") or []),
+                    "static_catalog_routes": len(static_routes),
+                    "core_catalog_routes": len(core_routes),
+                    "runtime_static_overlap": overlap,
+                },
+                "read_pipeline": read_pipeline_spec(),
+                "agent_effectiveness": agent_effectiveness,
+                "closed_loop_summary": closed_loop_summary,
+                "trade_lifecycle": trade_lifecycle,
+                "order_tracking": {
+                    "positions_summary": {
+                        "position_count": len(positions),
+                        "symbols": sorted(list({str(x.get("symbol") or "") for x in positions if str(x.get("symbol") or "")})),
+                    },
+                    "positions": positions[:50],
+                    "active_orders_summary": {"active_sltp_orders": len(active_orders)},
+                    "active_orders": active_orders[:50],
+                    "recent_execution_events": recent_execution_events[:40],
+                },
+                "profit_ops_overview": profit_ops_overview,
+                "memory_stats": memory_stats,
+                "static_route_catalog": static_routes,
+            }
+            out["priority_alerts"] = _build_platform_alerts(out)
+            out["humanized"] = _build_humanized_platform_oversight(out)
+            return out
         except Exception as e:
             return {"success": False, "message": str(e), "timestamp": datetime.now().isoformat()}
 

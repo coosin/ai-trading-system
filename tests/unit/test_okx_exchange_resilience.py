@@ -100,6 +100,88 @@ async def test_make_request_rebuilds_session_on_client_payload_error():
 
 
 @pytest.mark.asyncio
+async def test_make_request_rebuilds_session_when_connector_closed_client_error():
+    ex = _exchange()
+    ex._mark_request_failure = AsyncMock()
+    ex._mark_request_success = AsyncMock()
+    ex._record_payload_sample = AsyncMock()
+    ex._rebuild_session = AsyncMock()
+    ex._proxy_url = None
+
+    responses = [aiohttp.ClientError("Connector is closed"), [{"instId": "BTC-USDT-SWAP"}]]
+
+    class _Req:
+        def __init__(self, item):
+            self._item = item
+            self.status = 200
+
+        async def __aenter__(self):
+            if isinstance(self._item, Exception):
+                raise self._item
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return {"code": "0", "data": self._item}
+
+    class _Session:
+        closed = False
+
+        def get(self, *args, **kwargs):
+            return _Req(responses.pop(0))
+
+    ex._session = _Session()
+
+    out = await ex._make_request("GET", "/api/v5/public/instruments", {"instType": "SWAP"})
+
+    assert out == [{"instId": "BTC-USDT-SWAP"}]
+    ex._rebuild_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_make_request_rebuilds_closed_session_before_request():
+    ex = _exchange()
+    ex._mark_request_failure = AsyncMock()
+    ex._mark_request_success = AsyncMock()
+    ex._record_payload_sample = AsyncMock()
+    ex._proxy_url = None
+
+    class _Req:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return {"code": "0", "data": [{"ts": "1"}]}
+
+    class _LiveSession:
+        closed = False
+
+        def get(self, *args, **kwargs):
+            return _Req()
+
+    class _ClosedSession:
+        closed = True
+
+    async def _rebuild(reason: str):
+        ex._session = _LiveSession()
+
+    ex._session = _ClosedSession()
+    ex._rebuild_session = AsyncMock(side_effect=_rebuild)
+
+    out = await ex._make_request("GET", "/api/v5/public/time")
+
+    assert out == [{"ts": "1"}]
+    ex._rebuild_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_make_request_public_endpoint_does_not_require_auth_headers():
     ex = OKXExchange({"testnet": False})
     ex._mark_request_failure = AsyncMock()

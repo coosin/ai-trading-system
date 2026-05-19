@@ -87,6 +87,24 @@ def _engine(tmp_path: Path) -> AICoreDecisionEngine:
     return eng
 
 
+def test_adaptive_open_leverage_target_uses_30_to_100_range(tmp_path):
+    eng = _engine(tmp_path)
+    eng.config["leverage_min"] = 30
+    eng.config["leverage_max"] = 100
+    eng.config["default_leverage"] = 30
+
+    d = _decision()
+    d.confidence = 0.93
+    d.risk_level = "low"
+
+    high_vol = eng._adaptive_open_leverage_target(decision=d, atr_pct_1h=0.07)
+    low_vol = eng._adaptive_open_leverage_target(decision=d, atr_pct_1h=0.005)
+
+    assert 30 <= high_vol <= 100
+    assert 30 <= low_vol <= 100
+    assert low_vol > high_vol
+
+
 @pytest.mark.asyncio
 async def test_execute_decision_rejects_unreachable_exchange_and_records_governance(tmp_path):
     eng = _engine(tmp_path)
@@ -124,11 +142,11 @@ async def test_execute_decision_degraded_exchange_reduces_qty_and_leverage(tmp_p
     assert ok is True
     assert eng._execution_guards_stats["exchange_degraded_risk_reduced"] >= 1
     assert d.quantity == 7
-    assert d.leverage == 8
+    assert 30 <= d.leverage < 100
 
     called = eng.main_controller.execute_command.await_args.kwargs
     assert called["params"]["quantity"] == 7
-    assert called["params"]["leverage"] == 8
+    assert called["params"]["leverage"] == d.leverage
     trace = eng.main_controller.decision_trace_store.get_recent(1)[0]
     assert trace["workflow"]["mode"] == "execution_governed"
     assert trace["workflow"]["current_stage"] == "guard:execution_preflight"
@@ -153,7 +171,7 @@ async def test_execute_decision_high_vol_advisory_only_softens_instead_of_reject
     assert eng.main_controller.execute_command.await_count == 1
     assert eng._execution_guards_stats.get("regime_advisory_only_softened", 0) >= 1
     assert d.quantity < 10
-    assert d.leverage < 10
+    assert 30 <= d.leverage < 100
     called = eng.main_controller.execute_command.await_args.kwargs
     semantic = called["params"]["semantic_context"]
     assert semantic["risk_verdict"] == "caution"

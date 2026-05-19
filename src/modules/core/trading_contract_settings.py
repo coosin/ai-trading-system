@@ -51,7 +51,7 @@ def apply_trading_contract_unified(
             contract_config[key] = tc[key]
 
     if "leverage_min" in tc:
-        contract_config["leverage_min"] = _as_int(tc["leverage_min"], int(contract_config.get("leverage_min") or 20))
+        contract_config["leverage_min"] = _as_int(tc["leverage_min"], int(contract_config.get("leverage_min") or 30))
     if "leverage_max" in tc:
         contract_config["leverage_max"] = _as_int(tc["leverage_max"], int(contract_config.get("leverage_max") or 100))
     if "default_leverage" in tc:
@@ -70,7 +70,7 @@ def apply_trading_contract_unified(
 
     if ai_core_config is not None:
         if "leverage_min" in tc:
-            ai_core_config["leverage_min"] = int(contract_config.get("leverage_min", 20))
+            ai_core_config["leverage_min"] = int(contract_config.get("leverage_min", 30))
         if "leverage_max" in tc:
             ai_core_config["leverage_max"] = int(contract_config.get("leverage_max", 100))
         if "default_leverage" in tc:

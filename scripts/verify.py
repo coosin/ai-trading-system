@@ -5,6 +5,7 @@ Unified verification entrypoint.
 Subcommands:
 - trading: execution/SLTP/learning acceptance checks
 - network: production network baseline checks
+- trading-models: CLIProxyAPI trading alias acceptance checks
 """
 
 from __future__ import annotations
@@ -59,6 +60,13 @@ def main() -> int:
     g = sub.add_parser("trading-gates", help="Run microstructure gate regression tests")
     g.add_argument("--kexpr", default="microstructure")
 
+    m = sub.add_parser("trading-models", help="Validate CLIProxyAPI trading logical aliases")
+    m.add_argument("--base-url", default="http://127.0.0.1:8317/v1")
+    m.add_argument("--api-key", default="")
+    m.add_argument("--api-key-env", default="CLI_PROXY_API_KEY")
+    m.add_argument("--timeout", type=float, default=30.0)
+    m.add_argument("--skip-completions", action="store_true")
+
     args = ap.parse_args()
     if args.cmd == "trading":
         return _run(
@@ -83,6 +91,20 @@ def main() -> int:
                 str(args.kexpr),
             ]
         )
+    if args.cmd == "trading-models":
+        extra_args = [
+            "--base-url",
+            args.base_url,
+            "--api-key-env",
+            args.api_key_env,
+            "--timeout",
+            str(args.timeout),
+        ]
+        if args.api_key:
+            extra_args.extend(["--api-key", args.api_key])
+        if args.skip_completions:
+            extra_args.append("--skip-completions")
+        return _run("validate_trading_model_aliases.py", extra_args)
     return _run(
         "production_network_baseline.py",
         (["--apply"] if args.apply else [])
@@ -93,4 +115,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

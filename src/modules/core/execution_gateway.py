@@ -823,6 +823,12 @@ class ExecutionGateway:
 
         semantic = self._semantic_context_from_context(context if isinstance(context, dict) else {})
         if next_leg >= 2 and isinstance(semantic, dict):
+            profitability_ready = semantic.get("profitability_scale_in_ready")
+            blockers = semantic.get("profitability_scale_in_blockers")
+            if profitability_ready is False:
+                detail = ",".join(str(x) for x in (blockers or [])[:3]) or "weak_rationale"
+                return f"分层开仓拦截：第{next_leg}笔收益保护门控 {detail}"
+        if next_leg >= 2 and isinstance(semantic, dict):
             risk_verdict = str(semantic.get("risk_verdict") or "").strip().lower()
             exec_rec = str(semantic.get("execution_recommendation") or "").strip().lower()
             if risk_verdict == "deny":
@@ -936,6 +942,16 @@ class ExecutionGateway:
             "execution_recommendation": semantic.get("execution_recommendation")
             or ("completed" if status == "success" else "review_execution"),
         }
+        position_effect = (
+            context.get("position_effect")
+            if isinstance(context, dict) and isinstance(context.get("position_effect"), dict)
+            else {}
+        )
+        if position_effect:
+            extras["position_effect"] = dict(position_effect)
+            extras["position_effect_kind"] = str(position_effect.get("kind") or "")
+            extras["effective_action"] = str(position_effect.get("effective_action") or op)
+            extras["effective_side"] = str(position_effect.get("effective_side") or "")
         dts.record_execution_result(
             trace_id=trace_id,
             status=status,
@@ -1070,6 +1086,105 @@ class ExecutionGateway:
     def _extract_strategy_id(context: Optional[Dict[str, Any]], default: str = "") -> str:
         ctx = context if isinstance(context, dict) else {}
         return normalize_strategy_field(ctx, metadata=ctx, default=default)
+
+    async def _capture_symbol_position_snapshot(self, ex: Any, symbol: str) -> Optional[Dict[str, Any]]:
+        get_positions = getattr(ex, "get_positions", None)
+        if not callable(get_positions):
+            return None
+        target = _normalize_position_slot_symbol(symbol)
+        try:
+            rows = await get_positions()
+        except Exception:
+            return None
+        snap: Dict[str, Any] = {"symbol": target, "long": 0.0, "short": 0.0, "net": 0.0, "matched_rows": 0}
+        for row in rows or []:
+            if _normalize_position_slot_symbol(row.get("symbol") or row.get("instId") or "") != target:
+                continue
+            leg = self._normalize_position_side(
+                row.get("side") or row.get("posSide") or row.get("posSide_raw")
+            )
+            try:
+                size = abs(
+                    float(
+                        row.get("size")
+                        if row.get("size") is not None
+                        else row.get("raw_pos")
+                        if row.get("raw_pos") is not None
+                        else 0.0
+                    )
+                )
+            except Exception:
+                size = 0.0
+            if size <= 1e-9 or leg not in {"long", "short"}:
+                continue
+            snap[leg] += size
+            snap["matched_rows"] += 1
+        snap["net"] = float(snap["long"]) - float(snap["short"])
+        return snap
+
+    def _derive_open_position_effect(
+        self,
+        *,
+        requested_side: str,
+        requested_size: Optional[float],
+        before: Optional[Dict[str, Any]],
+        after: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return {}
+        req = self._normalize_position_side(requested_side)
+        if req not in {"long", "short"}:
+            return {}
+        opp = "short" if req == "long" else "long"
+        tol = 1e-9
+        try:
+            requested_qty = max(0.0, float(requested_size or 0.0))
+        except Exception:
+            requested_qty = 0.0
+        before_req = float(before.get(req) or 0.0)
+        before_opp = float(before.get(opp) or 0.0)
+        after_req = float(after.get(req) or 0.0)
+        after_opp = float(after.get(opp) or 0.0)
+        req_delta = after_req - before_req
+        opp_reduction = before_opp - after_opp
+        effect: Dict[str, Any] = {
+            "requested_action": "open",
+            "requested_side": req,
+            "requested_quantity": requested_qty,
+            "before": {"long": float(before.get("long") or 0.0), "short": float(before.get("short") or 0.0), "net": float(before.get("net") or 0.0)},
+            "after": {"long": float(after.get("long") or 0.0), "short": float(after.get("short") or 0.0), "net": float(after.get("net") or 0.0)},
+        }
+        if before_opp > tol and opp_reduction > tol:
+            effect["reduced_opposite_quantity"] = float(opp_reduction)
+            if req_delta > tol:
+                effect["kind"] = "flip_and_open"
+                effect["effective_action"] = "open"
+                effect["effective_side"] = req
+                effect["effective_quantity"] = float(req_delta)
+                effect["closed_opposite_quantity"] = float(opp_reduction)
+            else:
+                effect["kind"] = "reduce_opposite"
+                effect["effective_action"] = "close"
+                effect["effective_side"] = opp
+                effect["effective_quantity"] = float(opp_reduction)
+            return effect
+        if req_delta > tol:
+            effect["kind"] = "open_increase" if before_req > tol else "open_new"
+            effect["effective_action"] = "open"
+            effect["effective_side"] = req
+            effect["effective_quantity"] = float(req_delta)
+            return effect
+        if abs(req_delta) <= tol and abs(opp_reduction) <= tol:
+            effect["kind"] = "position_unchanged"
+            effect["effective_action"] = "open"
+            effect["effective_side"] = req
+            effect["effective_quantity"] = 0.0
+            return effect
+        effect["kind"] = "ambiguous"
+        effect["effective_action"] = "open"
+        effect["effective_side"] = req
+        effect["effective_quantity"] = float(max(req_delta, 0.0))
+        return effect
 
     def _close_idempotent_key(self, symbol: str, side: str, size: Optional[float], context: Optional[Dict[str, Any]]) -> str:
         """
@@ -2002,6 +2117,11 @@ class ExecutionGateway:
                 sym = symbol
                 if "/" not in sym and "-" in sym and "-SWAP" not in sym:
                     pass
+                before_snapshot: Optional[Dict[str, Any]] = None
+                try:
+                    before_snapshot = await self._capture_symbol_position_snapshot(ex, sym)
+                except Exception:
+                    before_snapshot = None
 
                 # 预检：合约最小张数/步进对齐（若交易所实现了 SWAP instruments 查询）
                 # 目的：减少必失败单（例如 size < minSz 或非 lotSz 整数倍）导致的反复下单失败。
@@ -2212,22 +2332,59 @@ class ExecutionGateway:
                     await asyncio.sleep(max(0.0, delay))
                 ok = bool(isinstance(res, dict) and res.get("success"))
                 detail = str(res.get("error") if isinstance(res, dict) else res)[:500]
-                self._record_order(source, "open", ok, detail or "ok", symbol=symbol, side=side, size=size, leverage=lev, reason=reason, context=context)
-                self._record_execution_semantics(
-                    context=context,
-                    status="success" if ok else "failed",
-                    detail=detail or "ok",
-                    op="open",
-                    symbol=symbol,
-                )
+                record_context = dict(context) if isinstance(context, dict) else {}
+                record_op = "open"
+                record_side = str(side)
+                record_size = float(size) if size is not None else None
+                position_effect: Dict[str, Any] = {}
                 if ok:
-                    self._mark_symbol_open_success(symbol)
-                    self._mark_recent_open_success(symbol, side)
-                    self._metric_inc("open_ok")
                     try:
                         res = await self._enrich_open_result_with_exchange_fills(ex, symbol, res)
                     except Exception:
                         pass
+                    try:
+                        await asyncio.sleep(0.35)
+                        after_snapshot = await self._capture_symbol_position_snapshot(ex, sym)
+                        position_effect = self._derive_open_position_effect(
+                            requested_side=side,
+                            requested_size=size,
+                            before=before_snapshot,
+                            after=after_snapshot,
+                        )
+                    except Exception:
+                        position_effect = {}
+                    if position_effect:
+                        if isinstance(res, dict):
+                            res["position_effect"] = dict(position_effect)
+                            res["effective_action"] = str(position_effect.get("effective_action") or "open")
+                            res["effective_side"] = str(position_effect.get("effective_side") or side)
+                            res["effective_quantity"] = position_effect.get("effective_quantity")
+                        record_context["position_effect"] = dict(position_effect)
+                        record_op = str(position_effect.get("effective_action") or "open")
+                        record_side = str(position_effect.get("effective_side") or side)
+                        try:
+                            if position_effect.get("effective_quantity") is not None:
+                                eff_qty = float(position_effect.get("effective_quantity") or 0.0)
+                                if eff_qty > 0:
+                                    record_size = eff_qty
+                        except Exception:
+                            record_size = float(size) if size is not None else None
+                    self._mark_symbol_open_success(symbol)
+                    if str(position_effect.get("kind") or "") != "reduce_opposite":
+                        self._mark_recent_open_success(symbol, side)
+                    self._metric_inc("open_ok")
+                    if str(position_effect.get("kind") or "") == "reduce_opposite":
+                        detail = (
+                            f"net_position_effect:reduce_opposite:"
+                            f"{position_effect.get('effective_side')}:{position_effect.get('effective_quantity')}"
+                        )
+                        logger.info(
+                            "ExecutionGateway: open_swap realized as net reduction symbol=%s requested_side=%s reduced_side=%s qty=%s",
+                            symbol,
+                            side,
+                            position_effect.get("effective_side"),
+                            position_effect.get("effective_quantity"),
+                        )
                     logger.info(
                         "ExecutionGateway: open_swap ok symbol=%s side=%s source=%s reason=%s",
                         symbol,
@@ -2246,9 +2403,17 @@ class ExecutionGateway:
                             parts.append(f"逻辑: {r}")
                         if parts:
                             extra = "\n" + "\n".join(parts)
-                    await self._notify_telegram(
-                        f"✅ 开仓\n交易对: {symbol}\n方向: {side}\n数量: {size}\n杠杆: {lev}x\n来源: {source}\n原因: {reason}{extra}"
-                    )
+                    if str(position_effect.get("kind") or "") == "reduce_opposite":
+                        extra = (
+                            f"{extra}\n净仓效果: 减少 {position_effect.get('effective_side')} "
+                            f"{position_effect.get('effective_quantity')}"
+                        )
+                    try:
+                        await self._notify_telegram(
+                            f"✅ 开仓\n交易对: {symbol}\n方向: {side}\n数量: {size}\n杠杆: {lev}x\n来源: {source}\n原因: {reason}{extra}"
+                        )
+                    except Exception as notify_err:
+                        logger.debug("ExecutionGateway: open notify skipped: %s", notify_err)
                 else:
                     self._mark_symbol_open_failure(symbol, detail)
                     self._metric_inc("open_fail")
@@ -2258,12 +2423,31 @@ class ExecutionGateway:
                         source,
                         detail,
                     )
+                self._record_order(
+                    source,
+                    record_op,
+                    ok,
+                    detail or "ok",
+                    symbol=symbol,
+                    side=record_side,
+                    size=record_size,
+                    leverage=lev,
+                    reason=reason,
+                    context=record_context,
+                )
+                self._record_execution_semantics(
+                    context=record_context,
+                    status="success" if ok else "failed",
+                    detail=detail or "ok",
+                    op=record_op,
+                    symbol=symbol,
+                )
                 # trade event fanout (best-effort)
                 try:
                     hub = getattr(self._mc, "trade_event_hub", None) if self._mc else None
                     trace_id = None
-                    if context and isinstance(context, dict):
-                        trace_id = context.get("trace_id")
+                    if record_context and isinstance(record_context, dict):
+                        trace_id = record_context.get("trace_id")
                     if not trace_id:
                         trace_id = str(uuid.uuid4())
                     if hub and hasattr(hub, "publish_fill"):
@@ -2274,12 +2458,12 @@ class ExecutionGateway:
                                 trace_id=str(trace_id),
                                 source=str(source or "gateway"),
                                 symbol=str(symbol),
-                                side=str(side),
-                                action="open",
+                                side=str(record_side),
+                                action=str(record_op),
                                 success=bool(ok),
                                 order_id=(res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
                                 price=float(res.get("average") or res.get("price") or 0) if isinstance(res, dict) and (res.get("average") or res.get("price")) else None,
-                                quantity=float(size) if size is not None else None,
+                                quantity=float(record_size) if record_size is not None else None,
                                 detail=detail,
                                 raw=dict(res) if isinstance(res, dict) else {"raw": str(res)},
                             )
@@ -2291,7 +2475,7 @@ class ExecutionGateway:
                     try:
                         ths = getattr(self._mc, "trade_history_service", None) if self._mc else None
                         if ths and hasattr(ths, "record_trade_dict"):
-                            ctx = context if isinstance(context, dict) else {}
+                            ctx = record_context if isinstance(record_context, dict) else {}
                             mkt = self._extract_market_context(ctx)
                             price_val: float = 0.0
                             try:
@@ -2315,31 +2499,43 @@ class ExecutionGateway:
                                 fee_val = 0.0
 
                             _sid = self._extract_strategy_id(ctx, default=str(source or "gateway"))
+                            pnl_val: float = 0.0
+                            try:
+                                if isinstance(res, dict):
+                                    pnl_val = float(res.get("realizedPnl") or res.get("pnl") or 0)
+                            except Exception:
+                                pnl_val = 0.0
                             await ths.record_trade_dict(
                                 {
                                     "timestamp": self._snapshot.last_order_at,
                                     "symbol": str(symbol),
-                                    "side": str(side),
-                                    "action": "open",
+                                    "side": str(record_side),
+                                    "action": str(record_op),
                                     "source": str(source or "gateway"),
                                     "reason": str(reason or ""),
                                     "status": "filled",
                                     "strategy": _sid,
                                     "order_id": (res.get("orderId") or res.get("order_id") or res.get("id")) if isinstance(res, dict) else None,
                                     "price": float(price_val),
-                                    "quantity": float(size) if size is not None else None,
+                                    "quantity": float(record_size) if record_size is not None else None,
                                     "leverage": int(lev) if lev is not None else None,
                                     "fee": float(fee_val),
+                                    "pnl": float(pnl_val),
                                     "metadata": {
                                         "market_context": {
                                             "regime": mkt.get("regime"),
                                             "effective_qty_factor": float(mkt.get("effective_qty_factor", 1.0)),
                                         },
                                         "gateway": {
-                                            "op": "open",
+                                            "op": str(record_op),
+                                            "requested_op": "open",
+                                            "requested_side": str(side),
+                                            "effective_action": str(record_op),
+                                            "effective_side": str(record_side),
                                             "source": str(source or "gateway"),
                                             "reason": str(reason or ""),
                                             "context": dict(ctx) if isinstance(ctx, dict) else {},
+                                            "position_effect": dict(position_effect) if position_effect else {},
                                         },
                                         "raw": dict(res) if isinstance(res, dict) else {"raw": str(res)},
                                     },

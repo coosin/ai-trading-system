@@ -41,6 +41,12 @@ export default function OverviewSection({ state, view, flowRows, updatedAt, acti
       return `${SEVERITY_LABEL[sev] || '告警'} · ${String(x?.key || '-')}（${Number(x?.count || 0)}）`;
     });
   const automationProfile = state.automationProfile?.data?.profile || state.systemStatus?.automation_profile || 'semi_auto';
+  const tradingWorkflow = state.tradingWorkflow?.data || state.tradingWorkflow || {};
+  const humanizedWorkflow = tradingWorkflow.humanized || {};
+  const systemMastery = state.systemMastery?.data || state.systemMastery || {};
+  const humanizedMastery = systemMastery.humanized || {};
+  const closedLoopSummary = state.closedLoopSummary?.data || state.closedLoopSummary || {};
+  const humanizedClosedLoop = closedLoopSummary.humanized || {};
   const profit = state.profitAnalytics?.data || state.profitAnalytics || {};
   const overall = profit?.overall || {};
   const byStrategy = Array.isArray(profit?.by_strategy_top) ? profit.by_strategy_top : [];
@@ -197,6 +203,49 @@ export default function OverviewSection({ state, view, flowRows, updatedAt, acti
       </div>
       <div className="panel-body">
         <MetricGrid items={metrics} />
+        {humanizedWorkflow.headline ? (
+          <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: 16, marginBottom: 16 }}>
+            <InsightCard
+              title="中文运行摘要"
+              tone="normal"
+              content={`${humanizedWorkflow.headline} ${humanizedWorkflow.verdict || ''} ${humanizedWorkflow.risk_hint || ''}`.trim()}
+            />
+            <div className="insight-card warn">
+              <div className="insight-title">当前处理建议</div>
+              <ActionList items={Array.isArray(humanizedWorkflow.next_actions) ? humanizedWorkflow.next_actions.slice(0, 4) : []} />
+            </div>
+          </div>
+        ) : null}
+        {!humanizedWorkflow.headline && humanizedMastery.headline ? (
+          <div style={{ marginBottom: 16 }}>
+            <InsightCard
+              title="全局中文总览"
+              tone="normal"
+              content={`${humanizedMastery.headline} ${humanizedMastery.verdict || ''}`.trim()}
+            />
+          </div>
+        ) : null}
+        {!humanizedWorkflow.headline && !humanizedMastery.headline && humanizedClosedLoop.headline ? (
+          <div style={{ marginBottom: 16 }}>
+            <InsightCard
+              title="闭环中文摘要"
+              tone="normal"
+              content={`${humanizedClosedLoop.headline} ${humanizedClosedLoop.verdict || ''}`.trim()}
+            />
+          </div>
+        ) : null}
+        {Array.isArray(humanizedWorkflow.focus_cards) && humanizedWorkflow.focus_cards.length ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12, marginBottom: 16 }}>
+            {humanizedWorkflow.focus_cards.slice(0, 3).map((card, idx) => (
+              <InsightCard
+                key={`${card.title || 'focus'}-${idx}`}
+                title={card.title || '摘要'}
+                tone={card.tone || 'normal'}
+                content={card.summary || '-'}
+              />
+            ))}
+          </div>
+        ) : null}
         <div className={`hosting-card ${currentMode === 'semi_auto' ? 'semi' : 'full'}`}>
           <div className="hosting-title">托管模式（傻瓜化一键切换）</div>
           <div className="hosting-current">

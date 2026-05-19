@@ -206,14 +206,14 @@ class StopLossTakeProfitConfig:
         }
     )
     # 分层固定止盈（锁仓）
-    # 默认按更贴近合约/日内的阈值配置（避免长期不触发导致“TP=0”的体感）：
-    # 1) 浮盈>=3%  平30%
-    # 2) 浮盈>=6%  再平40%
-    # 3) 浮盈>=10% 再平30%
+    # 默认按更贴近日内兑现的阈值配置，优先把浮盈锁成已实现收益：
+    # 1) 浮盈>=1.5% 平25%
+    # 2) 浮盈>=3.0% 再平35%
+    # 3) 浮盈>=5.0% 再平40%
     enable_partial_tp: bool = True
     layered_partial_tp_enable: bool = True
     layered_partial_tp_levels: List[Tuple[float, float]] = field(
-        default_factory=lambda: [(0.03, 0.30), (0.06, 0.40), (0.10, 0.30)]
+        default_factory=lambda: [(0.015, 0.25), (0.03, 0.35), (0.05, 0.40)]
     )
     # 分层移动止盈（按峰值回撤触发）：
     # 峰值浮盈>=3%  -> 回撤1%
@@ -266,8 +266,8 @@ class StopLossTakeProfitConfig:
     sr_lookback_bars_1h: int = 48
     sr_near_level_pct: float = 0.0035
     sr_breakout_buffer_pct: float = 0.0020
-    sr_partial_tp_trigger_pnl: float = 0.01
-    sr_partial_close_ratio: float = 0.25
+    sr_partial_tp_trigger_pnl: float = 0.0075
+    sr_partial_close_ratio: float = 0.33
     sr_breakeven_lock_pct: float = 0.0015
     # 净收益门槛：避免在名义盈利但不足以覆盖双边手续费/滑点时过早止盈。
     min_net_take_profit_percent: float = 0.003
@@ -741,8 +741,10 @@ class StopLossTakeProfitManager:
             cur_desired = float(desired_close_size or 0.0)
             prev_remain = float(row.get("remaining_quantity") or 0.0)
             prev_desired = float(row.get("desired_close_size") or 0.0)
-            remain_tol = max(1e-12, abs(cur_remain) * 1e-9, abs(prev_remain) * 1e-9)
-            desired_tol = max(1e-12, abs(cur_desired) * 1e-9, abs(prev_desired) * 1e-9)
+            # Keep the block alive across tiny float drift so the same impossible
+            # partial close is not repeatedly reclassified as a fresh failure.
+            remain_tol = max(1e-12, abs(cur_remain) * 1e-6, abs(prev_remain) * 1e-6)
+            desired_tol = max(1e-12, abs(cur_desired) * 1e-6, abs(prev_desired) * 1e-6)
 
             if abs(cur_remain - prev_remain) > remain_tol or abs(cur_desired - prev_desired) > desired_tol:
                 blocked.pop(str(reason or ""), None)

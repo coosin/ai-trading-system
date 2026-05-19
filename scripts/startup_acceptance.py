@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -42,7 +43,25 @@ def wait_health(base: str, total_wait: float = 120.0, step: float = 3.0) -> None
     raise SystemExit(f"健康检查超时: {last_err}")
 
 
+def run_trading_model_acceptance(skip: bool = False) -> int:
+    if skip:
+        print("\n=== CLIProxyAPI 交易别名验收 ===\n[SKIP] disabled by --skip-trading-models")
+        return 0
+    script = os.path.join(_REPO_ROOT, "scripts", "validate_trading_model_aliases.py")
+    cmd = [sys.executable, script]
+    print("\n=== CLIProxyAPI 交易别名验收 ===")
+    proc = subprocess.run(cmd, check=False, cwd=_REPO_ROOT, text=True, capture_output=True)
+    if proc.stdout:
+        print(proc.stdout[:12000])
+    if proc.returncode != 0 and proc.stderr:
+        print(proc.stderr[:4000])
+    return int(proc.returncode or 0)
+
+
 def main() -> int:
+    skip_trading_models = "--skip-trading-models" in sys.argv[1:]
+    if skip_trading_models:
+        sys.argv = [sys.argv[0], *[arg for arg in sys.argv[1:] if arg != "--skip-trading-models"]]
     base = (os.environ.get("OPENCLAW_API_BASE") or os.environ.get("ACCEPTANCE_BASE") or "").strip().rstrip("/")
     if not base:
         base = default_openclaw_api_base()
@@ -67,6 +86,9 @@ def main() -> int:
         except Exception as e:
             print(f"\n=== {title} 失败 ===\n{e}")
             return 1
+    alias_rc = run_trading_model_acceptance(skip=skip_trading_models)
+    if alias_rc != 0:
+        return alias_rc
     return 0
 
 

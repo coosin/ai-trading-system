@@ -219,6 +219,33 @@ async def test_layered_partial_skips_repeated_quantize_zero_block(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_quantize_zero_block_tolerates_tiny_float_drift(tmp_path):
+    cfg = StopLossTakeProfitConfig(
+        persist_file=str(tmp_path / "sl-quantize-zero-tol.json"),
+        check_interval=60,
+        execute_exchange_on_trigger=True,
+    )
+    mgr = StopLossTakeProfitManager(cfg)
+    await mgr.initialize()
+
+    order = await mgr.create_order(
+        symbol="BTC/USDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        stop_loss_config=StopLossConfig(stop_value=0.01),
+        take_profit_config=TakeProfitConfig(tp_value=0.9),
+    )
+    mgr._remember_quantize_zero_partial_block(order, "partial_take_profit_3", 0.3, 1.0)
+
+    blocked = mgr._is_quantize_zero_partial_blocked(order, "partial_take_profit_3", 0.3000001)
+
+    assert blocked is True
+    meta = order.metadata or {}
+    assert meta["partial_close_quantize_zero"]["partial_take_profit_3"]["skip_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_layered_partial_uses_effective_closed_size_for_remaining_quantity(tmp_path):
     cfg = StopLossTakeProfitConfig(
         persist_file=str(tmp_path / "sl-layered-effective-size.json"),

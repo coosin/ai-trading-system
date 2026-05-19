@@ -1,0 +1,12 @@
+{
+  "nvidia-fast-exp": {
+    "expected_owner": "nvidia-openclaw",
+    "expected_response_model": "nvidia/nemotron-mini-4b-instruct",
+    "validation": "ok"
+  },
+  "nvidia-reasoning-exp": {
+    "expected_owner": "nvidia-openclaw",
+    "expected_response_model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+    "validation": "reasoning_ok"
+  }
+}
