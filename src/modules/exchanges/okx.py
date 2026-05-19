@@ -279,6 +279,17 @@ class OKXExchange(ExchangeBase):
             ttl_dns_cache=max(10, ttl),
         )
 
+    async def _ensure_session_ready(self, reason: str) -> aiohttp.ClientSession:
+        """请求前确保 REST session 可用，避免把已关闭的 session 继续递给 aiohttp。"""
+        sess = self._session
+        if sess is not None and not bool(getattr(sess, "closed", False)):
+            return sess
+        await self._rebuild_session(reason)
+        sess = self._session
+        if sess is None or bool(getattr(sess, "closed", False)):
+            raise RuntimeError(f"OKX session unavailable after rebuild: {reason}")
+        return sess
+
     def _proxy_temporarily_disabled(self) -> bool:
         return time.time() < float(self._proxy_disabled_until or 0.0)
 
@@ -334,6 +345,8 @@ class OKXExchange(ExchangeBase):
         markers = (
             "server disconnected",
             "connection reset",
+            "connector is closed",
+            "session is closed",
             "broken pipe",
             "connection closed",
             "disconnect",
@@ -473,8 +486,9 @@ class OKXExchange(ExchangeBase):
         if (not force) and (now - float(getattr(self, "_last_time_sync_ts", 0.0) or 0.0) < 30.0):
             return False
         try:
+            session = await self._ensure_session_ready("sync_server_time_offset")
             timeout = aiohttp.ClientTimeout(total=5, connect=3, sock_read=3)
-            async with self._session.get(
+            async with session.get(
                 self.api_url + "/api/v5/public/time",
                 timeout=timeout,
                 proxy=proxy,
@@ -539,38 +553,63 @@ class OKXExchange(ExchangeBase):
 
         async def _run_one(item: Dict[str, Any]) -> Dict[str, Any]:
             url = self.api_url + str(item.get("path") or "")
-            try:
-                async with self._session.get(url, timeout=timeout, proxy=proxy) as resp:
-                    status = int(getattr(resp, "status", 0) or 0)
-                    payload = await resp.json()
-                data = payload.get("data") if isinstance(payload, dict) else None
-                row0 = data[0] if isinstance(data, list) and data else {}
-                is_ok = bool(status < 400 and item["validator"](payload))
-                return {
-                    "name": item["name"],
-                    "ok": is_ok,
-                    "status": status,
-                    "url": url,
-                    "reason": None if is_ok else "bad_response",
-                    "payload_code": (payload or {}).get("code") if isinstance(payload, dict) else None,
-                    "ts": float((row0 or {}).get("ts") or 0.0),
-                }
-            except Exception as e:
-                err_type = type(e).__name__
-                err_msg = str(e).strip()
-                err_repr = repr(e)
-                detail = err_msg or err_repr or err_type
-                return {
-                    "name": item["name"],
-                    "ok": False,
-                    "status": 0,
-                    "url": url,
-                    "reason": "exception",
-                    "error": detail[:240],
-                    "error_type": err_type,
-                }
+            last_exc: Optional[BaseException] = None
+            for attempt in range(2):
+                try:
+                    session = await self._ensure_session_ready(f"probe_public_api:{item['name']}")
+                    async with session.get(url, timeout=timeout, proxy=proxy) as resp:
+                        status = int(getattr(resp, "status", 0) or 0)
+                        payload = await resp.json()
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    row0 = data[0] if isinstance(data, list) and data else {}
+                    is_ok = bool(status < 400 and item["validator"](payload))
+                    return {
+                        "name": item["name"],
+                        "ok": is_ok,
+                        "status": status,
+                        "url": url,
+                        "reason": None if is_ok else "bad_response",
+                        "payload_code": (payload or {}).get("code") if isinstance(payload, dict) else None,
+                        "ts": float((row0 or {}).get("ts") or 0.0),
+                    }
+                except Exception as e:
+                    last_exc = e
+                    if attempt == 0:
+                        # Probe is part of the control-plane health path; one lightweight retry
+                        # avoids turning a transient proxy handshake blip into a false degraded state.
+                        if isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError)):
+                            await self._rebuild_session(f"probe retry {item['name']}: {type(e).__name__}")
+                        await asyncio.sleep(0.15)
+                        continue
+                    err_type = type(e).__name__
+                    err_msg = str(e).strip()
+                    err_repr = repr(e)
+                    detail = err_msg or err_repr or err_type
+                    return {
+                        "name": item["name"],
+                        "ok": False,
+                        "status": 0,
+                        "url": url,
+                        "reason": "exception",
+                        "error": detail[:240],
+                        "error_type": err_type,
+                    }
 
-        results = await asyncio.gather(*[_run_one(c) for c in checks], return_exceptions=False)
+            err_type = type(last_exc).__name__ if last_exc else "ProbeError"
+            detail = str(last_exc).strip() if last_exc else "probe_failed"
+            return {
+                "name": item["name"],
+                "ok": False,
+                "status": 0,
+                "url": url,
+                "reason": "exception",
+                "error": detail[:240],
+                "error_type": err_type,
+            }
+
+        results: List[Dict[str, Any]] = []
+        for item in checks:
+            results.append(await _run_one(item))
         by_name = {str(r.get("name")): r for r in results if isinstance(r, dict)}
         ok_count = sum(1 for r in results if bool((r or {}).get("ok")))
         total = max(1, len(results))
@@ -990,6 +1029,7 @@ class OKXExchange(ExchangeBase):
             
             for attempt in range(max_retries + 1):
                 try:
+                    session = await self._ensure_session_ready(f"request:{method}:{endpoint}")
                     timeout = aiohttp.ClientTimeout(
                         total=float(profile.get("timeout_total", self._timeout_total) or self._timeout_total),
                         connect=float(profile.get("timeout_connect", self._timeout_connect) or self._timeout_connect),
@@ -997,7 +1037,7 @@ class OKXExchange(ExchangeBase):
                     )
                     
                     if method == "GET":
-                        async with self._session.get(url, headers=headers, params=request_params, timeout=timeout, proxy=proxy) as response:
+                        async with session.get(url, headers=headers, params=request_params, timeout=timeout, proxy=proxy) as response:
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)
@@ -1041,7 +1081,7 @@ class OKXExchange(ExchangeBase):
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
                     elif method == "POST":
-                        async with self._session.post(url, headers=headers, data=body_str, timeout=timeout, proxy=proxy) as response:
+                        async with session.post(url, headers=headers, data=body_str, timeout=timeout, proxy=proxy) as response:
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)
@@ -1082,7 +1122,7 @@ class OKXExchange(ExchangeBase):
                                 raise Exception(f"OKX API错误: {error_msg}")
                                 
                     elif method == "DELETE":
-                        async with self._session.delete(url, headers=headers, json=body, timeout=timeout, proxy=proxy) as response:
+                        async with session.delete(url, headers=headers, json=body, timeout=timeout, proxy=proxy) as response:
                             if response.status == 429:  # Rate limit
                                 logger.warning(f"⚠️ OKX API 限流，等待 {retry_delay} 秒后重试...")
                                 await asyncio.sleep(retry_delay)

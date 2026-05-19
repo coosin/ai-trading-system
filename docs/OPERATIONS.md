@@ -97,6 +97,12 @@ OPENCLAW_OKX_PROXY_ONLY=1
 
 当前 OKX 推荐经本机 `mihomo` mixed-port `7890`，`okx.com` / `okx.cab` 由 OKX 专用分组分流。旧本地 GCP 隧道 `127.0.0.1:17892/17893` 不应作为主链路。
 
+当前运行补充：
+
+- `OPENCLAW_OKX_WS_ENABLED=1`，公共 tickers 由 WS 分担，降低 REST 压力。
+- 若宿主机代理出口对 OKX 公共 WS 不稳定，系统会按指数退避重连；连续短连达到阈值后，公共 WS 会暂停 `300s` 再试。
+- `OPENCLAW_OKX_PROXY_ONLY=1` 仍保持开启，说明当前生产假设是“OKX 必须经代理出口”；如要切直连，先在宿主机完成连通性验证，不要直接在线上切。
+
 检查：
 
 ```bash
@@ -107,17 +113,29 @@ python3 scripts/network_connectivity_smoke.py --include-api
 
 ## LLM 当前基线
 
-当前主模型配置在 `config/config.yaml`，生产默认已切到讯飞 Astron Code Latest：
+当前生产基线不再让交易系统直接绑定真实模型名，而是统一走宿主机 `CLIProxyAPI`：
 
-- `model_id=astron-code-latest`
-- `base_url=https://maas-coding-api.cn-huabei-1.xf-yun.com/v2`
-- `api_key_env=XFYUN_ASTRON_API_KEY`
+- `base_url=http://127.0.0.1:8317/v1`
+- 交易逻辑别名：
+  - `trading-fast`
+  - `trading-json`
+  - `trading-reasoning`
+  - `trading-fallback`
+- 当前 `ai_trading.ai_config.model_id=trading-reasoning`
+
+含义：
+
+- 交易系统只选择逻辑槽位，不直接依赖上游真实模型名。
+- `CLIProxyAPI` 负责把逻辑槽位映射到当前真实可用模型。
+- 诊断面若再出现历史真实模型名，优先怀疑文档或配置漂移，而不是先怀疑交易主链已经切回旧模型。
 
 检查：
 
 ```bash
 curl -s "$OPENCLAW_API_BASE/api/v1/ai-models/default"
-rg -n "astron-code-latest|maas-coding-api.cn-huabei-1.xf-yun.com" logs/app.log
+curl -s "$OPENCLAW_API_BASE/api/v1/modules/commander/trading-diagnosis?limit_events=20&timeout_sec=10"
+python3 scripts/validate_trading_model_aliases.py
+rg -n "127.0.0.1:8317|trading-reasoning|trading-fast|trading-json|trading-fallback" logs/app.log
 ```
 
 ## 配置重载
@@ -165,4 +183,3 @@ bash scripts/verify_full_stack_network.sh
 ```
 
 `verify_full_stack_network.sh` 成功时应输出 `VERIFY_FULL_STACK=PASS`。
-

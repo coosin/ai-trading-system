@@ -10,9 +10,10 @@ system:
   log_level: INFO
   environment: production
 llm:
-  # 主模型：千帆为主，Astron 作为唯一默认回退；DeepSeek 配置保留但默认禁用
-  default_model: qianfan-code-latest
-  # 自动轮询策略：优先当前主模型，失败后降级，支持自动恢复
+  # 交易系统只面向 CLIProxyAPI 暴露的逻辑别名；
+  # 真实模型、供应商、账号与切换策略在 CLIProxyAPI 统一管理。
+  default_model: trading-fast
+  # 自动轮询策略：优先当前逻辑槽位，失败后按槽位回退，支持自动恢复
   auto_polling:
     enabled: true
     strategy: priority_with_fallback
@@ -21,13 +22,34 @@ llm:
     max_failures_before_switch: 2
     cooldown_after_switch: 30
   models:
-  # 0. 千帆 Code Latest — 生产默认主模型（OpenAI 兼容）
+  # 0. trading-fast — 低延迟主槽位
   - provider: openai
-    model_id: qianfan-code-latest
-    display_name: Baidu Qianfan Code Latest
-    api_key_env: BAIDU_QIANFAN_API_KEY
-    base_url: https://qianfan.baidubce.com/v2/coding
+    model_id: trading-fast
+    display_name: CLIProxyAPI Trading Fast
+    api_key_env: CLI_PROXY_API_KEY
+    base_url: http://127.0.0.1:8317/v1
     temperature: 0.35
+    max_tokens: 16384
+    timeout: 60.0
+    max_retries: 3
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 200000
+    supports_vision: false
+    supports_reasoning: false
+    enabled: true
+    priority: 180
+    region: gateway
+    notes: Low-latency logical alias routed by local CLIProxyAPI
+    fallback_models:
+    - trading-fallback
+  # 1. trading-json — 结构化结果优先槽位
+  - provider: openai
+    model_id: trading-json
+    display_name: CLIProxyAPI Trading JSON
+    api_key_env: CLI_PROXY_API_KEY
+    base_url: http://127.0.0.1:8317/v1
+    temperature: 0.25
     max_tokens: 16384
     timeout: 60.0
     max_retries: 3
@@ -37,64 +59,40 @@ llm:
     supports_vision: false
     supports_reasoning: true
     enabled: true
-    priority: 180
-    region: cn
-    notes: Production primary via Baidu Qianfan official OpenAI-compatible endpoint
+    priority: 170
+    region: gateway
+    notes: Strict structured-output logical alias routed by local CLIProxyAPI
     fallback_models:
-    - astron-code-latest
-  # 1. DeepSeek V4 Flash — 低延迟回退
+    - trading-fast
+    - trading-fallback
+  # 2. trading-reasoning — 深度推理与决策槽位
   - provider: openai
-    model_id: deepseek-v4-flash
-    display_name: DeepSeek V4 Flash
-    api_key_env: DEEPSEEK_API_KEY
-    base_url: https://api.deepseek.com/v1
-    temperature: 0.35
-    max_tokens: 16384
-    timeout: 60.0
-    max_retries: 4
-    cost_per_input_token: 0.0
-    cost_per_output_token: 0.0
-    context_window: 128000
-    supports_vision: false
-    supports_reasoning: true
-    enabled: false
-    priority: 150
-    region: global
-    notes: Low-latency fallback via DeepSeek OpenAI-compatible endpoint
-    fallback_models:
-    - qianfan-code-latest
-    - deepseek-v4-pro
-    - astron-code-latest
-  # 2. DeepSeek V4 Pro — 高推理质量回退 / 重点任务优先
-  - provider: openai
-    model_id: deepseek-v4-pro
-    display_name: DeepSeek V4 Pro
-    api_key_env: DEEPSEEK_API_KEY
-    base_url: https://api.deepseek.com/v1
+    model_id: trading-reasoning
+    display_name: CLIProxyAPI Trading Reasoning
+    api_key_env: CLI_PROXY_API_KEY
+    base_url: http://127.0.0.1:8317/v1
     temperature: 0.30
     max_tokens: 16384
     timeout: 75.0
-    max_retries: 4
+    max_retries: 3
     cost_per_input_token: 0.0
     cost_per_output_token: 0.0
-    context_window: 128000
+    context_window: 200000
     supports_vision: false
     supports_reasoning: true
-    enabled: false
+    enabled: true
     priority: 160
-    region: global
-    notes: Deep reasoning fallback / preferred for complex decisions
+    region: gateway
+    notes: High-reasoning logical alias routed by local CLIProxyAPI
     fallback_models:
-    - qianfan-code-latest
-    - deepseek-v4-flash
-    - astron-code-latest
-  # 3. 讯飞 Astron Code Latest — 末级备用
+    - trading-fallback
+  # 3. trading-fallback — 保底兜底槽位
   - provider: openai
-    model_id: astron-code-latest
-    display_name: iFlytek Astron Code Latest
-    api_key_env: XFYUN_ASTRON_API_KEY
-    base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2
-    temperature: 0.4
+    model_id: trading-fallback
+    display_name: CLIProxyAPI Trading Fallback
+    api_key_env: CLI_PROXY_API_KEY
+    base_url: http://127.0.0.1:8317/v1
+    temperature: 0.35
     max_tokens: 16384
     timeout: 60.0
     max_retries: 3
@@ -105,41 +103,101 @@ llm:
     supports_reasoning: true
     enabled: true
     priority: 120
-    region: cn
-    notes: Final fallback via iFlytek MaaS coding OpenAI-compatible endpoint
+    region: gateway
+    notes: Conservative fallback logical alias routed by local CLIProxyAPI
+    fallback_models: []
+  # 4. nvidia-fast-exp — NVIDIA 实验低延迟槽位（不参与生产自动选模）
+  - provider: openai
+    model_id: nvidia-fast-exp
+    display_name: CLIProxyAPI NVIDIA Fast Experimental
+    api_key_env: CLI_PROXY_API_KEY
+    base_url: http://127.0.0.1:8317/v1
+    temperature: 0.2
+    max_tokens: 4096
+    timeout: 45.0
+    max_retries: 2
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 64000
+    supports_vision: false
+    supports_reasoning: false
+    enabled: true
+    priority: 40
+    region: gateway
+    notes: Experimental NVIDIA-backed alias for manual smoke tests and future canaries
+    fallback_models: []
+  # 5. nvidia-reasoning-exp — NVIDIA 实验推理槽位（不参与生产自动选模）
+  - provider: openai
+    model_id: nvidia-reasoning-exp
+    display_name: CLIProxyAPI NVIDIA Reasoning Experimental
+    api_key_env: CLI_PROXY_API_KEY
+    base_url: http://127.0.0.1:8317/v1
+    temperature: 0.0
+    max_tokens: 4096
+    timeout: 45.0
+    max_retries: 2
+    cost_per_input_token: 0.0
+    cost_per_output_token: 0.0
+    context_window: 64000
+    supports_vision: false
+    supports_reasoning: true
+    enabled: true
+    priority: 35
+    region: gateway
+    notes: Experimental NVIDIA reasoning alias kept out of production task mapping
     fallback_models: []
   task_model_mapping:
-    # 默认任务仅走千帆主路由 + Astron 兜底，避免 DeepSeek 配额不足时拖慢回退链。
+    # 交易系统按逻辑能力槽位选模；真实模型选择由 CLIProxyAPI 在槽位内部完成。
     general:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-fast
+    - trading-fallback
     market_analysis:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-json
+    - trading-fast
+    - trading-fallback
     strategy_generation:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-json
+    - trading-fast
+    - trading-fallback
     signal_generation:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-fast
+    - trading-fallback
     risk_assessment:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-json
+    - trading-fast
+    - trading-fallback
     news_analysis:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-fast
+    - trading-fallback
     code_generation:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-reasoning
+    - trading-fallback
     natural_language:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-fast
+    - trading-fallback
     decision_making:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-reasoning
+    - trading-fallback
     reasoning:
-    - qianfan-code-latest
-    - astron-code-latest
+    - trading-reasoning
+    - trading-fallback
+  integration:
+    task_overrides:
+      analyze_market:
+        max_tokens: 900
+        temperature: 0.4
+      generate_strategy:
+        max_tokens: 900
+        temperature: 0.4
+      analyze_news:
+        max_tokens: 800
+        temperature: 0.3
+      evaluate_risk:
+        max_tokens: 700
+        temperature: 0.3
+      generate_trading_signal:
+        max_tokens: 500
+        temperature: 0.2
 trading:
   # 默认关注列表（动态选币开启时仍作 always_include 候选）
   symbols:
@@ -518,6 +576,9 @@ controller:
   max_restart_attempts: 3
   health_check_interval: 30
   event_history_limit: 1000
+  # 启动即进入全自动托管；运行中仍可通过 commander 接口临时切换。
+  automation_profile: full_auto
+  hosting_mode: full_auto
 ai_core:
   # 生产稳态：保留自动回测/优化，但单轮限额，避免抢占交易主链路。
   authorization:
@@ -840,7 +901,8 @@ ai_trading:
   - BNB/USDT
   ai_config:
     enabled: true
-    model_id: astron-code-latest
+    # 交易系统对接 CLIProxyAPI 逻辑别名；真实后端由 8317 网关内部选择与切换。
+    model_id: trading-reasoning
     analysis_interval: 120
     min_confidence: 0.74
     max_positions: 4

@@ -38,6 +38,8 @@ class OKXWebSocketHub:
         self._session: Optional[aiohttp.ClientSession] = None
         self._public_ws_unstable_count: int = 0
         self._public_ws_suspended_until: float = 0.0
+        self._public_connect_seq: int = 0
+        self._last_public_subscribe_log_ts: float = 0.0
 
     def ws_private_url(self) -> str:
         configured = str(getattr(self._ex, "ws_private_url", "") or "").strip()
@@ -167,10 +169,26 @@ class OKXWebSocketHub:
                     kwargs["proxy"] = self._ex._proxy_url
 
                 connected_at = time.time()
+                self._public_connect_seq += 1
+                connect_seq = self._public_connect_seq
                 async with sess.ws_connect(self._ex.ws_url, **kwargs) as ws:
                     await ws.send_str(json.dumps({"op": "subscribe", "args": args}, separators=(",", ":")))
-                    logger.info("OKX WS 已订阅 tickers: %s", ",".join(inst_ids))
-                    backoff = 1.0
+                    now = time.time()
+                    if connect_seq == 1:
+                        logger.info("OKX WS 已订阅 tickers: %s", ",".join(inst_ids))
+                    elif now - self._last_public_subscribe_log_ts >= 30.0:
+                        logger.info(
+                            "OKX WS 公共频道已重连并恢复订阅: seq=%s inst_count=%s",
+                            connect_seq,
+                            len(inst_ids),
+                        )
+                    else:
+                        logger.debug(
+                            "OKX WS 公共频道已重连并恢复订阅: seq=%s inst_count=%s",
+                            connect_seq,
+                            len(inst_ids),
+                        )
+                    self._last_public_subscribe_log_ts = now
                     ping_task = asyncio.create_task(self._ws_send_periodic_ping(ws))
                     try:
                         while not self._stop.is_set():
@@ -225,8 +243,18 @@ class OKXWebSocketHub:
                             alive_for,
                             self._public_ws_unstable_count,
                         )
+                    else:
+                        logger.warning(
+                            "OKX WS 公共频道短连，%.1fs 后重连: alive_for=%.1fs failures=%s",
+                            backoff,
+                            alive_for,
+                            self._public_ws_unstable_count,
+                        )
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 1.8, 45.0)
                 else:
                     self._public_ws_unstable_count = 0
+                    backoff = 1.0
             except asyncio.CancelledError:
                 raise
             except Exception as e:

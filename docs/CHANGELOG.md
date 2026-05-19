@@ -1,5 +1,73 @@
 # 变更记录
 
+## 2026-05-19 — CLIProxyAPI 交易别名对齐、OKX 探针稳态化与 WS 退避保护
+
+- **LLM 生产链路对齐：**
+  - `config/config.yaml`
+    - `ai_trading.ai_config.model_id` 从过时的 `astron-code-latest` 收口为 `trading-reasoning`
+  - 运行基线：
+    - 交易系统继续只使用逻辑别名：
+      - `trading-fast`
+      - `trading-json`
+      - `trading-reasoning`
+      - `trading-fallback`
+    - 真实上游由宿主机 `CLIProxyAPI`（`http://127.0.0.1:8317/v1`）负责映射和切换
+  - 目的：
+    - 消除“运行态真实链路已切到 CLIProxyAPI，但诊断仍显示旧模型名”的配置漂移
+    - 保持交易系统只依赖稳定的逻辑能力槽位，不直接依赖上游真实模型名
+
+- **OKX 健康探针稳态化：**
+  - `src/modules/exchanges/okx.py`
+    - `probe_public_api()` 从“并发单次探测”调整为“串行探测 + 轻量重试 + 必要时重建 session”
+    - 避免 `mihomo` / 上游出口瞬时抖动时，控制面因为单次握手失败被误判为 `degraded` / `unreachable`
+  - 运行结论：
+    - 在本轮宿主机重启验证中，`/api/v1/system/health` 的 `exchange_reachability.probe` 连续保持 `2/2`
+    - 控制面健康不再被短时代理抖动轻易放大
+
+- **OKX 公共 WebSocket 退避与降噪：**
+  - `.env`
+    - 开启 `OPENCLAW_OKX_WS_ENABLED=1`
+    - 收紧 OKX REST 并发与节流：
+      - `OPENCLAW_OKX_MAX_CONCURRENCY=2`
+      - `OPENCLAW_OKX_MARKET_MAX_CONCURRENCY=1`
+      - `OPENCLAW_OKX_ACCOUNT_MAX_CONCURRENCY=1`
+      - `OPENCLAW_OKX_MIN_REQUEST_INTERVAL=0.35`
+      - `OPENCLAW_OKX_MAX_RETRIES=5`
+  - `src/modules/exchanges/okx_websocket.py`
+    - 公共 WS 遇到 `close_code=1006` 时，改为指数退避重连
+    - 连续短连达到阈值后，进入已有“暂停 300 秒再试”保护
+    - 将反复刷屏的“已订阅 tickers”日志，收口为首次订阅 + 恢复订阅摘要
+  - 运行结论：
+    - OKX 公共 WS 当前仍可能受宿主机代理出口波动影响
+    - 但系统已改为“WS 不稳时自我降噪和限流，由 REST 主链路继续兜底”，不再形成紧密重连风暴
+
+## 2026-05-19 — NVIDIA 实验别名接入交易系统灰度链路
+
+- `CLIProxyAPI/config.yaml`
+  - 新增 `nvidia-openclaw` provider
+  - 验证后保留两条可用实验别名：
+    - `nvidia-fast-exp` -> `nvidia/nemotron-mini-4b-instruct`
+    - `nvidia-reasoning-exp` -> `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`
+  - 未将 `DeepSeek V4` 接入实验别名：
+    - 虽然 `/v1/models` 可见 `deepseek-ai/deepseek-v4-pro`
+    - 但从当前主机对 `/v1/chat/completions` 的实测持续超时
+
+- `config/config.yaml`
+  - 将 `nvidia-fast-exp` 与 `nvidia-reasoning-exp` 注册进交易系统模型清单
+  - 不加入 `task_model_mapping`
+  - 目的：支持手动点名、冒烟验证与后续灰度，不影响当前生产 `trading-*` 自动选模
+
+- `scripts/validate_trading_model_aliases.py`
+  - 从固定校验 `trading-*` 扩展为按期望文件驱动
+  - 新增 `validation` 模式：
+    - `ok`
+    - `json`
+    - `reasoning_ok`
+
+- 新增验证期望文件
+  - `config/nvidia_model_alias_expectations.json`
+  - 用于独立验收 NVIDIA 实验别名，不混入生产主链验证
+
 ## 2026-05-15 — 系统文档按标准域架构重写
 
 - 重写系统级文档入口与核心手册：
